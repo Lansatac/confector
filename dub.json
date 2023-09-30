@@ -1,0 +1,12 @@
+{
+	"authors": [
+		"Jason Yegge"
+	],
+	"copyright": "Copyright © 2023, Jason Yegge",
+	"dependencies": {
+		"vibe-d": "~>0.9.7"
+	},
+	"description": "A build system.",
+	"license": "The Unlicense",
+	"name": "confector"
+}
