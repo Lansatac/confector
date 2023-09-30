@@ -1,0 +1,2 @@
+# confector
+A build system
