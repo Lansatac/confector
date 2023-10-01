@@ -8,4 +8,6 @@ html
       div.menu
         include navbar.dt
       div.content
-        block body
+        block maincontent
+      div.footer
+        include footer.dt
