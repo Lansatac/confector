@@ -38,10 +38,10 @@ body
   display: inline;
   a:visited
   {
-    color: green;
+    color: var(--accent-light);
   }
   a:hover {
-    color: hotpink;
+    color: #D470FF;
   }
 }
 .site-title
@@ -71,5 +71,5 @@ a:visited {
   color: purple;
 }
 a:hover {
-  color: hotpink;
+  color: #D470FF;
 }

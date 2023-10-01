@@ -1,6 +1,6 @@
 extends layout
 
-block body
+block maincontent
 	h1 Confector - Home
 	p Add the thing!
 	input( name='Repository address' )

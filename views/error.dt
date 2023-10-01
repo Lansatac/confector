@@ -1,0 +1,6 @@
+extends layout
+
+block body
+  h1 Error #{error.code}
+  p An error has occured!
+  p Details: #{error.message}

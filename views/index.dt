@@ -1,4 +1,4 @@
 extends layout
 
-block body
+block maincontent
 	h1 Confector - Home

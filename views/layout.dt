@@ -2,7 +2,7 @@ doctype 5
 html
   head
     title Confector
-    include styles.dt
+    link(rel="stylesheet", href="/static/styles/style.css")
   body
     div.container
       div.menu
