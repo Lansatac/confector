@@ -1,0 +1,8 @@
+div.menu-item
+  h1.site-title Confector
+div.menu-item
+  a.item-link(href="/") Home
+div.menu-item
+  a.item-link(href="/repositories/") Repositories
+div.menu-item
+  a.item-link(href="/projects/") Projects

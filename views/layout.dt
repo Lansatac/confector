@@ -1,6 +1,11 @@
-doctype html
+doctype 5
 html
-	head
-		title Example page
-	body
-		block body
+  head
+    title Confector
+    include styles.dt
+  body
+    div.container
+      div.menu
+        include navbar.dt
+      div.content
+        block body

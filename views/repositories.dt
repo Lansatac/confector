@@ -1,0 +1,8 @@
+extends layout
+
+block body
+  h1 Repositories
+  h2 All Repositories
+  - foreach(r; repositories)
+    li=r
+  a( href="add_repo/" ) Add Repository

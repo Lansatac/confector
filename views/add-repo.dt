@@ -1,0 +1,7 @@
+extends layout
+
+block body
+	h1 Confector - Home
+	p Add the thing!
+	input( name='Repository address' )
+	button( type='button' ) Add
