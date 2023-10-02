@@ -1,0 +1,23 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+    {
+      "type": "dub",
+      "run": true,
+      "cwd": "c:/Users/Jason/projects/confector",
+      "compiler": "$current",
+      "archType": "$current",
+      "buildType": "$current",
+      "configuration": "$current",
+      "problemMatcher": [
+        "$dmd"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "label": "dub: Run confector",
+      "detail": "dub run --compiler=dmd.EXE -a=x86_64 -b=debug -c=application"
+    }
+  ]
+}

@@ -44,6 +44,21 @@ body
     color: #D470FF;
   }
 }
+.repository-list
+{
+  border-block: 0.5rem solid;
+  writing-mode: horizontal-tb;
+  display: grid;
+  padding: 5px;
+}
+.repository-item
+{
+  display: grid;
+  column-gap: 10px;
+  
+  grid-template-columns: auto auto 1fr;
+
+}
 .site-title
 {
   margin-left: 30px;

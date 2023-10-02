@@ -2,6 +2,8 @@ import std.stdio;
 import vibe.vibe;
 import controller.repositorycontroller;
 
+debug static import std.stdio;
+
 void index(HTTPServerRequest req, HTTPServerResponse res)
 {
 	res.render!("index.dt", req);
@@ -26,13 +28,9 @@ void main()
 	auto dbs = client.getDatabases();
 	writeln("Current databases are: ", dbs);
 	
-	auto repositories = client.getCollection("core.repositories");
-
-	auto all = repositories.find();
-	writeln(all);
 	auto router = new URLRouter;
 	router.get("/", &index); 
-	router.any("*", repositoryRouter()); 
+	router.any("*", repositoryRouter(client)); 
 
   router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
   auto fsettings = new HTTPFileServerSettings;
@@ -42,6 +40,9 @@ void main()
 	auto settings = new HTTPServerSettings;
 	settings.port = 8080;
   settings.errorPageHandler = toDelegate(&errorPage);
+
+  //debug settings.accessLogToConsole = true;
+  debug settings.options = HTTPServerOption.defaults;
 	
 	listenHTTP(settings, router);
 	

@@ -1,0 +1,5 @@
+extends layout
+
+block maincontent
+  h1 #{name}
+  label Address: #{address}

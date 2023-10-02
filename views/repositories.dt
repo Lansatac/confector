@@ -3,6 +3,10 @@ extends layout
 block maincontent
   h1 Repositories
   h2 All Repositories
-  - foreach(r; repositories)
-    li=r
+  div.repository-list
+    - foreach(r; repositories)
+      div.repository-item
+        a( href="repo_details?name=#{r.name}" ) #{r.name}
+        label Address:
+        label #{r.address}
   a( href="add_repo/" ) Add Repository

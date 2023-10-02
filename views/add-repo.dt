@@ -1,7 +1,11 @@
 extends layout
 
 block maincontent
-	h1 Confector - Home
-	p Add the thing!
-	input( name='Repository address' )
-	button( type='button' ) Add
+  h1 Confector - Home
+  p Add the thing!
+  form(method="post", name='add-repo')
+    label Repository Name
+    input( name='repository-name' )
+    label Repository Address
+    input( name='repository-address' )
+    input(type='submit', value='Add')
