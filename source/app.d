@@ -21,8 +21,8 @@ void main()
 	MongoClient client = connectMongoDB("mongodb://root:example@127.0.0.1");
 	
 	auto router = new URLRouter;
-	router.get("/", &index); 
-	router.any("*", repositoryRouter(client)); 
+	router.get("/", &index);
+	router.any("*", repositoryRouter(client));
 
   router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
   auto fsettings = new HTTPFileServerSettings;

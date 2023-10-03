@@ -2,5 +2,6 @@
     "editor.tabSize": 2,
     "editor.indentSize": "tabSize",
     "editor.insertSpaces": true,
-    "editor.detectIndentation": false
+    "editor.detectIndentation": false,
+    "cmake.configureOnOpen": false
 }

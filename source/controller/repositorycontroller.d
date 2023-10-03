@@ -7,7 +7,6 @@ import std.typecons;
 
 debug import std.stdio;
 
-
 URLRouter repositoryRouter(MongoClient mongoClient)
 {
 	auto repositoryRouter = new URLRouter("/repositories");
@@ -39,7 +38,6 @@ class RepositoryController
   {
     render!("repository/add-repo.dt");
   }
-
   
   void getRepoDetails(HTTPServerRequest req)
   {
@@ -60,7 +58,7 @@ class RepositoryController
     render!("repository/add-error.dt");
   }
 
-  void postAddRepo(HTTPServerRequest req, HTTPServerResponse res)
+  void postAddRepo(HTTPServerRequest req)
   {
     import std.string : format;
 
@@ -79,8 +77,6 @@ class RepositoryController
     else
     {
       redirect("/repo_add_error");
-    }
-    
+    } 
   }
-
 }
