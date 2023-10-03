@@ -1,0 +1,4 @@
+extends layout
+
+block maincontent
+  p Error adding repository!

@@ -19,14 +19,6 @@ void errorPage(HTTPServerRequest req,
 void main()
 {
 	MongoClient client = connectMongoDB("mongodb://root:example@127.0.0.1");
-
-	// auto coll = client.getCollection("test.collection");
-	
-	// foreach (doc; coll.find(["name": "Peter"]))
-	// 	logInfo("Found entry: %s", doc.toJson());
-
-	auto dbs = client.getDatabases();
-	writeln("Current databases are: ", dbs);
 	
 	auto router = new URLRouter;
 	router.get("/", &index); 

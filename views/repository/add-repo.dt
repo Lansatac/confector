@@ -5,7 +5,7 @@ block maincontent
   p Add the thing!
   form(method="post", name='add-repo')
     label Repository Name
-    input( name='repository-name' )
+    input( name='repository-name', required )
     label Repository Address
-    input( name='repository-address' )
+    input( name='repository-address', required )
     input(type='submit', value='Add')

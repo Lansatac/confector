@@ -32,12 +32,12 @@ class RepositoryController
     auto all = repositoryCollection.find();
 
     auto repositories = all.map!(r=>tuple!("name", "address")(r["name"].get!string, r["address"].get!string)).array;
-    render!("repositories.dt", repositories);
+    render!("repository/repositories.dt", repositories);
   }
   
   void getAddRepo()
   {
-    render!("add-repo.dt");
+    render!("repository/add-repo.dt");
   }
 
   
@@ -52,40 +52,34 @@ class RepositoryController
     auto name = repoDetails["name"].get!string;
     auto address = repoDetails["address"].get!string;
     
-    render!("repository-details.dt", name, address);
+    render!("repository/repository-details.dt", name, address);
+  }
+
+  void getRepoAddError()
+  {
+    render!("repository/add-error.dt");
   }
 
   void postAddRepo(HTTPServerRequest req, HTTPServerResponse res)
   {
-    debug std.stdio.writefln("Post request to add repository: " ~ req.form.to!string);
+    import std.string : format;
 
-    try{
-      auto name = req.form["repository-name"];
-      auto address = req.form["repository-address"];
+    auto name = req.form["repository-name"];
+    auto address = req.form["repository-address"];
 
-      auto existing = repositoryCollection.find(["name": name]);
-      
-      debug writefln("Existing entries: %s", existing);
+    auto noExisting = repositoryCollection.find(["name": name]).empty;
 
-      if(existing.empty)
-      {
-        Bson doc = Bson(["name": Bson(name), "address": Bson(address)]);
-        repositoryCollection.insertOne(doc);
-        
-        redirect("/repo_details");
-      }
-      else
-      {
-        redirect("/repo_add_error");
-      }
-    }
-    catch(Exception e)
+    if(noExisting)
     {
-      debug writeln(e);
-      return;
+      Bson doc = Bson(["name": Bson(name), "address": Bson(address)]);
+      repositoryCollection.insertOne(doc);
+      
+      redirect("repo_details?name=%s".format(name));
     }
-    
-    debug std.stdio.writefln("Adding succeeded?");
+    else
+    {
+      redirect("/repo_add_error");
+    }
     
   }
 
