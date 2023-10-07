@@ -1,4 +1,5 @@
 import std.stdio;
+
 import vibe.vibe;
 import controller.repositorycontroller;
 
@@ -18,7 +19,24 @@ void errorPage(HTTPServerRequest req,
 
 void main()
 {
-	MongoClient client = connectMongoDB("mongodb://root:example@127.0.0.1");
+  import std.file;
+  import std.format;
+  import std.conv;
+
+  auto password = readText!wstring("/run/secrets/mongo-readwrite-password").to!string;
+
+  writeln("Connecting to mongo...");
+  MongoClient client;
+  try
+  {
+	  client = connectMongoDB("mongodb://mongo:27017/confector");
+  }
+  catch(MongoAuthException e)
+  {
+    writeln(e.message);
+    return;
+  }
+  writeln("Connected.");
 	
 	auto router = new URLRouter;
 	router.get("/", &index);
@@ -38,5 +56,6 @@ void main()
 	
 	listenHTTP(settings, router);
 	
+  writeln("Starting server");
 	runApplication();
 }
