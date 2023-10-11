@@ -54,11 +54,11 @@ void main()
 	//settings.port = 8080;
   settings.errorPageHandler = toDelegate(&errorPage);
 
-  debug settings.accessLogToConsole = true;
   settings.options = HTTPServerOption.defaults;
 
   debug settings.options = HTTPServerOption.defaults | HTTPServerOption.errorStackTraces;
-  debug setLogLevel(LogLevel.trace);
+  debug settings.accessLogToConsole = true;
+  debug setLogLevel(LogLevel.verbose1);
 	
 	listenHTTP(settings, router);
 	

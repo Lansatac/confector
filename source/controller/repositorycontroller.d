@@ -8,6 +8,7 @@ import std.typecons;
 import clonestatus;
 
 import std.stdio;
+import vibe.core.process;
 
 URLRouter repositoryRouter(MongoClient mongoClient)
 {
@@ -60,7 +61,7 @@ final class RepositoryController
       render!("repository/repository-details.dt", name, address, logLines);
     }
     catch (Exception e) {
-      //writeln(e);
+      logError(e.message);
       redirect("/error");
     }
   }
@@ -69,25 +70,44 @@ final class RepositoryController
   void postCloneRepo(HTTPServerRequest req)
   {
     import std.string : format;
+    import std.file;
+    import std.process;
 
 
     try{
       auto name = req.form["name"];
-      writefln("Cloning repo %s", name);
+
+      auto repoDir = "/home/dev/repositories/%s".format(name); // TODO: harden, validate name
+      mkdirRecurse(repoDir);
 
       auto repoQuery = repositoryCollection.findOne(["name": name], FindOptions.init);
       auto repoDetails = repoQuery;
       
       //auto name = repoDetails["name"].get!string;
       auto address = repoDetails["address"].get!string;
-      auto cloneTask = runTask(() nothrow  @safe {
+      auto cloneTask = runTask(() nothrow  @trusted {
         try{
         auto status = getOrCreateCloneStatus(name);
-			  sleep(dur!"seconds"(5));
-        writeln("Adding a log entry");
-        status.addLogLine("This is a test of the emergency log system.");
-        } catch (Exception) {
-          
+        
+        auto logFile = File("%s/clone.log".format(repoDir), "w");
+        auto inFile = File("/dev/null", "r");
+        
+        logInfo("spawning git command");
+        auto pid = spawnShell("git clone %s".format(address), inFile, logFile, logFile, null, Config.none, repoDir);
+        
+        wait(pid);
+        
+        auto logReader = File("%s/clone.log".format(repoDir), "r");
+        foreach (line; logReader.byLineCopy)
+        {
+          logInfo(line);
+          status.addLogLine(line);
+        }
+        logInfo("git command complete");
+
+
+        } catch (Exception e) {
+          logError(e.message);
         }
       });
 
@@ -98,7 +118,7 @@ final class RepositoryController
       cloneTask.join();
     }
     catch (Exception e) {
-      //writeln(e);
+      logError(e.message);
       redirect("/error");
     }
   }
@@ -120,8 +140,8 @@ final class RepositoryController
           status.waitForMessage(next_message);
         }
       }
-      catch (Exception) {
-        
+      catch (Exception e) {
+        logError(e.message);
       }
     });
 
