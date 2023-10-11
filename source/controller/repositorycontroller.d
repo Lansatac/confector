@@ -93,12 +93,12 @@ final class RepositoryController
         auto inFile = File("/dev/null", "r");
         
         logInfo("spawning git command");
-        auto pid = spawnShell("git clone %s".format(address), inFile, logFile, logFile, null, Config.none, repoDir);
+        auto pipe = pipeShell("git clone %s".format(address), Redirect.stdout | Redirect.stderrToStdout, null, Config.none, repoDir);
         
-        wait(pid);
+        scope(exit) wait(pipe.pid);
         
-        auto logReader = File("%s/clone.log".format(repoDir), "r");
-        foreach (line; logReader.byLineCopy)
+        //auto logReader = File("%s/clone.log".format(repoDir), "r");
+        foreach (line; pipe.stdout.byLineCopy)
         {
           logInfo(line);
           status.addLogLine(line);

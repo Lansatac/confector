@@ -57,7 +57,7 @@ void main()
   settings.options = HTTPServerOption.defaults;
 
   debug settings.options = HTTPServerOption.defaults | HTTPServerOption.errorStackTraces;
-  debug settings.accessLogToConsole = true;
+  //debug settings.accessLogToConsole = true;
   debug setLogLevel(LogLevel.verbose1);
 	
 	listenHTTP(settings, router);
