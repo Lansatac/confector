@@ -2,25 +2,21 @@ services:
   development:
     build:
       context: .
-      dockerfile: build/Dockerfile
+      dockerfile: build/development/Dockerfile
       # target: development
     secrets:
       - mongo-readwrite-password
     depends_on:
       - mongo
-    ports:
-      - 8080:8080
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./:/code
+      - ./:/home/dev/code
   mongo:
     image: mongo
     restart: always
     secrets:
       - mongo-admin-password
       - mongo-readwrite-password
-    ports:
-      - 27017:27017
     volumes:
       - ./mongo/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
 
@@ -37,6 +33,12 @@ services:
       ME_CONFIG_MONGODB_URL: mongodb://mongo:27017/
       #ME_CONFIG_MONGODB_SERVER: mongo
       MONGO_INITDB_DATABASE: confector
+  proxy:
+    build: build/proxy
+    ports:
+      - 8080:80
+    depends_on:
+      - development
 secrets:
   mongo-admin-password:
     file: mongo/dev-admin-password.txt

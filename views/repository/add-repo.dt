@@ -3,7 +3,7 @@ extends layout
 block maincontent
   h1 Confector - Home
   p Add the thing!
-  form(method="post", name='add-repo')
+  form(method="POST", action='/repositories/add_repo', name='add-repo')
     label Repository Name
     input( name='repository-name', required )
     label Repository Address

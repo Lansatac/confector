@@ -25,22 +25,25 @@ void main()
 
   auto password = readText!wstring("/run/secrets/mongo-readwrite-password").to!string;
 
-  writeln("Connecting to mongo...");
+  auto mongoAddress = "mongo:27017/confector";
+
+  writefln("Connecting to mongo at %s...", mongoAddress);
   MongoClient client;
   try
   {
-	  client = connectMongoDB("mongodb://mongo:27017/confector");
+	  client = connectMongoDB("mongodb://%s".format(mongoAddress));
   }
   catch(MongoAuthException e)
   {
     writeln(e.message);
     return;
   }
-  writeln("Connected.");
+  writeln("Connected to mongo.");
 	
 	auto router = new URLRouter;
 	router.get("/", &index);
-	router.any("*", repositoryRouter(client));
+  router.any("*", repositoryRouter(client));
+
 
   router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
   auto fsettings = new HTTPFileServerSettings;
@@ -48,11 +51,14 @@ void main()
   router.get("/static/*", serveStaticFiles("public/", fsettings));
 	
 	auto settings = new HTTPServerSettings;
-	settings.port = 8080;
+	//settings.port = 8080;
   settings.errorPageHandler = toDelegate(&errorPage);
 
-  //debug settings.accessLogToConsole = true;
-  debug settings.options = HTTPServerOption.defaults;
+  debug settings.accessLogToConsole = true;
+  settings.options = HTTPServerOption.defaults;
+
+  debug settings.options = HTTPServerOption.defaults | HTTPServerOption.errorStackTraces;
+  debug setLogLevel(LogLevel.trace);
 	
 	listenHTTP(settings, router);
 	

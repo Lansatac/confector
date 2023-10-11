@@ -5,19 +5,24 @@ import std.algorithm;
 import std.range;
 import std.typecons;
 
-debug import std.stdio;
+import clonestatus;
+
+import std.stdio;
 
 URLRouter repositoryRouter(MongoClient mongoClient)
 {
 	auto repositoryRouter = new URLRouter("/repositories");
 	repositoryRouter.registerWebInterface(new RepositoryController(mongoClient));
+
   return repositoryRouter;
 }
 
-class RepositoryController
+final class RepositoryController
 {
-  MongoClient mongoClient;
-  MongoCollection repositoryCollection;
+  private MongoClient mongoClient;
+  private MongoCollection repositoryCollection;
+
+	private CloneStatus[string] clonestatuses;
 
   public this(MongoClient mongoClient)
   {
@@ -40,18 +45,109 @@ class RepositoryController
   }
   
   void getRepoDetails(HTTPServerRequest req)
-  {
-    DictionaryList!(string,true,16L,false) queryParams;
-    parseURLEncodedForm(req.queryString, queryParams);
-    
-    auto queryName = queryParams["name"];
-    auto repoDetails = repositoryCollection.find(["name": queryName]).front;
+  {    
+    auto queryName = req.query["name"];
 
-    auto name = repoDetails["name"].get!string;
-    auto address = repoDetails["address"].get!string;
-    
-    render!("repository/repository-details.dt", name, address);
+    try{
+      auto repoQuery = repositoryCollection.findOne(["name": queryName], FindOptions.init);
+      auto repoDetails = repoQuery;
+      
+      auto name = repoDetails["name"].get!string;
+      auto address = repoDetails["address"].get!string;
+      auto status = getOrCreateCloneStatus(name);
+      auto logLines = status.logLines;
+      
+      render!("repository/repository-details.dt", name, address, logLines);
+    }
+    catch (Exception e) {
+      //writeln(e);
+      redirect("/error");
+    }
   }
+  
+  @safe
+  void postCloneRepo(HTTPServerRequest req)
+  {
+    import std.string : format;
+
+
+    try{
+      auto name = req.form["name"];
+      writefln("Cloning repo %s", name);
+
+      auto repoQuery = repositoryCollection.findOne(["name": name], FindOptions.init);
+      auto repoDetails = repoQuery;
+      
+      //auto name = repoDetails["name"].get!string;
+      auto address = repoDetails["address"].get!string;
+      auto cloneTask = runTask(() nothrow  @safe {
+        try{
+        auto status = getOrCreateCloneStatus(name);
+			  sleep(dur!"seconds"(5));
+        writeln("Adding a log entry");
+        status.addLogLine("This is a test of the emergency log system.");
+        } catch (Exception) {
+          
+        }
+      });
+
+      auto status = getOrCreateCloneStatus(name);
+      auto logLines = status.logLines;
+      
+      redirect("repo_details?name=%s".format(name));
+      cloneTask.join();
+    }
+    catch (Exception e) {
+      //writeln(e);
+      redirect("/error");
+    }
+  }
+
+  @safe
+  void getWS(HTTPServerRequest req, scope WebSocket socket)
+  {
+    auto status = getOrCreateCloneStatus(req.query["repo_name"]);
+
+    auto writer = runTask(() nothrow {
+      auto next_message = status.logLines.length;
+      try{
+        while (socket.connected) {
+          while (next_message < status.logLines.length)
+          {
+            socket.send(status.logLines[next_message++]);
+          }
+            
+          status.waitForMessage(next_message);
+        }
+      }
+      catch (Exception) {
+        
+      }
+    });
+
+    while (socket.connected) {
+      sleep(dur!"msecs"(100));
+    }
+    // while (socket.waitForData) {
+    //   auto message = socket.receiveText();
+    //   if (message.length) status.addLogLine(message);
+    // }
+
+    writer.join(); // wait for writer task to finish
+  }
+  
+  @safe
+	private nothrow CloneStatus getOrCreateCloneStatus(string id)
+	{
+    CloneStatus cs;
+    try{
+      if (auto pcs = id in clonestatuses) return *pcs;
+      cs = new CloneStatus;
+      clonestatuses[id] = cs;
+    }
+    catch(Exception){}
+    return cs;
+	}
 
   void getRepoAddError()
   {
@@ -72,11 +168,11 @@ class RepositoryController
       Bson doc = Bson(["name": Bson(name), "address": Bson(address)]);
       repositoryCollection.insertOne(doc);
       
-      redirect("repo_details?name=%s".format(name));
+      redirect("repo_details?name=%s".format(name), HTTPStatus.seeOther);
     }
     else
     {
-      redirect("/repo_add_error");
+      redirect("add_error");
     } 
   }
 }

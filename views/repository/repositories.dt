@@ -9,4 +9,4 @@ block maincontent
         a( href="repo_details?name=#{r.name}" ) #{r.name}
         label Address:
         label #{r.address}
-  a( href="add_repo/" ) Add Repository
+  a( href="add_repo" ) Add Repository

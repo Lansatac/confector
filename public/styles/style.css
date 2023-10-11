@@ -58,6 +58,11 @@ body
   
   grid-template-columns: 0.1fr auto 1fr;
 }
+textarea
+{
+  resize: vertical;
+  width: 100%
+}
 .site-title
 {
   margin-left: 30px;

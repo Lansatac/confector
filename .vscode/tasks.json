@@ -18,6 +18,42 @@
       },
       "label": "dub: Run confector",
       "detail": "dub run --compiler=dmd.EXE -a=x86_64 -b=debug -c=application"
+    },
+    {
+      "type": "dub",
+      "run": true,
+      "cwd": "${workspaceFolder}",
+      "compiler": "$current",
+      "archType": "$current",
+      "buildType": "$current",
+      "configuration": "$current",
+      "problemMatcher": [
+        "$dmd"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "label": "dub: Run confector",
+      "detail": "dub run --verror --compiler=ldc2 -b=debug -c=application"
+    },
+    {
+      "type": "dub",
+      "test": true,
+      "cwd": "c:/Users/Jason/projects/confector",
+      "compiler": "$current",
+      "archType": "$current",
+      "buildType": "$current",
+      "configuration": "$current",
+      "problemMatcher": [
+        "$dmd"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "label": "dub: Test confector",
+      "detail": "dub test --compiler=dmd -a=x86_64 -b=debug -c=application"
     }
   ]
 }
