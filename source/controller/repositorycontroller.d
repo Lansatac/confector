@@ -93,7 +93,11 @@ final class RepositoryController
         auto inFile = File("/dev/null", "r");
         
         logInfo("spawning git command");
-        auto pipe = pipeShell("git clone %s".format(address), Redirect.stdout | Redirect.stderrToStdout, null, Config.none, repoDir);
+        auto pipe = pipeShell("git clone %s".format(address),
+        Redirect.stdout | Redirect.stderrToStdout,
+        null,
+         Config.retainStderr,
+         repoDir);
         
         scope(exit) wait(pipe.pid);
         
@@ -103,6 +107,7 @@ final class RepositoryController
           logInfo(line);
           status.addLogLine(line);
         }
+
         logInfo("git command complete");
 
 
