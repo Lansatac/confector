@@ -7,7 +7,7 @@ USER dev
 # RUN mkdir -p /home/dev/code
 WORKDIR /home/dev
 VOLUME /home/dev/code
-COPY --chown=dev:developer . /home/dev/code
+COPY --chown=1001:developer . /home/dev/code
 CMD ["tail", "-f", "/dev/null"]
 # RUN dub build
 # FROM development AS build
