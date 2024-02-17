@@ -12,8 +12,11 @@ import vibe.core.process;
 
 URLRouter repositoryRouter(MongoClient mongoClient)
 {
-	auto repositoryRouter = new URLRouter("/repositories");
-	repositoryRouter.registerWebInterface(new RepositoryController(mongoClient));
+	auto repositoryRouter = new URLRouter();
+  auto settings = new WebInterfaceSettings();
+  settings.urlPrefix = "/repositories/";
+
+	repositoryRouter.registerWebInterface(new RepositoryController(mongoClient), settings);
 
   return repositoryRouter;
 }

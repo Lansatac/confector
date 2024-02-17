@@ -22,6 +22,7 @@ void main()
   import std.file;
   import std.format;
   import std.conv;
+  
 
   auto password = readText!wstring("/run/secrets/mongo-readwrite-password").to!string;
 
@@ -42,13 +43,14 @@ void main()
 	
 	auto router = new URLRouter;
 	router.get("/", &index);
-  router.any("*", repositoryRouter(client));
 
 
   router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
   auto fsettings = new HTTPFileServerSettings;
 	fsettings.serverPathPrefix = "/static";
   router.get("/static/*", serveStaticFiles("public/", fsettings));
+
+  router.any("*", repositoryRouter(client));
 	
 	auto settings = new HTTPServerSettings;
 	//settings.port = 8080;
@@ -58,7 +60,7 @@ void main()
 
   debug settings.options = HTTPServerOption.defaults | HTTPServerOption.errorStackTraces;
   //debug settings.accessLogToConsole = true;
-  debug setLogLevel(LogLevel.verbose1);
+  //debug setLogLevel(LogLevel.debugV);
 	
 	listenHTTP(settings, router);
 	

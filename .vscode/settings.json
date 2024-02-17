@@ -3,5 +3,6 @@
     "editor.indentSize": "tabSize",
     "editor.insertSpaces": true,
     "editor.detectIndentation": false,
-    "cmake.configureOnOpen": false
+    "cmake.configureOnOpen": false,
+    "d.stdlibPath": "auto"
 }
