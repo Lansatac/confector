@@ -6,6 +6,9 @@ import std.range;
 import std.typecons;
 
 import clonestatus;
+import confector.core.plugin;
+import confector.core.vcs;
+import confector.core.executor;
 
 import std.stdio;
 import vibe.core.process;
@@ -88,32 +91,30 @@ final class RepositoryController
       
       //auto name = repoDetails["name"].get!string;
       auto address = repoDetails["address"].get!string;
-      auto cloneTask = runTask(() nothrow  @trusted {
-        try{
-        auto status = getOrCreateCloneStatus(name);
-        
-        auto logFile = File("%s/clone.log".format(repoDir), "w");
-        auto inFile = File("/dev/null", "r");
-        
-        logInfo("spawning git command");
-        auto pipe = pipeShell("git clone %s".format(address),
-        Redirect.stdout | Redirect.stderrToStdout,
-        null,
-         Config.retainStderr,
-         repoDir);
-        
-        scope(exit) wait(pipe.pid);
-        
-        //auto logReader = File("%s/clone.log".format(repoDir), "r");
-        foreach (line; pipe.stdout.byLineCopy)
-        {
-          logInfo(line);
-          status.addLogLine(line);
-        }
+      auto cloneTask = runTask(() nothrow @trusted {
+        try {
+          auto status = getOrCreateCloneStatus(name);
+          auto providers = PluginRegistry.instance.getPluginsOfType!RepositoryProvider();
+          RepositoryProvider matchedProvider = null;
+          foreach (p; providers)
+          {
+            if (p.canHandle(address))
+            {
+              matchedProvider = p;
+              break;
+            }
+          }
 
-        logInfo("git command complete");
-
-
+          if (matchedProvider !is null)
+          {
+            matchedProvider.cloneRepository(address, repoDir, (line) @safe {
+              status.addLogLine(line);
+            });
+          }
+          else
+          {
+            status.addLogLine(format("No compatible repository provider plugin found for %s", address));
+          }
         } catch (Exception e) {
           logError(e.message);
         }

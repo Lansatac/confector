@@ -25,4 +25,7 @@ docs/
 
 # Code coverage
 *.lst
-confector
+/confector
+
+# LLMs
+.junie/plans

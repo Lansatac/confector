@@ -2,6 +2,9 @@ import std.stdio;
 
 import vibe.vibe;
 import controller.repositorycontroller;
+import confector.core.plugin;
+import confector.plugins.git;
+import confector.plugins.process_runner;
 
 debug static import std.stdio;
 
@@ -41,6 +44,11 @@ void main()
   }
   writeln("Connected to mongo.");
 	
+  // Initialize and register core default plugins
+  PluginRegistry.instance.registerPlugin(new GitRepositoryPlugin());
+  PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
+  writeln("Initialized modular plugins.");
+
 	auto router = new URLRouter;
 	router.get("/", &index);
 
