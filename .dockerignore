@@ -1,0 +1,9 @@
+.git
+.dub
+*.exe
+*.pdb
+*.obj
+*.o
+*.lib
+*.dll
+.junie
