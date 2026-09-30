@@ -67,7 +67,7 @@ final class RepositoryController
       render!("repository/repository-details.dt", name, address, logLines);
     }
     catch (Exception e) {
-      logError(e.message);
+      logError("%s", e.msg);
       redirect("/error");
     }
   }
@@ -116,7 +116,7 @@ final class RepositoryController
             status.addLogLine(format("No compatible repository provider plugin found for %s", address));
           }
         } catch (Exception e) {
-          logError(e.message);
+          logError("%s", e.msg);
         }
       });
 
@@ -127,7 +127,7 @@ final class RepositoryController
       cloneTask.join();
     }
     catch (Exception e) {
-      logError(e.message);
+      logError("%s", e.msg);
       redirect("/error");
     }
   }
@@ -150,7 +150,7 @@ final class RepositoryController
         }
       }
       catch (Exception e) {
-        logError(e.message);
+        logError("%s", e.msg);
       }
     });
 
