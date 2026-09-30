@@ -196,6 +196,35 @@ string[string] collectAndHashInputFiles(string baseDir, in string[] patterns) @t
     return result;
 }
 
+/**
+ * High-level helper struct for fingerprint computation.
+ */
+struct Fingerprinter
+{
+    /**
+     * Resolves input files and environment variables from the workspace to compute the node fingerprint.
+     */
+    static string computeNodeFingerprint(
+        in TaskNode task,
+        string workspaceDir,
+        in string[string] upstreamArtifactHashes = null
+    ) @trusted
+    {
+        import std.process : environment;
+        string[string] fileHashes = collectAndHashInputFiles(workspaceDir, task.inputs.files);
+        string[string] resolvedEnv;
+        foreach (envVar; task.inputs.env)
+        {
+            auto val = environment.get(envVar, null);
+            if (val !is null)
+            {
+                resolvedEnv[envVar] = val;
+            }
+        }
+        return .computeNodeFingerprint(task, fileHashes, upstreamArtifactHashes, resolvedEnv);
+    }
+}
+
 unittest
 {
     TaskNode task;

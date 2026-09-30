@@ -2,7 +2,11 @@ import std.stdio;
 
 import vibe.vibe;
 import controller.repositorycontroller;
+import controller.api_controller;
 import confector.core.plugin;
+import confector.core.storage;
+import confector.storage.mongo_repository;
+import confector.runner.engine;
 import confector.plugins.git;
 import confector.plugins.process_runner;
 
@@ -33,14 +37,16 @@ void main()
 
   writefln("Connecting to mongo at %s...", mongoAddress);
   MongoClient client;
+  BuildStateRepository stateRepo;
   try
   {
 	  client = connectMongoDB("mongodb://%s".format(mongoAddress));
+    stateRepo = new MongoBuildStateRepository(client);
   }
-  catch(MongoAuthException e)
+  catch(Exception e)
   {
-    writeln(e.message);
-    return;
+    writeln("MongoDB connection failed, using in-memory state repository: ", e.message);
+    stateRepo = new InMemoryBuildStateRepository();
   }
   writeln("Connected to mongo.");
 	
@@ -49,14 +55,21 @@ void main()
   PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
   writeln("Initialized modular plugins.");
 
+  // Initialize execution engine & storage
+  auto artifactStorage = new LocalArtifactStorage(".confector/artifacts");
+  auto taskEngine = new TaskEngine(artifactStorage, stateRepo);
+  writeln("Initialized Confector execution engine.");
+
 	auto router = new URLRouter;
 	router.get("/", &index);
-
 
   router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
   auto fsettings = new HTTPFileServerSettings;
 	fsettings.serverPathPrefix = "/static";
   router.get("/static/*", serveStaticFiles("public/", fsettings));
+
+  // Mount API & serverless execution endpoints
+  router.any("/api/v1/*", apiRouter(taskEngine));
 
   router.any("*", repositoryRouter(client));
 	
