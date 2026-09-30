@@ -1,0 +1,62 @@
+/**
+ * Confector Live Log Streamer
+ * Polls and refreshes live log output for executing builds and queue tasks.
+ */
+(function() {
+  document.addEventListener("DOMContentLoaded", function() {
+    var terminal = document.getElementById("live-terminal");
+    if (!terminal) return;
+
+    var buildId = terminal.getAttribute("data-build-id");
+    if (!buildId) return;
+
+    var autoScroll = true;
+    var autoscrollBtn = document.getElementById("btn-autoscroll");
+    var refreshBtn = document.getElementById("btn-refresh-logs");
+
+    if (autoscrollBtn) {
+      autoscrollBtn.addEventListener("click", function() {
+        autoScroll = !autoScroll;
+        autoscrollBtn.innerText = "Auto-scroll: " + (autoScroll ? "ON" : "OFF");
+        if (autoScroll) {
+          terminal.scrollTop = terminal.scrollHeight;
+        }
+      });
+    }
+
+    function fetchLogs() {
+      fetch("/api/v1/builds/logs?id=" + encodeURIComponent(buildId))
+        .then(function(res) {
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          return res.json();
+        })
+        .then(function(data) {
+          if (data && data.logs && data.logs.length > 0) {
+            terminal.innerHTML = "";
+            data.logs.forEach(function(line) {
+              var lineDiv = document.createElement("div");
+              lineDiv.className = "log-line";
+              lineDiv.textContent = line;
+              terminal.appendChild(lineDiv);
+            });
+            if (autoScroll) {
+              terminal.scrollTop = terminal.scrollHeight;
+            }
+          }
+        })
+        .catch(function(err) {
+          // Ignore network glitch during live streaming
+        });
+    }
+
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", fetchLogs);
+    }
+
+    // Live poll every 2.5 seconds
+    var pollInterval = setInterval(fetchLogs, 2500);
+
+    // Initial scroll
+    terminal.scrollTop = terminal.scrollHeight;
+  });
+})();

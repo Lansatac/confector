@@ -1,0 +1,86 @@
+extends layout
+
+block maincontent
+  div.build-details-container
+    div.header-section
+      div.title-row
+        h1 Build Details: #{build.buildId}
+        div.status-container
+          - if (build.status == "succeeded")
+            span.badge.badge-lg.badge-success SUCCESS
+          - else if (build.status == "cached")
+            span.badge.badge-lg.badge-cached CACHED
+          - else if (build.status == "failed")
+            span.badge.badge-lg.badge-danger FAILED
+          - else if (build.status == "running")
+            span.badge.badge-lg.badge-warning RUNNING
+          - else
+            span.badge.badge-lg.badge-secondary #{build.status}
+
+    div.details-grid
+      div.detail-item
+        strong Pipeline:
+        span  #{build.pipelineName}
+      div.detail-item
+        strong Trigger Source:
+        span  #{build.triggerSource}
+      div.detail-item
+        strong Target Task:
+        span  #{build.targetTaskId.length > 0 ? build.targetTaskId : "Full Graph"}
+      div.detail-item
+        strong Started:
+        span  #{build.startedAt}
+      div.detail-item
+        strong Finished:
+        span  #{build.finishedAt}
+      div.detail-item
+        strong Total Duration:
+        span  #{build.durationMs} ms
+
+    - if (build.errorMessage.length > 0)
+      div.alert.alert-danger
+        strong Error: 
+        span #{build.errorMessage}
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 DAG Pipeline Graph
+      div.graph-legend
+        span.legend-item
+          span.dot.dot-success
+          span Succeeded
+        span.legend-item
+          span.dot.dot-cached
+          span Cached
+        span.legend-item
+          span.dot.dot-running
+          span Running
+        span.legend-item
+          span.dot.dot-failed
+          span Failed
+
+    div#dag-container.dag-visualizer
+      canvas#dag-canvas(width="800", height="240")
+      div.dag-node-list
+        - foreach(taskId; build.executedTasks)
+          div.dag-node-card(data-task="#{taskId}")
+            div.node-header
+              span.node-id #{taskId}
+              span.badge.badge-sm.badge-success OK
+            div.node-meta
+              span Executed
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Live Execution Logs
+      div.log-controls
+        button.btn.btn-sm.btn-outline#btn-autoscroll Auto-scroll: ON
+        button.btn.btn-sm.btn-primary#btn-refresh-logs Refresh Logs
+
+    div.terminal-box#live-terminal(data-build-id="#{build.buildId}")
+      - if (logs.length == 0)
+        div.log-empty No log output recorded for this build.
+      - else
+        - foreach(line; logs)
+          div.log-line #{line}
+
+  script(src="/static/scripts/dag_visualizer.js")
+  script(src="/static/scripts/live_logs.js")

@@ -1,0 +1,49 @@
+extends layout
+
+block maincontent
+  div.builds-container
+    div.header-section
+      h1 Pipeline Builds
+      p Track execution history, cache hits, durations, and graph subgraphs.
+
+    - if (builds.length == 0)
+      div.empty-state
+        p No builds executed yet.
+        a.btn.btn-primary(href="/pipelines/") Launch a pipeline
+    - else
+      table.data-table
+        thead
+          tr
+            th Build ID
+            th Pipeline
+            th Status
+            th Trigger Source
+            th Started
+            th Finished
+            th Duration
+            th Tasks
+            th Actions
+        tbody
+          - foreach(b; builds)
+            tr
+              td
+                a.build-link(href="/builds/details?id=#{b.buildId}") #{b.buildId}
+              td #{b.pipelineName}
+              td
+                - if (b.status == "succeeded")
+                  span.badge.badge-success SUCCESS
+                - else if (b.status == "cached")
+                  span.badge.badge-cached CACHED
+                - else if (b.status == "failed")
+                  span.badge.badge-danger FAILED
+                - else if (b.status == "running")
+                  span.badge.badge-warning RUNNING
+                - else
+                  span.badge.badge-secondary #{b.status}
+              td #{b.triggerSource}
+              td #{b.startedAt}
+              td #{b.finishedAt}
+              td #{b.durationMs} ms
+              td #{b.executedTasks.length}
+              td
+                a.btn.btn-sm(href="/builds/details?id=#{b.buildId}") Details & Logs

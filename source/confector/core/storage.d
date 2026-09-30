@@ -163,6 +163,46 @@ interface BuildStateRepository
      * Checks if a cached fingerprint is recorded and returns previously produced artifact metadata.
      */
     bool getCachedFingerprint(string taskId, string fingerprint, out ArtifactMetadata[] producedArtifacts);
+
+    /**
+     * Saves or updates a build execution record.
+     */
+    void recordBuild(BuildRecord build);
+
+    /**
+     * Retrieves a build execution record.
+     */
+    bool getBuild(string buildId, out BuildRecord build);
+
+    /**
+     * Lists recent build execution records.
+     */
+    BuildRecord[] listBuilds(size_t limit = 50);
+
+    /**
+     * Appends a log line to a build's execution output stream.
+     */
+    void appendBuildLog(string buildId, string line);
+
+    /**
+     * Retrieves all log lines for a build execution.
+     */
+    string[] getBuildLogs(string buildId);
+
+    /**
+     * Saves a trigger rule configuration.
+     */
+    void saveTriggerRule(TriggerRuleRecord rule);
+
+    /**
+     * Lists configured trigger rules.
+     */
+    TriggerRuleRecord[] listTriggerRules();
+
+    /**
+     * Deletes a configured trigger rule by ID.
+     */
+    bool deleteTriggerRule(string ruleId);
 }
 
 /**
@@ -178,6 +218,9 @@ class InMemoryBuildStateRepository : BuildStateRepository
 
     private TaskStatus[string] m_taskStatuses;
     private CacheRecord[string] m_fingerprintCache;
+    private BuildRecord[string] m_builds;
+    private string[][string] m_buildLogs;
+    private TriggerRuleRecord[string] m_triggerRules;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -223,6 +266,74 @@ class InMemoryBuildStateRepository : BuildStateRepository
         }
         return false;
     }
+
+    override void recordBuild(BuildRecord build)
+    {
+        m_builds[build.buildId] = build;
+    }
+
+    override bool getBuild(string buildId, out BuildRecord build)
+    {
+        auto p = buildId in m_builds;
+        if (p !is null)
+        {
+            build = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override BuildRecord[] listBuilds(size_t limit = 50)
+    {
+        BuildRecord[] list;
+        foreach (b; m_builds)
+        {
+            list ~= b;
+            if (list.length >= limit) break;
+        }
+        return list;
+    }
+
+    override void appendBuildLog(string buildId, string line)
+    {
+        m_buildLogs[buildId] ~= line;
+    }
+
+    override string[] getBuildLogs(string buildId)
+    {
+        auto p = buildId in m_buildLogs;
+        if (p !is null)
+        {
+            return (*p).dup;
+        }
+        return [];
+    }
+
+    override void saveTriggerRule(TriggerRuleRecord rule)
+    {
+        m_triggerRules[rule.id] = rule;
+    }
+
+    override TriggerRuleRecord[] listTriggerRules()
+    {
+        TriggerRuleRecord[] list;
+        foreach (r; m_triggerRules)
+        {
+            list ~= r;
+        }
+        return list;
+    }
+
+    override bool deleteTriggerRule(string ruleId)
+    {
+        auto p = ruleId in m_triggerRules;
+        if (p !is null)
+        {
+            m_triggerRules.remove(ruleId);
+            return true;
+        }
+        return false;
+    }
 }
 
 unittest
@@ -257,4 +368,31 @@ unittest
     assert(stateRepo.getCachedFingerprint("t1", "hash123", cachedMetas));
     assert(cachedMetas.length == 1);
     assert(cachedMetas[0].sha256 == meta.sha256);
+
+    // Build recording and logging
+    BuildRecord bRecord;
+    bRecord.buildId = "b1";
+    bRecord.pipelineName = "test_pipe";
+    bRecord.status = "succeeded";
+    stateRepo.recordBuild(bRecord);
+
+    BuildRecord fetchedBuild;
+    assert(stateRepo.getBuild("b1", fetchedBuild));
+    assert(fetchedBuild.pipelineName == "test_pipe");
+    assert(stateRepo.listBuilds().length == 1);
+
+    stateRepo.appendBuildLog("b1", "[step1] Building application");
+    assert(stateRepo.getBuildLogs("b1").length == 1);
+    assert(stateRepo.getBuildLogs("b1")[0] == "[step1] Building application");
+
+    // Trigger rule recording
+    TriggerRuleRecord rule;
+    rule.id = "trig_1";
+    rule.name = "Main Branch Push";
+    rule.triggerType = "git_push";
+    rule.criteria = "main";
+    stateRepo.saveTriggerRule(rule);
+    assert(stateRepo.listTriggerRules().length == 1);
+    assert(stateRepo.deleteTriggerRule("trig_1"));
+    assert(stateRepo.listTriggerRules().length == 0);
 }

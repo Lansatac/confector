@@ -173,8 +173,12 @@ class TaskEngine
 
         // Log capture collector
         string[] capturedLogs;
-        LogDelegate combinedLogger = (string line) {
+        LogDelegate combinedLogger = (string line) @trusted {
             capturedLogs ~= line;
+            if (m_stateRepo !is null)
+            {
+                try { m_stateRepo.appendBuildLog(buildId, format("[%s] %s", task.id, line)); } catch (Exception) {}
+            }
             if (logCallback !is null)
             {
                 logCallback(line);
@@ -243,9 +247,24 @@ class TaskEngine
         LogDelegate logCallback = null
     )
     {
+        import std.datetime.systime : Clock;
+
+        auto totalSw = StopWatch(AutoStart.yes);
         PipelineExecutionResult pipelineResult;
         pipelineResult.buildId = buildId;
         pipelineResult.success = true;
+
+        BuildRecord buildRec;
+        buildRec.buildId = buildId;
+        buildRec.pipelineName = "default";
+        buildRec.status = "running";
+        buildRec.workspaceDir = workspaceDir;
+        buildRec.startedAt = Clock.currTime.toISOString();
+        if (m_stateRepo !is null)
+        {
+            m_stateRepo.recordBuild(buildRec);
+            m_stateRepo.appendBuildLog(buildId, format("[pipeline] Starting build %s with %d tasks", buildId, plan.orderedTaskIds.length));
+        }
 
         const(TaskNode)*[string] taskMap;
         foreach (ref task; pipeline.tasks)
@@ -254,6 +273,7 @@ class TaskEngine
         }
 
         string[string] currentArtifactHashes;
+        bool allCached = true;
 
         foreach (taskId; plan.orderedTaskIds)
         {
@@ -287,6 +307,11 @@ class TaskEngine
 
             pipelineResult.taskResults[taskId] = taskRes;
 
+            if (taskRes.status != TaskStatus.cached)
+            {
+                allCached = false;
+            }
+
             // Track produced artifact hashes for downstream tasks
             foreach (art; taskRes.producedArtifacts)
             {
@@ -296,8 +321,37 @@ class TaskEngine
             if (taskRes.status == TaskStatus.failed)
             {
                 pipelineResult.success = false;
+                if (m_stateRepo !is null)
+                {
+                    m_stateRepo.appendBuildLog(buildId, format("[pipeline] Build failed at task '%s': %s", taskId, taskRes.errorMessage));
+                }
                 break;
             }
+        }
+
+        totalSw.stop();
+        buildRec.finishedAt = Clock.currTime.toISOString();
+        buildRec.durationMs = totalSw.peek.total!"msecs";
+        buildRec.executedTasks = pipelineResult.executedOrder;
+
+        if (!pipelineResult.success)
+        {
+            buildRec.status = "failed";
+            buildRec.errorMessage = "One or more tasks failed execution";
+        }
+        else if (allCached && pipelineResult.executedOrder.length > 0)
+        {
+            buildRec.status = "cached";
+        }
+        else
+        {
+            buildRec.status = "succeeded";
+        }
+
+        if (m_stateRepo !is null)
+        {
+            m_stateRepo.recordBuild(buildRec);
+            m_stateRepo.appendBuildLog(buildId, format("[pipeline] Build completed with status '%s' in %d ms", buildRec.status, buildRec.durationMs));
         }
 
         return pipelineResult;

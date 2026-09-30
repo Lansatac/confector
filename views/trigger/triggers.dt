@@ -1,0 +1,88 @@
+extends layout
+
+block maincontent
+  div.triggers-container
+    div.header-section
+      h1 Trigger Management
+      p Configure node-level triggers for Webhooks, Git events, Cron schedules, and manual dispatches.
+
+    div.grid-2col
+      div.card
+        h3 Add Trigger Rule
+        form(action="/triggers/add", method="POST")
+          div.form-group
+            label(for="name") Trigger Name:
+            input.form-control#name(type="text", name="name", placeholder="e.g. Main Branch Push", required)
+
+          div.form-group
+            label(for="target_task_id") Target Node (Leave blank for full DAG):
+            input.form-control#target_task_id(type="text", name="target_task_id", placeholder="e.g. deploy or test")
+
+          div.form-group
+            label(for="trigger_type") Trigger Type:
+            select.form-control#trigger_type(name="trigger_type")
+              option(value="git_push") Git Push (Branch Pattern)
+              option(value="git_tag") Git Tag (Release Tag Pattern)
+              option(value="webhook") Webhook HTTP Event
+              option(value="cron") Cron Schedule
+              option(value="manual") Manual Dispatch
+
+          div.form-group
+            label(for="criteria") Matching Criteria:
+            input.form-control#criteria(type="text", name="criteria", placeholder="e.g. main, v*.*, 0 0 * * *")
+
+          div.form-group.checkbox-group
+            input#force_execution(type="checkbox", name="force_execution", value="true")
+            label(for="force_execution") Force Re-execution (Ignore Cached Artifacts)
+
+          button.btn.btn-primary(type="submit") Save Trigger Rule
+
+      div.card
+        h3 Webhook & API Dispatch Info
+        p Inbound webhooks can trigger any pipeline or isolated subgraph:
+        pre.code-block
+          | POST /api/v1/triggers/webhook
+          | Content-Type: application/json
+          |
+          | {
+          |   "branch": "main",
+          |   "target_task_id": "deploy",
+          |   "force": false
+          | }
+        p When a trigger matches a target node, ancestors are verified in cache and only invalid or dependent nodes run.
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Configured Trigger Rules
+
+    - if (triggers.length == 0)
+      div.empty-state
+        p No trigger rules configured yet.
+    - else
+      table.data-table
+        thead
+          tr
+            th ID
+            th Name
+            th Target Node
+            th Type
+            th Criteria
+            th Force Cache Bypass
+            th Created
+            th Actions
+        tbody
+          - foreach(t; triggers)
+            tr
+              td
+                code #{t.id}
+              td #{t.name}
+              td #{t.targetTaskId.length > 0 ? t.targetTaskId : "Full Graph"}
+              td
+                span.badge.badge-info #{t.triggerType}
+              td
+                code #{t.criteria}
+              td #{t.forceExecution ? "Yes" : "No"}
+              td #{t.createdAt}
+              td
+                form(action="/triggers/delete", method="POST", style="display:inline;")
+                  input(type="hidden", name="id", value="#{t.id}")
+                  button.btn.btn-sm.btn-danger(type="submit") Delete

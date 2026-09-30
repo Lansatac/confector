@@ -1,0 +1,88 @@
+extends layout
+
+block maincontent
+  div.dashboard-container
+    div.header-section
+      h1 Confector Dashboard
+      p Cloud-native DAG CI/CD engine with deterministic content caching and decoupled workers.
+
+    div.stats-grid
+      div.stat-card
+        div.stat-label Total Builds
+        div.stat-value #{totalBuilds}
+      div.stat-card
+        div.stat-label Successful / Cached
+        div.stat-value.text-success #{successfulBuilds}
+      div.stat-card
+        div.stat-label Failed
+        div.stat-value.text-danger #{failedBuilds}
+      div.stat-card
+        div.stat-label Queue Pending
+        div.stat-value.text-info #{pendingTasks}
+
+    div.section-title-bar
+      h2 Recent Builds
+      a.btn.btn-primary(href="/pipelines/") Run Pipeline
+
+    - if (builds.length == 0)
+      div.empty-state
+        p No builds executed yet.
+        a.btn.btn-outline(href="/pipelines/") Launch a pipeline
+    - else
+      table.data-table
+        thead
+          tr
+            th Build ID
+            th Status
+            th Trigger
+            th Started
+            th Duration
+            th Actions
+        tbody
+          - foreach(b; builds)
+            tr
+              td
+                a.build-link(href="/builds/details?id=#{b.buildId}") #{b.buildId}
+              td
+                - if (b.status == "succeeded")
+                  span.badge.badge-success SUCCESS
+                - else if (b.status == "cached")
+                  span.badge.badge-cached CACHED
+                - else if (b.status == "failed")
+                  span.badge.badge-danger FAILED
+                - else if (b.status == "running")
+                  span.badge.badge-warning RUNNING
+                - else
+                  span.badge.badge-secondary #{b.status}
+              td #{b.triggerSource}
+              td #{b.startedAt}
+              td #{b.durationMs} ms
+              td
+                a.btn.btn-sm(href="/builds/details?id=#{b.buildId}") View Graph & Logs
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Active Trigger Rules
+      a.btn.btn-sm.btn-secondary(href="/triggers/") Configure Triggers
+
+    - if (triggers.length == 0)
+      div.empty-state
+        p No trigger rules configured.
+        a.btn.btn-sm(href="/triggers/") Add Trigger Rule
+    - else
+      table.data-table
+        thead
+          tr
+            th Name
+            th Target Task
+            th Type
+            th Criteria
+            th Force Execution
+        tbody
+          - foreach(t; triggers)
+            tr
+              td #{t.name}
+              td #{t.targetTaskId}
+              td
+                span.badge.badge-info #{t.triggerType}
+              td #{t.criteria}
+              td #{t.forceExecution ? "Yes" : "No"}

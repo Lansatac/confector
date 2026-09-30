@@ -3,6 +3,7 @@ import std.stdio;
 import vibe.vibe;
 import controller.repositorycontroller;
 import controller.api_controller;
+import controller.dashboard_controller;
 import confector.core.plugin;
 import confector.core.storage;
 import confector.storage.mongo_repository;
@@ -66,7 +67,6 @@ void main()
   writeln("Initialized Confector execution engine.");
 
 	auto router = new URLRouter;
-	router.get("/", &index);
 
   router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
   auto fsettings = new HTTPFileServerSettings;
@@ -76,7 +76,13 @@ void main()
   // Mount API & serverless execution endpoints
   router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
 
-  router.any("*", repositoryRouter(client));
+  // Mount dashboard, builds, pipelines, and trigger UI
+  router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.any("/pipelines/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.any("/triggers/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo));
+
+  router.any("/repositories/*", repositoryRouter(client));
 	
 	auto settings = new HTTPServerSettings;
 	//settings.port = 8080;

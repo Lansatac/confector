@@ -137,6 +137,40 @@ struct ArtifactMetadata
 }
 
 /**
+ * Persisted record of a pipeline or build execution.
+ */
+struct BuildRecord
+{
+    @asName("build_id") string buildId;
+    @asName("pipeline_name") string pipelineName = "default";
+    @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached
+    @asName("trigger_source") string triggerSource = "manual";
+    @asName("target_task_id") string targetTaskId;
+    @asName("workspace_dir") string workspaceDir;
+    @asName("started_at") string startedAt;
+    @asName("finished_at") string finishedAt;
+    @asName("duration_ms") ulong durationMs = 0;
+    @asName("executed_tasks") string[] executedTasks;
+    @asName("error_message") string errorMessage;
+}
+
+/**
+ * Persisted configuration for a node-level trigger rule.
+ */
+struct TriggerRuleRecord
+{
+    @asName("id") string id;
+    @asName("name") string name;
+    @asName("pipeline_id") string pipelineId = "default";
+    @asName("target_task_id") string targetTaskId;
+    @asName("trigger_type") string triggerType; // manual, git_push, git_tag, webhook, cron
+    @asName("criteria") string criteria; // e.g. branch pattern, cron expression, webhook token
+    @asName("force_execution") bool forceExecution = false;
+    @asName("enabled") bool enabled = true;
+    @asName("created_at") string createdAt;
+}
+
+/**
  * Execution plan resolved from DAG and cache status.
  */
 struct ExecutionPlan

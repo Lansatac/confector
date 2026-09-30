@@ -1,0 +1,125 @@
+extends layout
+
+block maincontent
+  div.pipeline-container
+    div.header-section
+      h1 DAG Pipeline Engine
+      p Directed Acyclic Graph execution with content-addressed caching, node triggers, and memoization.
+
+    div.section-title-bar
+      h2 Pipeline DAG Visualizer
+      div.graph-legend
+        span.legend-item
+          span.dot.dot-primary
+          span Ready Node
+        span.legend-item
+          span.dot.dot-cached
+          span Content Cached
+
+    div#pipeline-canvas-container.dag-visualizer
+      canvas#pipeline-canvas(width="800", height="240")
+
+    div.grid-2col(style="margin-top: 30px;")
+      div.card
+        h3 Manual Pipeline Trigger & Execution
+        p Target any arbitrary node in the DAG. Confector will resolve upstream dependencies, check cache validity, and execute only what is necessary.
+        
+        form#pipeline-run-form(action="/api/v1/pipeline/execute", method="POST")
+          div.form-group
+            label(for="target_node") Target Node:
+            select.form-control#target_node(name="target_node")
+              option(value="") Full Graph (Topological Resolution)
+              option(value="lint") lint (Static Analysis)
+              option(value="build") build (Compilation)
+              option(value="test") test (Unit & Integration Tests)
+              option(value="package") package (Artifact Packaging)
+              option(value="deploy") deploy (Deployment)
+          
+          div.form-group
+            label(for="workspace_dir") Workspace Directory:
+            input.form-control#workspace_dir(type="text", name="workspace_dir", value=".", placeholder="Local directory path")
+
+          div.form-group.checkbox-group
+            input#force_execution(type="checkbox", name="force", value="true")
+            label(for="force_execution") Force Execution (Bypass Content-Addressed Cache)
+
+          button.btn.btn-primary#btn-dispatch-pipeline(type="button") Dispatch Execution
+
+      div.card
+        h3 Configured Pipeline Triggers
+        - if (triggers.length == 0)
+          div.empty-state
+            p No triggers configured for this pipeline.
+            a.btn.btn-sm.btn-outline(href="/triggers/") Setup Triggers
+        - else
+          table.data-table
+            thead
+              tr
+                th Trigger Name
+                th Target Node
+                th Event Type
+                th Criteria
+            tbody
+              - foreach(t; triggers)
+                tr
+                  td #{t.name}
+                  td #{t.targetTaskId}
+                  td
+                    span.badge.badge-info #{t.triggerType}
+                  td #{t.criteria}
+
+  script(src="/static/scripts/dag_visualizer.js")
+  script.
+    document.addEventListener("DOMContentLoaded", function() {
+      if (window.renderSamplePipeline) {
+        window.renderSamplePipeline("pipeline-canvas");
+      }
+
+      var dispatchBtn = document.getElementById("btn-dispatch-pipeline");
+      if (dispatchBtn) {
+        dispatchBtn.addEventListener("click", function() {
+          var targetNode = document.getElementById("target_node").value;
+          var workspace = document.getElementById("workspace_dir").value || ".";
+          var force = document.getElementById("force_execution").checked;
+
+          var sampleTasks = [
+            { id: "lint", name: "Lint Check", depends_on: [], script: "echo Running linter", inputs: { files: ["source/**/*.d"] } },
+            { id: "build", name: "Build App", depends_on: ["lint"], script: "echo Compiling application", inputs: { files: ["source/**/*.d", "dub.json"] } },
+            { id: "test", name: "Run Tests", depends_on: ["build"], script: "echo Running unit tests", inputs: { files: ["source/**/*.d"] } },
+            { id: "package", name: "Package Artifact", depends_on: ["build"], script: "echo Packaging binary", outputs: { artifacts: [{ path: "bin/confector", type: "file" }] } },
+            { id: "deploy", name: "Deploy Service", depends_on: ["test", "package"], script: "echo Deploying to cluster" }
+          ];
+
+          var buildId = "build_" + Date.now();
+          var payload = {
+            build_id: buildId,
+            workspace_dir: workspace,
+            pipeline: { version: "1.0", tasks: sampleTasks },
+            event: {
+              type: targetNode ? "manual" : "manual",
+              target_task_id: targetNode,
+              force: force,
+              parameters: {}
+            }
+          };
+
+          dispatchBtn.disabled = true;
+          dispatchBtn.innerText = "Executing...";
+
+          fetch("/api/v1/pipeline/execute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          })
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            window.location.href = "/builds/details?id=" + buildId;
+          })
+          .catch(function(err) {
+            alert("Execution error: " + err);
+            dispatchBtn.disabled = false;
+            dispatchBtn.innerText = "Dispatch Execution";
+          });
+        });
+      }
+    });

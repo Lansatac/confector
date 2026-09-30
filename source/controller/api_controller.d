@@ -222,5 +222,219 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
         }
     });
 
+    // Builds API
+    router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            auto repo = engine.stateRepository;
+            if (repo is null)
+            {
+                res.writeJsonBody(Json.emptyArray);
+                return;
+            }
+            auto builds = repo.listBuilds(50);
+            res.writeJsonBody(builds);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/builds/details", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string buildId = req.query.get("id", "");
+            auto repo = engine.stateRepository;
+            if (repo is null)
+            {
+                res.statusCode = HTTPStatus.notFound;
+                res.writeJsonBody(["error": "No state repository configured"]);
+                return;
+            }
+
+            BuildRecord buildRec;
+            if (repo.getBuild(buildId, buildRec))
+            {
+                res.writeJsonBody(buildRec);
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build not found: " ~ buildId);
+                res.writeJsonBody(err);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/builds/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string buildId = req.query.get("id", "");
+            auto repo = engine.stateRepository;
+            string[] logs = repo !is null ? repo.getBuildLogs(buildId) : [];
+            Json resp = Json.emptyObject;
+            resp["build_id"] = Json(buildId);
+            resp["logs"] = serializeToJson(logs);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Trigger Rules API
+    router.get("/triggers", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            auto repo = engine.stateRepository;
+            auto rules = repo !is null ? repo.listTriggerRules() : [];
+            res.writeJsonBody(rules);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.post("/triggers/create", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            TriggerRuleRecord rule = deserializeJson!TriggerRuleRecord(req.json);
+            if (rule.id.length == 0)
+            {
+                import std.uuid : randomUUID;
+                rule.id = "trig_" ~ randomUUID().toString();
+            }
+            if (rule.createdAt.length == 0)
+            {
+                rule.createdAt = Clock.currTime.toISOString();
+            }
+
+            auto repo = engine.stateRepository;
+            if (repo !is null)
+            {
+                repo.saveTriggerRule(rule);
+            }
+            res.writeJsonBody(rule);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.post("/triggers/delete", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string ruleId = req.json["id"].get!string;
+            auto repo = engine.stateRepository;
+            bool ok = repo !is null && repo.deleteTriggerRule(ruleId);
+            Json resp = Json.emptyObject;
+            resp["deleted"] = Json(ok);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Webhook receiver endpoint
+    router.post("/triggers/webhook", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            Json bodyJson = req.json;
+            TriggerEvent event;
+            event.type = TriggerType.webhook;
+            if ("branch" in bodyJson) event.branch = bodyJson["branch"].get!string;
+            if ("tag" in bodyJson) event.tag = bodyJson["tag"].get!string;
+            if ("endpoint" in bodyJson) event.endpoint = bodyJson["endpoint"].get!string;
+            if ("target_task_id" in bodyJson) event.targetTaskId = bodyJson["target_task_id"].get!string;
+            if ("force" in bodyJson) event.force = bodyJson["force"].get!bool;
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("received");
+            resp["event"] = serializeToJson(event);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
     return router;
+}
+
+unittest
+{
+    import confector.plugins.process_runner;
+    import confector.core.plugin;
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
+    import std.path : buildPath;
+
+    string testDir = "test_api_controller_run";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
+    auto storage = new LocalArtifactStorage(buildPath(testDir, "storage"));
+    auto stateRepo = new InMemoryBuildStateRepository();
+    auto engine = new TaskEngine(storage, stateRepo);
+    auto queue = new InMemoryWorkQueue();
+
+    auto router = apiRouter(engine, queue);
+    assert(router !is null);
+
+    // Test Trigger Rules state via repo
+    TriggerRuleRecord rule;
+    rule.id = "rule1";
+    rule.name = "CI Build";
+    rule.triggerType = "git_push";
+    rule.criteria = "main";
+    stateRepo.saveTriggerRule(rule);
+
+    assert(stateRepo.listTriggerRules().length == 1);
+    assert(stateRepo.listTriggerRules()[0].name == "CI Build");
+
+    // Test Build record tracking
+    BuildRecord bRec;
+    bRec.buildId = "build_test_1";
+    bRec.status = "succeeded";
+    stateRepo.recordBuild(bRec);
+    stateRepo.appendBuildLog("build_test_1", "Test log line");
+
+    BuildRecord fetched;
+    assert(stateRepo.getBuild("build_test_1", fetched));
+    assert(fetched.status == "succeeded");
+    assert(stateRepo.getBuildLogs("build_test_1").length == 1);
 }

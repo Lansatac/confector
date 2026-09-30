@@ -18,11 +18,17 @@ class MongoBuildStateRepository : BuildStateRepository
 {
     private MongoCollection m_statusCollection;
     private MongoCollection m_cacheCollection;
+    private MongoCollection m_buildsCollection;
+    private MongoCollection m_logsCollection;
+    private MongoCollection m_triggersCollection;
 
     this(MongoClient client, string dbName = "confector")
     {
         m_statusCollection = client.getCollection(format("%s.task_statuses", dbName));
         m_cacheCollection = client.getCollection(format("%s.fingerprint_cache", dbName));
+        m_buildsCollection = client.getCollection(format("%s.builds", dbName));
+        m_logsCollection = client.getCollection(format("%s.build_logs", dbName));
+        m_triggersCollection = client.getCollection(format("%s.triggers", dbName));
     }
 
     override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
@@ -132,5 +138,184 @@ class MongoBuildStateRepository : BuildStateRepository
         {
         }
         return false;
+    }
+
+    override void recordBuild(BuildRecord build)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(build.buildId);
+
+            Bson update = Bson.emptyObject;
+            update["$set"] = serializeToBson(build);
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_buildsCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override bool getBuild(string buildId, out BuildRecord build)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+
+            auto doc = m_buildsCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return false;
+            }
+
+            build = deserializeBson!BuildRecord(doc);
+            return true;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override BuildRecord[] listBuilds(size_t limit = 50)
+    {
+        BuildRecord[] list;
+        try
+        {
+            FindOptions opts;
+            opts.sort = Bson(["started_at": Bson(-1)]);
+            opts.limit = cast(int)limit;
+            auto cursor = m_buildsCollection.find(Bson.emptyObject, opts);
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!BuildRecord(doc);
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override void appendBuildLog(string buildId, string line)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+
+            Bson update = Bson.emptyObject;
+            Bson pushField = Bson.emptyObject;
+            pushField["lines"] = Bson(line);
+            update["$push"] = pushField;
+
+            Bson setField = Bson.emptyObject;
+            setField["build_id"] = Bson(buildId);
+            setField["updated_at"] = Bson(Clock.currTime.toISOString());
+            update["$set"] = setField;
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_logsCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override string[] getBuildLogs(string buildId)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+
+            auto doc = m_logsCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return [];
+            }
+
+            auto pLines = doc.tryIndex("lines");
+            if (!pLines.isNull && pLines.get.type == Bson.Type.array)
+            {
+                string[] lines;
+                foreach (Bson item; pLines.get)
+                {
+                    if (item.type == Bson.Type.string)
+                    {
+                        lines ~= item.get!string;
+                    }
+                }
+                return lines;
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return [];
+    }
+
+    override void saveTriggerRule(TriggerRuleRecord rule)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(rule.id);
+
+            Bson update = Bson.emptyObject;
+            update["$set"] = serializeToBson(rule);
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_triggersCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override TriggerRuleRecord[] listTriggerRules()
+    {
+        TriggerRuleRecord[] list;
+        try
+        {
+            auto cursor = m_triggersCollection.find();
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!TriggerRuleRecord(doc);
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override bool deleteTriggerRule(string ruleId)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(ruleId);
+            auto res = m_triggersCollection.deleteOne(query);
+            return res.deletedCount > 0;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
     }
 }
