@@ -3,14 +3,21 @@ services:
     build:
       context: .
       dockerfile: build/development/Dockerfile
-      # target: development
     secrets:
       - mongo-readwrite-password
     depends_on:
       - mongo
     volumes:
+      # Bind mount host source code
+      - .:/code:cached
+      # Mask .dub directory with an isolated named volume to prevent host/container conflicts
+      - dub-build-cache:/code/.dub
+      - dub-packages:/home/dev/.dub
+      # Docker socket for container-in-container workflows (if required by tasks)
       - /var/run/docker.sock:/var/run/docker.sock
-      # - ./:/home/dev/code
+    environment:
+      - DUB_CACHE_DIR=/home/dev/.dub
+
   mongo:
     image: mongo
     restart: always
@@ -19,6 +26,7 @@ services:
       - mongo-readwrite-password
     volumes:
       - ./mongo/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+      - mongo-data:/data/db
 
   mongo-express:
     image: mongo-express
@@ -33,15 +41,22 @@ services:
       ME_CONFIG_MONGODB_URL: mongodb://mongo:27017/
       #ME_CONFIG_MONGODB_SERVER: mongo
       MONGO_INITDB_DATABASE: confector
+
   proxy:
     build: build/proxy
     ports:
       - 8080:80
     depends_on:
       - development
+
 secrets:
   mongo-admin-password:
     file: mongo/dev-admin-password.txt
   mongo-readwrite-password:
     file: mongo/dev-readwrite-password.txt
+
+volumes:
+  dub-build-cache:
+  dub-packages:
+  mongo-data:
 

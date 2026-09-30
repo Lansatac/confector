@@ -1,0 +1,15 @@
+{
+  "name": "Confector Development",
+  "dockerComposeFile": ["../docker-compose.yaml"],
+  "service": "development",
+  "workspaceFolder": "/code",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "webfreak.code-d",
+        "vadimcn.vscode-lldb"
+      ]
+    }
+  },
+  "remoteUser": "dev"
+}

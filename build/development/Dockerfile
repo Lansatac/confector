@@ -1,17 +1,27 @@
-FROM alpine:latest AS development
-RUN apk update && apk add dmd ldc dub gcc musl-dev openssl-dev zlib-dev bash git gcompat libc6-compat gdb
-# RUN addgroup developer
-# RUN adduser -D -u 1010 -s /bin/bash -g "dev" dev developer
-# RUN echo 'dev:developerpass' | chpasswd
-# USER dev
-# # RUN mkdir -p /home/dev/code
-# WORKDIR /home/dev
-# COPY --chown=dev:developer . /home/dev/code
-COPY . /code
+FROM dlang2/dmd-ubuntu:latest AS development
+
+# Install system dependencies, OpenSSL for vibe-d, git, and gdb
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    git \
+    gdb \
+    libssl-dev \
+    zlib1g-dev \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root dev user matching standard dev container setups
+ARG USERNAME=dev
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+RUN groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME \
+    && mkdir -p /code /home/$USERNAME/.dub \
+    && chown -R $USERNAME:$USERNAME /code /home/$USERNAME/.dub
+
+WORKDIR /code
+USER $USERNAME
+
 CMD ["tail", "-f", "/dev/null"]
-# RUN dub build
-# FROM development AS build
-# FROM alpine:3.12
-# EXPOSE 8080
-# COPY --from=build /code/confector /confector
-# CMD ["/confector"]
