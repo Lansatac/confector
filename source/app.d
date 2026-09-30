@@ -6,6 +6,8 @@ import controller.api_controller;
 import confector.core.plugin;
 import confector.core.storage;
 import confector.storage.mongo_repository;
+import confector.queue.queue;
+import confector.queue.mongo_queue;
 import confector.runner.engine;
 import confector.plugins.git;
 import confector.plugins.process_runner;
@@ -38,15 +40,18 @@ void main()
   writefln("Connecting to mongo at %s...", mongoAddress);
   MongoClient client;
   BuildStateRepository stateRepo;
+  WorkQueue workQueue;
   try
   {
 	  client = connectMongoDB("mongodb://%s".format(mongoAddress));
     stateRepo = new MongoBuildStateRepository(client);
+    workQueue = new MongoWorkQueue(client);
   }
   catch(Exception e)
   {
-    writeln("MongoDB connection failed, using in-memory state repository: ", e.message);
+    writeln("MongoDB connection failed, using in-memory state repository and queue: ", e.message);
     stateRepo = new InMemoryBuildStateRepository();
+    workQueue = new InMemoryWorkQueue();
   }
   writeln("Connected to mongo.");
 	
@@ -69,7 +74,7 @@ void main()
   router.get("/static/*", serveStaticFiles("public/", fsettings));
 
   // Mount API & serverless execution endpoints
-  router.any("/api/v1/*", apiRouter(taskEngine));
+  router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
 
   router.any("*", repositoryRouter(client));
 	
