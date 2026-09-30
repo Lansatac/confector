@@ -1,15 +1,30 @@
-FROM dlang2/dmd-ubuntu:latest AS development
+FROM ubuntu:22.04 AS development
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies, OpenSSL for vibe-d, git, and gdb
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    ca-certificates \
+    curl \
     git \
     gdb \
     libssl-dev \
     zlib1g-dev \
     build-essential \
-    curl \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Trust workspace repository paths to prevent dubious ownership warnings with host mounts
+RUN git config --system --add safe.directory /code
+
+# Install official DMD compiler and DUB
+RUN curl -fsS https://dlang.org/install.sh | bash -s install dmd -p /opt/dlang \
+    && DMD_DIR=$(find /opt/dlang -maxdepth 1 -name "dmd-*" | head -n 1) \
+    && ln -s ${DMD_DIR}/linux/bin64/dmd /usr/local/bin/dmd \
+    && ln -s ${DMD_DIR}/linux/bin64/dub /usr/local/bin/dub \
+    && ln -s ${DMD_DIR}/linux/bin64/rdmd /usr/local/bin/rdmd \
+    && chmod -R a+rX /opt/dlang
 
 # Create a non-root dev user matching standard dev container setups
 ARG USERNAME=dev
