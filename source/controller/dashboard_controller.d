@@ -8,7 +8,7 @@ import confector.core.dag;
 import confector.runner.engine;
 import confector.queue.queue;
 
-import std.algorithm : filter, count;
+import std.algorithm : filter, count, canFind;
 import std.datetime.systime : Clock;
 import std.format : format;
 import std.string : split, strip;
@@ -208,12 +208,17 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             task.workingDirectory = req.form.get("working_directory", "").strip();
 
             // Dependencies
-            string depsStr = req.form.get("depends_on", "");
             string[] deps;
-            foreach (d; depsStr.split(","))
+            foreach (dVal; req.form.getAll("depends_on"))
             {
-                string s = d.strip();
-                if (s.length > 0) deps ~= s;
+                foreach (d; dVal.split(","))
+                {
+                    string s = d.strip();
+                    if (s.length > 0 && s != task.id && !deps.canFind(s))
+                    {
+                        deps ~= s;
+                    }
+                }
             }
             task.dependsOn = deps;
 

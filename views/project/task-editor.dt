@@ -1,6 +1,12 @@
 extends layout
 
 block maincontent
+  - import vibe.data.json : serializeToJson;
+  - struct TaskOpt { string id; string name; }
+  - TaskOpt[] availableTasksList;
+  - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
+  - string availableTasksJson = serializeToJson(availableTasksList).toString();
+
   div.projects-container
     div.header-section
       div(style="display: flex; justify-content: space-between; align-items: center;")
@@ -33,10 +39,25 @@ block maincontent
         div#tab-inputs.tab-pane
           h3 Inputs & Upstream Dependencies
           div.form-group
-            label(for="depends_on") Task Dependencies / Other Tasks (Comma-separated task IDs):
-            - string depsVal = "";
-            - foreach(i, d; task.dependsOn) { if (i > 0) depsVal ~= ", "; depsVal ~= d; }
-            input.form-control#depends_on(type="text", name="depends_on", value="#{depsVal}", placeholder="e.g. compile, unit-tests")
+            label Task Dependencies (Other tasks in this project):
+            div#dependencies-container.dependency-list
+              - foreach(dep; task.dependsOn)
+                div.dependency-row(style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;")
+                  select.form-control(name="depends_on", style="flex: 1;")
+                    option(value="", disabled) -- Select a task --
+                    - bool foundDep = false;
+                    - foreach(t; project.tasks)
+                      - if (t.id != task.id)
+                        - if (t.id == dep)
+                          - foundDep = true;
+                          option(value="#{t.id}", selected) #{t.id}#{t.name.length > 0 ? " (" ~ t.name ~ ")" : ""}
+                        - else
+                          option(value="#{t.id}") #{t.id}#{t.name.length > 0 ? " (" ~ t.name ~ ")" : ""}
+                    - if (!foundDep && dep.length > 0)
+                      option(value="#{dep}", selected) #{dep}
+                  button.btn.btn-danger.btn-sm.btn-remove-dep(type="button", onclick="removeDependency(this)", title="Remove dependency") ✕
+            div(style="margin-top: 6px;")
+              button.btn.btn-outline.btn-sm#add-dep-btn(type="button", onclick="addDependency()") + Add Dependency
 
           div.form-group
             label(for="input_files") Repositories & Input File Globs (Comma or newline separated):
@@ -79,6 +100,66 @@ block maincontent
           a.btn.btn-outline(href="/projects/details?id=#{project.id}") Cancel
 
   script.
+    var availableTasks = !{availableTasksJson};
+
+    function removeDependency(btn) {
+      var row = btn.closest('.dependency-row');
+      if (row) {
+        row.remove();
+      }
+    }
+
+    function addDependency(selectedId) {
+      var container = document.getElementById('dependencies-container');
+      if (!container) return;
+
+      var row = document.createElement('div');
+      row.className = 'dependency-row';
+      row.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
+
+      var select = document.createElement('select');
+      select.name = 'depends_on';
+      select.className = 'form-control';
+      select.style.flex = '1';
+
+      var defaultOpt = document.createElement('option');
+      defaultOpt.value = '';
+      defaultOpt.disabled = true;
+      if (!selectedId) defaultOpt.selected = true;
+      defaultOpt.textContent = '-- Select a task --';
+      select.appendChild(defaultOpt);
+
+      var tasks = availableTasks || [];
+      if (tasks.length === 0) {
+        var noneOpt = document.createElement('option');
+        noneOpt.value = '';
+        noneOpt.disabled = true;
+        noneOpt.textContent = 'No other tasks in this project';
+        select.appendChild(noneOpt);
+      } else {
+        for (var i = 0; i < tasks.length; i++) {
+          var opt = document.createElement('option');
+          opt.value = tasks[i].id;
+          opt.textContent = tasks[i].id + (tasks[i].name && tasks[i].name.length > 0 && tasks[i].name !== tasks[i].id ? ' (' + tasks[i].name + ')' : '');
+          if (selectedId && tasks[i].id === selectedId) {
+            opt.selected = true;
+          }
+          select.appendChild(opt);
+        }
+      }
+
+      var removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-danger btn-sm btn-remove-dep';
+      removeBtn.textContent = '✕';
+      removeBtn.title = 'Remove dependency';
+      removeBtn.onclick = function() { removeDependency(this); };
+
+      row.appendChild(select);
+      row.appendChild(removeBtn);
+      container.appendChild(row);
+    }
+
     function switchTab(tabName, btn) {
       var panes = document.querySelectorAll('.tab-pane');
       for (var i = 0; i < panes.length; i++) {
