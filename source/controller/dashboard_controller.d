@@ -205,8 +205,91 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 task.id = "task_" ~ randomUUID().toString()[0 .. 8];
             }
             task.name = req.form.get("name", "").strip();
-            task.script = req.form.get("script", "");
             task.workingDirectory = req.form.get("working_directory", "").strip();
+
+            // Build steps
+            string stepsJsonStr = req.form.get("steps_json", "");
+            BuildStep[] steps;
+            if (stepsJsonStr.length > 0)
+            {
+                try
+                {
+                    Json parsedSteps = parseJsonString(stepsJsonStr);
+                    if (parsedSteps.type == Json.Type.array)
+                    {
+                        steps = deserializeJson!(BuildStep[])(parsedSteps);
+                    }
+                }
+                catch (Exception e)
+                {
+                    logWarn("Failed to deserialize steps_json: %s", e.msg);
+                }
+            }
+
+            // Fallback to form parameters if steps_json was empty
+            if (steps.length == 0)
+            {
+                auto stepTypes = req.form.getAll("step_type");
+                auto stepCustomTypes = req.form.getAll("step_custom_type");
+                auto stepNames = req.form.getAll("step_name");
+                auto stepScripts = req.form.getAll("step_script");
+                auto stepCommands = req.form.getAll("step_command");
+                auto stepWorkDirs = req.form.getAll("step_working_dir");
+                auto stepRepoUrls = req.form.getAll("step_repo_url");
+                auto stepBranches = req.form.getAll("step_repo_branch");
+                auto stepTargetDirs = req.form.getAll("step_repo_target");
+                auto stepProps = req.form.getAll("step_props");
+
+                for (size_t i = 0; i < stepTypes.length; i++)
+                {
+                    string sType = stepTypes[i].strip();
+                    if (sType == "custom" && i < stepCustomTypes.length && stepCustomTypes[i].strip().length > 0)
+                    {
+                        sType = stepCustomTypes[i].strip();
+                    }
+                    if (sType.length == 0) continue;
+
+                    BuildStep step;
+                    step.type = sType;
+                    if (i < stepNames.length) step.name = stepNames[i].strip();
+                    if (i < stepScripts.length && stepScripts[i].length > 0) step.script = stepScripts[i];
+                    if (i < stepCommands.length && stepCommands[i].length > 0) step.command = stepCommands[i];
+                    if (i < stepWorkDirs.length && stepWorkDirs[i].strip().length > 0) step.workingDirectory = stepWorkDirs[i].strip();
+
+                    if (i < stepRepoUrls.length && stepRepoUrls[i].strip().length > 0)
+                    {
+                        step.parameters["repository"] = stepRepoUrls[i].strip();
+                    }
+                    if (i < stepBranches.length && stepBranches[i].strip().length > 0)
+                    {
+                        step.parameters["branch"] = stepBranches[i].strip();
+                    }
+                    if (i < stepTargetDirs.length && stepTargetDirs[i].strip().length > 0)
+                    {
+                        step.parameters["target_dir"] = stepTargetDirs[i].strip();
+                    }
+
+                    if (i < stepProps.length && stepProps[i].strip().length > 0)
+                    {
+                        try
+                        {
+                            step.properties = parseJsonString(stepProps[i].strip());
+                        }
+                        catch (Exception) {}
+                    }
+
+                    steps ~= step;
+                }
+            }
+            task.steps = steps;
+            if (task.steps.length == 1 && (task.steps[0].type == "process" || task.steps[0].type == "script"))
+            {
+                task.script = task.steps[0].script;
+            }
+            else if (task.steps.length == 0)
+            {
+                task.script = req.form.get("script", "");
+            }
 
             // Dependencies
             string[] deps;

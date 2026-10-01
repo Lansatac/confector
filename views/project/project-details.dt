@@ -75,7 +75,7 @@ block maincontent
             th Name
             th Depends On
             th Inputs / Artifacts
-            th Script / Command
+            th Steps / Execution
             th Actions
         tbody
           - foreach(t; project.tasks)
@@ -113,6 +113,10 @@ block maincontent
                 - if (t.steps.length > 0)
                   div
                     span.badge.badge-primary #{t.steps.length} step(s)
+                    - foreach(st; t.steps)
+                      div(style="font-size: 0.8em; color: #555; margin-top: 2px;")
+                        strong #{st.type}: 
+                        span #{st.name.length > 0 ? st.name : (st.script.length > 0 ? st.script : st.type)}
                 - else
                   code(style="font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; display: inline-block;") #{t.script}
               td

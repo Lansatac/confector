@@ -474,3 +474,38 @@ a:hover {
 .tab-pane.active {
   display: block;
 }
+
+/* Step list and Step cards */
+.step-row {
+  border: 1px solid #dcdcdc;
+  background: #fafafa;
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 14px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+}
+
+.step-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e8e8e8;
+}
+
+.step-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.step-index-badge {
+  background: var(--accent-dark);
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: bold;
+  white-space: nowrap;
+}
