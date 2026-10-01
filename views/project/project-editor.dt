@@ -12,6 +12,13 @@ block maincontent
 
     div.section-title-bar(style="margin-top: 15px;")
       h2 Visual DAG Preview
+      div.graph-legend
+        span.legend-item
+          span.dot.dot-primary
+            span Task
+        span.legend-item
+          span.dot.dot-repo
+          span Repository
     div#project-canvas-container.dag-visualizer
       canvas#dag-editor-canvas(width="800", height="220")
 

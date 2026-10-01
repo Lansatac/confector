@@ -299,6 +299,62 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             }
             task.outputs.artifacts = outDecls;
 
+            // Trigger rules
+            auto trigTypes = req.form.getAll("trigger_type");
+            auto trigBranches = req.form.getAll("trigger_branches");
+            auto trigTags = req.form.getAll("trigger_tags");
+            auto trigEndpoints = req.form.getAll("trigger_endpoint");
+            auto trigCrons = req.form.getAll("trigger_cron");
+
+            TriggerRule[] triggerRules;
+            for (size_t i = 0; i < trigTypes.length; i++)
+            {
+                string tTypeStr = trigTypes[i].strip();
+                if (tTypeStr.length == 0) continue;
+
+                TriggerRule rule;
+                if (tTypeStr == "git_push") rule.type = TriggerType.gitPush;
+                else if (tTypeStr == "git_tag") rule.type = TriggerType.gitTag;
+                else if (tTypeStr == "webhook") rule.type = TriggerType.webhook;
+                else if (tTypeStr == "cron") rule.type = TriggerType.cron;
+                else rule.type = TriggerType.manual;
+
+                if (i < trigBranches.length && trigBranches[i].strip().length > 0)
+                {
+                    string[] bList;
+                    foreach (b; trigBranches[i].split(","))
+                    {
+                        string s = b.strip();
+                        if (s.length > 0) bList ~= s;
+                    }
+                    rule.branches = bList;
+                }
+
+                if (i < trigTags.length && trigTags[i].strip().length > 0)
+                {
+                    string[] tgList;
+                    foreach (tg; trigTags[i].split(","))
+                    {
+                        string s = tg.strip();
+                        if (s.length > 0) tgList ~= s;
+                    }
+                    rule.tags = tgList;
+                }
+
+                if (i < trigEndpoints.length)
+                {
+                    rule.endpoint = trigEndpoints[i].strip();
+                }
+
+                if (i < trigCrons.length)
+                {
+                    rule.cronSchedule = trigCrons[i].strip();
+                }
+
+                triggerRules ~= rule;
+            }
+            task.triggers = triggerRules;
+
             // Replace existing or append
             bool updated = false;
             foreach (ref existing; project.tasks)
@@ -512,10 +568,12 @@ unittest
     tNode1.id = "test_node_1";
     tNode1.script = "echo dashboard test 1";
     tNode1.inputs.repositories = ["repo_main"];
+    tNode1.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
     TaskNode tNode2;
     tNode2.id = "test_node_2";
     tNode2.dependsOn = ["test_node_1"];
     tNode2.script = "echo dashboard test 2";
+    tNode2.triggers = [TriggerRule(TriggerType.webhook, null, null, "/api/v1/deploy")];
     p.tasks = [tNode1, tNode2];
     stateRepo.saveProject(p);
     assert(stateRepo.listProjects().length == 1);
@@ -531,7 +589,13 @@ unittest
     assert(fetchedProj.tasks.length == 2);
     assert(fetchedProj.tasks[0].id == "test_node_1");
     assert(fetchedProj.tasks[0].inputs.repositories == ["repo_main"]);
+    assert(fetchedProj.tasks[0].triggers.length == 1);
+    assert(fetchedProj.tasks[0].triggers[0].type == TriggerType.gitPush);
+    assert(fetchedProj.tasks[0].triggers[0].branches == ["main", "feature/*"]);
     assert(fetchedProj.tasks[1].id == "test_node_2");
+    assert(fetchedProj.tasks[1].triggers.length == 1);
+    assert(fetchedProj.tasks[1].triggers[0].type == TriggerType.webhook);
+    assert(fetchedProj.tasks[1].triggers[0].endpoint == "/api/v1/deploy");
 
     // Test Build linked to project and task statuses
     BuildRecord b2;

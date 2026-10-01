@@ -50,6 +50,13 @@ block maincontent
     - if (project.tasks.length > 0)
       div.section-title-bar(style="margin-top: 30px;")
         h2 Visual Task Graph Preview
+        div.graph-legend
+          span.legend-item
+            span.dot.dot-primary
+            span Task
+          span.legend-item
+            span.dot.dot-repo
+            span Repository
       div#project-dag-container.dag-visualizer
         canvas#project-dag-canvas(width="800", height="220")
 
@@ -102,6 +109,10 @@ block maincontent
                     div
                       strong Outputs: 
                       span #{t.outputs.artifacts.length} artifact(s)
+                  - if (t.triggers.length > 0)
+                    div
+                      strong Triggers: 
+                      span #{t.triggers.length} rule(s)
               td
                 code(style="font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; display: inline-block;") #{t.script}
               td

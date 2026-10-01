@@ -57,6 +57,9 @@ block maincontent
         span.legend-item
           span.dot.dot-failed
           span Failed
+        span.legend-item
+          span.dot.dot-repo
+          span Repository
 
     div#dag-container.dag-visualizer
       canvas#dag-canvas(width="800", height="240")

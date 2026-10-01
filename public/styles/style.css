@@ -393,6 +393,7 @@ a:hover {
 .dot-cached { background-color: #00bcd4; }
 .dot-running { background-color: #ff9800; }
 .dot-failed { background-color: #f44336; }
+.dot-repo, .dot-repository { background-color: #7c3aed; }
 
 /* Details Grid */
 .details-grid {

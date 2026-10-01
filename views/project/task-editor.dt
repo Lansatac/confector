@@ -2,6 +2,7 @@ extends layout
 
 block maincontent
   - import vibe.data.json : serializeToJson;
+  - import confector.core.model : TriggerType;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
@@ -28,6 +29,7 @@ block maincontent
         button.tab-btn(type="button", onclick="switchTab('inputs', this)") Inputs
         button.tab-btn(type="button", onclick="switchTab('steps', this)") Steps
         button.tab-btn(type="button", onclick="switchTab('outputs', this)") Outputs
+        button.tab-btn(type="button", onclick="switchTab('triggers', this)") Triggers
 
       div.card
         div#tab-general.tab-pane.active
@@ -118,6 +120,44 @@ block maincontent
             - string outVal = "";
             - foreach(i, outArt; task.outputs.artifacts) { if (i > 0) outVal ~= "\n"; outVal ~= outArt.path ~ (outArt.type.length > 0 ? ":" ~ outArt.type : ""); }
             textarea.form-control#output_artifacts(name="output_artifacts", rows="4", placeholder="bin/confector.exe:binary\nbuild/output.tar.gz:archive", style="font-family: monospace;") #{outVal}
+
+        div#tab-triggers.tab-pane
+          h3 Triggers & Event Dispatches
+          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Configure node-level triggers (Git Push, Git Tag, Webhook, Cron, Manual) that automatically dispatch this task and its downstream graph slice.
+          div#triggers-container.trigger-list
+            - foreach(trig; task.triggers)
+              div.trigger-row(style="border: 1px solid #e0e0e0; background: #fafafa; border-radius: 6px; padding: 15px; margin-bottom: 12px; position: relative;")
+                div(style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;")
+                  div(style="display: flex; align-items: center; gap: 10px;")
+                    label(style="font-weight: bold; margin: 0;") Trigger Type:
+                    select.form-control(name="trigger_type", style="width: auto;", onchange="onTriggerTypeChange(this)")
+                      option(value="git_push", selected=(trig.type == TriggerType.gitPush)) Git Push (Commit/Branch)
+                      option(value="git_tag", selected=(trig.type == TriggerType.gitTag)) Git Tag (Release)
+                      option(value="webhook", selected=(trig.type == TriggerType.webhook)) Webhook (HTTP Endpoint)
+                      option(value="cron", selected=(trig.type == TriggerType.cron)) Cron Schedule
+                      option(value="manual", selected=(trig.type == TriggerType.manual)) Manual Dispatch
+                  button.btn.btn-danger.btn-sm.btn-remove-trig(type="button", onclick="removeTriggerRule(this)", title="Remove trigger") ✕
+
+                - string branchStr = "";
+                - foreach(i, b; trig.branches) { if (i > 0) branchStr ~= ", "; branchStr ~= b; }
+                - string tagStr = "";
+                - foreach(i, tg; trig.tags) { if (i > 0) tagStr ~= ", "; tagStr ~= tg; }
+
+                div.trigger-fields
+                  div.form-group.field-branches(style=(trig.type == TriggerType.gitPush ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
+                    label Branch Patterns (Comma-separated globs, e.g. main, feature/*):
+                    input.form-control(type="text", name="trigger_branches", value="#{branchStr}", placeholder="e.g. main, feature/*, release/*")
+                  div.form-group.field-tags(style=(trig.type == TriggerType.gitTag ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
+                    label Tag Patterns (Comma-separated globs, e.g. v*.*.*, release-*):
+                    input.form-control(type="text", name="trigger_tags", value="#{tagStr}", placeholder="e.g. v*.*.*, release-*")
+                  div.form-group.field-endpoint(style=(trig.type == TriggerType.webhook ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
+                    label Webhook Endpoint Path:
+                    input.form-control(type="text", name="trigger_endpoint", value="#{trig.endpoint}", placeholder="e.g. /api/v1/triggers/deploy")
+                  div.form-group.field-cron(style=(trig.type == TriggerType.cron ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
+                    label Cron Schedule Expression:
+                    input.form-control(type="text", name="trigger_cron", value="#{trig.cronSchedule}", placeholder="e.g. 0 0 * * 0")
+          div(style="margin-top: 10px;")
+            button.btn.btn-outline.btn-sm#add-trig-btn(type="button", onclick="addTriggerRule()") + Add Trigger Rule
 
         div(style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #eee; display: flex; gap: 10px;")
           button.btn.btn-primary(type="submit") Save Task
@@ -259,4 +299,104 @@ block maincontent
       if (btn) {
         btn.classList.add('active');
       }
+    }
+
+    function onTriggerTypeChange(selectElem) {
+      var row = selectElem.closest('.trigger-row');
+      if (!row) return;
+      var val = selectElem.value;
+      var fieldBranches = row.querySelector('.field-branches');
+      var fieldTags = row.querySelector('.field-tags');
+      var fieldEndpoint = row.querySelector('.field-endpoint');
+      var fieldCron = row.querySelector('.field-cron');
+
+      if (fieldBranches) fieldBranches.style.display = (val === 'git_push') ? 'block' : 'none';
+      if (fieldTags) fieldTags.style.display = (val === 'git_tag') ? 'block' : 'none';
+      if (fieldEndpoint) fieldEndpoint.style.display = (val === 'webhook') ? 'block' : 'none';
+      if (fieldCron) fieldCron.style.display = (val === 'cron') ? 'block' : 'none';
+    }
+
+    function removeTriggerRule(btn) {
+      var row = btn.closest('.trigger-row');
+      if (row) {
+        row.remove();
+      }
+    }
+
+    function addTriggerRule(defaultType) {
+      var container = document.getElementById('triggers-container');
+      if (!container) return;
+
+      var type = defaultType || 'git_push';
+      var row = document.createElement('div');
+      row.className = 'trigger-row';
+      row.style.cssText = 'border: 1px solid #e0e0e0; background: #fafafa; border-radius: 6px; padding: 15px; margin-bottom: 12px; position: relative;';
+
+      var header = document.createElement('div');
+      header.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;';
+
+      var typeWrapper = document.createElement('div');
+      typeWrapper.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+
+      var label = document.createElement('label');
+      label.style.cssText = 'font-weight: bold; margin: 0;';
+      label.textContent = 'Trigger Type:';
+      typeWrapper.appendChild(label);
+
+      var select = document.createElement('select');
+      select.name = 'trigger_type';
+      select.className = 'form-control';
+      select.style.width = 'auto';
+      select.onchange = function() { onTriggerTypeChange(this); };
+
+      var options = [
+        { value: 'git_push', label: 'Git Push (Commit/Branch)' },
+        { value: 'git_tag', label: 'Git Tag (Release)' },
+        { value: 'webhook', label: 'Webhook (HTTP Endpoint)' },
+        { value: 'cron', label: 'Cron Schedule' },
+        { value: 'manual', label: 'Manual Dispatch' }
+      ];
+
+      for (var i = 0; i < options.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = options[i].value;
+        opt.textContent = options[i].label;
+        if (options[i].value === type) opt.selected = true;
+        select.appendChild(opt);
+      }
+      typeWrapper.appendChild(select);
+      header.appendChild(typeWrapper);
+
+      var removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-danger btn-sm btn-remove-trig';
+      removeBtn.textContent = '✕';
+      removeBtn.title = 'Remove trigger';
+      removeBtn.onclick = function() { removeTriggerRule(this); };
+      header.appendChild(removeBtn);
+      row.appendChild(header);
+
+      var fields = document.createElement('div');
+      fields.className = 'trigger-fields';
+
+      fields.innerHTML =
+        '<div class="form-group field-branches" style="' + (type === 'git_push' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
+          '<label>Branch Patterns (Comma-separated globs, e.g. main, feature/*):</label>' +
+          '<input class="form-control" type="text" name="trigger_branches" placeholder="e.g. main, feature/*, release/*">' +
+        '</div>' +
+        '<div class="form-group field-tags" style="' + (type === 'git_tag' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
+          '<label>Tag Patterns (Comma-separated globs, e.g. v*.*.*, release-*):</label>' +
+          '<input class="form-control" type="text" name="trigger_tags" placeholder="e.g. v*.*.*, release-*">' +
+        '</div>' +
+        '<div class="form-group field-endpoint" style="' + (type === 'webhook' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
+          '<label>Webhook Endpoint Path:</label>' +
+          '<input class="form-control" type="text" name="trigger_endpoint" placeholder="e.g. /api/v1/triggers/deploy">' +
+        '</div>' +
+        '<div class="form-group field-cron" style="' + (type === 'cron' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
+          '<label>Cron Schedule Expression:</label>' +
+          '<input class="form-control" type="text" name="trigger_cron" placeholder="e.g. 0 0 * * 0">' +
+        '</div>';
+
+      row.appendChild(fields);
+      container.appendChild(row);
     }
