@@ -244,6 +244,14 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
     }
 }
 
+/**
+ * Exported factory function for dynamic plugin loading.
+ */
+extern(C) export Plugin confector_create_plugin()
+{
+    return new BashPlugin();
+}
+
 unittest
 {
     auto plugin = new BashPlugin();

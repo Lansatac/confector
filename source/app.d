@@ -5,16 +5,14 @@ import controller.repositorycontroller;
 import controller.api_controller;
 import controller.dashboard_controller;
 import controller.executor_controller;
+import controller.admin_controller;
 import confector.core.plugin;
+import confector.core.plugin_loader;
 import confector.core.storage;
 import confector.storage.mongo_repository;
 import confector.queue.queue;
 import confector.queue.mongo_queue;
 import confector.runner.engine;
-import plugins.git;
-import plugins.bash;
-import plugins.powershell;
-import plugins.local_executor;
 
 debug static import std.stdio;
 
@@ -59,12 +57,53 @@ void main()
   }
   writeln("Connected to mongo.");
 	
-  // Initialize and register core default plugins
-  PluginRegistry.instance.registerPlugin(new GitRepositoryPlugin());
-  PluginRegistry.instance.registerPlugin(new BashPlugin());
-  PluginRegistry.instance.registerPlugin(new PowerShellPlugin());
-  PluginRegistry.instance.registerPlugin(new LocalExecutorPlugin());
-  writeln("Initialized modular plugins.");
+  // Dynamically load configured plugins
+  import std.process : environment;
+  import std.string : split, strip;
+  import std.algorithm.searching : canFind;
+
+  string confectorPluginsEnv = environment.get("CONFECTOR_PLUGINS", "");
+  string[] pluginPaths;
+  if (confectorPluginsEnv.length > 0)
+  {
+      version(Windows)
+      {
+          pluginPaths = confectorPluginsEnv.split(";");
+      }
+      else
+      {
+          pluginPaths = confectorPluginsEnv.split(":");
+      }
+      if (pluginPaths.length == 1 && confectorPluginsEnv.canFind(","))
+      {
+          pluginPaths = confectorPluginsEnv.split(",");
+      }
+  }
+
+  if (pluginPaths.length > 0)
+  {
+      foreach (path; pluginPaths)
+      {
+          string trimmed = path.strip;
+          if (trimmed.length > 0)
+          {
+              try
+              {
+                  auto p = PluginLoader.instance.loadPlugin(trimmed);
+                  writefln("[plugins] Dynamically loaded plugin '%s' v%s from %s", p.name, p.versionString, trimmed);
+              }
+              catch (Exception e)
+              {
+                  writefln("[plugins] Warning: Failed to load configured plugin '%s': %s", trimmed, e.msg);
+              }
+          }
+      }
+  }
+  else
+  {
+      writeln("[plugins] No external plugins configured via CONFECTOR_PLUGINS.");
+  }
+  writefln("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
 
   // Initialize execution engine & storage
   auto artifactStorage = new LocalArtifactStorage(".confector/artifacts");
@@ -81,11 +120,13 @@ void main()
   // Mount API & serverless execution endpoints
   router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
 
-  // Mount dashboard, builds, projects, and executors UI
+  // Mount dashboard, builds, projects, executors, and admin UI
   router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance));
   router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
+  router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
+  router.get("/admin", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/admin/plugins"); });
   router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo));
 
   router.any("/repositories/*", repositoryRouter(client));

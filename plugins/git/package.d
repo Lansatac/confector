@@ -272,6 +272,14 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
     }
 }
 
+/**
+ * Exported factory function for dynamic plugin loading.
+ */
+extern(C) export Plugin confector_create_plugin()
+{
+    return new GitRepositoryPlugin();
+}
+
 unittest
 {
     auto plugin = new GitRepositoryPlugin();

@@ -255,17 +255,43 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 unittest
 {
     import confector.core.storage : InMemoryBuildStateRepository;
-    import plugins.local_executor : LocalExecutorPlugin;
+    import confector.core.plugin : Plugin;
+    import confector.core.executor : ExecutorProvider, TaskExecutor;
+
+    class MockExecutorProvider : Plugin, ExecutorProvider
+    {
+        @property string name() const { return "mock-executor-plugin"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Mock Executor Provider"; }
+        @property string providerType() const { return "mock-local"; }
+        @property string displayName() const { return "Mock Local Executor"; }
+        @property string[] supportedStepTypes() const { return ["process", "mock"]; }
+
+        void initialize() {}
+        void shutdown() {}
+
+        Json defaultConfig() const
+        {
+            Json c = Json.emptyObject;
+            c["maxConcurrency"] = 2;
+            c["workspaceDir"] = ".workspaces";
+            return c;
+        }
+
+        string[] validateConfig(in Json config) const { return null; }
+        string renderConfigFormHtml(in Json currentConfig) const { return "<div>Mock Config</div>"; }
+        TaskExecutor createExecutor(in ExecutorRecord record) const { return null; }
+    }
 
     auto repo = new InMemoryBuildStateRepository();
     auto reg = PluginRegistry.instance;
     reg.shutdownAll();
 
-    auto localPlugin = new LocalExecutorPlugin();
-    reg.registerPlugin(localPlugin);
+    auto mockPlugin = new MockExecutorProvider();
+    reg.registerPlugin(mockPlugin);
 
     assert(reg.getExecutorProviders().length == 1);
-    assert(reg.getExecutorProvider("local") is localPlugin);
+    assert(reg.getExecutorProvider("mock-local") is mockPlugin);
 
     auto router = executorRouter(repo, reg);
     assert(router !is null);
@@ -274,9 +300,9 @@ unittest
     ExecutorRecord exec;
     exec.id = "exec-test-init";
     exec.name = "Initial Executor";
-    exec.providerType = "local";
+    exec.providerType = "mock-local";
     exec.enabled = false;
-    exec.configuration = localPlugin.defaultConfig();
+    exec.configuration = mockPlugin.defaultConfig();
     repo.saveExecutor(exec);
 
     assert(repo.listExecutors().length == 1);

@@ -1,7 +1,7 @@
 {
 	"name": "bash",
 	"description": "Bash Plugin for Confector",
-	"targetType": "library",
+	"targetType": "dynamicLibrary",
 	"sourcePaths": ["."],
 	"importPaths": [".."],
 	"stringImportPaths": ["."],
@@ -9,5 +9,6 @@
 		"confector:core": {"path": "../.."},
 		"diet-ng": "~>1.8",
 		"vibe-d": "~>0.10.3"
-	}
+	},
+	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
 }

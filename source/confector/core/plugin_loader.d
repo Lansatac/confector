@@ -1,0 +1,369 @@
+module confector.core.plugin_loader;
+
+import confector.core.plugin;
+import std.string : toStringz, strip;
+import std.path : isAbsolute, absolutePath;
+import std.file : exists, isFile;
+import std.format : format;
+import std.conv : to;
+
+version (Windows)
+{
+    import core.runtime : Runtime;
+    import core.sys.windows.windows;
+    import std.utf : toUTF16z;
+}
+else version (Posix)
+{
+    import core.sys.posix.dlfcn;
+}
+
+/**
+ * Standard C-ABI export symbol name for plugin factories.
+ */
+enum string CONFECTOR_PLUGIN_FACTORY_SYMBOL = "confector_create_plugin";
+
+/**
+ * Function pointer type for plugin instantiation factory.
+ */
+alias PluginFactoryFn = extern(C) Plugin function();
+
+/**
+ * Exception thrown when dynamic plugin loading fails.
+ */
+class PluginLoadException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__, Throwable next = null) pure nothrow @safe
+    {
+        super(msg, file, line, next);
+    }
+}
+
+/**
+ * Record holding state for a dynamically loaded plugin library.
+ */
+struct LoadedPluginRecord
+{
+    string path;
+    void* handle;
+    Plugin plugin;
+}
+
+/**
+ * Subsystem responsible for dynamically loading, resolving, tracking, and unloading plugin shared libraries.
+ */
+final class PluginLoader
+{
+    private static PluginLoader _instance;
+    private LoadedPluginRecord[string] _loadedPlugins; // Keyed by plugin.name
+    private string[string] _pathToPluginName; // Keyed by absolute library path
+
+    public static PluginLoader instance()
+    {
+        if (_instance is null)
+        {
+            _instance = new PluginLoader();
+        }
+        return _instance;
+    }
+
+    public static void resetInstance()
+    {
+        if (_instance !is null)
+        {
+            _instance.unloadAll();
+            _instance = null;
+        }
+    }
+
+    public @property LoadedPluginRecord[string] loadedPlugins()
+    {
+        return _loadedPlugins.dup;
+    }
+
+    public @property LoadedPluginRecord[] allLoadedRecords()
+    {
+        return _loadedPlugins.values;
+    }
+
+    public Plugin getLoadedPlugin(string name)
+    {
+        if (auto p = name in _loadedPlugins)
+        {
+            return p.plugin;
+        }
+        return null;
+    }
+
+    /**
+     * Loads a shared dynamic library plugin from the given path, resolves its factory entrypoint,
+     * instantiates the plugin, and registers it with PluginRegistry.
+     */
+    public Plugin loadPlugin(string libraryPath)
+    {
+        string trimmedPath = libraryPath.strip;
+        if (trimmedPath.length == 0)
+        {
+            throw new PluginLoadException("Plugin library path cannot be empty");
+        }
+
+        if (!exists(trimmedPath))
+        {
+            throw new PluginLoadException(format("Plugin library file does not exist: %s", trimmedPath));
+        }
+
+        if (!isFile(trimmedPath))
+        {
+            throw new PluginLoadException(format("Plugin library path is not a file: %s", trimmedPath));
+        }
+
+        string absPath = absolutePath(trimmedPath);
+
+        // Check if already loaded by this path
+        if (auto pName = absPath in _pathToPluginName)
+        {
+            if (auto rec = *pName in _loadedPlugins)
+            {
+                return rec.plugin;
+            }
+        }
+
+        void* handle = null;
+
+        version (Windows)
+        {
+            handle = Runtime.loadLibrary(trimmedPath);
+            if (handle is null)
+            {
+                handle = cast(void*) LoadLibraryW(trimmedPath.toUTF16z());
+            }
+            if (handle is null)
+            {
+                DWORD err = GetLastError();
+                throw new PluginLoadException(format("Failed to load dynamic library '%s' (Win32 error %d)", trimmedPath, err));
+            }
+        }
+        else version (Posix)
+        {
+            handle = dlopen(trimmedPath.toStringz(), RTLD_NOW | RTLD_LOCAL);
+            if (handle is null)
+            {
+                const(char)* err = dlerror();
+                throw new PluginLoadException(format("Failed to load dynamic library '%s': %s", trimmedPath, err ? to!string(err) : "unknown error"));
+            }
+        }
+        else
+        {
+            static assert(0, "Unsupported platform for dynamic plugin loading");
+        }
+
+        void* sym = null;
+        version (Windows)
+        {
+            sym = cast(void*) GetProcAddress(cast(HMODULE) handle, CONFECTOR_PLUGIN_FACTORY_SYMBOL.toStringz());
+        }
+        else version (Posix)
+        {
+            sym = dlsym(handle, CONFECTOR_PLUGIN_FACTORY_SYMBOL.toStringz());
+        }
+
+        if (sym is null)
+        {
+            unloadHandle(handle);
+            throw new PluginLoadException(format("Dynamic library '%s' does not export entrypoint '%s'", trimmedPath, CONFECTOR_PLUGIN_FACTORY_SYMBOL));
+        }
+
+        auto factory = cast(PluginFactoryFn) sym;
+        Plugin plugin = null;
+        try
+        {
+            plugin = factory();
+        }
+        catch (Throwable t)
+        {
+            unloadHandle(handle);
+            throw new PluginLoadException(format("Exception invoking plugin factory in '%s': %s", trimmedPath, t.msg), __FILE__, __LINE__, t);
+        }
+
+        if (plugin is null)
+        {
+            unloadHandle(handle);
+            throw new PluginLoadException(format("Plugin factory '%s' in '%s' returned null", CONFECTOR_PLUGIN_FACTORY_SYMBOL, trimmedPath));
+        }
+
+        // Register with PluginRegistry
+        PluginRegistry.instance.registerPlugin(plugin);
+
+        LoadedPluginRecord record;
+        record.path = absPath;
+        record.handle = handle;
+        record.plugin = plugin;
+
+        _loadedPlugins[plugin.name] = record;
+        _pathToPluginName[absPath] = plugin.name;
+
+        return plugin;
+    }
+
+    /**
+     * Loads multiple plugin dynamic libraries from an array of file paths.
+     */
+    public Plugin[] loadPlugins(in string[] libraryPaths)
+    {
+        Plugin[] loaded;
+        foreach (path; libraryPaths)
+        {
+            string trimmed = path.strip;
+            if (trimmed.length > 0)
+            {
+                loaded ~= loadPlugin(trimmed);
+            }
+        }
+        return loaded;
+    }
+
+    /**
+     * Unloads a loaded plugin by its name, calling plugin shutdown, unregistering from PluginRegistry,
+     * and releasing the dynamic library handle.
+     */
+    public void unloadPlugin(string name)
+    {
+        if (auto rec = name in _loadedPlugins)
+        {
+            auto record = *rec;
+            _loadedPlugins.remove(name);
+            _pathToPluginName.remove(record.path);
+
+            PluginRegistry.instance.unregisterPlugin(name);
+            unloadHandle(record.handle);
+        }
+    }
+
+    /**
+     * Unloads all dynamically loaded plugins and releases their library handles.
+     */
+    public void unloadAll()
+    {
+        auto names = _loadedPlugins.keys;
+        foreach (name; names)
+        {
+            unloadPlugin(name);
+        }
+        _loadedPlugins.clear();
+        _pathToPluginName.clear();
+    }
+
+    private static void unloadHandle(void* handle)
+    {
+        if (handle is null) return;
+        version (Windows)
+        {
+            try
+            {
+                if (!Runtime.unloadLibrary(handle))
+                {
+                    FreeLibrary(cast(HMODULE) handle);
+                }
+            }
+            catch (Throwable t)
+            {
+                FreeLibrary(cast(HMODULE) handle);
+            }
+        }
+        else version (Posix)
+        {
+            dlclose(handle);
+        }
+    }
+}
+
+unittest
+{
+    auto loader = PluginLoader.instance;
+    scope(exit) loader.unloadAll();
+
+    // 1. Negative test: Empty path
+    bool caughtEmpty = false;
+    try
+    {
+        loader.loadPlugin("");
+    }
+    catch (PluginLoadException e)
+    {
+        caughtEmpty = true;
+    }
+    assert(caughtEmpty, "Should throw PluginLoadException for empty path");
+
+    // 2. Negative test: Non-existent file
+    bool caughtNonExistent = false;
+    try
+    {
+        loader.loadPlugin("non_existent_plugin_file_12345.dll");
+    }
+    catch (PluginLoadException e)
+    {
+        caughtNonExistent = true;
+    }
+    assert(caughtNonExistent, "Should throw PluginLoadException for non-existent file");
+
+    // 3. Negative test: Path is a directory
+    bool caughtDir = false;
+    try
+    {
+        loader.loadPlugin(".");
+    }
+    catch (PluginLoadException e)
+    {
+        caughtDir = true;
+    }
+    assert(caughtDir, "Should throw PluginLoadException when path is a directory");
+
+    // 4. Negative test: Library without confector_create_plugin export
+    version (Windows)
+    {
+        string systemLib = "C:\\Windows\\System32\\kernel32.dll";
+        if (exists(systemLib))
+        {
+            bool caughtMissingSymbol = false;
+            try
+            {
+                loader.loadPlugin(systemLib);
+            }
+            catch (PluginLoadException e)
+            {
+                caughtMissingSymbol = true;
+            }
+            assert(caughtMissingSymbol, "Should throw PluginLoadException when library lacks factory symbol");
+        }
+    }
+    else version (Posix)
+    {
+        string systemLib = "/lib/x86_64-linux-gnu/libc.so.6";
+        if (!exists(systemLib)) systemLib = "/usr/lib/libc.dylib";
+        if (exists(systemLib))
+        {
+            bool caughtMissingSymbol = false;
+            try
+            {
+                loader.loadPlugin(systemLib);
+            }
+            catch (PluginLoadException e)
+            {
+                caughtMissingSymbol = true;
+            }
+            assert(caughtMissingSymbol, "Should throw PluginLoadException when library lacks factory symbol");
+        }
+    }
+
+    // 5. Array loading with empty/whitespace items
+    assert(loader.loadPlugins(["", "   "]).length == 0);
+
+    // 6. Loaded tracking methods
+    assert(loader.loadedPlugins.length == 0);
+    assert(loader.allLoadedRecords.length == 0);
+    assert(loader.getLoadedPlugin("non_existent") is null);
+
+    // 7. Unload non-existent plugin does not throw
+    loader.unloadPlugin("non_existent");
+    loader.unloadAll();
+}

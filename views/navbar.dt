@@ -10,3 +10,5 @@ div.menu-item
   a.item-link(href="/executors/") Executors
 div.menu-item
   a.item-link(href="/repositories/") Repositories
+div.menu-item
+  a.item-link(href="/admin/plugins") Admin

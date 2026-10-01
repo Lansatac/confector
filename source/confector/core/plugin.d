@@ -142,6 +142,74 @@ final class PluginRegistry
         }
     }
 
+    public void unregisterPlugin(string name)
+    {
+        if (auto p = name in _plugins)
+        {
+            auto plugin = *p;
+            _plugins.remove(name);
+            plugin.shutdown();
+
+            import std.algorithm.mutation : remove;
+            if (auto resolver = cast(InputResolverSystem) plugin)
+            {
+                for (size_t i = 0; i < _inputResolvers.length; )
+                {
+                    if (_inputResolvers[i] is resolver) _inputResolvers = _inputResolvers.remove(i);
+                    else i++;
+                }
+            }
+            if (auto contributor = cast(FingerprintContributionSystem) plugin)
+            {
+                for (size_t i = 0; i < _fingerprintContributors.length; )
+                {
+                    if (_fingerprintContributors[i] is contributor) _fingerprintContributors = _fingerprintContributors.remove(i);
+                    else i++;
+                }
+            }
+            if (auto execSystem = cast(TaskExecutionSystem) plugin)
+            {
+                for (size_t i = 0; i < _executionSystems.length; )
+                {
+                    if (_executionSystems[i] is execSystem) _executionSystems = _executionSystems.remove(i);
+                    else i++;
+                }
+            }
+            if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
+            {
+                for (size_t i = 0; i < _artifactPublishers.length; )
+                {
+                    if (_artifactPublishers[i] is pubSystem) _artifactPublishers = _artifactPublishers.remove(i);
+                    else i++;
+                }
+            }
+            if (auto stepSystem = cast(BuildStepSystem) plugin)
+            {
+                for (size_t i = 0; i < _stepSystems.length; )
+                {
+                    if (_stepSystems[i] is stepSystem) _stepSystems = _stepSystems.remove(i);
+                    else i++;
+                }
+            }
+            if (auto stepProvider = cast(BuildStepProvider) plugin)
+            {
+                for (size_t i = 0; i < _stepProviders.length; )
+                {
+                    if (_stepProviders[i] is stepProvider) _stepProviders = _stepProviders.remove(i);
+                    else i++;
+                }
+            }
+            if (auto provider = cast(ExecutorProvider) plugin)
+            {
+                for (size_t i = 0; i < _executorProviders.length; )
+                {
+                    if (_executorProviders[i] is provider) _executorProviders = _executorProviders.remove(i);
+                    else i++;
+                }
+            }
+        }
+    }
+
     public InputResolverSystem[] getInputResolvers()
     {
         return _inputResolvers;

@@ -17,6 +17,8 @@
 # Debug
 *.pdb
 
+*.exp
+
 # DUB
 .dub
 docs.json

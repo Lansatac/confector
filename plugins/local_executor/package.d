@@ -289,7 +289,7 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
 
     @property string[] supportedStepTypes() const
     {
-        return ["bash", "powershell", "git"];
+        return ["process", "bash", "powershell", "git"];
     }
 
     void initialize()
@@ -406,6 +406,14 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
     {
         return new LocalTaskExecutor(record);
     }
+}
+
+/**
+ * Exported factory function for dynamic plugin loading.
+ */
+extern(C) export Plugin confector_create_plugin()
+{
+    return new LocalExecutorPlugin();
 }
 
 unittest

@@ -499,19 +499,134 @@ class TaskEngine
 
 unittest
 {
-    import plugins.bash;
-    import plugins.powershell;
     import std.file : rmdirRecurse, mkdirRecurse, write;
+    import std.process : pipeShell, Redirect, Config, wait;
+
+    class MockEnginePlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem
+    {
+        @property string name() const { return "mock-engine-plugin"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Mock engine runner plugin"; }
+        @property string runnerType() const { return "process"; }
+        @property string systemName() const { return "mock-engine-system"; }
+        @property string stepType() const { return "process"; }
+
+        void initialize() {}
+        void shutdown() {}
+
+        bool canExecute(in ExecutionRequest request) const { return true; }
+        bool canExecute(in TaskNode task) const { return true; }
+
+        ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
+        {
+            ExecutionResult res;
+            try
+            {
+                auto pipe = pipeShell(request.command, Redirect.stdout | Redirect.stderrToStdout, request.environmentVariables.length > 0 ? request.environmentVariables : null, Config.retainStderr, request.workingDirectory);
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    res.outputLines ~= line;
+                    if (logCallback !is null) logCallback(line);
+                }
+                res.exitCode = wait(pipe.pid);
+                res.success = (res.exitCode == 0);
+            }
+            catch (Exception e)
+            {
+                res.exitCode = -1;
+                res.success = false;
+                res.errorMessage = e.msg;
+            }
+            return res;
+        }
+
+        ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null)
+        {
+            ExecutionResult res;
+            try
+            {
+                auto pipe = pipeShell(task.script, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr, request.workingDirectory);
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    res.outputLines ~= line;
+                    if (logCallback !is null) logCallback(line);
+                }
+                res.exitCode = wait(pipe.pid);
+                res.success = (res.exitCode == 0);
+            }
+            catch (Exception e)
+            {
+                res.exitCode = -1;
+                res.success = false;
+                res.errorMessage = e.msg;
+            }
+            return res;
+        }
+
+        bool canExecuteStep(in BuildStep step) const
+        {
+            return step.type == "process" || step.type == "bash" || step.type == "powershell" || step.type == "sh" || step.type == "pwsh";
+        }
+
+        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+        {
+            import std.process : pipeProcess, ProcessPipes;
+            StepExecutionResult res;
+            string cmd = step.script.length > 0 ? step.script : step.command;
+            if (cmd.length == 0)
+            {
+                res.exitCode = 1;
+                res.errorMessage = "Empty command";
+                return res;
+            }
+            try
+            {
+                ProcessPipes pipe;
+                if (step.type == "powershell" || step.type == "pwsh")
+                {
+                    version(Windows)
+                    {
+                        string[] args = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd];
+                        pipe = pipeProcess(args, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr, context.workingDirectory);
+                    }
+                    else
+                    {
+                        string[] args = ["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd];
+                        pipe = pipeProcess(args, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr, context.workingDirectory);
+                    }
+                }
+                else
+                {
+                    pipe = pipeShell(cmd, Redirect.stdout | Redirect.stderrToStdout, context.environment.length > 0 ? context.environment : null, Config.retainStderr, context.workingDirectory);
+                }
+
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    res.outputLines ~= line;
+                    if (context.logCallback !is null) context.logCallback(line);
+                }
+                res.exitCode = wait(pipe.pid);
+                res.success = (res.exitCode == 0);
+                if (!res.success) res.errorMessage = format("Step exited with code %d", res.exitCode);
+            }
+            catch (Exception e)
+            {
+                res.exitCode = -1;
+                res.success = false;
+                res.errorMessage = e.msg;
+            }
+            return res;
+        }
+    }
 
     string testDir = "test_engine_run";
     if (exists(testDir)) rmdirRecurse(testDir);
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    // Register plugins
-    PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
-    PluginRegistry.instance.registerPlugin(new BashPlugin());
-    PluginRegistry.instance.registerPlugin(new PowerShellPlugin());
+    // Register decoupled mock plugin
+    PluginRegistry.instance.shutdownAll();
+    PluginRegistry.instance.registerPlugin(new MockEnginePlugin());
 
     auto storage = new LocalArtifactStorage(buildPath(testDir, "storage"));
     auto stateRepo = new InMemoryBuildStateRepository();
@@ -672,11 +787,67 @@ unittest
     }
 
     // Executor Provider & Persistence Integration Test
-    import plugins.local_executor : LocalExecutorPlugin;
     import confector.core.executor : ExecutorRecord, ExecutorProvider, TaskExecutor;
     import controller.executor_controller : executorRouter;
+    import vibe.data.json : Json;
 
-    auto localExecPlugin = new LocalExecutorPlugin();
+    class MockEngineExecutorProvider : Plugin, ExecutorProvider
+    {
+        @property string name() const { return "mock-local-executor-plugin"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Mock local executor plugin"; }
+        @property string providerType() const { return "local"; }
+        @property string displayName() const { return "Local Process Executor"; }
+        @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+
+        void initialize() {}
+        void shutdown() {}
+
+        Json defaultConfig() const
+        {
+            Json c = Json.emptyObject;
+            c["maxConcurrency"] = 4;
+            c["workspaceDir"] = ".confector/workspaces";
+            c["defaultShell"] = "powershell";
+            return c;
+        }
+
+        string[] validateConfig(in Json config) const { return null; }
+        string renderConfigFormHtml(in Json currentConfig) const { return "<div>Local Config</div>"; }
+
+        TaskExecutor createExecutor(in ExecutorRecord record) const
+        {
+            class MockTaskExecutor : TaskExecutor
+            {
+                ExecutorRecord m_rec;
+                this(in ExecutorRecord rec) { m_rec = cast()rec; }
+                @property string id() const { return m_rec.id; }
+                @property string providerType() const { return m_rec.providerType; }
+                @property bool isEnabled() const { return m_rec.enabled; }
+                @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+
+                ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
+                {
+                    ExecutionResult res;
+                    if (!m_rec.enabled)
+                    {
+                        res.exitCode = -1;
+                        res.success = false;
+                        res.errorMessage = "Executor is disabled";
+                        return res;
+                    }
+                    res.exitCode = 0;
+                    res.success = true;
+                    res.outputLines = ["Mock execution output"];
+                    if (logCallback !is null) logCallback("Mock execution output");
+                    return res;
+                }
+            }
+            return new MockTaskExecutor(record);
+        }
+    }
+
+    auto localExecPlugin = new MockEngineExecutorProvider();
     PluginRegistry.instance.registerPlugin(localExecPlugin);
 
     auto providers = PluginRegistry.instance.getExecutorProviders();

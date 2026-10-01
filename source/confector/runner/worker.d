@@ -191,11 +191,75 @@ class WorkerRunner
 unittest
 {
     import confector.core.plugin;
+    import confector.core.system : TaskExecutionSystem;
+    import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
     import std.file : rmdirRecurse;
+    import std.process : pipeShell, Redirect, Config, wait;
+
+    class MockWorkerTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem
+    {
+        @property string name() const { return "mock-worker-runner"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Mock worker task runner"; }
+        @property string runnerType() const { return "process"; }
+        @property string systemName() const { return "mock-worker-system"; }
+
+        void initialize() {}
+        void shutdown() {}
+
+        bool canExecute(in ExecutionRequest request) const { return true; }
+        bool canExecute(in TaskNode task) const { return true; }
+
+        ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
+        {
+            ExecutionResult res;
+            try
+            {
+                auto pipe = pipeShell(request.command, Redirect.stdout | Redirect.stderrToStdout, request.environmentVariables.length > 0 ? request.environmentVariables : null, Config.retainStderr, request.workingDirectory);
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    res.outputLines ~= line;
+                    if (logCallback !is null) logCallback(line);
+                }
+                res.exitCode = wait(pipe.pid);
+                res.success = (res.exitCode == 0);
+            }
+            catch (Exception e)
+            {
+                res.exitCode = -1;
+                res.success = false;
+                res.errorMessage = e.msg;
+            }
+            return res;
+        }
+
+        ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null)
+        {
+            ExecutionResult res;
+            try
+            {
+                auto pipe = pipeShell(task.script, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr, request.workingDirectory);
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    res.outputLines ~= line;
+                    if (logCallback !is null) logCallback(line);
+                }
+                res.exitCode = wait(pipe.pid);
+                res.success = (res.exitCode == 0);
+            }
+            catch (Exception e)
+            {
+                res.exitCode = -1;
+                res.success = false;
+                res.errorMessage = e.msg;
+            }
+            return res;
+        }
+    }
 
     if (PluginRegistry.instance.getPluginsOfType!TaskRunner().length == 0)
     {
-        PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
+        PluginRegistry.instance.registerPlugin(new MockWorkerTaskRunnerPlugin());
     }
 
     string testDir = "test_worker_runner_env";

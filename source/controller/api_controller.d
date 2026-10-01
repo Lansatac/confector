@@ -806,7 +806,16 @@ unittest
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
+    class MockApiPlugin : Plugin
+    {
+        @property string name() const { return "mock-api-plugin"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Mock api plugin"; }
+        void initialize() {}
+        void shutdown() {}
+    }
+
+    PluginRegistry.instance.registerPlugin(new MockApiPlugin());
     auto storage = new LocalArtifactStorage(buildPath(testDir, "storage"));
     auto stateRepo = new InMemoryBuildStateRepository();
     auto engine = new TaskEngine(storage, stateRepo);

@@ -294,6 +294,14 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
     }
 }
 
+/**
+ * Exported factory function for dynamic plugin loading.
+ */
+extern(C) export Plugin confector_create_plugin()
+{
+    return new PowerShellPlugin();
+}
+
 unittest
 {
     auto plugin = new PowerShellPlugin();
