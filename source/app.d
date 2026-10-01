@@ -12,6 +12,8 @@ import confector.queue.mongo_queue;
 import confector.runner.engine;
 import confector.plugins.git;
 import confector.plugins.process_runner;
+import confector.plugins.bash;
+import confector.plugins.powershell;
 
 debug static import std.stdio;
 
@@ -59,6 +61,8 @@ void main()
   // Initialize and register core default plugins
   PluginRegistry.instance.registerPlugin(new GitRepositoryPlugin());
   PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
+  PluginRegistry.instance.registerPlugin(new BashPlugin());
+  PluginRegistry.instance.registerPlugin(new PowerShellPlugin());
   writeln("Initialized modular plugins.");
 
   // Initialize execution engine & storage

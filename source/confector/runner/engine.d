@@ -502,6 +502,8 @@ class TaskEngine
 unittest
 {
     import confector.plugins.process_runner;
+    import confector.plugins.bash;
+    import confector.plugins.powershell;
     import std.file : rmdirRecurse, mkdirRecurse, write;
 
     string testDir = "test_engine_run";
@@ -509,8 +511,10 @@ unittest
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    // Register process runner plugin
+    // Register plugins
     PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
+    PluginRegistry.instance.registerPlugin(new BashPlugin());
+    PluginRegistry.instance.registerPlugin(new PowerShellPlugin());
 
     auto storage = new LocalArtifactStorage(buildPath(testDir, "storage"));
     auto stateRepo = new InMemoryBuildStateRepository();
@@ -643,4 +647,30 @@ unittest
     auto unknownStepRes = engine.executeTask("build_unknown_step", unknownStepTask, testDir);
     assert(unknownStepRes.status == TaskStatus.failed);
     assert(unknownStepRes.errorMessage.length > 0);
+
+    // Bash and PowerShell step plugin execution test
+    TaskNode scriptPluginTask;
+    scriptPluginTask.id = "script_plugins_task";
+    version(Windows)
+    {
+        scriptPluginTask.steps = [
+            BuildStep("Bash Step", "bash", null, "echo bash_output > bash.txt"),
+            BuildStep("PowerShell Step", "powershell", null, "Write-Output 'ps_output' | Out-File -FilePath ps.txt -Encoding ascii")
+        ];
+    }
+    else
+    {
+        scriptPluginTask.steps = [
+            BuildStep("Bash Step", "bash", null, "echo bash_output > bash.txt")
+        ];
+    }
+    scriptPluginTask.outputs.artifacts = [OutputArtifactDecl("bash.txt", "file")];
+
+    auto scriptPluginRes = engine.executeTask("build_script_plugins", scriptPluginTask, testDir);
+    assert(scriptPluginRes.status == TaskStatus.succeeded);
+    assert(exists(buildPath(testDir, "bash.txt")));
+    version(Windows)
+    {
+        assert(exists(buildPath(testDir, "ps.txt")));
+    }
 }
