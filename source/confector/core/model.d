@@ -111,7 +111,7 @@ struct UpstreamArtifactInputComponent
 struct BuildStep
 {
     @optional string name;
-    string type; // e.g. "clone_repository", "git_clone", "process", "script", "command"
+    string type; // e.g. "clone_repository", "git_clone", "script", "command"
     @optional string[string] parameters;
     @optional string script;
     @optional string command;

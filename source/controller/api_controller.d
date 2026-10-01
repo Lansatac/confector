@@ -797,7 +797,6 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
 
 unittest
 {
-    import plugins.process_runner;
     import confector.core.plugin;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;

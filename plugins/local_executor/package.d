@@ -66,7 +66,7 @@ class LocalTaskExecutor : TaskExecutor
                 }
             }
         }
-        return ["process", "bash", "powershell", "git"];
+        return [];
     }
 
     ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
@@ -289,7 +289,7 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
 
     @property string[] supportedStepTypes() const
     {
-        return ["process", "bash", "powershell", "git"];
+        return ["bash", "powershell", "git"];
     }
 
     void initialize()

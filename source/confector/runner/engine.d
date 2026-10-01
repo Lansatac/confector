@@ -499,7 +499,6 @@ class TaskEngine
 
 unittest
 {
-    import plugins.process_runner;
     import plugins.bash;
     import plugins.powershell;
     import std.file : rmdirRecurse, mkdirRecurse, write;

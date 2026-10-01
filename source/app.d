@@ -12,7 +12,6 @@ import confector.queue.queue;
 import confector.queue.mongo_queue;
 import confector.runner.engine;
 import plugins.git;
-import plugins.process_runner;
 import plugins.bash;
 import plugins.powershell;
 import plugins.local_executor;
@@ -62,7 +61,6 @@ void main()
 	
   // Initialize and register core default plugins
   PluginRegistry.instance.registerPlugin(new GitRepositoryPlugin());
-  PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
   PluginRegistry.instance.registerPlugin(new BashPlugin());
   PluginRegistry.instance.registerPlugin(new PowerShellPlugin());
   PluginRegistry.instance.registerPlugin(new LocalExecutorPlugin());

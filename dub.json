@@ -10,8 +10,7 @@
 		"confector:bash": "*",
 		"confector:git": "*",
 		"confector:local_executor": "*",
-		"confector:powershell": "*",
-		"confector:process_runner": "*"
+		"confector:powershell": "*"
 	},
 	"description": "A build system.",
 	"license": "The Unlicense",
@@ -29,7 +28,6 @@
 		"./plugins/bash",
 		"./plugins/git",
 		"./plugins/local_executor",
-		"./plugins/powershell",
-		"./plugins/process_runner"
+		"./plugins/powershell"
 	]
 }

@@ -5,7 +5,6 @@ import confector.core.storage;
 import confector.core.executor : TaskRunner;
 import confector.runner.engine;
 import confector.core.plugin;
-import plugins.process_runner;
 
 import vibe.data.json;
 import vibe.data.serialization : asName = name;
@@ -70,12 +69,6 @@ ServerlessTaskResponse executeServerlessTask(
     TaskEngine engine = customEngine;
     if (engine is null)
     {
-        // Ensure default ProcessTaskRunnerPlugin is registered
-        if (PluginRegistry.instance.getPluginsOfType!TaskRunner().length == 0)
-        {
-            PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
-        }
-
         string storageDir = request.storageBaseDir.length > 0 ? request.storageBaseDir : ".confector/artifacts";
         auto storage = new LocalArtifactStorage(storageDir);
         auto stateRepo = new InMemoryBuildStateRepository();
