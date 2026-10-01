@@ -69,7 +69,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             projId = proj.id;
             proj.name = req.form.get("name", "Project");
             proj.description = req.form.get("description", "");
-            proj.workspaceDir = req.form.get("workspace_dir", ".");
             proj.repositoryUrl = req.form.get("repository_url", "");
             string now = Clock.currTime.toISOString();
             proj.createdAt = now;
@@ -103,7 +102,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         {
             project.id = projId;
             project.name = "Unknown Project";
-            project.workspaceDir = ".";
         }
         string tasksJson = serializeToJson(project.tasks).toString();
         res.render!("project/project-details.dt", project, tasksJson);
@@ -133,7 +131,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             project.id = projId;
             project.name = req.form.get("name", project.name.length > 0 ? project.name : "Project");
             project.description = req.form.get("description", project.description);
-            project.workspaceDir = req.form.get("workspace_dir", project.workspaceDir.length > 0 ? project.workspaceDir : ".");
             project.repositoryUrl = req.form.get("repository_url", project.repositoryUrl);
 
             string tasksJsonText = req.form.get("tasks_json", "[]");
@@ -537,7 +534,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             ProjectRecord proj;
             if (stateRepo !is null && stateRepo.getProject(projId, proj))
             {
-                string workspaceDir = proj.workspaceDir.length > 0 ? proj.workspaceDir : ".";
+                string workspaceDir = ".";
 
                 auto graph = new TaskGraph(proj.tasks);
                 string[] orderedTasks;
@@ -675,7 +672,6 @@ unittest
     ProjectRecord p;
     p.id = "proj_dash_1";
     p.name = "Dashboard Project";
-    p.workspaceDir = ".";
     TaskNode tNode1;
     tNode1.id = "test_node_1";
     tNode1.script = "echo dashboard test 1";

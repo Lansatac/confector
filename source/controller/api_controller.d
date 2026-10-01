@@ -663,7 +663,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
             Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
             string targetTaskId = "";
             bool force = false;
-            string workspaceDir = proj.workspaceDir.length > 0 ? proj.workspaceDir : ".";
+            string workspaceDir = ".";
 
             if ("target_task_id" in bodyJson && bodyJson["target_task_id"].type == Json.Type.string)
             {
@@ -729,7 +729,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
 
             Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
             bool force = false;
-            string workspaceDir = proj.workspaceDir.length > 0 ? proj.workspaceDir : ".";
+            string workspaceDir = ".";
 
             if ("force" in bodyJson && bodyJson["force"].type == Json.Type.bool_)
             {
@@ -843,7 +843,6 @@ unittest
     ProjectRecord proj;
     proj.id = "proj_api_1";
     proj.name = "API Project";
-    proj.workspaceDir = testDir;
     TaskNode node;
     node.id = "n1";
     node.script = "echo hi";

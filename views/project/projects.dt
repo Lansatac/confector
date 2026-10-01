@@ -6,7 +6,7 @@ block maincontent
       div.d-flex.justify-content-between.align-items-center(style="display: flex; justify-content: space-between; align-items: center;")
         div
           h1 Projects
-          p Manage project workspaces, repositories, and discrete DAG task workflows.
+          p Manage projects, repositories, and discrete DAG task workflows.
         div
           a.btn.btn-primary(href="/projects/add") + New Project
 
@@ -23,7 +23,6 @@ block maincontent
           tr
             th ID
             th Project Name
-            th Workspace Directory
             th Tasks
             th Repository URL
             th Created At
@@ -35,8 +34,6 @@ block maincontent
                 code #{p.id}
               td
                 a(href="/projects/details?id=#{p.id}", style="font-weight: bold; text-decoration: none;") #{p.name}
-              td
-                code #{p.workspaceDir}
               td
                 - if (p.tasks.length > 0)
                   div(style="display: flex; flex-wrap: wrap; gap: 6px;")

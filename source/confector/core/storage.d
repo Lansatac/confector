@@ -612,7 +612,6 @@ unittest
     ProjectRecord proj;
     proj.id = "proj-confector";
     proj.name = "Confector";
-    proj.workspaceDir = ".";
     TaskNode node;
     node.id = "build";
     node.script = "dub build";

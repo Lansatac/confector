@@ -106,7 +106,7 @@ block maincontent
 
           div.form-group(style="margin-top: 20px; padding-top: 15px; border-top: 1px dashed #ddd;")
             label(for="working_directory") Default Task Working Directory Override (Optional):
-            input.form-control#working_directory(type="text", name="working_directory", value="#{task.workingDirectory}", placeholder="Leave blank to use project workspace")
+            input.form-control#working_directory(type="text", name="working_directory", value="#{task.workingDirectory}", placeholder="Leave blank to use default workspace")
 
         div#tab-outputs.tab-pane
           h3 Output Artifacts

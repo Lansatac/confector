@@ -39,10 +39,6 @@ block maincontent
             textarea.form-control#description(name="description", rows="2") #{project.description}
 
           div.form-group
-            label(for="workspace_dir") Workspace Directory:
-            input.form-control#workspace_dir(type="text", name="workspace_dir", value="#{project.workspaceDir}", placeholder="e.g. . or /path/to/repo")
-
-          div.form-group
             label(for="repository_url") Repository URL:
             input.form-control#repository_url(type="text", name="repository_url", value="#{project.repositoryUrl}", placeholder="https://github.com/org/repo")
 

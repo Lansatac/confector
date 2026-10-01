@@ -293,14 +293,13 @@ struct RepositoryRecord
 }
 
 /**
- * Persisted record of a project workspace, repository, and task registry.
+ * Persisted record of a project, repository, and task registry.
  */
 struct ProjectRecord
 {
     @optional @asName("id") string id;
     @optional @asName("name") string name;
     @optional @asName("description") string description;
-    @optional @asName("workspace_dir") string workspaceDir;
     @optional @asName("repository_url") string repositoryUrl;
     @optional @asName("tasks") TaskNode[] tasks;
     @optional @asName("created_at") string createdAt;
@@ -363,20 +362,17 @@ unittest
     project.id = "proj-1";
     project.name = "Confector Project";
     project.description = "Self build project";
-    project.workspaceDir = ".";
     project.repositoryUrl = "https://github.com/example/confector";
     project.tasks = [node];
     project.createdAt = "2026-09-30T12:00:00Z";
     project.updatedAt = "2026-09-30T12:00:00Z";
 
     Json projJson = serializeToJson(project);
-    assert(projJson["workspace_dir"].get!string == ".");
     assert(projJson["tasks"].length == 1);
     assert(projJson["tasks"][0]["id"].get!string == "build");
 
     ProjectRecord projDeserialized = deserializeJson!ProjectRecord(projJson);
     assert(projDeserialized.id == "proj-1");
-    assert(projDeserialized.workspaceDir == ".");
     assert(projDeserialized.tasks.length == 1);
     assert(projDeserialized.tasks[0].id == "build");
     assert(projDeserialized.tasks[0].dependsOn == ["lint"]);

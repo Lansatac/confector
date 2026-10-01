@@ -24,10 +24,6 @@ block maincontent
             td
               code #{project.id}
           tr
-            th Workspace Directory
-            td
-              code #{project.workspaceDir}
-          tr
             th Repository URL
             td #{project.repositoryUrl.length > 0 ? project.repositoryUrl : "—"}
           tr
