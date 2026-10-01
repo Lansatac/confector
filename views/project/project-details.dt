@@ -86,6 +86,10 @@ block maincontent
                   span(style="color: #6c757d; font-size: 0.85em;") Root node (None)
               td
                 div(style="font-size: 0.85em;")
+                  - if (t.inputs.repositories.length > 0)
+                    div
+                      strong Repos: 
+                      span #{t.inputs.repositories.length} repo(s)
                   - if (t.inputs.files.length > 0)
                     div
                       strong Files: 

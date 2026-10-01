@@ -22,6 +22,7 @@ class MongoBuildStateRepository : BuildStateRepository
     private MongoCollection m_logsCollection;
     private MongoCollection m_triggersCollection;
     private MongoCollection m_projectsCollection;
+    private MongoCollection m_repositoriesCollection;
 
     this(MongoClient client, string dbName = "confector")
     {
@@ -31,6 +32,7 @@ class MongoBuildStateRepository : BuildStateRepository
         m_logsCollection = client.getCollection(format("%s.build_logs", dbName));
         m_triggersCollection = client.getCollection(format("%s.triggers", dbName));
         m_projectsCollection = client.getCollection(format("%s.projects", dbName));
+        m_repositoriesCollection = client.getCollection(format("%s.repositories", dbName));
     }
 
     override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
@@ -390,6 +392,103 @@ class MongoBuildStateRepository : BuildStateRepository
             Bson query = Bson.emptyObject;
             query["id"] = Bson(projectId);
             auto res = m_projectsCollection.deleteOne(query);
+            return res.deletedCount > 0;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override void saveRepository(in RepositoryRecord repo)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["name"] = Bson(repo.name);
+
+            Bson update = Bson.emptyObject;
+            Bson setFields = Bson.emptyObject;
+            setFields["name"] = Bson(repo.name);
+            setFields["address"] = Bson(repo.address);
+            if (repo.createdAt.length > 0)
+            {
+                setFields["created_at"] = Bson(repo.createdAt);
+            }
+            update["$set"] = setFields;
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_repositoriesCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override bool getRepository(string name, out RepositoryRecord repo)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["name"] = Bson(name);
+
+            auto doc = m_repositoriesCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return false;
+            }
+
+            repo = deserializeBson!RepositoryRecord(doc);
+            return true;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override RepositoryRecord[] listRepositories()
+    {
+        RepositoryRecord[] list;
+        try
+        {
+            auto cursor = m_repositoriesCollection.find();
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    RepositoryRecord r;
+                    auto pName = doc.tryIndex("name");
+                    if (!pName.isNull && pName.get.type == Bson.Type.string)
+                        r.name = pName.get.get!string;
+                    auto pAddr = doc.tryIndex("address");
+                    if (!pAddr.isNull && pAddr.get.type == Bson.Type.string)
+                        r.address = pAddr.get.get!string;
+                    auto pCreated = doc.tryIndex("created_at");
+                    if (!pCreated.isNull && pCreated.get.type == Bson.Type.string)
+                        r.createdAt = pCreated.get.get!string;
+                    if (r.name.length > 0)
+                    {
+                        list ~= r;
+                    }
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override bool deleteRepository(string name)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["name"] = Bson(name);
+            auto res = m_repositoriesCollection.deleteOne(query);
             return res.deletedCount > 0;
         }
         catch (Exception e)

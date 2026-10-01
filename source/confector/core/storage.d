@@ -260,6 +260,26 @@ interface BuildStateRepository
      * Deletes a project record by ID.
      */
     bool deleteProject(string projectId);
+
+    /**
+     * Saves or updates a repository record.
+     */
+    void saveRepository(in RepositoryRecord repo);
+
+    /**
+     * Retrieves a repository record by name.
+     */
+    bool getRepository(string name, out RepositoryRecord repo);
+
+    /**
+     * Lists all registered repositories.
+     */
+    RepositoryRecord[] listRepositories();
+
+    /**
+     * Deletes a repository record by name.
+     */
+    bool deleteRepository(string name);
 }
 
 /**
@@ -279,6 +299,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private string[][string] m_buildLogs;
     private TriggerRuleRecord[string] m_triggerRules;
     private ProjectRecord[string] m_projects;
+    private RepositoryRecord[string] m_repositories;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -429,6 +450,43 @@ class InMemoryBuildStateRepository : BuildStateRepository
         }
         return false;
     }
+
+    override void saveRepository(in RepositoryRecord repo)
+    {
+        m_repositories[repo.name] = cast()repo;
+    }
+
+    override bool getRepository(string name, out RepositoryRecord repo)
+    {
+        auto p = name in m_repositories;
+        if (p !is null)
+        {
+            repo = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override RepositoryRecord[] listRepositories()
+    {
+        RepositoryRecord[] list;
+        foreach (r; m_repositories)
+        {
+            list ~= r;
+        }
+        return list;
+    }
+
+    override bool deleteRepository(string name)
+    {
+        auto p = name in m_repositories;
+        if (p !is null)
+        {
+            m_repositories.remove(name);
+            return true;
+        }
+        return false;
+    }
 }
 
 unittest
@@ -513,4 +571,16 @@ unittest
 
     assert(stateRepo.deleteProject("proj-confector"));
     assert(stateRepo.listProjects().length == 0);
+
+    // Repository persistence in InMemoryBuildStateRepository
+    RepositoryRecord repo;
+    repo.name = "confector-core";
+    repo.address = "https://github.com/confector/confector.git";
+    stateRepo.saveRepository(repo);
+    assert(stateRepo.listRepositories().length == 1);
+    RepositoryRecord fetchedRepo;
+    assert(stateRepo.getRepository("confector-core", fetchedRepo));
+    assert(fetchedRepo.address == "https://github.com/confector/confector.git");
+    assert(stateRepo.deleteRepository("confector-core"));
+    assert(stateRepo.listRepositories().length == 0);
 }

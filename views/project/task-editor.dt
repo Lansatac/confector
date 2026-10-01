@@ -6,6 +6,10 @@ block maincontent
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
   - string availableTasksJson = serializeToJson(availableTasksList).toString();
+  - struct RepoOpt { string name; string address; }
+  - RepoOpt[] availableReposList;
+  - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
+  - string availableReposJson = serializeToJson(availableReposList).toString();
 
   div.projects-container
     div.header-section
@@ -60,7 +64,27 @@ block maincontent
               button.btn.btn-outline.btn-sm#add-dep-btn(type="button", onclick="addDependency()") + Add Dependency
 
           div.form-group
-            label(for="input_files") Repositories & Input File Globs (Comma or newline separated):
+            label Repository Dependencies:
+            div#repo-dependencies-container.dependency-list
+              - foreach(repoDep; task.inputs.repositories)
+                div.dependency-row(style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;")
+                  select.form-control(name="repositories", style="flex: 1;")
+                    option(value="", disabled) -- Select a repository --
+                    - bool foundRepo = false;
+                    - foreach(r; repositories)
+                      - if (r.name == repoDep || r.address == repoDep)
+                        - foundRepo = true;
+                        option(value="#{r.name}", selected) #{r.name}#{r.address.length > 0 ? " (" ~ r.address ~ ")" : ""}
+                      - else
+                        option(value="#{r.name}") #{r.name}#{r.address.length > 0 ? " (" ~ r.address ~ ")" : ""}
+                    - if (!foundRepo && repoDep.length > 0)
+                      option(value="#{repoDep}", selected) #{repoDep}
+                  button.btn.btn-danger.btn-sm.btn-remove-repo(type="button", onclick="removeRepoDependency(this)", title="Remove repository") ✕
+            div(style="margin-top: 6px;")
+              button.btn.btn-outline.btn-sm#add-repo-btn(type="button", onclick="addRepoDependency()") + Add Repository
+
+          div.form-group
+            label(for="input_files") Input File Globs (Comma or newline separated):
             - string filesVal = "";
             - foreach(i, f; task.inputs.files) { if (i > 0) filesVal ~= "\n"; filesVal ~= f; }
             textarea.form-control#input_files(name="input_files", rows="3", placeholder="source/**/*.d\ndub.json\nviews/**/*.dt", style="font-family: monospace;") #{filesVal}
@@ -101,6 +125,7 @@ block maincontent
 
   script.
     var availableTasks = !{availableTasksJson};
+    var availableRepos = !{availableReposJson};
 
     function removeDependency(btn) {
       var row = btn.closest('.dependency-row');
@@ -154,6 +179,64 @@ block maincontent
       removeBtn.textContent = '✕';
       removeBtn.title = 'Remove dependency';
       removeBtn.onclick = function() { removeDependency(this); };
+
+      row.appendChild(select);
+      row.appendChild(removeBtn);
+      container.appendChild(row);
+    }
+
+    function removeRepoDependency(btn) {
+      var row = btn.closest('.dependency-row');
+      if (row) {
+        row.remove();
+      }
+    }
+
+    function addRepoDependency(selectedName) {
+      var container = document.getElementById('repo-dependencies-container');
+      if (!container) return;
+
+      var row = document.createElement('div');
+      row.className = 'dependency-row';
+      row.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
+
+      var select = document.createElement('select');
+      select.name = 'repositories';
+      select.className = 'form-control';
+      select.style.flex = '1';
+
+      var defaultOpt = document.createElement('option');
+      defaultOpt.value = '';
+      defaultOpt.disabled = true;
+      if (!selectedName) defaultOpt.selected = true;
+      defaultOpt.textContent = '-- Select a repository --';
+      select.appendChild(defaultOpt);
+
+      var repos = availableRepos || [];
+      if (repos.length === 0) {
+        var noneOpt = document.createElement('option');
+        noneOpt.value = '';
+        noneOpt.disabled = true;
+        noneOpt.textContent = 'No repositories configured';
+        select.appendChild(noneOpt);
+      } else {
+        for (var i = 0; i < repos.length; i++) {
+          var opt = document.createElement('option');
+          opt.value = repos[i].name;
+          opt.textContent = repos[i].name + (repos[i].address && repos[i].address.length > 0 ? ' (' + repos[i].address + ')' : '');
+          if (selectedName && repos[i].name === selectedName) {
+            opt.selected = true;
+          }
+          select.appendChild(opt);
+        }
+      }
+
+      var removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-danger btn-sm btn-remove-repo';
+      removeBtn.textContent = '✕';
+      removeBtn.title = 'Remove repository';
+      removeBtn.onclick = function() { removeRepoDependency(this); };
 
       row.appendChild(select);
       row.appendChild(removeBtn);

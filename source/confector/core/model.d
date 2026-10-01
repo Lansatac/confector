@@ -72,6 +72,7 @@ struct UpstreamArtifactRef
 struct TaskInputs
 {
     @optional string[] files;
+    @optional string[] repositories;
     @optional string[] env;
     @optional @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
     @optional string[string] parameters;
@@ -163,6 +164,16 @@ struct TriggerRuleRecord
 }
 
 /**
+ * Persisted record of a repository.
+ */
+struct RepositoryRecord
+{
+    @optional @asName("name") string name;
+    @optional @asName("address") string address;
+    @optional @asName("created_at") string createdAt;
+}
+
+/**
  * Persisted record of a project workspace, repository, and task registry.
  */
 struct ProjectRecord
@@ -224,6 +235,7 @@ unittest
     node.dependsOn = ["lint"];
     node.script = "dub build";
     node.inputs.files = ["source/**/*.d", "dub.json"];
+    node.inputs.repositories = ["confector-repo", "common-utils"];
     node.inputs.env = ["DUB_ARGS"];
     node.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports/lint.json")];
     node.outputs.artifacts = [OutputArtifactDecl("bin/confector", "binary")];
@@ -251,6 +263,7 @@ unittest
     assert(projDeserialized.tasks.length == 1);
     assert(projDeserialized.tasks[0].id == "build");
     assert(projDeserialized.tasks[0].dependsOn == ["lint"]);
+    assert(projDeserialized.tasks[0].inputs.repositories == ["confector-repo", "common-utils"]);
     assert(projDeserialized.tasks[0].inputs.upstreamArtifacts.length == 1);
     assert(projDeserialized.tasks[0].inputs.upstreamArtifacts[0].taskId == "lint");
 

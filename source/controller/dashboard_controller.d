@@ -184,7 +184,8 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             }
         }
 
-        res.render!("project/task-editor.dt", project, task);
+        auto repositories = stateRepo !is null ? stateRepo.listRepositories() : [];
+        res.render!("project/task-editor.dt", project, task, repositories);
     });
 
     router.post("/projects/tasks/save", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -221,6 +222,21 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 }
             }
             task.dependsOn = deps;
+
+            // Repository dependencies
+            string[] repos;
+            foreach (rVal; req.form.getAll("repositories"))
+            {
+                foreach (r; rVal.split(","))
+                {
+                    string s = r.strip();
+                    if (s.length > 0 && !repos.canFind(s))
+                    {
+                        repos ~= s;
+                    }
+                }
+            }
+            task.inputs.repositories = repos;
 
             // Input files
             string filesStr = req.form.get("input_files", "");
@@ -495,6 +511,7 @@ unittest
     TaskNode tNode1;
     tNode1.id = "test_node_1";
     tNode1.script = "echo dashboard test 1";
+    tNode1.inputs.repositories = ["repo_main"];
     TaskNode tNode2;
     tNode2.id = "test_node_2";
     tNode2.dependsOn = ["test_node_1"];
@@ -503,10 +520,17 @@ unittest
     stateRepo.saveProject(p);
     assert(stateRepo.listProjects().length == 1);
 
+    RepositoryRecord rRecord;
+    rRecord.name = "repo_main";
+    rRecord.address = "https://github.com/example/repo_main.git";
+    stateRepo.saveRepository(rRecord);
+    assert(stateRepo.listRepositories().length == 1);
+
     ProjectRecord fetchedProj;
     assert(stateRepo.getProject("proj_dash_1", fetchedProj));
     assert(fetchedProj.tasks.length == 2);
     assert(fetchedProj.tasks[0].id == "test_node_1");
+    assert(fetchedProj.tasks[0].inputs.repositories == ["repo_main"]);
     assert(fetchedProj.tasks[1].id == "test_node_2");
 
     // Test Build linked to project and task statuses
