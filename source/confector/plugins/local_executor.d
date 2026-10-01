@@ -6,8 +6,13 @@ import std.stdio;
 import std.file : exists, mkdirRecurse;
 import std.parallelism : totalCPUs;
 import std.path : buildPath, isAbsolute;
+import core.sync.mutex : Mutex;
+import core.time : Duration, seconds, msecs, MonoTime;
+import core.thread : Thread;
+
 import vibe.data.json : Json;
 import vibe.core.log;
+import vibe.core.sync : TaskCondition;
 
 import confector.core.model;
 import confector.core.plugin : Plugin;
@@ -101,15 +106,136 @@ class LocalTaskExecutor : TaskExecutor
             }
         }
 
-        try
+        static class ExecState
         {
-            auto pipe = pipeShell(request.command,
-                Redirect.stdout | Redirect.stderrToStdout,
-                request.environmentVariables.length > 0 ? request.environmentVariables : null,
-                Config.retainStderr,
-                effectiveWorkDir.length > 0 ? effectiveWorkDir : null);
+            Mutex mutex;
+            TaskCondition condition;
+            string[] pendingLines;
+            bool finished;
+            int exitCode = -1;
+            bool success;
+            string errorMessage;
+            Pid processPid;
 
-            foreach (line; pipe.stdout.byLineCopy)
+            this()
+            {
+                mutex = new Mutex();
+                condition = new TaskCondition(mutex);
+            }
+        }
+
+        auto state = new ExecState();
+        string cmd = request.command;
+        string[string] envVars = request.environmentVariables.length > 0 ? cast(string[string])request.environmentVariables.dup : null;
+        string workDir = effectiveWorkDir.length > 0 ? effectiveWorkDir : null;
+
+        auto worker = new Thread({
+            try
+            {
+                auto pipe = pipeShell(cmd,
+                    Redirect.stdout | Redirect.stderrToStdout,
+                    envVars,
+                    Config.retainStderr,
+                    workDir);
+
+                synchronized (state.mutex)
+                {
+                    state.processPid = pipe.pid;
+                }
+
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    synchronized (state.mutex)
+                    {
+                        state.pendingLines ~= line.idup;
+                        state.condition.notifyAll();
+                    }
+                }
+
+                int code = wait(pipe.pid);
+                synchronized (state.mutex)
+                {
+                    state.exitCode = code;
+                    state.success = (code == 0);
+                    if (!state.success)
+                    {
+                        state.errorMessage = format("Process exited with code %d", code);
+                    }
+                    state.finished = true;
+                    state.condition.notifyAll();
+                }
+            }
+            catch (Exception e)
+            {
+                synchronized (state.mutex)
+                {
+                    state.exitCode = -1;
+                    state.success = false;
+                    state.errorMessage = e.msg;
+                    state.finished = true;
+                    state.condition.notifyAll();
+                }
+            }
+        });
+        worker.isDaemon = true;
+        worker.start();
+
+        auto startTime = MonoTime.currTime;
+        Duration timeout = request.timeoutSeconds > 0 ? request.timeoutSeconds.seconds : Duration.max;
+
+        while (true)
+        {
+            string[] linesToProcess;
+            bool isFinished;
+
+            synchronized (state.mutex)
+            {
+                if (state.pendingLines.length > 0)
+                {
+                    linesToProcess = state.pendingLines;
+                    state.pendingLines = null;
+                }
+                isFinished = state.finished;
+
+                if (!isFinished && linesToProcess.length == 0)
+                {
+                    if (timeout != Duration.max)
+                    {
+                        auto elapsed = MonoTime.currTime - startTime;
+                        if (elapsed >= timeout)
+                        {
+                            // Timed out
+                            if (state.processPid !is null)
+                            {
+                                try { kill(state.processPid); } catch (Exception) {}
+                            }
+                            state.finished = true;
+                            state.exitCode = -1;
+                            state.success = false;
+                            state.errorMessage = format("Execution timed out after %d seconds", request.timeoutSeconds);
+                            isFinished = true;
+                        }
+                        else
+                        {
+                            auto remaining = timeout - elapsed;
+                            state.condition.wait(remaining > 100.msecs ? 100.msecs : remaining);
+                        }
+                    }
+                    else
+                    {
+                        state.condition.wait();
+                    }
+
+                    if (state.pendingLines.length > 0)
+                    {
+                        linesToProcess = state.pendingLines;
+                        state.pendingLines = null;
+                    }
+                    isFinished = state.finished;
+                }
+            }
+
+            foreach (line; linesToProcess)
             {
                 result.outputLines ~= line;
                 if (logCallback !is null)
@@ -118,22 +244,22 @@ class LocalTaskExecutor : TaskExecutor
                 }
             }
 
-            result.exitCode = wait(pipe.pid);
-            result.success = (result.exitCode == 0);
-            if (!result.success)
+            if (isFinished && linesToProcess.length == 0)
             {
-                result.errorMessage = format("Process exited with code %d", result.exitCode);
+                break;
             }
         }
-        catch (Exception e)
+
+        synchronized (state.mutex)
         {
-            result.exitCode = -1;
-            result.success = false;
-            result.errorMessage = e.msg;
-            if (logCallback !is null)
-            {
-                logCallback(format("Execution error: %s", e.msg));
-            }
+            result.exitCode = state.exitCode;
+            result.success = state.success;
+            result.errorMessage = state.errorMessage;
+        }
+
+        if (!result.success && result.errorMessage.length > 0 && logCallback !is null && result.outputLines.length == 0)
+        {
+            logCallback(format("Execution error: %s", result.errorMessage));
         }
 
         return result;
@@ -354,8 +480,30 @@ unittest
     record.enabled = true;
     auto enabledExecutor = plugin.createExecutor(record);
     assert(enabledExecutor.isEnabled);
-    auto resEnabled = enabledExecutor.execute(req);
+
+    string[] loggedLines;
+    auto resEnabled = enabledExecutor.execute(req, (line) {
+        loggedLines ~= line;
+    });
     assert(resEnabled.success);
     assert(resEnabled.exitCode == 0);
     assert(resEnabled.outputLines.length > 0);
+    assert(loggedLines.length > 0);
+
+    // Timeout testing
+    ExecutionRequest timeoutReq;
+    version(Windows)
+    {
+        timeoutReq.command = "powershell -Command \"Start-Sleep -Seconds 5\"";
+    }
+    else
+    {
+        timeoutReq.command = "sleep 5";
+    }
+    timeoutReq.timeoutSeconds = 1;
+    auto resTimeout = enabledExecutor.execute(timeoutReq);
+    assert(!resTimeout.success);
+    assert(resTimeout.exitCode != 0);
+    import std.algorithm : canFind;
+    assert(resTimeout.errorMessage.canFind("timed out"));
 }

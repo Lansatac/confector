@@ -3,6 +3,7 @@ extends layout
 block maincontent
   - import vibe.data.json : serializeToJson;
   - import confector.core.model : TriggerType, BuildStep;
+  - import controller.dashboard_controller : StepProviderViewModel;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
@@ -12,6 +13,7 @@ block maincontent
   - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
   - string availableReposJson = serializeToJson(availableReposList).toString();
   - string initialStepsJson = serializeToJson(task.steps).toString();
+  - string stepProvidersJson = serializeToJson(stepProvidersView).toString();
 
   div.projects-container
     div.header-section
@@ -95,11 +97,11 @@ block maincontent
 
         div#tab-steps.tab-pane
           h3 Ordered Build Steps
-          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Configure plugin-defined build steps (Git repository cloning, process script/commands, or custom plugin steps) executed sequentially in order.
+          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Configure plugin-defined build steps executed sequentially in order. Sub-templates and configurations are provided directly by plugins.
           div#steps-container.step-list
           div(style="margin-top: 15px; display: flex; flex-wrap: wrap; gap: 8px;")
-            button.btn.btn-outline.btn-sm#add-process-step-btn(type="button", onclick="addBuildStep('process')") + Add Process / Script Step
-            button.btn.btn-outline.btn-sm#add-clone-step-btn(type="button", onclick="addBuildStep('clone_repository')") + Add Clone Repository Step
+            - foreach(p; stepProvidersView)
+              button.btn.btn-outline.btn-sm(type="button", onclick="addBuildStep('" ~ p.stepType ~ "')") + Add #{p.displayName}
             button.btn.btn-outline.btn-sm#add-custom-step-btn(type="button", onclick="addBuildStep('custom')") + Add Custom Step
 
           div.form-group(style="margin-top: 20px; padding-top: 15px; border-top: 1px dashed #ddd;")
@@ -160,8 +162,14 @@ block maincontent
     var availableTasks = !{availableTasksJson};
     var availableRepos = !{availableReposJson};
     var initialSteps = !{initialStepsJson} || [];
+    var stepProviders = !{stepProvidersJson} || [];
     var initialScript = !{serializeToJson(task.script).toString()};
     var initialTaskWorkDir = !{serializeToJson(task.workingDirectory).toString()};
+
+    var stepProviderMap = {};
+    for (var i = 0; i < stepProviders.length; i++) {
+      stepProviderMap[stepProviders[i].stepType] = stepProviders[i];
+    }
 
     function escapeHtml(str) {
       if (!str) return '';
@@ -204,26 +212,91 @@ block maincontent
       }
     }
 
+    function getCustomStepHtml(customType, script, propsStr) {
+      return '<div class="step-subform step-subform-custom">\n' +
+        '  <div class="form-group" style="margin-bottom: 8px;">\n' +
+        '    <label style="font-size: 0.9em; font-weight: bold;">Custom Step Type Identifier:</label>\n' +
+        '    <input class="form-control" type="text" name="step_custom_type" value="' + escapeHtml(customType) + '" placeholder="e.g. docker:build, s3:sync, artifact:publish">\n' +
+        '  </div>\n' +
+        '  <div class="form-group" style="margin-bottom: 8px;">\n' +
+        '    <label style="font-size: 0.9em;">Step Command / Script / Payload:</label>\n' +
+        '    <textarea class="form-control code-font step-field-script" name="step_custom_script" rows="3" placeholder="Command or payload string">' + escapeHtml(script) + '</textarea>\n' +
+        '  </div>\n' +
+        '  <div class="form-group" style="margin-bottom: 0;">\n' +
+        '    <label style="font-size: 0.9em;">Custom JSON Properties (Optional):</label>\n' +
+        '    <textarea class="form-control code-font" name="step_props" rows="2" placeholder="{}">' + escapeHtml(propsStr) + '</textarea>\n' +
+        '  </div>\n' +
+        '</div>';
+    }
+
+    function attachRepoHelpers(row) {
+      var repoInput = row.querySelector('.step-field-repository') || row.querySelector('[name="step_param_repository"]');
+      if (!repoInput) return;
+      if (row.querySelector('.step-repo-picker-wrapper')) return;
+      if (!availableRepos || availableRepos.length === 0) return;
+
+      var pickerDiv = document.createElement('div');
+      pickerDiv.className = 'step-repo-picker-wrapper';
+      pickerDiv.style.cssText = 'display: flex; gap: 8px; margin-bottom: 6px;';
+
+      var repoSelect = document.createElement('select');
+      repoSelect.className = 'form-control';
+      repoSelect.style.flex = '1';
+      var defaultOpt = document.createElement('option');
+      defaultOpt.value = '';
+      defaultOpt.textContent = '-- Or choose from registered repositories --';
+      repoSelect.appendChild(defaultOpt);
+
+      for (var r = 0; r < availableRepos.length; r++) {
+        var rAddr = availableRepos[r].address || availableRepos[r].name;
+        var opt = document.createElement('option');
+        opt.value = rAddr;
+        opt.textContent = availableRepos[r].name + (availableRepos[r].address ? ' (' + availableRepos[r].address + ')' : '');
+        repoSelect.appendChild(opt);
+      }
+
+      repoSelect.onchange = function() {
+        if (this.value && this.value.length > 0) {
+          repoInput.value = this.value;
+        }
+      };
+
+      pickerDiv.appendChild(repoSelect);
+      repoInput.parentNode.insertBefore(pickerDiv, repoInput);
+    }
+
     function onStepTypeChange(selectElem) {
       var row = selectElem.closest('.step-row');
       if (!row) return;
-      var val = selectElem.value;
-      var processFields = row.querySelector('.step-fields-process');
-      var cloneFields = row.querySelector('.step-fields-clone');
-      var customFields = row.querySelector('.step-fields-custom');
+      var newType = selectElem.value;
+      var subformContainer = row.querySelector('.step-subform-container');
+      if (!subformContainer) return;
 
-      if (processFields) processFields.style.display = (val === 'process' || val === 'script' || val === 'command') ? 'block' : 'none';
-      if (cloneFields) cloneFields.style.display = (val === 'clone_repository' || val === 'git_clone' || val === 'checkout_repository') ? 'block' : 'none';
-      if (customFields) customFields.style.display = (val === 'custom') ? 'block' : 'none';
-    }
+      // Preserve existing script and working dir across type switches
+      var prevScript = '';
+      var sElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]') || row.querySelector('[name="step_custom_script"]');
+      if (sElem) prevScript = sElem.value;
 
-    function onStepRepoSelect(selectElem) {
-      var row = selectElem.closest('.step-row');
-      if (!row) return;
-      var input = row.querySelector('.step-repo-url-input');
-      if (input && selectElem.value.length > 0) {
-        input.value = selectElem.value;
+      var prevWorkDir = '';
+      var wElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
+      if (wElem) prevWorkDir = wElem.value;
+
+      if (stepProviderMap[newType]) {
+        subformContainer.innerHTML = stepProviderMap[newType].defaultHtml;
+      } else {
+        subformContainer.innerHTML = getCustomStepHtml(newType !== 'custom' ? newType : '', prevScript, '');
       }
+
+      if (prevScript.length > 0) {
+        var newScriptElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]') || row.querySelector('[name="step_custom_script"]');
+        if (newScriptElem) newScriptElem.value = prevScript;
+      }
+      if (prevWorkDir.length > 0) {
+        var newWorkDirElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
+        if (newWorkDirElem) newWorkDirElem.value = prevWorkDir;
+      }
+
+      attachRepoHelpers(row);
     }
 
     function addBuildStep(defaultType, stepData) {
@@ -231,24 +304,29 @@ block maincontent
       if (!container) return;
 
       var data = stepData || {};
-      var type = data.type || defaultType || 'process';
+      var type = data.type || defaultType || (stepProviders.length > 0 ? stepProviders[0].stepType : 'process');
+
+      // Normalize alias types if any
       var normalizedType = type;
-      if (type === 'clone_repository' || type === 'git_clone' || type === 'checkout_repository' || type === 'git') {
-        normalizedType = 'clone_repository';
-      } else if (type === 'process' || type === 'script' || type === 'command' || type === 'shell') {
-        normalizedType = 'process';
-      } else if (type !== 'custom') {
-        normalizedType = 'custom';
+      if (!stepProviderMap[normalizedType]) {
+        if (normalizedType === 'git_clone' || normalizedType === 'checkout_repository' || normalizedType === 'git') {
+          if (stepProviderMap['clone_repository']) normalizedType = 'clone_repository';
+        } else if (normalizedType === 'script' || normalizedType === 'command' || normalizedType === 'shell') {
+          if (stepProviderMap['process']) normalizedType = 'process';
+        } else if (normalizedType === 'sh') {
+          if (stepProviderMap['bash']) normalizedType = 'bash';
+        } else if (normalizedType === 'pwsh' || normalizedType === 'ps1') {
+          if (stepProviderMap['powershell']) normalizedType = 'powershell';
+        }
       }
 
-      var name = data.name || (normalizedType === 'clone_repository' ? 'Clone Repository' : (normalizedType === 'process' ? 'Execute Script' : 'Custom Step'));
-      var script = data.script || data.command || '';
-      var workDir = data.working_directory || data.workingDirectory || '';
-      var params = data.parameters || {};
-      var repoUrl = params.repository || params.url || params.address || '';
-      var branch = params.branch || '';
-      var targetDir = params.target_dir || params.targetDirectory || params.target || '';
-      var propsStr = data.properties ? JSON.stringify(data.properties, null, 2) : '';
+      var defaultLabel = 'Step';
+      if (stepProviderMap[normalizedType]) {
+        defaultLabel = stepProviderMap[normalizedType].displayName;
+      } else if (normalizedType === 'custom') {
+        defaultLabel = 'Custom Step';
+      }
+      var name = data.name || defaultLabel;
 
       var row = document.createElement('div');
       row.className = 'step-row';
@@ -270,22 +348,24 @@ block maincontent
       typeSelect.style.cssText = 'width: 220px; font-weight: bold;';
       typeSelect.onchange = function() { onStepTypeChange(this); };
 
-      var optProcess = document.createElement('option');
-      optProcess.value = 'process';
-      optProcess.textContent = 'Process / Script Runner';
-      if (normalizedType === 'process') optProcess.selected = true;
-      typeSelect.appendChild(optProcess);
-
-      var optClone = document.createElement('option');
-      optClone.value = 'clone_repository';
-      optClone.textContent = 'Clone Repository (Git)';
-      if (normalizedType === 'clone_repository') optClone.selected = true;
-      typeSelect.appendChild(optClone);
+      var isKnownProvider = false;
+      for (var p = 0; p < stepProviders.length; p++) {
+        var opt = document.createElement('option');
+        opt.value = stepProviders[p].stepType;
+        opt.textContent = stepProviders[p].displayName;
+        if (normalizedType === stepProviders[p].stepType) {
+          opt.selected = true;
+          isKnownProvider = true;
+        }
+        typeSelect.appendChild(opt);
+      }
 
       var optCustom = document.createElement('option');
       optCustom.value = 'custom';
       optCustom.textContent = 'Custom Plugin Step';
-      if (normalizedType === 'custom') optCustom.selected = true;
+      if (!isKnownProvider || normalizedType === 'custom') {
+        optCustom.selected = true;
+      }
       typeSelect.appendChild(optCustom);
 
       leftControls.appendChild(typeSelect);
@@ -333,84 +413,60 @@ block maincontent
       var body = document.createElement('div');
       body.className = 'step-body';
 
-      // Process fields
-      var processDiv = document.createElement('div');
-      processDiv.className = 'step-fields-process';
-      processDiv.style.display = (normalizedType === 'process') ? 'block' : 'none';
+      var subformContainer = document.createElement('div');
+      subformContainer.className = 'step-subform-container';
 
-      var procScriptGroup = document.createElement('div');
-      procScriptGroup.className = 'form-group';
-      procScriptGroup.style.marginBottom = '8px';
-      procScriptGroup.innerHTML = '<label style="font-size: 0.9em; font-weight: bold;">Script / Shell Command:</label>' +
-        '<textarea class="form-control" name="step_script" rows="4" style="font-family: monospace;" placeholder="e.g. dub build --build=release">' + (normalizedType === 'process' ? escapeHtml(script) : '') + '</textarea>';
-      processDiv.appendChild(procScriptGroup);
+      var scriptVal = data.script || data.command || '';
+      var workDirVal = data.working_directory || data.workingDirectory || '';
+      var params = data.parameters || {};
+      var propsStr = data.properties ? JSON.stringify(data.properties, null, 2) : '';
 
-      var procDirGroup = document.createElement('div');
-      procDirGroup.className = 'form-group';
-      procDirGroup.style.marginBottom = '0';
-      procDirGroup.innerHTML = '<label style="font-size: 0.9em;">Step Working Directory (Optional):</label>' +
-        '<input class="form-control" type="text" name="step_working_dir" value="' + escapeHtml(workDir) + '" placeholder="Leave blank to use task workspace directory">';
-      processDiv.appendChild(procDirGroup);
-      body.appendChild(processDiv);
-
-      // Clone fields
-      var cloneDiv = document.createElement('div');
-      cloneDiv.className = 'step-fields-clone';
-      cloneDiv.style.display = (normalizedType === 'clone_repository') ? 'block' : 'none';
-
-      var cloneRepoGroup = document.createElement('div');
-      cloneRepoGroup.className = 'form-group';
-      cloneRepoGroup.style.marginBottom = '8px';
-
-      var repoSelectHtml = '<option value="">-- Choose registered repository or enter URL below --</option>';
-      var repos = availableRepos || [];
-      for (var r = 0; r < repos.length; r++) {
-        var rAddr = repos[r].address || repos[r].name;
-        var selected = (repoUrl === rAddr || repoUrl === repos[r].name) ? ' selected' : '';
-        repoSelectHtml += '<option value="' + escapeHtml(rAddr) + '"' + selected + '>' + escapeHtml(repos[r].name + (repos[r].address ? ' (' + repos[r].address + ')' : '')) + '</option>';
+      if (stepProviderMap[normalizedType]) {
+        subformContainer.innerHTML = stepProviderMap[normalizedType].defaultHtml;
+      } else {
+        subformContainer.innerHTML = getCustomStepHtml(type !== 'custom' ? type : '', scriptVal, propsStr);
       }
 
-      cloneRepoGroup.innerHTML = '<label style="font-size: 0.9em; font-weight: bold;">Repository URL / Address:</label>' +
-        '<div style="display: flex; gap: 8px; margin-bottom: 6px;">' +
-          '<select class="form-control" style="flex: 1;" onchange="onStepRepoSelect(this)">' + repoSelectHtml + '</select>' +
-        '</div>' +
-        '<input class="form-control step-repo-url-input" type="text" name="step_repo_url" value="' + escapeHtml(repoUrl) + '" placeholder="https://github.com/org/repo.git">';
-      cloneDiv.appendChild(cloneRepoGroup);
+      // Populate values from stepData
+      if (scriptVal.length > 0) {
+        var sElem = subformContainer.querySelector('.step-field-script') || subformContainer.querySelector('[name="step_script"]') || subformContainer.querySelector('[name="step_custom_script"]');
+        if (sElem) sElem.value = scriptVal;
+      }
+      if (workDirVal.length > 0) {
+        var wElem = subformContainer.querySelector('.step-field-working-dir') || subformContainer.querySelector('[name="step_workingDirectory"]') || subformContainer.querySelector('[name="step_working_dir"]');
+        if (wElem) wElem.value = workDirVal;
+      }
+      for (var paramKey in params) {
+        if (params.hasOwnProperty(paramKey)) {
+          var pElem = subformContainer.querySelector('[name="step_param_' + paramKey + '"]') || subformContainer.querySelector('.step-field-' + paramKey);
+          if (pElem) {
+            pElem.value = params[paramKey];
+          }
+        }
+      }
+      // Check common parameter aliases
+      if (params.repository || params.url || params.address) {
+        var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
+        if (repoElem) repoElem.value = params.repository || params.url || params.address;
+      }
+      if (params.branch) {
+        var bElem = subformContainer.querySelector('.step-field-branch') || subformContainer.querySelector('[name="step_param_branch"]');
+        if (bElem) bElem.value = params.branch;
+      }
+      if (params.target_dir || params.targetDirectory || params.target) {
+        var tElem = subformContainer.querySelector('.step-field-target-dir') || subformContainer.querySelector('[name="step_param_target_dir"]');
+        if (tElem) tElem.value = params.target_dir || params.targetDirectory || params.target;
+      }
+      if (params.executable) {
+        var eElem = subformContainer.querySelector('.step-field-executable') || subformContainer.querySelector('[name="step_param_executable"]');
+        if (eElem) eElem.value = params.executable;
+      }
 
-      var cloneGrid = document.createElement('div');
-      cloneGrid.style.cssText = 'display: grid; grid-template-columns: 1fr 1fr; gap: 10px;';
-      cloneGrid.innerHTML = '<div class="form-group" style="margin-bottom: 0;">' +
-          '<label style="font-size: 0.9em;">Branch / Tag / Ref (Optional):</label>' +
-          '<input class="form-control" type="text" name="step_repo_branch" value="' + escapeHtml(branch) + '" placeholder="e.g. main, v1.0.0">' +
-        '</div>' +
-        '<div class="form-group" style="margin-bottom: 0;">' +
-          '<label style="font-size: 0.9em;">Target Directory (Optional):</label>' +
-          '<input class="form-control" type="text" name="step_repo_target" value="' + escapeHtml(targetDir) + '" placeholder="Leave blank for repo name">' +
-        '</div>';
-      cloneDiv.appendChild(cloneGrid);
-      body.appendChild(cloneDiv);
-
-      // Custom fields
-      var customDiv = document.createElement('div');
-      customDiv.className = 'step-fields-custom';
-      customDiv.style.display = (normalizedType === 'custom') ? 'block' : 'none';
-
-      customDiv.innerHTML = '<div class="form-group" style="margin-bottom: 8px;">' +
-          '<label style="font-size: 0.9em; font-weight: bold;">Custom Step Type Identifier:</label>' +
-          '<input class="form-control" type="text" name="step_custom_type" value="' + escapeHtml(type !== 'process' && type !== 'clone_repository' ? type : '') + '" placeholder="e.g. docker:build, s3:sync, artifact:publish">' +
-        '</div>' +
-        '<div class="form-group" style="margin-bottom: 8px;">' +
-          '<label style="font-size: 0.9em;">Step Command / Script / Payload:</label>' +
-          '<textarea class="form-control" name="step_custom_script" rows="3" style="font-family: monospace;" placeholder="Command or payload string">' + (normalizedType === 'custom' ? escapeHtml(script) : '') + '</textarea>' +
-        '</div>' +
-        '<div class="form-group" style="margin-bottom: 0;">' +
-          '<label style="font-size: 0.9em;">Custom JSON Properties (Optional):</label>' +
-          '<textarea class="form-control" name="step_props" rows="2" style="font-family: monospace;" placeholder="{}">' + escapeHtml(propsStr) + '</textarea>' +
-        '</div>';
-      body.appendChild(customDiv);
-
+      body.appendChild(subformContainer);
       row.appendChild(body);
       container.appendChild(row);
+
+      attachRepoHelpers(row);
       updateStepIndices();
     }
 
@@ -427,29 +483,14 @@ block maincontent
         var name = nameInput ? nameInput.value.trim() : '';
 
         var stepObj = {
-          name: name
+          name: name,
+          parameters: {}
         };
 
-        if (type === 'process') {
-          stepObj.type = 'process';
-          var sElem = row.querySelector('.step-fields-process [name="step_script"]');
-          if (sElem && sElem.value.length > 0) stepObj.script = sElem.value;
-          var wElem = row.querySelector('.step-fields-process [name="step_working_dir"]');
-          if (wElem && wElem.value.trim().length > 0) stepObj.working_directory = wElem.value.trim();
-        } else if (type === 'clone_repository') {
-          stepObj.type = 'clone_repository';
-          var rUrlElem = row.querySelector('[name="step_repo_url"]');
-          var bElem = row.querySelector('[name="step_repo_branch"]');
-          var tElem = row.querySelector('[name="step_repo_target"]');
-          var params = {};
-          if (rUrlElem && rUrlElem.value.trim().length > 0) params.repository = rUrlElem.value.trim();
-          if (bElem && bElem.value.trim().length > 0) params.branch = bElem.value.trim();
-          if (tElem && tElem.value.trim().length > 0) params.target_dir = tElem.value.trim();
-          if (Object.keys(params).length > 0) stepObj.parameters = params;
-        } else {
+        if (type === 'custom') {
           var cTypeElem = row.querySelector('[name="step_custom_type"]');
           stepObj.type = (cTypeElem && cTypeElem.value.trim().length > 0) ? cTypeElem.value.trim() : 'custom';
-          var cScriptElem = row.querySelector('[name="step_custom_script"]');
+          var cScriptElem = row.querySelector('[name="step_custom_script"]') || row.querySelector('.step-field-script');
           if (cScriptElem && cScriptElem.value.length > 0) stepObj.script = cScriptElem.value;
           var cPropsElem = row.querySelector('[name="step_props"]');
           if (cPropsElem && cPropsElem.value.trim().length > 0) {
@@ -457,6 +498,31 @@ block maincontent
               stepObj.properties = JSON.parse(cPropsElem.value.trim());
             } catch (e) {}
           }
+        } else {
+          stepObj.type = type;
+
+          var sElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]');
+          if (sElem && sElem.value.length > 0) stepObj.script = sElem.value;
+
+          var wElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
+          if (wElem && wElem.value.trim().length > 0) stepObj.working_directory = wElem.value.trim();
+
+          // Collect all step_param_* fields
+          var paramInputs = row.querySelectorAll('input, textarea, select');
+          for (var p = 0; p < paramInputs.length; p++) {
+            var inputName = paramInputs[p].name || '';
+            if (inputName.indexOf('step_param_') === 0) {
+              var pKey = inputName.substring('step_param_'.length);
+              var pVal = paramInputs[p].value;
+              if (pVal && pVal.trim().length > 0) {
+                stepObj.parameters[pKey] = pVal.trim();
+              }
+            }
+          }
+        }
+
+        if (Object.keys(stepObj.parameters).length === 0) {
+          delete stepObj.parameters;
         }
 
         steps.push(stepObj);

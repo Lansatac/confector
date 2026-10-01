@@ -9,14 +9,14 @@ import vibe.data.json : Json;
 
 import confector.core.model;
 import confector.core.plugin;
-import confector.core.system : TaskExecutionSystem, BuildStepSystem, StepExecutionContext, StepExecutionResult;
+import confector.core.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
 import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
 
 /**
  * PowerShell script execution plugin.
  * Implements TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces for PowerShell / pwsh scripts.
  */
-class PowerShellPlugin : TaskRunner, TaskExecutionSystem, BuildStepSystem
+class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
 {
     @property string name() const { return "powershell-plugin"; }
     @property string versionString() const { return "1.0.0"; }
@@ -24,9 +24,98 @@ class PowerShellPlugin : TaskRunner, TaskExecutionSystem, BuildStepSystem
     @property string runnerType() const { return "powershell"; }
     @property string systemName() const { return "powershell-step-system"; }
     @property string stepType() const { return "powershell"; }
+    @property string displayName() const { return "PowerShell Script"; }
 
     void initialize() {}
     void shutdown() {}
+
+    Json defaultParameters() const
+    {
+        Json p = Json.emptyObject;
+        p["script"] = "";
+        p["workingDirectory"] = "";
+        version(Windows)
+        {
+            p["executable"] = "powershell";
+        }
+        else
+        {
+            p["executable"] = "pwsh";
+        }
+        return p;
+    }
+
+    string[] validateParameters(in Json parameters) const
+    {
+        string[] errors;
+        if (parameters.type != Json.Type.object)
+        {
+            errors ~= "Parameters must be a JSON object";
+            return errors;
+        }
+        auto pScript = "script" in parameters;
+        auto pCommand = "command" in parameters;
+        if ((pScript is null || pScript.get!string.length == 0) &&
+            (pCommand is null || pCommand.get!string.length == 0))
+        {
+            errors ~= "PowerShell script or command cannot be empty";
+        }
+        return errors;
+    }
+
+    string renderStepFormHtml(in Json currentParameters) const
+    {
+        import std.array : appender;
+        import vibe.textfilter.html : htmlEscape;
+
+        auto html = appender!string;
+        string script = "";
+        string workingDir = "";
+        string executable = "";
+        version(Windows)
+        {
+            executable = "powershell";
+        }
+        else
+        {
+            executable = "pwsh";
+        }
+
+        if (currentParameters.type == Json.Type.object)
+        {
+            if (auto p = "script" in currentParameters) script = p.get!string;
+            else if (auto p = "command" in currentParameters) script = p.get!string;
+
+            if (auto p = "workingDirectory" in currentParameters) workingDir = p.get!string;
+            else if (auto p = "working_directory" in currentParameters) workingDir = p.get!string;
+
+            if (auto p = "executable" in currentParameters) executable = p.get!string;
+        }
+
+        html.put("<div class=\"step-subform step-subform-powershell\">\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>PowerShell Script (-Command)</label>\n");
+        html.put("    <textarea name=\"step_script\" class=\"form-control code-font step-field-script\" rows=\"4\" placeholder=\"Write-Output 'Building...'\ndub test\" required>");
+        html.put(htmlEscape(script));
+        html.put("</textarea>\n");
+        html.put("    <small class=\"form-help-text\">PowerShell script executed with <code>-NoProfile -NonInteractive -ExecutionPolicy Bypass</code>.</small>\n");
+        html.put("  </div>\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Working Directory (Optional)</label>\n");
+        html.put("    <input type=\"text\" name=\"step_workingDirectory\" class=\"form-control step-field-working-dir\" placeholder=\"Subdirectory or relative path inside workspace\" value=\"");
+        html.put(htmlEscape(workingDir));
+        html.put("\" />\n");
+        html.put("  </div>\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>PowerShell Executable</label>\n");
+        html.put("    <input type=\"text\" name=\"step_param_executable\" class=\"form-control step-field-executable\" placeholder=\"powershell or pwsh\" value=\"");
+        html.put(htmlEscape(executable));
+        html.put("\" />\n");
+        html.put("  </div>\n");
+        html.put("</div>\n");
+
+        return html.data;
+    }
 
     private string getExecutable(string stepType = "powershell", in string[string] parameters = null) const
     {
@@ -274,4 +363,15 @@ unittest
     auto emptyRes = plugin.executeStep(emptyStep, sCtx);
     assert(!emptyRes.success);
     assert(emptyRes.exitCode != 0);
+
+    // BuildStepProvider testing
+    assert(plugin.displayName == "PowerShell Script");
+    assert(plugin.defaultParameters()["script"].get!string == "");
+    auto html = plugin.renderStepFormHtml(Json.emptyObject);
+    assert(html.length > 0);
+    assert(plugin.validateParameters(Json.emptyObject).length > 0);
+
+    Json validParams = Json.emptyObject;
+    validParams["script"] = "Write-Output 'hello powershell'";
+    assert(plugin.validateParameters(validParams).length == 0);
 }

@@ -111,6 +111,20 @@ struct StepExecutionResult
 }
 
 /**
+ * Plugin interface for providing build step types, validation, and dynamic sub-template configuration UI.
+ */
+interface BuildStepProvider
+{
+    @property string stepType() const;
+    @property string displayName() const;
+    @property string description() const;
+
+    Json defaultParameters() const;
+    string[] validateParameters(in Json parameters) const;
+    string renderStepFormHtml(in Json currentParameters) const;
+}
+
+/**
  * Stateless system interface for executing plugin-defined build steps.
  */
 interface BuildStepSystem
@@ -190,4 +204,19 @@ unittest
     auto sRes = stepSys.executeStep(bStep, sCtx);
     assert(sRes.success);
     assert(sRes.outputLines == ["mock-step executed"]);
+
+    class MockStepProvider : BuildStepProvider
+    {
+        @property string stepType() const { return "mock-step"; }
+        @property string displayName() const { return "Mock Step"; }
+        @property string description() const { return "Mock step description"; }
+        Json defaultParameters() const { return Json.emptyObject; }
+        string[] validateParameters(in Json parameters) const { return null; }
+        string renderStepFormHtml(in Json currentParameters) const { return "<div>Mock</div>"; }
+    }
+
+    auto stepProv = new MockStepProvider();
+    assert(stepProv.stepType == "mock-step");
+    assert(stepProv.displayName == "Mock Step");
+    assert(stepProv.renderStepFormHtml(Json.emptyObject) == "<div>Mock</div>");
 }

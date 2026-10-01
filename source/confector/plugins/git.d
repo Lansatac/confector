@@ -11,14 +11,14 @@ import vibe.data.json : Json;
 import confector.core.model;
 import confector.core.plugin;
 import confector.core.vcs;
-import confector.core.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult;
+import confector.core.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
 import confector.core.executor : LogDelegate;
 
 /**
  * Git repository provider, input resolution, and build step execution plugin.
  * Encapsulates Git-specific cloning, command operations, and input staging.
  */
-class GitRepositoryPlugin : RepositoryProvider, InputResolverSystem, BuildStepSystem
+class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, BuildStepSystem, BuildStepProvider
 {
     @property string name() const { return "git-provider"; }
     @property string versionString() const { return "1.0.0"; }
@@ -26,9 +26,86 @@ class GitRepositoryPlugin : RepositoryProvider, InputResolverSystem, BuildStepSy
     @property string providerType() const { return "git"; }
     @property string systemName() const { return "git-input-resolver"; }
     @property string stepType() const { return "clone_repository"; }
+    @property string displayName() const { return "Clone Git Repository"; }
 
     void initialize() {}
     void shutdown() {}
+
+    Json defaultParameters() const
+    {
+        Json p = Json.emptyObject;
+        p["repository"] = "";
+        p["branch"] = "";
+        p["target_dir"] = "";
+        return p;
+    }
+
+    string[] validateParameters(in Json parameters) const
+    {
+        string[] errors;
+        if (parameters.type != Json.Type.object)
+        {
+            errors ~= "Parameters must be a JSON object";
+            return errors;
+        }
+        auto pRepo = "repository" in parameters;
+        auto pUrl = "url" in parameters;
+        auto pAddress = "address" in parameters;
+        if ((pRepo is null || pRepo.get!string.length == 0) &&
+            (pUrl is null || pUrl.get!string.length == 0) &&
+            (pAddress is null || pAddress.get!string.length == 0))
+        {
+            errors ~= "Repository URL or address cannot be empty";
+        }
+        return errors;
+    }
+
+    string renderStepFormHtml(in Json currentParameters) const
+    {
+        import std.array : appender;
+        import vibe.textfilter.html : htmlEscape;
+
+        auto html = appender!string;
+        string repoUrl = "";
+        string branch = "";
+        string targetDir = "";
+
+        if (currentParameters.type == Json.Type.object)
+        {
+            if (auto p = "repository" in currentParameters) repoUrl = p.get!string;
+            else if (auto p = "url" in currentParameters) repoUrl = p.get!string;
+            else if (auto p = "address" in currentParameters) repoUrl = p.get!string;
+
+            if (auto p = "branch" in currentParameters) branch = p.get!string;
+            if (auto p = "target_dir" in currentParameters) targetDir = p.get!string;
+            else if (auto p = "targetDirectory" in currentParameters) targetDir = p.get!string;
+            else if (auto p = "target" in currentParameters) targetDir = p.get!string;
+        }
+
+        html.put("<div class=\"step-subform step-subform-git\">\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Repository URL / Address</label>\n");
+        html.put("    <input type=\"text\" name=\"step_param_repository\" class=\"form-control step-field-repository\" placeholder=\"e.g. https://github.com/org/repo.git or git@github.com:...\" value=\"");
+        html.put(htmlEscape(repoUrl));
+        html.put("\" required />\n");
+        html.put("    <small class=\"form-help-text\">Git clone URL for HTTPS, SSH, or local repository path.</small>\n");
+        html.put("  </div>\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Branch / Tag / Ref (Optional)</label>\n");
+        html.put("    <input type=\"text\" name=\"step_param_branch\" class=\"form-control step-field-branch\" placeholder=\"e.g. main, master, v1.0.0 (default branch if empty)\" value=\"");
+        html.put(htmlEscape(branch));
+        html.put("\" />\n");
+        html.put("  </div>\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Target Subdirectory (Optional)</label>\n");
+        html.put("    <input type=\"text\" name=\"step_param_target_dir\" class=\"form-control step-field-target-dir\" placeholder=\"Subdirectory inside workspace (defaults to repository name)\" value=\"");
+        html.put(htmlEscape(targetDir));
+        html.put("\" />\n");
+        html.put("  </div>\n");
+        html.put("</div>\n");
+
+        return html.data;
+    }
 
     bool canHandle(string repositoryAddress) const
     {
@@ -241,4 +318,15 @@ unittest
     TaskNode nonGitNode;
     nonGitNode.id = "local-task";
     assert(!plugin.canResolve(nonGitNode));
+
+    // BuildStepProvider testing
+    assert(plugin.displayName == "Clone Git Repository");
+    assert(plugin.defaultParameters()["repository"].get!string == "");
+    auto html = plugin.renderStepFormHtml(Json.emptyObject);
+    assert(html.length > 0);
+    assert(plugin.validateParameters(Json.emptyObject).length > 0);
+
+    Json validParams = Json.emptyObject;
+    validParams["repository"] = "https://github.com/org/repo.git";
+    assert(plugin.validateParameters(validParams).length == 0);
 }

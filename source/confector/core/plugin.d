@@ -1,7 +1,7 @@
 module confector.core.plugin;
 
 import confector.core.model : TaskNode, BuildStep;
-import confector.core.system : InputResolverSystem, FingerprintContributionSystem, TaskExecutionSystem, ArtifactPublishingSystem, BuildStepSystem;
+import confector.core.system : InputResolverSystem, FingerprintContributionSystem, TaskExecutionSystem, ArtifactPublishingSystem, BuildStepSystem, BuildStepProvider;
 import confector.core.executor : ExecutorProvider;
 
 /**
@@ -31,6 +31,7 @@ final class PluginRegistry
     private TaskExecutionSystem[] _executionSystems;
     private ArtifactPublishingSystem[] _artifactPublishers;
     private BuildStepSystem[] _stepSystems;
+    private BuildStepProvider[] _stepProviders;
     private ExecutorProvider[] _executorProviders;
 
     public static PluginRegistry instance()
@@ -67,6 +68,10 @@ final class PluginRegistry
         if (auto stepSystem = cast(BuildStepSystem) plugin)
         {
             registerStepSystem(stepSystem);
+        }
+        if (auto stepProvider = cast(BuildStepProvider) plugin)
+        {
+            registerStepProvider(stepProvider);
         }
         if (auto provider = cast(ExecutorProvider) plugin)
         {
@@ -119,6 +124,15 @@ final class PluginRegistry
         }
     }
 
+    public void registerStepProvider(BuildStepProvider provider)
+    {
+        import std.algorithm : canFind;
+        if (!_stepProviders.canFind(provider))
+        {
+            _stepProviders ~= provider;
+        }
+    }
+
     public void registerExecutorProvider(ExecutorProvider provider)
     {
         import std.algorithm : canFind;
@@ -151,6 +165,23 @@ final class PluginRegistry
     public BuildStepSystem[] getStepSystems()
     {
         return _stepSystems;
+    }
+
+    public BuildStepProvider[] getStepProviders()
+    {
+        return _stepProviders;
+    }
+
+    public BuildStepProvider getStepProvider(string stepType)
+    {
+        foreach (p; _stepProviders)
+        {
+            if (p.stepType == stepType)
+            {
+                return p;
+            }
+        }
+        return null;
     }
 
     public ExecutorProvider[] getExecutorProviders()
@@ -231,6 +262,7 @@ final class PluginRegistry
         _executionSystems.length = 0;
         _artifactPublishers.length = 0;
         _stepSystems.length = 0;
+        _stepProviders.length = 0;
         _executorProviders.length = 0;
     }
 }
@@ -264,16 +296,17 @@ unittest
     assert(registry.getPlugin("mock-plugin") is null);
 
     // Test system registration via plugin
-    import confector.core.system : InputResolutionContext, StepExecutionContext, StepExecutionResult, BuildStepSystem;
+    import confector.core.system : InputResolutionContext, StepExecutionContext, StepExecutionResult, BuildStepSystem, BuildStepProvider;
     import confector.core.executor : ExecutionRequest, ExecutionResult, LogDelegate;
 
-    class IntegratedPlugin : Plugin, InputResolverSystem, TaskExecutionSystem, BuildStepSystem
+    class IntegratedPlugin : Plugin, InputResolverSystem, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
     {
         @property string name() const { return "integrated-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Integrated test plugin"; }
         @property string systemName() const { return "integrated-system"; }
         @property string stepType() const { return "test-step"; }
+        @property string displayName() const { return "Test Step"; }
 
         void initialize() {}
         void shutdown() {}
@@ -296,6 +329,11 @@ unittest
             res.success = true;
             return res;
         }
+
+        import vibe.data.json : Json;
+        Json defaultParameters() const { return Json.emptyObject; }
+        string[] validateParameters(in Json parameters) const { return null; }
+        string renderStepFormHtml(in Json currentParameters) const { return "<div>Test Step UI</div>"; }
     }
 
     auto integrated = new IntegratedPlugin();
@@ -304,6 +342,9 @@ unittest
     assert(registry.getInputResolvers().length == 1);
     assert(registry.getExecutionSystems().length == 1);
     assert(registry.getStepSystems().length == 1);
+    assert(registry.getStepProviders().length == 1);
+    assert(registry.getStepProvider("test-step") is integrated);
+    assert(registry.getStepProvider("non-existent") is null);
 
     TaskNode testNode;
     testNode.id = "task-resolved";

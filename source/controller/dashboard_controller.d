@@ -1,10 +1,12 @@
 module controller.dashboard_controller;
 
 import vibe.vibe;
-import vibe.core.log : logError, logInfo;
+import vibe.core.log : logError, logInfo, logWarn;
 import confector.core.model;
 import confector.core.storage;
 import confector.core.dag;
+import confector.core.plugin : PluginRegistry;
+import confector.core.system : BuildStepProvider;
 import confector.runner.engine;
 import confector.queue.queue;
 
@@ -14,8 +16,20 @@ import std.format : format;
 import std.string : split, strip;
 import std.uuid : randomUUID;
 
-URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateRepository stateRepo)
+struct StepProviderViewModel
 {
+    string stepType;
+    string displayName;
+    string description;
+    string defaultHtml;
+}
+
+URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateRepository stateRepo, PluginRegistry registry = null)
+{
+    if (registry is null)
+    {
+        registry = PluginRegistry.instance;
+    }
     auto router = new URLRouter();
 
     // Home / Dashboard
@@ -185,7 +199,20 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         }
 
         auto repositories = stateRepo !is null ? stateRepo.listRepositories() : [];
-        res.render!("project/task-editor.dt", project, task, repositories);
+        StepProviderViewModel[] stepProvidersView;
+        if (registry !is null)
+        {
+            foreach (p; registry.getStepProviders())
+            {
+                StepProviderViewModel vm;
+                vm.stepType = p.stepType;
+                vm.displayName = p.displayName;
+                vm.description = p.description;
+                vm.defaultHtml = p.renderStepFormHtml(p.defaultParameters());
+                stepProvidersView ~= vm;
+            }
+        }
+        res.render!("project/task-editor.dt", project, task, repositories, stepProvidersView);
     });
 
     router.post("/projects/tasks/save", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -235,9 +262,14 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 auto stepScripts = req.form.getAll("step_script");
                 auto stepCommands = req.form.getAll("step_command");
                 auto stepWorkDirs = req.form.getAll("step_working_dir");
+                auto stepWorkDirs2 = req.form.getAll("step_workingDirectory");
                 auto stepRepoUrls = req.form.getAll("step_repo_url");
+                auto stepRepoUrls2 = req.form.getAll("step_param_repository");
                 auto stepBranches = req.form.getAll("step_repo_branch");
+                auto stepBranches2 = req.form.getAll("step_param_branch");
                 auto stepTargetDirs = req.form.getAll("step_repo_target");
+                auto stepTargetDirs2 = req.form.getAll("step_param_target_dir");
+                auto stepExecutables = req.form.getAll("step_param_executable");
                 auto stepProps = req.form.getAll("step_props");
 
                 for (size_t i = 0; i < stepTypes.length; i++)
@@ -255,18 +287,38 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                     if (i < stepScripts.length && stepScripts[i].length > 0) step.script = stepScripts[i];
                     if (i < stepCommands.length && stepCommands[i].length > 0) step.command = stepCommands[i];
                     if (i < stepWorkDirs.length && stepWorkDirs[i].strip().length > 0) step.workingDirectory = stepWorkDirs[i].strip();
+                    else if (i < stepWorkDirs2.length && stepWorkDirs2[i].strip().length > 0) step.workingDirectory = stepWorkDirs2[i].strip();
 
                     if (i < stepRepoUrls.length && stepRepoUrls[i].strip().length > 0)
                     {
                         step.parameters["repository"] = stepRepoUrls[i].strip();
                     }
+                    else if (i < stepRepoUrls2.length && stepRepoUrls2[i].strip().length > 0)
+                    {
+                        step.parameters["repository"] = stepRepoUrls2[i].strip();
+                    }
+
                     if (i < stepBranches.length && stepBranches[i].strip().length > 0)
                     {
                         step.parameters["branch"] = stepBranches[i].strip();
                     }
+                    else if (i < stepBranches2.length && stepBranches2[i].strip().length > 0)
+                    {
+                        step.parameters["branch"] = stepBranches2[i].strip();
+                    }
+
                     if (i < stepTargetDirs.length && stepTargetDirs[i].strip().length > 0)
                     {
                         step.parameters["target_dir"] = stepTargetDirs[i].strip();
+                    }
+                    else if (i < stepTargetDirs2.length && stepTargetDirs2[i].strip().length > 0)
+                    {
+                        step.parameters["target_dir"] = stepTargetDirs2[i].strip();
+                    }
+
+                    if (i < stepExecutables.length && stepExecutables[i].strip().length > 0)
+                    {
+                        step.parameters["executable"] = stepExecutables[i].strip();
                     }
 
                     if (i < stepProps.length && stepProps[i].strip().length > 0)

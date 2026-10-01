@@ -9,14 +9,14 @@ import vibe.data.json : Json;
 
 import confector.core.model;
 import confector.core.plugin;
-import confector.core.system : TaskExecutionSystem, BuildStepSystem, StepExecutionContext, StepExecutionResult;
+import confector.core.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
 import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
 
 /**
  * Bash script execution plugin.
  * Implements TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces for Bash scripts.
  */
-class BashPlugin : TaskRunner, TaskExecutionSystem, BuildStepSystem
+class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
 {
     @property string name() const { return "bash-plugin"; }
     @property string versionString() const { return "1.0.0"; }
@@ -24,9 +24,83 @@ class BashPlugin : TaskRunner, TaskExecutionSystem, BuildStepSystem
     @property string runnerType() const { return "bash"; }
     @property string systemName() const { return "bash-step-system"; }
     @property string stepType() const { return "bash"; }
+    @property string displayName() const { return "Bash Script"; }
 
     void initialize() {}
     void shutdown() {}
+
+    Json defaultParameters() const
+    {
+        Json p = Json.emptyObject;
+        p["script"] = "";
+        p["workingDirectory"] = "";
+        p["executable"] = "bash";
+        return p;
+    }
+
+    string[] validateParameters(in Json parameters) const
+    {
+        string[] errors;
+        if (parameters.type != Json.Type.object)
+        {
+            errors ~= "Parameters must be a JSON object";
+            return errors;
+        }
+        auto pScript = "script" in parameters;
+        auto pCommand = "command" in parameters;
+        if ((pScript is null || pScript.get!string.length == 0) &&
+            (pCommand is null || pCommand.get!string.length == 0))
+        {
+            errors ~= "Bash script or command cannot be empty";
+        }
+        return errors;
+    }
+
+    string renderStepFormHtml(in Json currentParameters) const
+    {
+        import std.array : appender;
+        import vibe.textfilter.html : htmlEscape;
+
+        auto html = appender!string;
+        string script = "";
+        string workingDir = "";
+        string executable = "bash";
+
+        if (currentParameters.type == Json.Type.object)
+        {
+            if (auto p = "script" in currentParameters) script = p.get!string;
+            else if (auto p = "command" in currentParameters) script = p.get!string;
+
+            if (auto p = "workingDirectory" in currentParameters) workingDir = p.get!string;
+            else if (auto p = "working_directory" in currentParameters) workingDir = p.get!string;
+
+            if (auto p = "executable" in currentParameters) executable = p.get!string;
+        }
+
+        html.put("<div class=\"step-subform step-subform-bash\">\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Bash Script (bash -c)</label>\n");
+        html.put("    <textarea name=\"step_script\" class=\"form-control code-font step-field-script\" rows=\"4\" placeholder=\"#!/usr/bin/env bash\necho 'Building...'\ndub test\" required>");
+        html.put(htmlEscape(script));
+        html.put("</textarea>\n");
+        html.put("    <small class=\"form-help-text\">Bash script executed with <code>bash -c</code>.</small>\n");
+        html.put("  </div>\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Working Directory (Optional)</label>\n");
+        html.put("    <input type=\"text\" name=\"step_workingDirectory\" class=\"form-control step-field-working-dir\" placeholder=\"Subdirectory or relative path inside workspace\" value=\"");
+        html.put(htmlEscape(workingDir));
+        html.put("\" />\n");
+        html.put("  </div>\n");
+        html.put("  <div class=\"form-group\">\n");
+        html.put("    <label>Shell Executable</label>\n");
+        html.put("    <input type=\"text\" name=\"step_param_executable\" class=\"form-control step-field-executable\" placeholder=\"bash or /bin/bash\" value=\"");
+        html.put(htmlEscape(executable));
+        html.put("\" />\n");
+        html.put("  </div>\n");
+        html.put("</div>\n");
+
+        return html.data;
+    }
 
     bool canExecute(in ExecutionRequest request) const
     {
@@ -232,4 +306,15 @@ unittest
     auto emptyRes = plugin.executeStep(emptyStep, sCtx);
     assert(!emptyRes.success);
     assert(emptyRes.exitCode != 0);
+
+    // BuildStepProvider testing
+    assert(plugin.displayName == "Bash Script");
+    assert(plugin.defaultParameters()["executable"].get!string == "bash");
+    auto html = plugin.renderStepFormHtml(Json.emptyObject);
+    assert(html.length > 0);
+    assert(plugin.validateParameters(Json.emptyObject).length > 0);
+
+    Json validParams = Json.emptyObject;
+    validParams["script"] = "echo 'hello bash'";
+    assert(plugin.validateParameters(validParams).length == 0);
 }
