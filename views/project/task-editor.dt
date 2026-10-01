@@ -12,9 +12,16 @@ block maincontent
 
     form(action="/projects/tasks/save", method="POST", style="margin-top: 20px;")
       input(type="hidden", name="project_id", value="#{project.id}")
-      div.grid-2col
-        div.card
-          h3 Task Node Identification
+
+      div.tabs-nav
+        button.tab-btn.active(type="button", onclick="switchTab('general', this)") General
+        button.tab-btn(type="button", onclick="switchTab('inputs', this)") Inputs
+        button.tab-btn(type="button", onclick="switchTab('steps', this)") Steps
+        button.tab-btn(type="button", onclick="switchTab('outputs', this)") Outputs
+
+      div.card
+        div#tab-general.tab-pane.active
+          h3 General Settings
           div.form-group
             label(for="task_id") Task Identifier (ID):
             input.form-control#task_id(type="text", name="task_id", value="#{task.id}", placeholder="e.g. build-release, test-unit, deploy-stage", required)
@@ -23,24 +30,16 @@ block maincontent
             label(for="name") Display Name:
             input.form-control#name(type="text", name="name", value="#{task.name}", placeholder="e.g. Build Release Binary")
 
+        div#tab-inputs.tab-pane
+          h3 Inputs & Upstream Dependencies
           div.form-group
-            label(for="depends_on") Dependencies (Comma-separated task IDs):
+            label(for="depends_on") Task Dependencies / Other Tasks (Comma-separated task IDs):
             - string depsVal = "";
             - foreach(i, d; task.dependsOn) { if (i > 0) depsVal ~= ", "; depsVal ~= d; }
             input.form-control#depends_on(type="text", name="depends_on", value="#{depsVal}", placeholder="e.g. compile, unit-tests")
 
           div.form-group
-            label(for="script") Execution Script / Command:
-            textarea.form-control#script(name="script", rows="6", placeholder="e.g. dub build --build=release", style="font-family: monospace;") #{task.script}
-
-          div.form-group
-            label(for="working_directory") Working Directory Override (Optional):
-            input.form-control#working_directory(type="text", name="working_directory", value="#{task.workingDirectory}", placeholder="Leave blank to use project workspace")
-
-        div.card
-          h3 Inputs & Output Declarations
-          div.form-group
-            label(for="input_files") Input File Globs (Comma or newline separated):
+            label(for="input_files") Repositories & Input File Globs (Comma or newline separated):
             - string filesVal = "";
             - foreach(i, f; task.inputs.files) { if (i > 0) filesVal ~= "\n"; filesVal ~= f; }
             textarea.form-control#input_files(name="input_files", rows="3", placeholder="source/**/*.d\ndub.json\nviews/**/*.dt", style="font-family: monospace;") #{filesVal}
@@ -57,12 +56,43 @@ block maincontent
             - foreach(i, up; task.inputs.upstreamArtifacts) { if (i > 0) upVal ~= "\n"; upVal ~= up.taskId ~ ":" ~ up.name; }
             textarea.form-control#upstream_artifacts(name="upstream_artifacts", rows="3", placeholder="build-release:confector.exe\ncompile:build/game.zip", style="font-family: monospace;") #{upVal}
 
+        div#tab-steps.tab-pane
+          h3 Execution Steps
+          div.form-group
+            label(for="script") Execution Script / Command:
+            textarea.form-control#script(name="script", rows="6", placeholder="e.g. dub build --build=release", style="font-family: monospace;") #{task.script}
+
+          div.form-group
+            label(for="working_directory") Working Directory Override (Optional):
+            input.form-control#working_directory(type="text", name="working_directory", value="#{task.workingDirectory}", placeholder="Leave blank to use project workspace")
+
+        div#tab-outputs.tab-pane
+          h3 Output Artifacts
           div.form-group
             label(for="output_artifacts") Produced Output Artifacts (Format: filePath:type or filePath per line):
             - string outVal = "";
             - foreach(i, outArt; task.outputs.artifacts) { if (i > 0) outVal ~= "\n"; outVal ~= outArt.path ~ (outArt.type.length > 0 ? ":" ~ outArt.type : ""); }
-            textarea.form-control#output_artifacts(name="output_artifacts", rows="3", placeholder="bin/confector.exe:binary\nbuild/output.tar.gz:archive", style="font-family: monospace;") #{outVal}
+            textarea.form-control#output_artifacts(name="output_artifacts", rows="4", placeholder="bin/confector.exe:binary\nbuild/output.tar.gz:archive", style="font-family: monospace;") #{outVal}
 
-          div(style="margin-top: 20px; display: flex; gap: 10px;")
-            button.btn.btn-primary(type="submit") Save Task
-            a.btn.btn-outline(href="/projects/details?id=#{project.id}") Cancel
+        div(style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #eee; display: flex; gap: 10px;")
+          button.btn.btn-primary(type="submit") Save Task
+          a.btn.btn-outline(href="/projects/details?id=#{project.id}") Cancel
+
+  script.
+    function switchTab(tabName, btn) {
+      var panes = document.querySelectorAll('.tab-pane');
+      for (var i = 0; i < panes.length; i++) {
+        panes[i].classList.remove('active');
+      }
+      var buttons = document.querySelectorAll('.tab-btn');
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].classList.remove('active');
+      }
+      var target = document.getElementById('tab-' + tabName);
+      if (target) {
+        target.classList.add('active');
+      }
+      if (btn) {
+        btn.classList.add('active');
+      }
+    }
