@@ -1,6 +1,6 @@
 module controller.repositorycontroller;
 import vibe.vibe;
-import vibe.utils.dictionarylist;
+import vibe.container.dictionarylist;
 import std.algorithm;
 import std.range;
 import std.typecons;

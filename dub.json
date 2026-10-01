@@ -4,7 +4,7 @@
 	],
 	"copyright": "Copyright © 2023, Jason Yegge",
 	"dependencies": {
-		"vibe-d": "~>0.9.7"
+		"vibe-d": "~>0.10.3"
 	},
 	"description": "A build system.",
 	"license": "The Unlicense",
