@@ -174,8 +174,6 @@ string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
     auto app = appender!string();
     app.put(task.id);
     app.put("|");
-    app.put(task.workingDirectory);
-    app.put("|");
     app.put(computeEnvDigest(task.environment));
     return sha256Hex(app.data);
 }
@@ -286,7 +284,6 @@ unittest
     TaskNode task;
     task.id = "build";
     task.script = "dub build --build=release";
-    task.workingDirectory = "/workspace";
     task.environment = ["DUB_ARGS": "-q", "RELEASE_TAG": "v1.0.0"];
 
     string[string] artifacts1 = [

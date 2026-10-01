@@ -136,7 +136,6 @@ struct ProcessExecutionComponent
     @optional string script;
     @optional string command;
     @optional string[] arguments;
-    @optional string workingDirectory;
     @optional string[string] environment;
     @optional size_t timeoutSeconds = 900;
 }
@@ -180,7 +179,6 @@ struct TaskNode
     @optional @asName("steps") BuildStep[] steps;
     @optional TriggerRule[] triggers;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
-    @optional @asName("working_directory") string workingDirectory;
     @optional string[string] environment;
     @optional Json[string] components;
 
@@ -216,7 +214,6 @@ struct TaskNode
     {
         ProcessExecutionComponent comp;
         comp.script = script;
-        comp.workingDirectory = workingDirectory;
         comp.timeoutSeconds = timeoutSeconds;
         foreach (k, v; environment)
         {

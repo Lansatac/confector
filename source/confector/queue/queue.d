@@ -26,7 +26,6 @@ struct TaskExecutionPayload
     @asName("repository_url") string repositoryUrl;
     @asName("commit_sha") string commitSha;
     string script;
-    @asName("working_directory") string workingDirectory;
     string[string] environment;
     @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
     @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;

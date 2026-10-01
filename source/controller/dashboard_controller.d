@@ -229,7 +229,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 task.id = "task_" ~ randomUUID().toString()[0 .. 8];
             }
             task.name = req.form.get("name", "").strip();
-            task.workingDirectory = req.form.get("working_directory", "").strip();
 
             // Build steps
             string stepsJsonStr = req.form.get("steps_json", "");
@@ -331,14 +330,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 }
             }
             task.steps = steps;
-            if (task.steps.length == 1 && (task.steps[0].type == "process" || task.steps[0].type == "script"))
-            {
-                task.script = task.steps[0].script;
-            }
-            else if (task.steps.length == 0)
-            {
-                task.script = req.form.get("script", "");
-            }
 
             // Dependencies
             string[] deps;

@@ -104,10 +104,6 @@ block maincontent
               button.btn.btn-outline.btn-sm(type="button", onclick="addBuildStep('" ~ p.stepType ~ "')") + Add #{p.displayName}
             button.btn.btn-outline.btn-sm#add-custom-step-btn(type="button", onclick="addBuildStep('custom')") + Add Custom Step
 
-          div.form-group(style="margin-top: 20px; padding-top: 15px; border-top: 1px dashed #ddd;")
-            label(for="working_directory") Default Task Working Directory Override (Optional):
-            input.form-control#working_directory(type="text", name="working_directory", value="#{task.workingDirectory}", placeholder="Leave blank to use default workspace")
-
         div#tab-outputs.tab-pane
           h3 Output Artifacts
           div.form-group
@@ -163,8 +159,6 @@ block maincontent
     var availableRepos = !{availableReposJson};
     var initialSteps = !{initialStepsJson} || [];
     var stepProviders = !{stepProvidersJson} || [];
-    var initialScript = !{serializeToJson(task.script).toString()};
-    var initialTaskWorkDir = !{serializeToJson(task.workingDirectory).toString()};
 
     var stepProviderMap = {};
     for (var i = 0; i < stepProviders.length; i++) {
@@ -773,13 +767,6 @@ block maincontent
         for (var i = 0; i < initialSteps.length; i++) {
           addBuildStep(initialSteps[i].type, initialSteps[i]);
         }
-      } else if (initialScript && initialScript.length > 0) {
-        addBuildStep('process', {
-          name: 'Execute Script',
-          type: 'process',
-          script: initialScript,
-          working_directory: initialTaskWorkDir
-        });
       } else {
         addBuildStep('process', {
           name: 'Build Step',

@@ -128,10 +128,8 @@ class TaskEngine
             m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.running);
         }
 
-        // Resolve working directory
-        string effectiveWorkingDir = task.workingDirectory.length > 0
-            ? (isAbsolute(task.workingDirectory) ? task.workingDirectory : buildPath(workspaceDir, task.workingDirectory))
-            : workspaceDir;
+        // Effective working directory defaults to workspace directory
+        string effectiveWorkingDir = workspaceDir;
 
         // 4. Input Resolution Systems pass
         InputResolutionContext inputCtx;

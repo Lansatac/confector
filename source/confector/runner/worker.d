@@ -112,7 +112,6 @@ class WorkerRunner
                 node.id = taskId;
                 node.name = taskId;
                 node.script = msg.executionPayload.script;
-                node.workingDirectory = msg.executionPayload.workingDirectory;
                 node.environment = msg.executionPayload.environment;
                 node.outputs.artifacts = msg.executionPayload.expectedOutputs;
             }
