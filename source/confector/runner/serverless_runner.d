@@ -5,7 +5,7 @@ import confector.core.storage;
 import confector.core.executor : TaskRunner;
 import confector.runner.engine;
 import confector.core.plugin;
-import confector.plugins.process_runner;
+import plugins.process_runner;
 
 import vibe.data.json;
 import vibe.data.serialization : asName = name;

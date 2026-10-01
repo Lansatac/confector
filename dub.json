@@ -4,9 +4,32 @@
 	],
 	"copyright": "Copyright © 2023, Jason Yegge",
 	"dependencies": {
-		"vibe-d": "~>0.10.3"
+		"diet-ng": "~>1.8",
+		"vibe-d": "~>0.10.3",
+		"confector:core": "*",
+		"confector:bash": "*",
+		"confector:git": "*",
+		"confector:local_executor": "*",
+		"confector:powershell": "*",
+		"confector:process_runner": "*"
 	},
 	"description": "A build system.",
 	"license": "The Unlicense",
-	"name": "confector"
+	"name": "confector",
+	"subPackages": [
+		{
+			"name": "core",
+			"targetType": "library",
+			"sourcePaths": ["source/confector/core"],
+			"importPaths": ["source"],
+			"dependencies": {
+				"vibe-d": "~>0.10.3"
+			}
+		},
+		"./plugins/bash",
+		"./plugins/git",
+		"./plugins/local_executor",
+		"./plugins/powershell",
+		"./plugins/process_runner"
+	]
 }

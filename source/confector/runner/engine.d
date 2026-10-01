@@ -499,9 +499,9 @@ class TaskEngine
 
 unittest
 {
-    import confector.plugins.process_runner;
-    import confector.plugins.bash;
-    import confector.plugins.powershell;
+    import plugins.process_runner;
+    import plugins.bash;
+    import plugins.powershell;
     import std.file : rmdirRecurse, mkdirRecurse, write;
 
     string testDir = "test_engine_run";
@@ -673,7 +673,7 @@ unittest
     }
 
     // Executor Provider & Persistence Integration Test
-    import confector.plugins.local_executor : LocalExecutorPlugin;
+    import plugins.local_executor : LocalExecutorPlugin;
     import confector.core.executor : ExecutorRecord, ExecutorProvider, TaskExecutor;
     import controller.executor_controller : executorRouter;
 

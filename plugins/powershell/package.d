@@ -1,4 +1,4 @@
-module confector.plugins.powershell;
+module plugins.powershell;
 
 import std.format;
 import std.process;
@@ -14,7 +14,7 @@ import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, 
 
 /**
  * PowerShell script execution plugin.
- * Implements TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces for PowerShell / pwsh scripts.
+ * Implements TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces for PowerShell scripts.
  */
 class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
 {
@@ -65,8 +65,8 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
 
     string renderStepFormHtml(in Json currentParameters) const
     {
+        import diet.html : compileHTMLDietFile;
         import std.array : appender;
-        import vibe.textfilter.html : htmlEscape;
 
         auto html = appender!string;
         string script = "";
@@ -92,27 +92,7 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
             if (auto p = "executable" in currentParameters) executable = p.get!string;
         }
 
-        html.put("<div class=\"step-subform step-subform-powershell\">\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>PowerShell Script (-Command)</label>\n");
-        html.put("    <textarea name=\"step_script\" class=\"form-control code-font step-field-script\" rows=\"4\" placeholder=\"Write-Output 'Building...'\ndub test\" required>");
-        html.put(htmlEscape(script));
-        html.put("</textarea>\n");
-        html.put("    <small class=\"form-help-text\">PowerShell script executed with <code>-NoProfile -NonInteractive -ExecutionPolicy Bypass</code>.</small>\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Working Directory (Optional)</label>\n");
-        html.put("    <input type=\"text\" name=\"step_workingDirectory\" class=\"form-control step-field-working-dir\" placeholder=\"Subdirectory or relative path inside workspace\" value=\"");
-        html.put(htmlEscape(workingDir));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>PowerShell Executable</label>\n");
-        html.put("    <input type=\"text\" name=\"step_param_executable\" class=\"form-control step-field-executable\" placeholder=\"powershell or pwsh\" value=\"");
-        html.put(htmlEscape(executable));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("</div>\n");
+        compileHTMLDietFile!("step.dt", script, workingDir, executable)(html);
 
         return html.data;
     }
@@ -188,9 +168,8 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
         ExecutionResult result;
         try
         {
-            string executable = getExecutable("powershell");
-            string[] args = buildProcessArgs(executable, request.command);
-
+            string exec = getExecutable("powershell");
+            string[] args = buildProcessArgs(exec, request.command);
             auto pipe = pipeProcess(args,
                 Redirect.stdout | Redirect.stderrToStdout,
                 request.environmentVariables.length > 0 ? request.environmentVariables : null,
@@ -234,7 +213,9 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
 
     bool canExecuteStep(in BuildStep step) const
     {
-        return step.type == "powershell" || step.type == "pwsh" || step.type == "ps1";
+        return step.type == "powershell"
+            || step.type == "pwsh"
+            || step.type == "ps1";
     }
 
     StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
@@ -248,7 +229,7 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
         {
             res.success = false;
             res.exitCode = 1;
-            res.errorMessage = "No script or command specified for powershell build step";
+            res.errorMessage = "No script or command specified for PowerShell build step";
             return res;
         }
 
@@ -266,16 +247,16 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
             stepEnv[k] = v;
         }
 
-        string executable = getExecutable(step.type, step.parameters);
+        string psExecutable = getExecutable(step.type, step.parameters);
 
         try
         {
             if (context.logCallback !is null)
             {
-                context.logCallback(format("[powershell] Running: %s", commandToRun));
+                context.logCallback(format("[%s] Running: %s", psExecutable, commandToRun));
             }
 
-            string[] args = buildProcessArgs(executable, commandToRun);
+            string[] args = buildProcessArgs(psExecutable, commandToRun);
             auto pipe = pipeProcess(args,
                 Redirect.stdout | Redirect.stderrToStdout,
                 stepEnv.length > 0 ? stepEnv : null,
@@ -321,20 +302,15 @@ unittest
     assert(plugin.systemName == "powershell-step-system");
     assert(plugin.stepType == "powershell");
 
-    BuildStep psStep;
-    psStep.type = "powershell";
-    psStep.script = "Write-Output 'powershell step test'";
-    assert(plugin.canExecuteStep(psStep));
+    BuildStep bStep;
+    bStep.type = "powershell";
+    bStep.script = "Write-Output 'powershell step test'";
+    assert(plugin.canExecuteStep(bStep));
 
     BuildStep pwshStep;
     pwshStep.type = "pwsh";
     pwshStep.script = "Write-Output 'pwsh step test'";
     assert(plugin.canExecuteStep(pwshStep));
-
-    BuildStep ps1Step;
-    ps1Step.type = "ps1";
-    ps1Step.script = "Write-Output 'ps1 step test'";
-    assert(plugin.canExecuteStep(ps1Step));
 
     BuildStep procStep;
     procStep.type = "process";
@@ -349,13 +325,10 @@ unittest
     assert(plugin.canExecute(taskNode));
 
     StepExecutionContext sCtx;
-    version(Windows)
-    {
-        auto sRes = plugin.executeStep(psStep, sCtx);
-        assert(sRes.success);
-        assert(sRes.exitCode == 0);
-        assert(sRes.outputLines.length > 0);
-    }
+    auto sRes = plugin.executeStep(bStep, sCtx);
+    assert(sRes.success);
+    assert(sRes.exitCode == 0);
+    assert(sRes.outputLines.length > 0);
 
     // Empty script failure handling test
     BuildStep emptyStep;
@@ -366,7 +339,7 @@ unittest
 
     // BuildStepProvider testing
     assert(plugin.displayName == "PowerShell Script");
-    assert(plugin.defaultParameters()["script"].get!string == "");
+    assert(plugin.defaultParameters()["executable"].get!string.length > 0);
     auto html = plugin.renderStepFormHtml(Json.emptyObject);
     assert(html.length > 0);
     assert(plugin.validateParameters(Json.emptyObject).length > 0);

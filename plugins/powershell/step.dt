@@ -1,0 +1,14 @@
+div.step-subform.step-subform-powershell
+  div.form-group
+    label PowerShell Script (-Command)
+    textarea.form-control.code-font.step-field-script(name="step_script", rows="4", placeholder="Write-Output 'Building...'\ndub test", required) #{script}
+    small.form-help-text
+      | PowerShell script executed with 
+      code -NoProfile -NonInteractive -ExecutionPolicy Bypass
+      | .
+  div.form-group
+    label Working Directory (Optional)
+    input.form-control.step-field-working-dir(type="text", name="step_workingDirectory", placeholder="Subdirectory or relative path inside workspace", value=workingDir)
+  div.form-group
+    label PowerShell Executable
+    input.form-control.step-field-executable(type="text", name="step_param_executable", placeholder="powershell or pwsh", value=executable)

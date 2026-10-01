@@ -11,11 +11,11 @@ import confector.storage.mongo_repository;
 import confector.queue.queue;
 import confector.queue.mongo_queue;
 import confector.runner.engine;
-import confector.plugins.git;
-import confector.plugins.process_runner;
-import confector.plugins.bash;
-import confector.plugins.powershell;
-import confector.plugins.local_executor;
+import plugins.git;
+import plugins.process_runner;
+import plugins.bash;
+import plugins.powershell;
+import plugins.local_executor;
 
 debug static import std.stdio;
 

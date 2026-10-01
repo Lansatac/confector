@@ -191,7 +191,7 @@ class WorkerRunner
 unittest
 {
     import confector.core.plugin;
-    import confector.plugins.process_runner;
+    import plugins.process_runner;
     import std.file : rmdirRecurse;
 
     if (PluginRegistry.instance.getPluginsOfType!TaskRunner().length == 0)

@@ -255,7 +255,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 unittest
 {
     import confector.core.storage : InMemoryBuildStateRepository;
-    import confector.plugins.local_executor : LocalExecutorPlugin;
+    import plugins.local_executor : LocalExecutorPlugin;
 
     auto repo = new InMemoryBuildStateRepository();
     auto reg = PluginRegistry.instance;

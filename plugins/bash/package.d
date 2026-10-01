@@ -1,4 +1,4 @@
-module confector.plugins.bash;
+module plugins.bash;
 
 import std.format;
 import std.process;
@@ -58,8 +58,8 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
 
     string renderStepFormHtml(in Json currentParameters) const
     {
+        import diet.html : compileHTMLDietFile;
         import std.array : appender;
-        import vibe.textfilter.html : htmlEscape;
 
         auto html = appender!string;
         string script = "";
@@ -77,27 +77,7 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
             if (auto p = "executable" in currentParameters) executable = p.get!string;
         }
 
-        html.put("<div class=\"step-subform step-subform-bash\">\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Bash Script (bash -c)</label>\n");
-        html.put("    <textarea name=\"step_script\" class=\"form-control code-font step-field-script\" rows=\"4\" placeholder=\"#!/usr/bin/env bash\necho 'Building...'\ndub test\" required>");
-        html.put(htmlEscape(script));
-        html.put("</textarea>\n");
-        html.put("    <small class=\"form-help-text\">Bash script executed with <code>bash -c</code>.</small>\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Working Directory (Optional)</label>\n");
-        html.put("    <input type=\"text\" name=\"step_workingDirectory\" class=\"form-control step-field-working-dir\" placeholder=\"Subdirectory or relative path inside workspace\" value=\"");
-        html.put(htmlEscape(workingDir));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Shell Executable</label>\n");
-        html.put("    <input type=\"text\" name=\"step_param_executable\" class=\"form-control step-field-executable\" placeholder=\"bash or /bin/bash\" value=\"");
-        html.put(htmlEscape(executable));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("</div>\n");
+        compileHTMLDietFile!("step.dt", script, workingDir, executable)(html);
 
         return html.data;
     }

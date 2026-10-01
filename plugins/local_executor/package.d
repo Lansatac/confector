@@ -1,4 +1,4 @@
-module confector.plugins.local_executor;
+module plugins.local_executor;
 
 import std.format;
 import std.process;
@@ -109,157 +109,148 @@ class LocalTaskExecutor : TaskExecutor
         static class ExecState
         {
             Mutex mutex;
-            TaskCondition condition;
-            string[] pendingLines;
-            bool finished;
+            bool processExited = false;
             int exitCode = -1;
-            bool success;
-            string errorMessage;
-            Pid processPid;
+            string[] outputLines;
+            string errorMessage = "";
+            bool timedOut = false;
 
             this()
             {
                 mutex = new Mutex();
-                condition = new TaskCondition(mutex);
             }
         }
 
         auto state = new ExecState();
-        string cmd = request.command;
-        string[string] envVars = request.environmentVariables.length > 0 ? cast(string[string])request.environmentVariables.dup : null;
-        string workDir = effectiveWorkDir.length > 0 ? effectiveWorkDir : null;
 
-        auto worker = new Thread({
-            try
-            {
-                auto pipe = pipeShell(cmd,
-                    Redirect.stdout | Redirect.stderrToStdout,
-                    envVars,
-                    Config.retainStderr,
-                    workDir);
+        try
+        {
+            auto pipe = pipeShell(request.command,
+                Redirect.stdout | Redirect.stderrToStdout,
+                request.environmentVariables.length > 0 ? request.environmentVariables : null,
+                Config.retainStderr,
+                effectiveWorkDir.length > 0 ? effectiveWorkDir : null);
 
-                synchronized (state.mutex)
+            auto readerThread = new Thread({
+                try
                 {
-                    state.processPid = pipe.pid;
-                }
+                    foreach (line; pipe.stdout.byLineCopy)
+                    {
+                        synchronized (state.mutex)
+                        {
+                            state.outputLines ~= line;
+                        }
+                        if (logCallback !is null)
+                        {
+                            logCallback(line);
+                        }
+                    }
 
-                foreach (line; pipe.stdout.byLineCopy)
+                    auto ec = wait(pipe.pid);
+                    synchronized (state.mutex)
+                    {
+                        state.exitCode = ec;
+                        state.processExited = true;
+                    }
+                }
+                catch (Exception e)
                 {
                     synchronized (state.mutex)
                     {
-                        state.pendingLines ~= line.idup;
-                        state.condition.notifyAll();
+                        state.errorMessage = e.msg;
+                        state.processExited = true;
                     }
                 }
+            });
+            readerThread.isDaemon = true;
+            readerThread.start();
 
-                int code = wait(pipe.pid);
-                synchronized (state.mutex)
-                {
-                    state.exitCode = code;
-                    state.success = (code == 0);
-                    if (!state.success)
-                    {
-                        state.errorMessage = format("Process exited with code %d", code);
-                    }
-                    state.finished = true;
-                    state.condition.notifyAll();
-                }
-            }
-            catch (Exception e)
+            if (request.timeoutSeconds > 0)
             {
-                synchronized (state.mutex)
+                auto startTime = MonoTime.currTime();
+                auto maxDur = seconds(request.timeoutSeconds);
+
+                while (true)
                 {
-                    state.exitCode = -1;
-                    state.success = false;
-                    state.errorMessage = e.msg;
-                    state.finished = true;
-                    state.condition.notifyAll();
+                    synchronized (state.mutex)
+                    {
+                        if (state.processExited)
+                        {
+                            break;
+                        }
+                    }
+
+                    if ((MonoTime.currTime() - startTime) >= maxDur)
+                    {
+                        synchronized (state.mutex)
+                        {
+                            state.timedOut = true;
+                        }
+                        try
+                        {
+                            kill(pipe.pid);
+                        }
+                        catch (Exception) {}
+                        break;
+                    }
+
+                    Thread.sleep(50.msecs);
                 }
             }
-        });
-        worker.isDaemon = true;
-        worker.start();
-
-        auto startTime = MonoTime.currTime;
-        Duration timeout = request.timeoutSeconds > 0 ? request.timeoutSeconds.seconds : Duration.max;
-
-        while (true)
-        {
-            string[] linesToProcess;
-            bool isFinished;
+            else
+            {
+                while (true)
+                {
+                    synchronized (state.mutex)
+                    {
+                        if (state.processExited)
+                        {
+                            break;
+                        }
+                    }
+                    Thread.sleep(50.msecs);
+                }
+            }
 
             synchronized (state.mutex)
             {
-                if (state.pendingLines.length > 0)
+                result.outputLines = state.outputLines;
+                if (state.timedOut)
                 {
-                    linesToProcess = state.pendingLines;
-                    state.pendingLines = null;
+                    result.exitCode = -1;
+                    result.success = false;
+                    result.errorMessage = format("Command timed out after %d seconds.", request.timeoutSeconds);
+                    if (logCallback !is null)
+                    {
+                        logCallback(format("Execution error: %s", result.errorMessage));
+                    }
                 }
-                isFinished = state.finished;
-
-                if (!isFinished && linesToProcess.length == 0)
+                else if (state.errorMessage.length > 0)
                 {
-                    if (timeout != Duration.max)
-                    {
-                        auto elapsed = MonoTime.currTime - startTime;
-                        if (elapsed >= timeout)
-                        {
-                            // Timed out
-                            if (state.processPid !is null)
-                            {
-                                try { kill(state.processPid); } catch (Exception) {}
-                            }
-                            state.finished = true;
-                            state.exitCode = -1;
-                            state.success = false;
-                            state.errorMessage = format("Execution timed out after %d seconds", request.timeoutSeconds);
-                            isFinished = true;
-                        }
-                        else
-                        {
-                            auto remaining = timeout - elapsed;
-                            state.condition.wait(remaining > 100.msecs ? 100.msecs : remaining);
-                        }
-                    }
-                    else
-                    {
-                        state.condition.wait();
-                    }
-
-                    if (state.pendingLines.length > 0)
-                    {
-                        linesToProcess = state.pendingLines;
-                        state.pendingLines = null;
-                    }
-                    isFinished = state.finished;
+                    result.exitCode = -1;
+                    result.success = false;
+                    result.errorMessage = state.errorMessage;
                 }
-            }
-
-            foreach (line; linesToProcess)
-            {
-                result.outputLines ~= line;
-                if (logCallback !is null)
+                else
                 {
-                    logCallback(line);
+                    result.exitCode = state.exitCode;
+                    result.success = (state.exitCode == 0);
+                    if (!result.success)
+                    {
+                        result.errorMessage = format("Command exited with code %d", result.exitCode);
+                    }
                 }
-            }
-
-            if (isFinished && linesToProcess.length == 0)
-            {
-                break;
             }
         }
-
-        synchronized (state.mutex)
+        catch (Exception e)
         {
-            result.exitCode = state.exitCode;
-            result.success = state.success;
-            result.errorMessage = state.errorMessage;
-        }
-
-        if (!result.success && result.errorMessage.length > 0 && logCallback !is null && result.outputLines.length == 0)
-        {
-            logCallback(format("Execution error: %s", result.errorMessage));
+            result.exitCode = -1;
+            result.success = false;
+            result.errorMessage = e.msg;
+            if (logCallback !is null)
+            {
+                logCallback(format("Execution error: %s", e.msg));
+            }
         }
 
         return result;
@@ -267,44 +258,63 @@ class LocalTaskExecutor : TaskExecutor
 }
 
 /**
- * Local process executor plugin.
- * Exposes host OS execution capabilities with sub-template UI configuration rendering.
+ * Built-in LocalExecutor plugin providing local host process execution.
  */
 class LocalExecutorPlugin : Plugin, ExecutorProvider
 {
-    @property string name() const { return "local-executor-plugin"; }
-    @property string versionString() const { return "1.0.0"; }
-    @property string description() const { return "Local process executor provider running build tasks on host infrastructure"; }
-    @property string providerType() const { return "local"; }
-    @property string displayName() const { return "Local Process Executor"; }
-    @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+    @property string name() const
+    {
+        return "local-executor-plugin";
+    }
 
-    void initialize() {}
-    void shutdown() {}
+    @property string versionString() const
+    {
+        return "1.0.0";
+    }
+
+    @property string description() const
+    {
+        return "Provides local child process task execution on host system";
+    }
+
+    @property string providerType() const
+    {
+        return "local";
+    }
+
+    @property string displayName() const
+    {
+        return "Local Process Executor";
+    }
+
+    @property string[] supportedStepTypes() const
+    {
+        return ["process", "bash", "powershell", "git"];
+    }
+
+    void initialize()
+    {
+    }
+
+    void shutdown()
+    {
+    }
 
     Json defaultConfig() const
     {
-        Json conf = Json.emptyObject;
-        conf["maxConcurrency"] = cast(int) totalCPUs;
-        conf["workspaceDir"] = ".confector/workspaces";
+        Json config = Json.emptyObject;
+        config["maxConcurrency"] = cast(int) totalCPUs;
+        config["workspaceDir"] = ".confector/workspaces";
+        config["defaultShell"] = "powershell";
 
-        version(Windows)
+        Json allowedSteps = Json.emptyArray;
+        foreach (st; supportedStepTypes)
         {
-            conf["defaultShell"] = "powershell";
+            allowedSteps ~= Json(st);
         }
-        else
-        {
-            conf["defaultShell"] = "sh";
-        }
+        config["allowedStepTypes"] = allowedSteps;
 
-        Json steps = Json.emptyArray;
-        foreach (s; supportedStepTypes)
-        {
-            steps ~= Json(s);
-        }
-        conf["allowedStepTypes"] = steps;
-
-        return conf;
+        return config;
     }
 
     string[] validateConfig(in Json config) const
@@ -340,12 +350,13 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
 
     string renderConfigFormHtml(in Json currentConfig) const
     {
+        import diet.html : compileHTMLDietFile;
         import std.array : appender;
-        import std.conv : to;
 
         auto html = appender!string;
 
         int concurrency = cast(int) totalCPUs;
+        int hostCores = cast(int) totalCPUs;
         string workspaceDir = ".confector/workspaces";
         string defaultShell = "powershell";
         string allowedStepsStr = "process, bash, powershell, git";
@@ -386,36 +397,7 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
             }
         }
 
-        html.put("<div class=\"executor-config-subform\">\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label for=\"config_maxConcurrency\">Max Concurrency (Worker Threads)</label>\n");
-        html.put(format("    <input type=\"number\" id=\"config_maxConcurrency\" name=\"config_maxConcurrency\" min=\"1\" max=\"128\" value=\"%d\" class=\"form-control\" required />\n", concurrency));
-        html.put(format("    <small class=\"form-help-text\">Maximum parallel build tasks permitted on this host (Host CPU cores detected: %d).</small>\n", totalCPUs));
-        html.put("  </div>\n\n");
-
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label for=\"config_workspaceDir\">Working Directory / Workspace Base</label>\n");
-        html.put(format("    <input type=\"text\" id=\"config_workspaceDir\" name=\"config_workspaceDir\" value=\"%s\" class=\"form-control\" required />\n", workspaceDir));
-        html.put("    <small class=\"form-help-text\">Local directory path where repositories and task workspaces are provisioned.</small>\n");
-        html.put("  </div>\n\n");
-
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label for=\"config_defaultShell\">Default Shell</label>\n");
-        html.put("    <select id=\"config_defaultShell\" name=\"config_defaultShell\" class=\"form-control\">\n");
-        html.put(format("      <option value=\"powershell\"%s>PowerShell</option>\n", defaultShell == "powershell" ? " selected" : ""));
-        html.put(format("      <option value=\"bash\"%s>Bash</option>\n", defaultShell == "bash" ? " selected" : ""));
-        html.put(format("      <option value=\"sh\"%s>POSIX Shell (sh)</option>\n", defaultShell == "sh" ? " selected" : ""));
-        html.put(format("      <option value=\"cmd\"%s>Windows Command Prompt (cmd.exe)</option>\n", defaultShell == "cmd" ? " selected" : ""));
-        html.put("    </select>\n");
-        html.put("    <small class=\"form-help-text\">Primary shell invoked for generic script and command build steps.</small>\n");
-        html.put("  </div>\n\n");
-
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label for=\"config_allowedStepTypes\">Allowed Step Types (comma-separated)</label>\n");
-        html.put(format("    <input type=\"text\" id=\"config_allowedStepTypes\" name=\"config_allowedStepTypes\" value=\"%s\" class=\"form-control\" />\n", allowedStepsStr));
-        html.put("    <small class=\"form-help-text\">Supported build step types (e.g. process, bash, powershell, git).</small>\n");
-        html.put("  </div>\n");
-        html.put("</div>\n");
+        compileHTMLDietFile!("config.dt", concurrency, hostCores, workspaceDir, defaultShell, allowedStepsStr)(html);
 
         return html.data;
     }

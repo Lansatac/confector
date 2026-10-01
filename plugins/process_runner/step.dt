@@ -1,0 +1,8 @@
+div.step-subform.step-subform-process
+  div.form-group
+    label Command / Script to Execute
+    textarea.form-control.code-font.step-field-script(name="step_script", rows="3", placeholder="e.g. echo 'Building...' && dub build", required) #{script}
+    small.form-help-text Shell command or script executed using the default system shell.
+  div.form-group
+    label Working Directory (Optional)
+    input.form-control.step-field-working-dir(type="text", name="step_workingDirectory", placeholder="Subdirectory or relative path inside workspace", value=workingDir)

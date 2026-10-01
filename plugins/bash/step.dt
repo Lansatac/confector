@@ -1,0 +1,14 @@
+div.step-subform.step-subform-bash
+  div.form-group
+    label Bash Script (bash -c)
+    textarea.form-control.code-font.step-field-script(name="step_script", rows="4", placeholder="#!/usr/bin/env bash\necho 'Building...'\ndub test", required) #{script}
+    small.form-help-text
+      | Bash script executed with 
+      code bash -c
+      | .
+  div.form-group
+    label Working Directory (Optional)
+    input.form-control.step-field-working-dir(type="text", name="step_workingDirectory", placeholder="Subdirectory or relative path inside workspace", value=workingDir)
+  div.form-group
+    label Shell Executable
+    input.form-control.step-field-executable(type="text", name="step_param_executable", placeholder="bash or /bin/bash", value=executable)

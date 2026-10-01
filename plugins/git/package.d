@@ -1,4 +1,4 @@
-module confector.plugins.git;
+module plugins.git;
 
 import std.format;
 import std.process;
@@ -62,8 +62,8 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
 
     string renderStepFormHtml(in Json currentParameters) const
     {
+        import diet.html : compileHTMLDietFile;
         import std.array : appender;
-        import vibe.textfilter.html : htmlEscape;
 
         auto html = appender!string;
         string repoUrl = "";
@@ -82,27 +82,7 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             else if (auto p = "target" in currentParameters) targetDir = p.get!string;
         }
 
-        html.put("<div class=\"step-subform step-subform-git\">\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Repository URL / Address</label>\n");
-        html.put("    <input type=\"text\" name=\"step_param_repository\" class=\"form-control step-field-repository\" placeholder=\"e.g. https://github.com/org/repo.git or git@github.com:...\" value=\"");
-        html.put(htmlEscape(repoUrl));
-        html.put("\" required />\n");
-        html.put("    <small class=\"form-help-text\">Git clone URL for HTTPS, SSH, or local repository path.</small>\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Branch / Tag / Ref (Optional)</label>\n");
-        html.put("    <input type=\"text\" name=\"step_param_branch\" class=\"form-control step-field-branch\" placeholder=\"e.g. main, master, v1.0.0 (default branch if empty)\" value=\"");
-        html.put(htmlEscape(branch));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Target Subdirectory (Optional)</label>\n");
-        html.put("    <input type=\"text\" name=\"step_param_target_dir\" class=\"form-control step-field-target-dir\" placeholder=\"Subdirectory inside workspace (defaults to repository name)\" value=\"");
-        html.put(htmlEscape(targetDir));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("</div>\n");
+        compileHTMLDietFile!("step.dt", repoUrl, branch, targetDir)(html);
 
         return html.data;
     }

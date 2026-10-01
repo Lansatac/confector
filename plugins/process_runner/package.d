@@ -1,30 +1,30 @@
-module confector.plugins.process_runner;
+module plugins.process_runner;
 
 import std.format;
 import std.process;
 import std.stdio;
 import std.path : buildPath, isAbsolute;
 import vibe.core.log;
+import vibe.data.json : Json;
 
 import confector.core.model;
 import confector.core.plugin;
 import confector.core.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
-import confector.core.executor;
-import vibe.data.json : Json;
+import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
 
 /**
- * Standard local process execution runner plugin.
- * Implements TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces for OS process execution.
+ * Built-in ProcessRunner plugin.
+ * Implements TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces using system processes.
  */
-class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
+class ProcessRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
 {
-    @property string name() const { return "process-task-runner"; }
+    @property string name() const { return "process-runner"; }
     @property string versionString() const { return "1.0.0"; }
-    @property string description() const { return "Standard process execution runner and build step plugin"; }
+    @property string description() const { return "Executes build tasks and steps as local child processes"; }
     @property string runnerType() const { return "process"; }
-    @property string systemName() const { return "process-task-runner"; }
+    @property string systemName() const { return "process-execution-system"; }
     @property string stepType() const { return "process"; }
-    @property string displayName() const { return "Process / Script Runner"; }
+    @property string displayName() const { return "Process Command"; }
 
     void initialize() {}
     void shutdown() {}
@@ -57,8 +57,8 @@ class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildSt
 
     string renderStepFormHtml(in Json currentParameters) const
     {
+        import diet.html : compileHTMLDietFile;
         import std.array : appender;
-        import vibe.textfilter.html : htmlEscape;
 
         auto html = appender!string;
         string script = "";
@@ -73,21 +73,7 @@ class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildSt
             else if (auto p = "working_directory" in currentParameters) workingDir = p.get!string;
         }
 
-        html.put("<div class=\"step-subform step-subform-process\">\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Command / Script to Execute</label>\n");
-        html.put("    <textarea name=\"step_script\" class=\"form-control code-font step-field-script\" rows=\"3\" placeholder=\"e.g. echo 'Building...' && dub build\" required>");
-        html.put(htmlEscape(script));
-        html.put("</textarea>\n");
-        html.put("    <small class=\"form-help-text\">Shell command or script executed using the default system shell.</small>\n");
-        html.put("  </div>\n");
-        html.put("  <div class=\"form-group\">\n");
-        html.put("    <label>Working Directory (Optional)</label>\n");
-        html.put("    <input type=\"text\" name=\"step_workingDirectory\" class=\"form-control step-field-working-dir\" placeholder=\"Subdirectory or relative path inside workspace\" value=\"");
-        html.put(htmlEscape(workingDir));
-        html.put("\" />\n");
-        html.put("  </div>\n");
-        html.put("</div>\n");
+        compileHTMLDietFile!("step.dt", script, workingDir)(html);
 
         return html.data;
     }
@@ -99,7 +85,7 @@ class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildSt
 
     bool canExecute(in TaskNode task) const
     {
-        return task.script.length > 0 || task.hasCustomComponent("process_execution");
+        return task.script.length > 0 || task.hasCustomComponent("process_runner");
     }
 
     ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
@@ -124,6 +110,10 @@ class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildSt
 
             result.exitCode = wait(pipe.pid);
             result.success = (result.exitCode == 0);
+            if (!result.success)
+            {
+                result.errorMessage = format("Process exited with code %d", result.exitCode);
+            }
         }
         catch (Exception e)
         {
@@ -147,25 +137,23 @@ class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildSt
     bool canExecuteStep(in BuildStep step) const
     {
         return step.type == "process"
-            || step.type == "script"
             || step.type == "command"
-            || step.type == "shell"
-            || step.type == "exec"
-            || (step.type.length == 0 && (step.script.length > 0 || step.command.length > 0));
+            || step.type == "script"
+            || step.type == "shell";
     }
 
     StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
     {
         StepExecutionResult res;
         string commandToRun = step.script.length > 0 ? step.script : step.command;
-        if (commandToRun.length == 0 && "command" in step.parameters) commandToRun = step.parameters["command"];
         if (commandToRun.length == 0 && "script" in step.parameters) commandToRun = step.parameters["script"];
+        if (commandToRun.length == 0 && "command" in step.parameters) commandToRun = step.parameters["command"];
 
         if (commandToRun.length == 0)
         {
             res.success = false;
             res.exitCode = 1;
-            res.errorMessage = "No script or command specified for process build step";
+            res.errorMessage = "No command or script specified for build step";
             return res;
         }
 
@@ -227,48 +215,52 @@ class ProcessTaskRunnerPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildSt
     }
 }
 
+/// Alias for backwards compatibility with legacy imports
+alias ProcessTaskRunnerPlugin = ProcessRunnerPlugin;
+
 unittest
 {
-    auto runner = new ProcessTaskRunnerPlugin();
-    assert(runner.name == "process-task-runner");
-    assert(runner.runnerType == "process");
-    assert(runner.systemName == "process-task-runner");
-    assert(runner.stepType == "process");
-
-    ExecutionRequest req;
-    req.command = "echo test_runner_output";
-    assert(runner.canExecute(req));
-
-    TaskNode node;
-    node.id = "run-test";
-    node.script = "echo test_runner_output";
-    assert(runner.canExecute(node));
-
-    string[] logged;
-    auto result = runner.executeTask(node, req, (line) @safe {
-        // Log callback test
-    });
-    assert(result.success);
-    assert(result.exitCode == 0);
+    auto plugin = new ProcessRunnerPlugin();
+    assert(plugin.name == "process-runner");
+    assert(plugin.runnerType == "process");
+    assert(plugin.systemName == "process-execution-system");
+    assert(plugin.stepType == "process");
 
     BuildStep bStep;
     bStep.type = "process";
-    bStep.script = "echo build_step_output";
-    assert(runner.canExecuteStep(bStep));
+    bStep.script = "echo 'hello process step'";
+    assert(plugin.canExecuteStep(bStep));
+
+    BuildStep scriptStep;
+    scriptStep.type = "script";
+    scriptStep.script = "echo 'hello script step'";
+    assert(plugin.canExecuteStep(scriptStep));
+
+    BuildStep unknownStep;
+    unknownStep.type = "unsupported_xyz";
+    assert(!plugin.canExecuteStep(unknownStep));
 
     StepExecutionContext sCtx;
-    auto sRes = runner.executeStep(bStep, sCtx);
+    auto sRes = plugin.executeStep(bStep, sCtx);
     assert(sRes.success);
     assert(sRes.exitCode == 0);
+    assert(sRes.outputLines.length > 0);
+
+    // Empty command failure handling test
+    BuildStep emptyStep;
+    emptyStep.type = "process";
+    auto emptyRes = plugin.executeStep(emptyStep, sCtx);
+    assert(!emptyRes.success);
+    assert(emptyRes.exitCode != 0);
 
     // BuildStepProvider testing
-    assert(runner.displayName == "Process / Script Runner");
-    assert(runner.defaultParameters()["script"].get!string == "");
-    auto html = runner.renderStepFormHtml(Json.emptyObject);
+    assert(plugin.displayName == "Process Command");
+    assert(plugin.defaultParameters()["script"].get!string == "");
+    auto html = plugin.renderStepFormHtml(Json.emptyObject);
     assert(html.length > 0);
-    assert(runner.validateParameters(Json.emptyObject).length > 0);
+    assert(plugin.validateParameters(Json.emptyObject).length > 0);
 
     Json validParams = Json.emptyObject;
-    validParams["script"] = "echo 'ok'";
-    assert(runner.validateParameters(validParams).length == 0);
+    validParams["script"] = "echo 'valid command'";
+    assert(plugin.validateParameters(validParams).length == 0);
 }
