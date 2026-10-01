@@ -238,29 +238,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             }
             task.inputs.repositories = repos;
 
-            // Input files
-            string filesStr = req.form.get("input_files", "");
-            string[] files;
-            foreach (line; filesStr.split("\n"))
-            {
-                foreach (f; line.split(","))
-                {
-                    string s = f.strip();
-                    if (s.length > 0) files ~= s;
-                }
-            }
-            task.inputs.files = files;
-
-            // Input env
-            string envStr = req.form.get("input_env", "");
-            string[] envKeys;
-            foreach (e; envStr.split(","))
-            {
-                string s = e.strip();
-                if (s.length > 0) envKeys ~= s;
-            }
-            task.inputs.env = envKeys;
-
             // Upstream artifacts
             string upStr = req.form.get("upstream_artifacts", "");
             UpstreamArtifactRef[] upstreamRefs;

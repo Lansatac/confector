@@ -86,18 +86,6 @@ block maincontent
               button.btn.btn-outline.btn-sm#add-repo-btn(type="button", onclick="addRepoDependency()") + Add Repository
 
           div.form-group
-            label(for="input_files") Input File Globs (Comma or newline separated):
-            - string filesVal = "";
-            - foreach(i, f; task.inputs.files) { if (i > 0) filesVal ~= "\n"; filesVal ~= f; }
-            textarea.form-control#input_files(name="input_files", rows="3", placeholder="source/**/*.d\ndub.json\nviews/**/*.dt", style="font-family: monospace;") #{filesVal}
-
-          div.form-group
-            label(for="input_env") Environment Variables to Hash (Comma-separated keys):
-            - string envVal = "";
-            - foreach(i, e; task.inputs.env) { if (i > 0) envVal ~= ", "; envVal ~= e; }
-            input.form-control#input_env(type="text", name="input_env", value="#{envVal}", placeholder="e.g. CHEATS, BUILD_TYPE, DUB_ARGS")
-
-          div.form-group
             label(for="upstream_artifacts") Required Upstream Artifacts (Format: taskId:artifactPath per line):
             - string upVal = "";
             - foreach(i, up; task.inputs.upstreamArtifacts) { if (i > 0) upVal ~= "\n"; upVal ~= up.taskId ~ ":" ~ up.name; }

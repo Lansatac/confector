@@ -11,7 +11,7 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Rationale**: Linear pipelines artificially constrain execution order and prevent fine-grained dependency modeling. An explicit DAG allows maximal parallelism, fan-out/fan-in patterns, and exact dependency isolation.
 
 ### 1.2 Deterministic Content-Addressed Caching
-- **Decision**: Task execution is memoized using cryptographic input fingerprints (source files, environment variables, upstream artifact digests, and script definitions).
+- **Decision**: Task execution is memoized using cryptographic input fingerprints (upstream artifact digests, task configurations, custom components, and script definitions).
 - **Rationale**: Eliminates redundant computation. If inputs and upstream artifacts have not changed, execution is skipped with a `cached` status, enabling near-instant validation cycles.
 
 ### 1.3 Arbitrary Node-Level Triggers & Subgraph Slicing

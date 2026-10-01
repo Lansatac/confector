@@ -6,9 +6,8 @@ import confector.core.plugin : PluginRegistry;
 import std.algorithm : sort;
 import std.array : appender;
 import std.digest.sha : SHA256, toHexString, LetterCase, digest;
-import std.file : exists, isFile, read, dirEntries, SpanMode;
+import std.file : exists, isFile, read;
 import std.format : format;
-import std.path : globMatch, relativePath, buildNormalizedPath;
 import vibe.data.json : serializeToJsonString;
 
 /**
@@ -39,31 +38,6 @@ string computeFileSha256(string filePath) @trusted
     {
         throw new FingerprintException(format("Failed to read file for hashing '%s': %s", filePath, e.msg));
     }
-}
-
-/**
- * Computes deterministic SHA256 digest of input file hashes.
- */
-string computeFilesHashesDigest(in string[string] fileHashes) pure nothrow @trusted
-{
-    if (fileHashes.length == 0) return sha256Hex("");
-
-    string[] keys;
-    foreach (k; fileHashes.byKey)
-    {
-        keys ~= k;
-    }
-    keys.sort();
-
-    auto app = appender!string();
-    foreach (k; keys)
-    {
-        app.put(k);
-        app.put(":");
-        app.put(fileHashes[k]);
-        app.put("\n");
-    }
-    return sha256Hex(app.data);
 }
 
 /**
@@ -166,29 +140,21 @@ string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
  * Computes the full Node Fingerprint according to the specification:
  * NodeFingerprint = SHA256(
  *     TaskScriptContent
- *   + SortAndHash(InputFileContentHashes)
  *   + SortAndHash(UpstreamArtifactHashes)
- *   + SortAndHash(ResolvedEnvironmentVariables)
  *   + TaskConfigurationHash
  *   + CustomComponentsHash
  * )
  */
 string computeNodeFingerprint(
     in TaskNode task,
-    in string[string] inputFileHashes,
-    in string[string] upstreamArtifactHashes,
-    in string[string] resolvedEnv
+    in string[string] upstreamArtifactHashes
 ) @trusted
 {
     auto app = appender!string();
     app.put("SCRIPT:");
     app.put(task.script);
-    app.put("\nFILES:");
-    app.put(computeFilesHashesDigest(inputFileHashes));
     app.put("\nARTIFACTS:");
     app.put(computeArtifactHashesDigest(upstreamArtifactHashes));
-    app.put("\nENV:");
-    app.put(computeEnvDigest(resolvedEnv));
     app.put("\nCONFIG:");
     app.put(computeTaskConfigDigest(task));
     app.put("\nCOMPONENTS:");
@@ -198,49 +164,12 @@ string computeNodeFingerprint(
 }
 
 /**
- * Scans a base directory for files matching glob patterns and returns a map of relative path -> SHA256 hash.
- */
-string[string] collectAndHashInputFiles(string baseDir, in string[] patterns) @trusted
-{
-    string[string] result;
-    if (patterns.length == 0 || !exists(baseDir)) return result;
-
-    foreach (entry; dirEntries(baseDir, SpanMode.depth))
-    {
-        if (!entry.isFile) continue;
-
-        string relPath = buildNormalizedPath(relativePath(entry.name, baseDir));
-        // Normalize backslashes to forward slashes for cross-platform consistency
-        import std.array : replace;
-        string normalizedRel = relPath.replace("\\", "/");
-
-        bool matches = false;
-        foreach (pat; patterns)
-        {
-            string normalizedPat = pat.replace("\\", "/");
-            if (globMatch(normalizedRel, normalizedPat) || globMatch(relPath, pat))
-            {
-                matches = true;
-                break;
-            }
-        }
-
-        if (matches)
-        {
-            result[normalizedRel] = computeFileSha256(entry.name);
-        }
-    }
-
-    return result;
-}
-
-/**
  * High-level helper struct for fingerprint computation.
  */
 struct Fingerprinter
 {
     /**
-     * Resolves input files and environment variables from the workspace to compute the node fingerprint.
+     * Resolves task configuration and upstream artifact hashes to compute the node fingerprint.
      */
     static string computeNodeFingerprint(
         in TaskNode task,
@@ -248,18 +177,6 @@ struct Fingerprinter
         in string[string] upstreamArtifactHashes = null
     ) @trusted
     {
-        import std.process : environment;
-        string[string] fileHashes = collectAndHashInputFiles(workspaceDir, task.inputs.files);
-        string[string] resolvedEnv;
-        foreach (envVar; task.inputs.env)
-        {
-            auto val = environment.get(envVar, null);
-            if (val !is null)
-            {
-                resolvedEnv[envVar] = val;
-            }
-        }
-
         string[string] relevantArtifacts;
         if (upstreamArtifactHashes !is null)
         {
@@ -287,7 +204,7 @@ struct Fingerprinter
             }
         }
 
-        string baseFp = .computeNodeFingerprint(task, fileHashes, relevantArtifacts, resolvedEnv);
+        string baseFp = .computeNodeFingerprint(task, relevantArtifacts);
 
         // Incorporate registered FingerprintContributionSystem outputs if present
         auto contributors = PluginRegistry.instance.getFingerprintContributors();
@@ -295,7 +212,6 @@ struct Fingerprinter
         {
             FingerprintContributionContext ctx;
             ctx.workspaceDir = workspaceDir;
-            ctx.resolvedEnv = resolvedEnv;
             ctx.upstreamArtifactHashes = relevantArtifacts;
 
             auto app = appender!string();
@@ -324,29 +240,21 @@ unittest
     task.id = "build";
     task.script = "dub build --build=release";
     task.workingDirectory = "/workspace";
+    task.environment = ["DUB_ARGS": "-q", "RELEASE_TAG": "v1.0.0"];
 
-    string[string] fileHashes1 = [
-        "source/app.d": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "dub.json": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+    string[string] artifacts1 = [
+        "lint:reports/lint.json": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+        "test:coverage.xml": "b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef01"
     ];
 
     // Same hashes inserted in reverse order
-    string[string] fileHashes2 = [
-        "dub.json": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
-        "source/app.d": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    ];
-
-    string[string] artifacts = [
+    string[string] artifacts2 = [
+        "test:coverage.xml": "b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef01",
         "lint:reports/lint.json": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0"
     ];
 
-    string[string] env = [
-        "DUB_ARGS": "-q",
-        "RELEASE_TAG": "v1.0.0"
-    ];
-
-    string fp1 = computeNodeFingerprint(task, fileHashes1, artifacts, env);
-    string fp2 = computeNodeFingerprint(task, fileHashes2, artifacts, env);
+    string fp1 = computeNodeFingerprint(task, artifacts1);
+    string fp2 = computeNodeFingerprint(task, artifacts2);
 
     // 1. Must be deterministic regardless of associative array iteration order
     assert(fp1 == fp2, "Fingerprints must be identical across insertion order");
@@ -355,35 +263,29 @@ unittest
     // 2. Invalidation when script changes
     TaskNode taskModScript = task;
     taskModScript.script = "dub build --build=debug";
-    string fpModScript = computeNodeFingerprint(taskModScript, fileHashes1, artifacts, env);
+    string fpModScript = computeNodeFingerprint(taskModScript, artifacts1);
     assert(fpModScript != fp1, "Fingerprint must change when script changes");
 
-    // 3. Invalidation when input file hash changes
-    string[string] fileHashesMod = fileHashes1.dup;
-    fileHashesMod["source/app.d"] = "1111111111111111111111111111111111111111111111111111111111111111";
-    string fpModFiles = computeNodeFingerprint(task, fileHashesMod, artifacts, env);
-    assert(fpModFiles != fp1, "Fingerprint must change when file hash changes");
-
-    // 4. Invalidation when upstream artifact changes
-    string[string] artifactsMod = artifacts.dup;
+    // 3. Invalidation when upstream artifact changes
+    string[string] artifactsMod = artifacts1.dup;
     artifactsMod["lint:reports/lint.json"] = "2222222222222222222222222222222222222222222222222222222222222222";
-    string fpModArtifacts = computeNodeFingerprint(task, fileHashes1, artifactsMod, env);
+    string fpModArtifacts = computeNodeFingerprint(task, artifactsMod);
     assert(fpModArtifacts != fp1, "Fingerprint must change when upstream artifact changes");
 
-    // 5. Invalidation when environment variable changes
-    string[string] envMod = env.dup;
-    envMod["DUB_ARGS"] = "-v";
-    string fpModEnv = computeNodeFingerprint(task, fileHashes1, artifacts, envMod);
-    assert(fpModEnv != fp1, "Fingerprint must change when environment variable changes");
+    // 4. Invalidation when task environment configuration changes
+    TaskNode taskModEnv = task;
+    taskModEnv.environment["DUB_ARGS"] = "-v";
+    string fpModEnv = computeNodeFingerprint(taskModEnv, artifacts1);
+    assert(fpModEnv != fp1, "Fingerprint must change when task environment configuration changes");
 
-    // 6. Invalidation when custom component is added or modified
+    // 5. Invalidation when custom component is added or modified
     import vibe.data.json : Json;
     TaskNode taskCustom = task;
     taskCustom.setCustomComponent("s3_source", Json(["bucket": Json("artifacts-bucket"), "key": Json("item.zip")]));
-    string fpCustom = computeNodeFingerprint(taskCustom, fileHashes1, artifacts, env);
+    string fpCustom = computeNodeFingerprint(taskCustom, artifacts1);
     assert(fpCustom != fp1, "Fingerprint must change when custom component is added");
 
-    // 7. System contribution
+    // 6. System contribution
     class CustomFingerprintSystem : FingerprintContributionSystem
     {
         @property string systemName() const { return "custom-hash-system"; }
@@ -396,8 +298,8 @@ unittest
 
     auto sys = new CustomFingerprintSystem();
     PluginRegistry.instance.registerFingerprintContributor(sys);
-    string fpWithSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts);
+    string fpWithSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts1);
     PluginRegistry.instance.shutdownAll();
-    string fpWithoutSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts);
+    string fpWithoutSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts1);
     assert(fpWithSys != fpWithoutSys);
 }

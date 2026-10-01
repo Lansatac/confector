@@ -97,10 +97,6 @@ block maincontent
                     div
                       strong Repos: 
                       span #{t.inputs.repositories.length} repo(s)
-                  - if (t.inputs.files.length > 0)
-                    div
-                      strong Files: 
-                      span #{t.inputs.files.length} pattern(s)
                   - if (t.inputs.upstreamArtifacts.length > 0)
                     div
                       strong Upstream: 

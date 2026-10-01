@@ -71,9 +71,7 @@ struct UpstreamArtifactRef
  */
 struct TaskInputs
 {
-    @optional string[] files;
     @optional string[] repositories;
-    @optional string[] env;
     @optional @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
     @optional string[string] parameters;
 }
@@ -88,14 +86,6 @@ struct OutputArtifactDecl
 }
 
 /**
- * File input component data.
- */
-struct FileInputComponent
-{
-    @optional string[] files;
-}
-
-/**
  * Repository input component data.
  */
 struct RepositoryInputComponent
@@ -105,14 +95,6 @@ struct RepositoryInputComponent
     @optional string targetDirectory;
     @optional string branch;
     @optional string tag;
-}
-
-/**
- * Environment variable input component data.
- */
-struct EnvInputComponent
-{
-    @optional string[] env;
 }
 
 /**
@@ -204,19 +186,9 @@ struct TaskNode
         components[componentName] = data;
     }
 
-    FileInputComponent getFileInputComponent() const pure nothrow @safe
-    {
-        return FileInputComponent(inputs.files.dup);
-    }
-
     RepositoryInputComponent getRepositoryInputComponent() const pure nothrow @safe
     {
         return RepositoryInputComponent(inputs.repositories.dup);
-    }
-
-    EnvInputComponent getEnvInputComponent() const pure nothrow @safe
-    {
-        return EnvInputComponent(inputs.env.dup);
     }
 
     UpstreamArtifactInputComponent getUpstreamArtifactInputComponent() const pure nothrow @safe
@@ -365,9 +337,7 @@ unittest
     node.name = "Compile Application";
     node.dependsOn = ["lint"];
     node.script = "dub build";
-    node.inputs.files = ["source/**/*.d", "dub.json"];
     node.inputs.repositories = ["confector-repo", "common-utils"];
-    node.inputs.env = ["DUB_ARGS"];
     node.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports/lint.json")];
     node.outputs.artifacts = [OutputArtifactDecl("bin/confector", "binary")];
     node.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
@@ -419,9 +389,7 @@ unittest
     assert(taskArray[0].id == "task-1");
 
     // Test ECS component helpers
-    assert(node.getFileInputComponent().files == ["source/**/*.d", "dub.json"]);
     assert(node.getRepositoryInputComponent().repositories == ["confector-repo", "common-utils"]);
-    assert(node.getEnvInputComponent().env == ["DUB_ARGS"]);
     assert(node.getUpstreamArtifactInputComponent().upstreamArtifacts.length == 1);
     assert(node.getProcessExecutionComponent().script == "dub build");
     assert(node.getArtifactOutputComponent().artifacts.length == 1);

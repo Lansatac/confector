@@ -43,7 +43,6 @@ interface InputResolverSystem
 struct FingerprintContributionContext
 {
     string workspaceDir;
-    string[string] resolvedEnv;
     string[string] upstreamArtifactHashes;
     string[string] parameters;
 }
