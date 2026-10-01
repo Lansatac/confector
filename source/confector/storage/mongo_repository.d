@@ -21,6 +21,8 @@ class MongoBuildStateRepository : BuildStateRepository
     private MongoCollection m_buildsCollection;
     private MongoCollection m_logsCollection;
     private MongoCollection m_triggersCollection;
+    private MongoCollection m_projectsCollection;
+    private MongoCollection m_pipelinesCollection;
 
     this(MongoClient client, string dbName = "confector")
     {
@@ -29,6 +31,8 @@ class MongoBuildStateRepository : BuildStateRepository
         m_buildsCollection = client.getCollection(format("%s.builds", dbName));
         m_logsCollection = client.getCollection(format("%s.build_logs", dbName));
         m_triggersCollection = client.getCollection(format("%s.triggers", dbName));
+        m_projectsCollection = client.getCollection(format("%s.projects", dbName));
+        m_pipelinesCollection = client.getCollection(format("%s.pipelines", dbName));
     }
 
     override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
@@ -311,6 +315,183 @@ class MongoBuildStateRepository : BuildStateRepository
             Bson query = Bson.emptyObject;
             query["id"] = Bson(ruleId);
             auto res = m_triggersCollection.deleteOne(query);
+            return res.deletedCount > 0;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override void saveProject(in ProjectRecord project)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(project.id);
+
+            Bson update = Bson.emptyObject;
+            update["$set"] = serializeToBson(project);
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_projectsCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override bool getProject(string projectId, out ProjectRecord project)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(projectId);
+
+            auto doc = m_projectsCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return false;
+            }
+
+            project = deserializeBson!ProjectRecord(doc);
+            return true;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override ProjectRecord[] listProjects()
+    {
+        ProjectRecord[] list;
+        try
+        {
+            auto cursor = m_projectsCollection.find();
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!ProjectRecord(doc);
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override bool deleteProject(string projectId)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(projectId);
+            auto res = m_projectsCollection.deleteOne(query);
+            return res.deletedCount > 0;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override void savePipeline(in PipelineRecord pipeline)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(pipeline.id);
+
+            Bson update = Bson.emptyObject;
+            update["$set"] = serializeToBson(pipeline);
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_pipelinesCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override bool getPipeline(string pipelineId, out PipelineRecord pipeline)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(pipelineId);
+
+            auto doc = m_pipelinesCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return false;
+            }
+
+            pipeline = deserializeBson!PipelineRecord(doc);
+            return true;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override PipelineRecord[] listPipelinesForProject(string projectId)
+    {
+        PipelineRecord[] list;
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["project_id"] = Bson(projectId);
+            auto cursor = m_pipelinesCollection.find(query);
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!PipelineRecord(doc);
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override PipelineRecord[] listAllPipelines()
+    {
+        PipelineRecord[] list;
+        try
+        {
+            auto cursor = m_pipelinesCollection.find();
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!PipelineRecord(doc);
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override bool deletePipeline(string pipelineId)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(pipelineId);
+            auto res = m_pipelinesCollection.deleteOne(query);
             return res.deletedCount > 0;
         }
         catch (Exception e)

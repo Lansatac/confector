@@ -3,6 +3,8 @@ div.menu-item
 div.menu-item
   a.item-link(href="/") Dashboard
 div.menu-item
+  a.item-link(href="/projects/") Projects
+div.menu-item
   a.item-link(href="/builds/") Builds
 div.menu-item
   a.item-link(href="/pipelines/") Pipelines

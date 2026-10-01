@@ -10,6 +10,8 @@ import confector.runner.serverless_runner;
 import confector.queue.queue;
 
 import std.format : format;
+import std.uuid : randomUUID;
+import std.datetime.systime : Clock;
 
 URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
 {
@@ -321,7 +323,6 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
             TriggerRuleRecord rule = deserializeJson!TriggerRuleRecord(req.json);
             if (rule.id.length == 0)
             {
-                import std.uuid : randomUUID;
                 rule.id = "trig_" ~ randomUUID().toString();
             }
             if (rule.createdAt.length == 0)
@@ -354,6 +355,336 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
             Json resp = Json.emptyObject;
             resp["deleted"] = Json(ok);
             res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Projects REST API
+    router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            auto repo = engine.stateRepository;
+            auto projects = repo !is null ? repo.listProjects() : [];
+            res.writeJsonBody(projects);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.post("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            ProjectRecord proj = deserializeJson!ProjectRecord(req.json);
+            if (proj.id.length == 0)
+            {
+                proj.id = "proj_" ~ randomUUID().toString()[0 .. 8];
+            }
+            string now = Clock.currTime.toISOString();
+            if (proj.createdAt.length == 0)
+            {
+                proj.createdAt = now;
+            }
+            proj.updatedAt = now;
+
+            auto repo = engine.stateRepository;
+            if (repo !is null)
+            {
+                repo.saveProject(proj);
+            }
+            res.writeJsonBody(proj);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string projId = req.params["id"];
+            auto repo = engine.stateRepository;
+            ProjectRecord proj;
+            if (repo !is null && repo.getProject(projId, proj))
+            {
+                res.writeJsonBody(proj);
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Project not found: " ~ projId);
+                res.writeJsonBody(err);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.delete_("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string projId = req.params["id"];
+            auto repo = engine.stateRepository;
+            bool ok = repo !is null && repo.deleteProject(projId);
+            if (ok)
+            {
+                Json resp = Json.emptyObject;
+                resp["deleted"] = Json(true);
+                res.writeJsonBody(resp);
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Project not found: " ~ projId);
+                res.writeJsonBody(err);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/projects/:id/pipelines", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string projId = req.params["id"];
+            auto repo = engine.stateRepository;
+            auto pipes = repo !is null ? repo.listPipelinesForProject(projId) : [];
+            res.writeJsonBody(pipes);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.post("/projects/:id/pipelines", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string projId = req.params["id"];
+            PipelineRecord pipe = deserializeJson!PipelineRecord(req.json);
+            pipe.projectId = projId;
+            if (pipe.id.length == 0)
+            {
+                pipe.id = "pipe_" ~ randomUUID().toString()[0 .. 8];
+            }
+            string now = Clock.currTime.toISOString();
+            if (pipe.createdAt.length == 0)
+            {
+                pipe.createdAt = now;
+            }
+            pipe.updatedAt = now;
+
+            // Validate DAG
+            auto graph = new TaskGraph(pipe.definition);
+
+            auto repo = engine.stateRepository;
+            if (repo !is null)
+            {
+                repo.savePipeline(pipe);
+            }
+            res.writeJsonBody(pipe);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Pipelines REST API
+    router.get("/pipelines", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            auto repo = engine.stateRepository;
+            auto pipes = repo !is null ? repo.listAllPipelines() : [];
+            res.writeJsonBody(pipes);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/pipelines/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string pipeId = req.params["id"];
+            auto repo = engine.stateRepository;
+            PipelineRecord pipe;
+            if (repo !is null && repo.getPipeline(pipeId, pipe))
+            {
+                res.writeJsonBody(pipe);
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Pipeline not found: " ~ pipeId);
+                res.writeJsonBody(err);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.post("/pipelines/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string pipeId = req.params["id"];
+            PipelineRecord pipe = deserializeJson!PipelineRecord(req.json);
+            pipe.id = pipeId;
+            pipe.updatedAt = Clock.currTime.toISOString();
+
+            auto graph = new TaskGraph(pipe.definition);
+
+            auto repo = engine.stateRepository;
+            if (repo !is null)
+            {
+                repo.savePipeline(pipe);
+            }
+            res.writeJsonBody(pipe);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.delete_("/pipelines/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string pipeId = req.params["id"];
+            auto repo = engine.stateRepository;
+            bool ok = repo !is null && repo.deletePipeline(pipeId);
+            if (ok)
+            {
+                Json resp = Json.emptyObject;
+                resp["deleted"] = Json(true);
+                res.writeJsonBody(resp);
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Pipeline not found: " ~ pipeId);
+                res.writeJsonBody(err);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.post("/pipelines/:id/execute", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string pipeId = req.params["id"];
+            auto repo = engine.stateRepository;
+            PipelineRecord pipe;
+            if (repo is null || !repo.getPipeline(pipeId, pipe))
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Pipeline not found: " ~ pipeId);
+                res.writeJsonBody(err);
+                return;
+            }
+
+            Json bodyJson = req.json;
+            string targetTaskId = "";
+            bool force = false;
+            string workspaceDir = ".";
+
+            if ("target_task_id" in bodyJson && bodyJson["target_task_id"].type == Json.Type.string)
+            {
+                targetTaskId = bodyJson["target_task_id"].get!string;
+            }
+            if ("force" in bodyJson && bodyJson["force"].type == Json.Type.bool_)
+            {
+                force = bodyJson["force"].get!bool;
+            }
+            if ("workspace_dir" in bodyJson && bodyJson["workspace_dir"].type == Json.Type.string)
+            {
+                workspaceDir = bodyJson["workspace_dir"].get!string;
+            }
+            else if (pipe.projectId.length > 0)
+            {
+                ProjectRecord proj;
+                if (repo.getProject(pipe.projectId, proj) && proj.workspaceDir.length > 0)
+                {
+                    workspaceDir = proj.workspaceDir;
+                }
+            }
+
+            auto graph = new TaskGraph(pipe.definition);
+            string[] orderedTasks;
+            if (targetTaskId.length > 0)
+            {
+                orderedTasks = graph.resolveSubgraph(targetTaskId);
+            }
+            else
+            {
+                orderedTasks = graph.topologicalSort();
+            }
+
+            ExecutionPlan plan;
+            plan.orderedTaskIds = orderedTasks;
+            plan.toExecuteTaskIds = orderedTasks;
+
+            string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
+            if ("build_id" in bodyJson && bodyJson["build_id"].type == Json.Type.string)
+            {
+                buildId = bodyJson["build_id"].get!string;
+            }
+
+            auto execResult = engine.executePipeline(buildId, pipe.definition, plan, workspaceDir, force);
+            res.writeJsonBody(execResult);
         }
         catch (Exception e)
         {
@@ -437,4 +768,28 @@ unittest
     assert(stateRepo.getBuild("build_test_1", fetched));
     assert(fetched.status == "succeeded");
     assert(stateRepo.getBuildLogs("build_test_1").length == 1);
+
+    // Test Projects and Pipelines via repo
+    ProjectRecord proj;
+    proj.id = "proj_api_1";
+    proj.name = "API Project";
+    proj.workspaceDir = testDir;
+    stateRepo.saveProject(proj);
+    assert(stateRepo.listProjects().length == 1);
+
+    PipelineRecord pipe;
+    pipe.id = "pipe_api_1";
+    pipe.projectId = "proj_api_1";
+    pipe.name = "Test Pipeline";
+    TaskNode node;
+    node.id = "n1";
+    node.script = "echo hi";
+    pipe.definition.tasks = [node];
+    stateRepo.savePipeline(pipe);
+
+    assert(stateRepo.listPipelinesForProject("proj_api_1").length == 1);
+    assert(stateRepo.listAllPipelines().length == 1);
+    PipelineRecord fetchedPipe;
+    assert(stateRepo.getPipeline("pipe_api_1", fetchedPipe));
+    assert(fetchedPipe.name == "Test Pipeline");
 }

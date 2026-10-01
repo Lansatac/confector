@@ -120,6 +120,95 @@
     });
   }
 
+  window.renderPipelineDAG = function(canvasId, tasks, taskStatuses) {
+    if (!tasks || !tasks.length) return;
+    taskStatuses = taskStatuses || {};
+
+    // 1. Calculate in-degrees and levels
+    var graph = {};
+    var inDegree = {};
+    var taskMap = {};
+
+    tasks.forEach(function(t) {
+      taskMap[t.id] = t;
+      graph[t.id] = [];
+      inDegree[t.id] = 0;
+    });
+
+    tasks.forEach(function(t) {
+      var deps = t.depends_on || t.dependsOn || [];
+      deps.forEach(function(dep) {
+        if (graph[dep]) {
+          graph[dep].push(t.id);
+          inDegree[t.id] = (inDegree[t.id] || 0) + 1;
+        }
+      });
+    });
+
+    // Compute levels (longest path from roots)
+    var levels = {};
+    function computeLevel(nodeId, visited) {
+      if (levels[nodeId] !== undefined) return levels[nodeId];
+      var t = taskMap[nodeId];
+      if (!t) return 0;
+      var deps = t.depends_on || t.dependsOn || [];
+      if (!deps.length) {
+        levels[nodeId] = 0;
+        return 0;
+      }
+      var maxL = 0;
+      deps.forEach(function(d) {
+        if (!visited[d]) {
+          visited[d] = true;
+          maxL = Math.max(maxL, computeLevel(d, visited) + 1);
+        }
+      });
+      levels[nodeId] = maxL;
+      return maxL;
+    }
+
+    tasks.forEach(function(t) {
+      var visited = {};
+      visited[t.id] = true;
+      computeLevel(t.id, visited);
+    });
+
+    // Group nodes by level
+    var levelGroups = {};
+    var maxLevel = 0;
+    tasks.forEach(function(t) {
+      var lvl = levels[t.id] || 0;
+      if (lvl > maxLevel) maxLevel = lvl;
+      if (!levelGroups[lvl]) levelGroups[lvl] = [];
+      levelGroups[lvl].push(t);
+    });
+
+    // Assign coordinates
+    var nodes = [];
+    var edges = [];
+    var xSpacing = 160;
+    var startX = 40;
+
+    Object.keys(levelGroups).forEach(function(lvlKey) {
+      var lvl = parseInt(lvlKey, 10);
+      var group = levelGroups[lvl];
+      var totalInLvl = group.length;
+      group.forEach(function(t, idx) {
+        var x = startX + lvl * xSpacing;
+        var y = 40 + idx * 70;
+        var status = taskStatuses[t.id] || "ready";
+        nodes.push({ id: t.id, name: t.name || t.id, x: x, y: y, status: status });
+
+        var deps = t.depends_on || t.dependsOn || [];
+        deps.forEach(function(d) {
+          edges.push({ from: d, to: t.id });
+        });
+      });
+    });
+
+    renderGraph(canvasId, nodes, edges);
+  };
+
   window.renderSamplePipeline = function(canvasId) {
     var nodes = [
       { id: "lint", name: "lint", x: 40, y: 90, status: "ready" },

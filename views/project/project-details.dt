@@ -1,0 +1,78 @@
+extends layout
+
+block maincontent
+  div.projects-container
+    div.header-section
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 #{project.name}
+          p #{project.description.length > 0 ? project.description : "No description provided."}
+        div(style="display: flex; gap: 10px;")
+          a.btn.btn-primary(href="/pipelines/edit?project_id=#{project.id}") + Author Pipeline
+          a.btn.btn-outline(href="/projects/") Back to Projects
+
+    div.grid-2col(style="margin-top: 20px;")
+      div.card
+        h3 Project Configuration
+        table.data-table
+          tr
+            th ID
+            td
+              code #{project.id}
+          tr
+            th Workspace Directory
+            td
+              code #{project.workspaceDir}
+          tr
+            th Repository URL
+            td #{project.repositoryUrl.length > 0 ? project.repositoryUrl : "—"}
+          tr
+            th Created At
+            td #{project.createdAt}
+          tr
+            th Updated At
+            td #{project.updatedAt}
+
+      div.card
+        h3 Quick Actions
+        p Author custom arbitrary DAG execution pipelines for this workspace.
+        div(style="display: flex; flex-direction: column; gap: 10px;")
+          a.btn.btn-primary(href="/pipelines/edit?project_id=#{project.id}") Author New Pipeline DAG
+          form(action="/projects/delete", method="POST")
+            input(type="hidden", name="id", value="#{project.id}")
+            button.btn.btn-danger(type="submit", onclick="return confirm('Delete this project and all its pipelines?');") Delete Project
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Pipelines for #{project.name}
+
+    - if (pipelines.length == 0)
+      div.empty-state
+        p No pipelines configured for this project yet.
+        a.btn.btn-primary(href="/pipelines/edit?project_id=#{project.id}") Author Pipeline
+    - else
+      table.data-table
+        thead
+          tr
+            th Pipeline ID
+            th Name
+            th Tasks (Nodes)
+            th Description
+            th Actions
+        tbody
+          - foreach(pipe; pipelines)
+            tr
+              td
+                code #{pipe.id}
+              td
+                strong #{pipe.name}
+              td
+                span.badge.badge-info #{pipe.definition.tasks.length} node(s)
+              td #{pipe.description}
+              td
+                a.btn.btn-sm.btn-outline(href="/pipelines/edit?id=#{pipe.id}&project_id=#{project.id}", style="margin-right: 5px;") Edit DAG
+                form(action="/pipelines/run", method="POST", style="display:inline; margin-right: 5px;")
+                  input(type="hidden", name="id", value="#{pipe.id}")
+                  button.btn.btn-sm.btn-primary(type="submit") Execute
+                form(action="/pipelines/delete", method="POST", style="display:inline;")
+                  input(type="hidden", name="id", value="#{pipe.id}")
+                  button.btn.btn-sm.btn-danger(type="submit", onclick="return confirm('Delete pipeline?');") Delete

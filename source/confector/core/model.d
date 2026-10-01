@@ -2,7 +2,7 @@ module confector.core.model;
 
 import std.typecons : Nullable;
 import vibe.data.json;
-import vibe.data.serialization : asName = name;
+import vibe.data.serialization : asName = name, optional;
 
 /**
  * Task execution status states.
@@ -35,12 +35,12 @@ enum TriggerType : string
  */
 struct TriggerRule
 {
-    TriggerType type;
-    string[] branches;
-    string[] tags;
-    string endpoint;
-    string cronSchedule;
-    string[string] parameters;
+    @optional TriggerType type;
+    @optional string[] branches;
+    @optional string[] tags;
+    @optional string endpoint;
+    @optional string cronSchedule;
+    @optional string[string] parameters;
 }
 
 /**
@@ -48,13 +48,13 @@ struct TriggerRule
  */
 struct TriggerEvent
 {
-    TriggerType type;
-    string branch;
-    string tag;
-    string endpoint;
-    string[string] parameters;
-    bool force = false;
-    string targetTaskId;
+    @optional TriggerType type;
+    @optional string branch;
+    @optional string tag;
+    @optional string endpoint;
+    @optional string[string] parameters;
+    @optional bool force = false;
+    @optional string targetTaskId;
 }
 
 /**
@@ -63,7 +63,7 @@ struct TriggerEvent
 struct UpstreamArtifactRef
 {
     @asName("task_id") string taskId;
-    string name;
+    @optional string name;
 }
 
 /**
@@ -71,10 +71,10 @@ struct UpstreamArtifactRef
  */
 struct TaskInputs
 {
-    string[] files;
-    string[] env;
-    @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
-    string[string] parameters;
+    @optional string[] files;
+    @optional string[] env;
+    @optional @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
+    @optional string[string] parameters;
 }
 
 /**
@@ -83,7 +83,7 @@ struct TaskInputs
 struct OutputArtifactDecl
 {
     string path;
-    string type = "file";
+    @optional string type = "file";
 }
 
 /**
@@ -91,7 +91,7 @@ struct OutputArtifactDecl
  */
 struct TaskOutputs
 {
-    OutputArtifactDecl[] artifacts;
+    @optional OutputArtifactDecl[] artifacts;
 }
 
 /**
@@ -100,15 +100,15 @@ struct TaskOutputs
 struct TaskNode
 {
     string id;
-    string name;
-    @asName("depends_on") string[] dependsOn;
-    TaskInputs inputs;
-    TaskOutputs outputs;
-    string script;
-    TriggerRule[] triggers;
-    @asName("timeout_seconds") size_t timeoutSeconds = 900;
-    @asName("working_directory") string workingDirectory;
-    string[string] environment;
+    @optional string name;
+    @optional @asName("depends_on") string[] dependsOn;
+    @optional TaskInputs inputs;
+    @optional TaskOutputs outputs;
+    @optional string script;
+    @optional TriggerRule[] triggers;
+    @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
+    @optional @asName("working_directory") string workingDirectory;
+    @optional string[string] environment;
 }
 
 /**
@@ -116,8 +116,8 @@ struct TaskNode
  */
 struct PipelineDefinition
 {
-    @asName("version") string schemaVersion = "1.0";
-    TaskNode[] tasks;
+    @optional @asName("version") string schemaVersion = "1.0";
+    @optional TaskNode[] tasks;
 }
 
 /**
@@ -125,15 +125,15 @@ struct PipelineDefinition
  */
 struct ArtifactMetadata
 {
-    @asName("artifact_id") string artifactId;
-    @asName("build_id") string buildId;
-    @asName("task_id") string taskId;
-    @asName("file_path") string filePath;
-    string sha256;
-    @asName("size_bytes") ulong sizeBytes;
-    @asName("storage_backend") string storageBackend;
-    @asName("storage_uri") string storageUri;
-    @asName("created_at") string createdAt;
+    @optional @asName("artifact_id") string artifactId;
+    @optional @asName("build_id") string buildId;
+    @optional @asName("task_id") string taskId;
+    @optional @asName("file_path") string filePath;
+    @optional string sha256;
+    @optional @asName("size_bytes") ulong sizeBytes;
+    @optional @asName("storage_backend") string storageBackend;
+    @optional @asName("storage_uri") string storageUri;
+    @optional @asName("created_at") string createdAt;
 }
 
 /**
@@ -141,17 +141,17 @@ struct ArtifactMetadata
  */
 struct BuildRecord
 {
-    @asName("build_id") string buildId;
-    @asName("pipeline_name") string pipelineName = "default";
-    @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached
-    @asName("trigger_source") string triggerSource = "manual";
-    @asName("target_task_id") string targetTaskId;
-    @asName("workspace_dir") string workspaceDir;
-    @asName("started_at") string startedAt;
-    @asName("finished_at") string finishedAt;
-    @asName("duration_ms") ulong durationMs = 0;
-    @asName("executed_tasks") string[] executedTasks;
-    @asName("error_message") string errorMessage;
+    @optional @asName("build_id") string buildId;
+    @optional @asName("pipeline_name") string pipelineName = "default";
+    @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached
+    @optional @asName("trigger_source") string triggerSource = "manual";
+    @optional @asName("target_task_id") string targetTaskId;
+    @optional @asName("workspace_dir") string workspaceDir;
+    @optional @asName("started_at") string startedAt;
+    @optional @asName("finished_at") string finishedAt;
+    @optional @asName("duration_ms") ulong durationMs = 0;
+    @optional @asName("executed_tasks") string[] executedTasks;
+    @optional @asName("error_message") string errorMessage;
 }
 
 /**
@@ -159,15 +159,44 @@ struct BuildRecord
  */
 struct TriggerRuleRecord
 {
-    @asName("id") string id;
-    @asName("name") string name;
-    @asName("pipeline_id") string pipelineId = "default";
-    @asName("target_task_id") string targetTaskId;
-    @asName("trigger_type") string triggerType; // manual, git_push, git_tag, webhook, cron
-    @asName("criteria") string criteria; // e.g. branch pattern, cron expression, webhook token
-    @asName("force_execution") bool forceExecution = false;
-    @asName("enabled") bool enabled = true;
-    @asName("created_at") string createdAt;
+    @optional @asName("id") string id;
+    @optional @asName("name") string name;
+    @optional @asName("pipeline_id") string pipelineId = "default";
+    @optional @asName("target_task_id") string targetTaskId;
+    @optional @asName("trigger_type") string triggerType; // manual, git_push, git_tag, webhook, cron
+    @optional @asName("criteria") string criteria; // e.g. branch pattern, cron expression, webhook token
+    @optional @asName("force_execution") bool forceExecution = false;
+    @optional @asName("enabled") bool enabled = true;
+    @optional @asName("created_at") string createdAt;
+}
+
+/**
+ * Persisted record of a project workspace and repository configuration.
+ */
+struct ProjectRecord
+{
+    @optional @asName("id") string id;
+    @optional @asName("name") string name;
+    @optional @asName("description") string description;
+    @optional @asName("workspace_dir") string workspaceDir;
+    @optional @asName("repository_url") string repositoryUrl;
+    @optional @asName("default_pipeline_id") string defaultPipelineId;
+    @optional @asName("created_at") string createdAt;
+    @optional @asName("updated_at") string updatedAt;
+}
+
+/**
+ * Persisted record of a pipeline containing an arbitrary TaskNode DAG definition.
+ */
+struct PipelineRecord
+{
+    @optional @asName("id") string id;
+    @optional @asName("project_id") string projectId;
+    @optional @asName("name") string name;
+    @optional @asName("description") string description;
+    @optional @asName("definition") PipelineDefinition definition;
+    @optional @asName("created_at") string createdAt;
+    @optional @asName("updated_at") string updatedAt;
 }
 
 /**
@@ -236,4 +265,50 @@ unittest
     assert(deserialized.tasks[0].dependsOn == ["lint"]);
     assert(deserialized.tasks[0].inputs.upstreamArtifacts.length == 1);
     assert(deserialized.tasks[0].inputs.upstreamArtifacts[0].taskId == "lint");
+
+    // Test ProjectRecord serialization
+    ProjectRecord project;
+    project.id = "proj-1";
+    project.name = "Confector Project";
+    project.description = "Self build project";
+    project.workspaceDir = ".";
+    project.repositoryUrl = "https://github.com/example/confector";
+    project.defaultPipelineId = "pipe-1";
+    project.createdAt = "2026-09-30T12:00:00Z";
+    project.updatedAt = "2026-09-30T12:00:00Z";
+
+    Json projJson = serializeToJson(project);
+    assert(projJson["workspace_dir"].get!string == ".");
+    ProjectRecord projDeserialized = deserializeJson!ProjectRecord(projJson);
+    assert(projDeserialized.id == "proj-1");
+    assert(projDeserialized.workspaceDir == ".");
+
+    // Test PipelineRecord serialization
+    PipelineRecord pipelineRec;
+    pipelineRec.id = "pipe-1";
+    pipelineRec.projectId = "proj-1";
+    pipelineRec.name = "Self Build Pipeline";
+    pipelineRec.description = "Arbitrary pipeline";
+    pipelineRec.definition = pipeline;
+    pipelineRec.createdAt = "2026-09-30T12:00:00Z";
+    pipelineRec.updatedAt = "2026-09-30T12:00:00Z";
+
+    Json pipeJson = serializeToJson(pipelineRec);
+    assert(pipeJson["project_id"].get!string == "proj-1");
+    PipelineRecord pipeDeserialized = deserializeJson!PipelineRecord(pipeJson);
+    assert(pipeDeserialized.id == "pipe-1");
+    assert(pipeDeserialized.definition.tasks.length == 1);
+    assert(pipeDeserialized.definition.tasks[0].id == "build");
+
+    string sampleJsonStr = `{"version":"1.0","tasks":[{"id":"unit-tests","name":"Unit Tests","depends_on":[],"script":"dub test","inputs":{"files":["source/**/*.d","dub.json"],"env":[]}},{"id":"compile-release","name":"Compile Binary","depends_on":["unit-tests"],"script":"dub build --build=release","inputs":{"files":["source/**/*.d","views/**/*.dt","public/**/*","dub.json"]},"outputs":{"artifacts":[{"path":"confector.exe","type":"binary"}]}},{"id":"verify-artifact","name":"Verify Artifact","depends_on":["compile-release"],"script":"confector.exe --version || echo Binary verified","inputs":{"upstream_artifacts":[{"task_id":"compile-release","name":"confector.exe"}]}}]}`;
+    Json sampleParsed = parseJsonString(sampleJsonStr);
+    PipelineDefinition sampleDef = deserializeJson!PipelineDefinition(sampleParsed);
+    assert(sampleDef.tasks.length == 3);
+
+    // Test array-only format
+    string arrayJsonStr = `[{"id":"task-1","script":"echo hello"}]`;
+    Json arrayParsed = parseJsonString(arrayJsonStr);
+    TaskNode[] taskArray = deserializeJson!(TaskNode[])(arrayParsed);
+    assert(taskArray.length == 1);
+    assert(taskArray[0].id == "task-1");
 }

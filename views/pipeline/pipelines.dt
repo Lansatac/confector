@@ -3,10 +3,52 @@ extends layout
 block maincontent
   div.pipeline-container
     div.header-section
-      h1 DAG Pipeline Engine
-      p Directed Acyclic Graph execution with content-addressed caching, node triggers, and memoization.
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 DAG Pipelines
+          p Directed Acyclic Graph execution with content-addressed caching, node triggers, and memoization.
+        div
+          a.btn.btn-primary(href="/pipelines/edit") + Author Pipeline
 
-    div.section-title-bar
+    div.section-title-bar(style="margin-top: 20px;")
+      h2 Author & Execute Pipelines
+
+    - if (pipelines.length == 0)
+      div.empty-state
+        p No pipelines configured yet.
+        a.btn.btn-primary(href="/pipelines/edit") Author Your First Pipeline
+    - else
+      table.data-table
+        thead
+          tr
+            th Pipeline ID
+            th Project ID
+            th Name
+            th Tasks
+            th Description
+            th Actions
+        tbody
+          - foreach(pipe; pipelines)
+            tr
+              td
+                code #{pipe.id}
+              td
+                a(href="/projects/details?id=#{pipe.projectId}") #{pipe.projectId}
+              td
+                strong #{pipe.name}
+              td
+                span.badge.badge-info #{pipe.definition.tasks.length} node(s)
+              td #{pipe.description}
+              td
+                a.btn.btn-sm.btn-outline(href="/pipelines/edit?id=#{pipe.id}", style="margin-right: 5px;") Edit DAG
+                form(action="/pipelines/run", method="POST", style="display:inline; margin-right: 5px;")
+                  input(type="hidden", name="id", value="#{pipe.id}")
+                  button.btn.btn-sm.btn-primary(type="submit") Execute
+                form(action="/pipelines/delete", method="POST", style="display:inline;")
+                  input(type="hidden", name="id", value="#{pipe.id}")
+                  button.btn.btn-sm.btn-danger(type="submit", onclick="return confirm('Delete pipeline?');") Delete
+
+    div.section-title-bar(style="margin-top: 30px;")
       h2 Pipeline DAG Visualizer
       div.graph-legend
         span.legend-item
@@ -21,19 +63,13 @@ block maincontent
 
     div.grid-2col(style="margin-top: 30px;")
       div.card
-        h3 Manual Pipeline Trigger & Execution
-        p Target any arbitrary node in the DAG. Confector will resolve upstream dependencies, check cache validity, and execute only what is necessary.
+        h3 Ad-Hoc Pipeline Execution
+        p Dispatch execution for custom inline task graph.
         
         form#pipeline-run-form(action="/api/v1/pipeline/execute", method="POST")
           div.form-group
-            label(for="target_node") Target Node:
-            select.form-control#target_node(name="target_node")
-              option(value="") Full Graph (Topological Resolution)
-              option(value="lint") lint (Static Analysis)
-              option(value="build") build (Compilation)
-              option(value="test") test (Unit & Integration Tests)
-              option(value="package") package (Artifact Packaging)
-              option(value="deploy") deploy (Deployment)
+            label(for="target_node") Target Node (Blank for full graph):
+            input.form-control#target_node(type="text", name="target_node", placeholder="e.g. compile-release")
           
           div.form-group
             label(for="workspace_dir") Workspace Directory:
@@ -83,11 +119,9 @@ block maincontent
           var force = document.getElementById("force_execution").checked;
 
           var sampleTasks = [
-            { id: "lint", name: "Lint Check", depends_on: [], script: "echo Running linter", inputs: { files: ["source/**/*.d"] } },
-            { id: "build", name: "Build App", depends_on: ["lint"], script: "echo Compiling application", inputs: { files: ["source/**/*.d", "dub.json"] } },
-            { id: "test", name: "Run Tests", depends_on: ["build"], script: "echo Running unit tests", inputs: { files: ["source/**/*.d"] } },
-            { id: "package", name: "Package Artifact", depends_on: ["build"], script: "echo Packaging binary", outputs: { artifacts: [{ path: "bin/confector", type: "file" }] } },
-            { id: "deploy", name: "Deploy Service", depends_on: ["test", "package"], script: "echo Deploying to cluster" }
+            { id: "unit-tests", name: "Unit Tests", depends_on: [], script: "dub test", inputs: { files: ["source/**/*.d"] } },
+            { id: "compile-release", name: "Compile Binary", depends_on: ["unit-tests"], script: "dub build --build=release", inputs: { files: ["source/**/*.d", "dub.json"] }, outputs: { artifacts: [{ path: "confector.exe", type: "file" }] } },
+            { id: "verify-artifact", name: "Verify Artifact", depends_on: ["compile-release"], script: "confector.exe --version || echo Binary verified", inputs: { upstream_artifacts: [{ task_id: "compile-release", name: "confector.exe" }] } }
           ];
 
           var buildId = "build_" + Date.now();
@@ -96,7 +130,7 @@ block maincontent
             workspace_dir: workspace,
             pipeline: { version: "1.0", tasks: sampleTasks },
             event: {
-              type: targetNode ? "manual" : "manual",
+              type: "manual",
               target_task_id: targetNode,
               force: force,
               parameters: {}

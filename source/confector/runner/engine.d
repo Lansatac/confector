@@ -127,15 +127,52 @@ class TaskEngine
             m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.running);
         }
 
+        // Resolve working directory
+        string effectiveWorkingDir = task.workingDirectory.length > 0
+            ? (isAbsolute(task.workingDirectory) ? task.workingDirectory : buildPath(workspaceDir, task.workingDirectory))
+            : workspaceDir;
+
         // 4. Retrieve any upstream artifacts required into workspace
-        if (m_artifactStorage !is null && task.inputs.upstreamArtifacts.length > 0)
+        if (task.inputs.upstreamArtifacts.length > 0)
         {
+            if (m_artifactStorage is null)
+            {
+                result.status = TaskStatus.failed;
+                result.errorMessage = "ArtifactStorage is null but task requires upstream artifacts";
+                if (m_stateRepo !is null)
+                {
+                    m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                }
+                sw.stop();
+                result.durationMs = sw.peek.total!"msecs";
+                return result;
+            }
+
             foreach (refArt; task.inputs.upstreamArtifacts)
             {
-                string targetLocal = buildPath(workspaceDir, refArt.name);
-                if (m_artifactStorage.artifactExists(buildId, refArt.taskId, refArt.name))
+                if (!m_artifactStorage.artifactExists(buildId, refArt.taskId, refArt.name))
                 {
-                    m_artifactStorage.retrieveArtifact(buildId, refArt.taskId, refArt.name, targetLocal);
+                    result.status = TaskStatus.failed;
+                    result.errorMessage = format("Missing upstream artifact '%s' from task '%s'", refArt.name, refArt.taskId);
+                    if (m_stateRepo !is null)
+                    {
+                        m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                        m_stateRepo.appendBuildLog(buildId, format("[%s] Error: %s", task.id, result.errorMessage));
+                    }
+                    if (logCallback !is null)
+                    {
+                        logCallback(format("[confector] Task '%s' failed: %s", task.id, result.errorMessage));
+                    }
+                    sw.stop();
+                    result.durationMs = sw.peek.total!"msecs";
+                    return result;
+                }
+
+                string targetLocal = buildPath(effectiveWorkingDir, refArt.name);
+                m_artifactStorage.retrieveArtifact(buildId, refArt.taskId, refArt.name, targetLocal);
+                if (logCallback !is null)
+                {
+                    logCallback(format("[confector] Staged upstream artifact '%s' from task '%s' to '%s'", refArt.name, refArt.taskId, targetLocal));
                 }
             }
         }
@@ -160,9 +197,7 @@ class TaskEngine
         // 6. Prepare ExecutionRequest
         ExecutionRequest req;
         req.command = task.script;
-        req.workingDirectory = task.workingDirectory.length > 0
-            ? (isAbsolute(task.workingDirectory) ? task.workingDirectory : buildPath(workspaceDir, task.workingDirectory))
-            : workspaceDir;
+        req.workingDirectory = effectiveWorkingDir;
 
         // Build environment
         foreach (k, v; task.environment)
@@ -217,6 +252,10 @@ class TaskEngine
                 {
                     auto meta = m_artifactStorage.storeArtifact(buildId, task.id, localArtifactPath, artDecl.type);
                     producedArtifacts ~= meta;
+                    if (logCallback !is null)
+                    {
+                        logCallback(format("[confector] Stored output artifact '%s' (SHA256: %s)", artDecl.path, meta.sha256[0 .. 8]));
+                    }
                 }
             }
         }
@@ -315,7 +354,11 @@ class TaskEngine
             // Track produced artifact hashes for downstream tasks
             foreach (art; taskRes.producedArtifacts)
             {
+                import std.path : baseName;
                 currentArtifactHashes[art.filePath] = art.sha256;
+                currentArtifactHashes[baseName(art.filePath)] = art.sha256;
+                currentArtifactHashes[format("%s:%s", art.taskId, baseName(art.filePath))] = art.sha256;
+                currentArtifactHashes[format("%s:%s", art.taskId, art.filePath)] = art.sha256;
             }
 
             if (taskRes.status == TaskStatus.failed)
@@ -403,4 +446,48 @@ unittest
     // Forced execution: should re-run
     auto res3 = engine.executeTask("build_3", node1, testDir, null, true);
     assert(res3.status == TaskStatus.succeeded);
+
+    // Multi-node pipeline test with artifact staging
+    TaskNode node2;
+    node2.id = "step2";
+    node2.name = "Step 2";
+    node2.dependsOn = ["step1"];
+    node2.inputs.upstreamArtifacts = [UpstreamArtifactRef("step1", "output.txt")];
+    version(Windows)
+    {
+        node2.script = "cmd /c \"type output.txt > result.txt\"";
+    }
+    else
+    {
+        node2.script = "cat output.txt > result.txt";
+    }
+    node2.outputs.artifacts = [OutputArtifactDecl("result.txt", "file")];
+
+    PipelineDefinition pipelineDef;
+    pipelineDef.tasks = [node1, node2];
+
+    ExecutionPlan plan;
+    plan.orderedTaskIds = ["step1", "step2"];
+
+    // Execute full pipeline
+    auto pipeRes1 = engine.executePipeline("build_pipe_1", pipelineDef, plan, testDir);
+    assert(pipeRes1.success);
+    assert(pipeRes1.executedOrder == ["step1", "step2"]);
+    assert(pipeRes1.taskResults["step2"].status == TaskStatus.succeeded);
+    assert(storage.artifactExists("build_pipe_1", "step2", "result.txt"));
+
+    // Second pipeline execution without changes: all nodes should be cached
+    auto pipeRes2 = engine.executePipeline("build_pipe_2", pipelineDef, plan, testDir);
+    assert(pipeRes2.success);
+    assert(pipeRes2.taskResults["step1"].status == TaskStatus.cached);
+    assert(pipeRes2.taskResults["step2"].status == TaskStatus.cached);
+
+    // Missing upstream artifact failure test
+    TaskNode nodeBad;
+    nodeBad.id = "bad_step";
+    nodeBad.inputs.upstreamArtifacts = [UpstreamArtifactRef("non_existent_task", "missing.txt")];
+    nodeBad.script = "cmd /c \"echo should not run\"";
+    auto badRes = engine.executeTask("build_bad", nodeBad, testDir);
+    assert(badRes.status == TaskStatus.failed);
+    assert(badRes.errorMessage.length > 0);
 }

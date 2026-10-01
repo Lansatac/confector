@@ -221,7 +221,35 @@ struct Fingerprinter
                 resolvedEnv[envVar] = val;
             }
         }
-        return .computeNodeFingerprint(task, fileHashes, upstreamArtifactHashes, resolvedEnv);
+
+        string[string] relevantArtifacts;
+        if (upstreamArtifactHashes !is null)
+        {
+            if (task.inputs.upstreamArtifacts.length > 0)
+            {
+                foreach (refArt; task.inputs.upstreamArtifacts)
+                {
+                    string key1 = format("%s:%s", refArt.taskId, refArt.name);
+                    string key2 = refArt.name;
+                    auto p1 = key1 in upstreamArtifactHashes;
+                    auto p2 = key2 in upstreamArtifactHashes;
+                    if (p1 !is null)
+                    {
+                        relevantArtifacts[key1] = *p1;
+                    }
+                    else if (p2 !is null)
+                    {
+                        relevantArtifacts[key1] = *p2;
+                    }
+                }
+            }
+            else
+            {
+                relevantArtifacts = cast(string[string])upstreamArtifactHashes;
+            }
+        }
+
+        return .computeNodeFingerprint(task, fileHashes, relevantArtifacts, resolvedEnv);
     }
 }
 

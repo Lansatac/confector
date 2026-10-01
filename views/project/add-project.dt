@@ -1,0 +1,33 @@
+extends layout
+
+block maincontent
+  div.projects-container
+    div.header-section
+      h1 Create Project
+      p Define a new project workspace directory and repository configuration.
+
+    div.card(style="max-width: 680px; margin-top: 20px;")
+      form(action="/projects/add", method="POST")
+        div.form-group
+          label(for="id") Project Identifier:
+          input.form-control#id(type="text", name="id", placeholder="e.g. confector-core (optional, auto-generated if empty)")
+
+        div.form-group
+          label(for="name") Project Name:
+          input.form-control#name(type="text", name="name", placeholder="e.g. Confector Core Engine", required)
+
+        div.form-group
+          label(for="description") Description:
+          textarea.form-control#description(name="description", rows="3", placeholder="Description of the project workspace and build targets")
+
+        div.form-group
+          label(for="workspace_dir") Workspace Directory (Root path for file globs & scripts):
+          input.form-control#workspace_dir(type="text", name="workspace_dir", value=".", placeholder="e.g. . or /path/to/repo", required)
+
+        div.form-group
+          label(for="repository_url") Repository URL (Optional):
+          input.form-control#repository_url(type="text", name="repository_url", placeholder="https://github.com/org/repo")
+
+        div(style="margin-top: 20px; display: flex; gap: 10px;")
+          button.btn.btn-primary(type="submit") Save Project
+          a.btn.btn-outline(href="/projects/") Cancel

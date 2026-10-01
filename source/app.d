@@ -77,6 +77,7 @@ void main()
   router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
 
   // Mount dashboard, builds, pipelines, and trigger UI
+  router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/pipelines/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/triggers/*", dashboardRouter(taskEngine, workQueue, stateRepo));

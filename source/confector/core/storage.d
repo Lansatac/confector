@@ -92,7 +92,27 @@ class LocalArtifactStorage : ArtifactStorage
         string filename = baseName(artifactPath);
         string sourcePath = buildPath(m_baseStorageDir, buildId, taskId, filename);
 
-        if (!exists(sourcePath))
+        if (!exists(sourcePath) || !isFile(sourcePath))
+        {
+            if (exists(m_baseStorageDir))
+            {
+                import std.file : dirEntries, SpanMode;
+                foreach (entry; dirEntries(m_baseStorageDir, SpanMode.shallow))
+                {
+                    if (entry.isDir)
+                    {
+                        string altPath = buildPath(entry.name, taskId, filename);
+                        if (exists(altPath) && isFile(altPath))
+                        {
+                            sourcePath = altPath;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!exists(sourcePath) || !isFile(sourcePath))
         {
             throw new Exception(format("Artifact not found in storage: %s (looked at %s)", artifactPath, sourcePath));
         }
@@ -110,7 +130,24 @@ class LocalArtifactStorage : ArtifactStorage
     {
         string filename = baseName(artifactPath);
         string sourcePath = buildPath(m_baseStorageDir, buildId, taskId, filename);
-        return exists(sourcePath) && isFile(sourcePath);
+        if (exists(sourcePath) && isFile(sourcePath)) return true;
+
+        if (exists(m_baseStorageDir))
+        {
+            import std.file : dirEntries, SpanMode;
+            foreach (entry; dirEntries(m_baseStorageDir, SpanMode.shallow))
+            {
+                if (entry.isDir)
+                {
+                    string altPath = buildPath(entry.name, taskId, filename);
+                    if (exists(altPath) && isFile(altPath))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     override bool getArtifactMetadata(string buildId, string taskId, string artifactPath, out ArtifactMetadata metadata)
@@ -203,6 +240,51 @@ interface BuildStateRepository
      * Deletes a configured trigger rule by ID.
      */
     bool deleteTriggerRule(string ruleId);
+
+    /**
+     * Saves or updates a project record.
+     */
+    void saveProject(in ProjectRecord project);
+
+    /**
+     * Retrieves a project record by ID.
+     */
+    bool getProject(string projectId, out ProjectRecord project);
+
+    /**
+     * Lists all registered projects.
+     */
+    ProjectRecord[] listProjects();
+
+    /**
+     * Deletes a project record by ID.
+     */
+    bool deleteProject(string projectId);
+
+    /**
+     * Saves or updates a pipeline record.
+     */
+    void savePipeline(in PipelineRecord pipeline);
+
+    /**
+     * Retrieves a pipeline record by ID.
+     */
+    bool getPipeline(string pipelineId, out PipelineRecord pipeline);
+
+    /**
+     * Lists all pipelines belonging to a project.
+     */
+    PipelineRecord[] listPipelinesForProject(string projectId);
+
+    /**
+     * Lists all pipelines across all projects.
+     */
+    PipelineRecord[] listAllPipelines();
+
+    /**
+     * Deletes a pipeline record by ID.
+     */
+    bool deletePipeline(string pipelineId);
 }
 
 /**
@@ -221,6 +303,8 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private BuildRecord[string] m_builds;
     private string[][string] m_buildLogs;
     private TriggerRuleRecord[string] m_triggerRules;
+    private ProjectRecord[string] m_projects;
+    private PipelineRecord[string] m_pipelines;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -334,6 +418,93 @@ class InMemoryBuildStateRepository : BuildStateRepository
         }
         return false;
     }
+
+    override void saveProject(in ProjectRecord project)
+    {
+        m_projects[project.id] = cast()project;
+    }
+
+    override bool getProject(string projectId, out ProjectRecord project)
+    {
+        auto p = projectId in m_projects;
+        if (p !is null)
+        {
+            project = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override ProjectRecord[] listProjects()
+    {
+        ProjectRecord[] list;
+        foreach (p; m_projects)
+        {
+            list ~= p;
+        }
+        return list;
+    }
+
+    override bool deleteProject(string projectId)
+    {
+        auto p = projectId in m_projects;
+        if (p !is null)
+        {
+            m_projects.remove(projectId);
+            return true;
+        }
+        return false;
+    }
+
+    override void savePipeline(in PipelineRecord pipeline)
+    {
+        m_pipelines[pipeline.id] = cast()pipeline;
+    }
+
+    override bool getPipeline(string pipelineId, out PipelineRecord pipeline)
+    {
+        auto p = pipelineId in m_pipelines;
+        if (p !is null)
+        {
+            pipeline = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override PipelineRecord[] listPipelinesForProject(string projectId)
+    {
+        PipelineRecord[] list;
+        foreach (p; m_pipelines)
+        {
+            if (p.projectId == projectId)
+            {
+                list ~= p;
+            }
+        }
+        return list;
+    }
+
+    override PipelineRecord[] listAllPipelines()
+    {
+        PipelineRecord[] list;
+        foreach (p; m_pipelines)
+        {
+            list ~= p;
+        }
+        return list;
+    }
+
+    override bool deletePipeline(string pipelineId)
+    {
+        auto p = pipelineId in m_pipelines;
+        if (p !is null)
+        {
+            m_pipelines.remove(pipelineId);
+            return true;
+        }
+        return false;
+    }
 }
 
 unittest
@@ -395,4 +566,43 @@ unittest
     assert(stateRepo.listTriggerRules().length == 1);
     assert(stateRepo.deleteTriggerRule("trig_1"));
     assert(stateRepo.listTriggerRules().length == 0);
+
+    // Project and Pipeline persistence in InMemoryBuildStateRepository
+    ProjectRecord proj;
+    proj.id = "proj-confector";
+    proj.name = "Confector";
+    proj.workspaceDir = ".";
+    proj.createdAt = "2026-09-30T12:00:00Z";
+    proj.updatedAt = "2026-09-30T12:00:00Z";
+
+    stateRepo.saveProject(proj);
+    assert(stateRepo.listProjects().length == 1);
+    ProjectRecord fetchedProj;
+    assert(stateRepo.getProject("proj-confector", fetchedProj));
+    assert(fetchedProj.name == "Confector");
+
+    PipelineRecord pipe;
+    pipe.id = "pipe-build";
+    pipe.projectId = "proj-confector";
+    pipe.name = "Build Pipeline";
+    TaskNode node;
+    node.id = "build";
+    node.script = "dub build";
+    pipe.definition.tasks = [node];
+    pipe.createdAt = "2026-09-30T12:00:00Z";
+    pipe.updatedAt = "2026-09-30T12:00:00Z";
+
+    stateRepo.savePipeline(pipe);
+    assert(stateRepo.listAllPipelines().length == 1);
+    assert(stateRepo.listPipelinesForProject("proj-confector").length == 1);
+    assert(stateRepo.listPipelinesForProject("other-project").length == 0);
+    PipelineRecord fetchedPipe;
+    assert(stateRepo.getPipeline("pipe-build", fetchedPipe));
+    assert(fetchedPipe.definition.tasks.length == 1);
+    assert(fetchedPipe.definition.tasks[0].id == "build");
+
+    assert(stateRepo.deletePipeline("pipe-build"));
+    assert(stateRepo.listAllPipelines().length == 0);
+    assert(stateRepo.deleteProject("proj-confector"));
+    assert(stateRepo.listProjects().length == 0);
 }
