@@ -1,0 +1,54 @@
+extends layout
+
+block maincontent
+  div.executors-container
+    div.header-section
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 Edit Executor: #{executor.name}
+          p Modify runtime parameters, concurrency limits, and enablement status.
+        div
+          a.btn.btn-outline(href="/executors/details?id=#{executor.id}") Back to Details
+
+    - if (errorMessage.length > 0)
+      div.alert.alert-danger #{errorMessage}
+
+    div.card(style="max-width: 720px; margin-top: 20px;")
+      form(action="/executors/save", method="POST")
+        input(type="hidden", name="id", value="#{executor.id}")
+        input(type="hidden", name="provider_type", value="#{executor.providerType}")
+
+        div.form-group
+          label Identifier:
+          input.form-control(type="text", value="#{executor.id}", disabled)
+
+        div.form-group
+          label Provider Type:
+          input.form-control(type="text", value="#{executor.providerType}", disabled)
+
+        div.form-group
+          label(for="name") Display Name:
+          input.form-control#name(type="text", name="name", value="#{executor.name}", required)
+
+        div.form-group
+          label(for="description") Description:
+          textarea.form-control#description(name="description", rows="2") #{executor.description}
+
+        div.form-group(style="margin: 20px 0; background-color: #f8fafc; padding: 12px; border-radius: 6px; border: 1px solid #e2e8f0;")
+          label(style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;")
+            - if (executor.enabled)
+              input(type="checkbox", name="enabled", value="true", checked)
+            - else
+              input(type="checkbox", name="enabled", value="true")
+            strong Enable Executor
+          small(style="color: #64748b; display: block; margin-top: 4px; margin-left: 24px;")
+            | When checked, tasks can be assigned and dispatched to this executor instance.
+
+        div.section-title-bar(style="margin-top: 20px; border-bottom: 1px solid #cbd5e1; padding-bottom: 6px;")
+          h3(style="margin: 0; font-size: 1.1em;") Provider Configuration
+
+        != configFormHtml
+
+        div(style="margin-top: 25px; display: flex; gap: 10px;")
+          button.btn.btn-primary(type="submit") Save Changes
+          a.btn.btn-outline(href="/executors/details?id=#{executor.id}") Cancel

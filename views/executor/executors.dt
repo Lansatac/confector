@@ -1,0 +1,114 @@
+extends layout
+
+block maincontent
+  - import vibe.data.json : Json;
+  div.executors-container
+    div.header-section
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 Executors
+          p Manage build execution backends, worker concurrency, and plugin-defined runner configurations.
+        div
+          a.btn.btn-primary(href="/executors/add") + Add Executor
+
+    div.stats-grid(style="margin-top: 20px;")
+      div.stat-card
+        div.stat-value #{executors.length}
+        div.stat-label Total Configured Executors
+      div.stat-card
+        div.stat-value #{enabledCount}
+        div.stat-label Active / Enabled
+      div.stat-card
+        div.stat-value #{disabledCount}
+        div.stat-label Disabled (Safe Mode)
+      div.stat-card
+        div.stat-value #{providers.length}
+        div.stat-label Available Provider Types
+
+    div.section-title-bar(style="margin-top: 25px;")
+      h2 Configured Executor Instances
+
+    - if (executors.length == 0)
+      div.empty-state
+        p No executor instances configured yet. All newly created executors remain disabled by default for host protection.
+        a.btn.btn-primary(href="/executors/add", style="margin-top: 10px;") Provision First Executor
+    - else
+      table.data-table
+        thead
+          tr
+            th Status
+            th Name & ID
+            th Provider
+            th Concurrency / Workspace
+            th Supported Steps
+            th Actions
+        tbody
+          - foreach(e; executors)
+            tr
+              td
+                - if (e.enabled)
+                  span.badge.badge-enabled Active
+                - else
+                  span.badge.badge-disabled Disabled
+              td
+                div(style="font-weight: bold;")
+                  a(href="/executors/details?id=#{e.id}", style="text-decoration: none;") #{e.name}
+                div(style="color: #64748b; font-size: 0.85em;")
+                  code #{e.id}
+                - if (e.description.length > 0)
+                  div(style="color: #475569; font-size: 0.85em; margin-top: 3px;") #{e.description}
+              td
+                span.badge.badge-secondary #{e.providerType}
+              td
+                div
+                  strong Concurrency: 
+                  - if (e.configuration.type == Json.Type.object && "maxConcurrency" in e.configuration)
+                    span #{e.configuration["maxConcurrency"]}
+                  - else
+                    span Default
+                div(style="color: #64748b; font-size: 0.85em;")
+                  - if (e.configuration.type == Json.Type.object && "workspaceDir" in e.configuration)
+                    code #{e.configuration["workspaceDir"].get!string}
+                  - else
+                    span Default Workspace
+              td
+                div(style="display: flex; flex-wrap: wrap; gap: 4px;")
+                  - if (e.configuration.type == Json.Type.object && "allowedStepTypes" in e.configuration && e.configuration["allowedStepTypes"].type == Json.Type.array)
+                    - foreach(step; e.configuration["allowedStepTypes"])
+                      span.badge.badge-info #{step.get!string}
+                  - else
+                    span.badge.badge-info process
+                    span.badge.badge-info bash
+                    span.badge.badge-info powershell
+                    span.badge.badge-info git
+              td
+                div(style="display: flex; gap: 6px; align-items: center;")
+                  a.btn.btn-sm.btn-outline(href="/executors/details?id=#{e.id}") Details
+                  a.btn.btn-sm.btn-primary(href="/executors/edit?id=#{e.id}") Edit
+                  form(action="/executors/toggle", method="POST", style="display:inline; margin: 0;")
+                    input(type="hidden", name="id", value="#{e.id}")
+                    - if (e.enabled)
+                      button.btn.btn-sm.btn-warning(type="submit") Disable
+                    - else
+                      button.btn.btn-sm.btn-success(type="submit") Enable
+                  form(action="/executors/delete", method="POST", style="display:inline; margin: 0;")
+                    input(type="hidden", name="id", value="#{e.id}")
+                    button.btn.btn-sm.btn-danger(type="submit", onclick="return confirm('Delete executor?');") Delete
+
+    div.section-title-bar(style="margin-top: 35px;")
+      h2 Registered Plugin Providers
+
+    div.details-grid(style="margin-top: 15px;")
+      - foreach(p; providers)
+        div.card(style="padding: 16px; margin: 0;")
+          div(style="display: flex; justify-content: space-between; align-items: start;")
+            h3(style="margin: 0; font-size: 1.1em;") #{p.displayName}
+            span.badge.badge-secondary #{p.providerType}
+          p(style="color: #475569; font-size: 0.9em; margin: 8px 0;") #{p.description}
+          div(style="margin-top: 10px;")
+            strong(style="font-size: 0.85em; color: #334155;") Supported Step Handlers:
+            div(style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;")
+              - foreach(s; p.supportedStepTypes)
+                span.badge.badge-info #{s}
+          div(style="margin-top: 15px;")
+            a.btn.btn-sm.btn-outline(href="/executors/add?provider=#{p.providerType}") + Create #{p.displayName} Instance

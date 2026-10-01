@@ -23,6 +23,8 @@ docs.json
 __dummy.html
 docs/
 
+confector-test-library
+
 # Code coverage
 *.lst
 /confector

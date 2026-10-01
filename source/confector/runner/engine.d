@@ -673,4 +673,59 @@ unittest
     {
         assert(exists(buildPath(testDir, "ps.txt")));
     }
+
+    // Executor Provider & Persistence Integration Test
+    import confector.plugins.local_executor : LocalExecutorPlugin;
+    import confector.core.executor : ExecutorRecord, ExecutorProvider, TaskExecutor;
+    import controller.executor_controller : executorRouter;
+
+    auto localExecPlugin = new LocalExecutorPlugin();
+    PluginRegistry.instance.registerPlugin(localExecPlugin);
+
+    auto providers = PluginRegistry.instance.getExecutorProviders();
+    assert(providers.length >= 1);
+    auto foundLocal = PluginRegistry.instance.getExecutorProvider("local");
+    assert(foundLocal !is null);
+    assert(foundLocal.supportedStepTypes.length >= 4);
+
+    // Verify sub-template generation
+    auto localDefConfig = foundLocal.defaultConfig();
+    string formHtml = foundLocal.renderConfigFormHtml(localDefConfig);
+    assert(formHtml.length > 0);
+
+    // Verify newly instantiated executor is disabled by default
+    ExecutorRecord execRecord;
+    execRecord.id = "exec_integ_1";
+    execRecord.name = "Integration Test Runner";
+    execRecord.providerType = "local";
+    execRecord.description = "Test runner instance";
+    execRecord.enabled = false;
+    execRecord.configuration = localDefConfig;
+
+    stateRepo.saveExecutor(execRecord);
+    ExecutorRecord fetchedExec;
+    assert(stateRepo.getExecutor("exec_integ_1", fetchedExec));
+    assert(!fetchedExec.enabled);
+
+    auto taskExec = foundLocal.createExecutor(fetchedExec);
+    assert(!taskExec.isEnabled);
+
+    ExecutionRequest execReq;
+    execReq.command = "echo local_integration_exec";
+    auto disabledExecRes = taskExec.execute(execReq);
+    assert(!disabledExecRes.success);
+    assert(disabledExecRes.exitCode != 0);
+
+    // Toggle enabled and execute
+    fetchedExec.enabled = true;
+    stateRepo.saveExecutor(fetchedExec);
+    auto enabledTaskExec = foundLocal.createExecutor(fetchedExec);
+    assert(enabledTaskExec.isEnabled);
+    auto enabledExecRes = enabledTaskExec.execute(execReq);
+    assert(enabledExecRes.success);
+    assert(enabledExecRes.exitCode == 0);
+
+    // Test controller router creation
+    auto execRouter = executorRouter(stateRepo, PluginRegistry.instance);
+    assert(execRouter !is null);
 }

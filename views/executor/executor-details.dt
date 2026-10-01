@@ -1,0 +1,82 @@
+extends layout
+
+block maincontent
+  - import vibe.data.json : Json;
+  div.executors-container
+    div.header-section
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          div(style="display: flex; align-items: center; gap: 12px;")
+            h1(style="margin: 0;") #{executor.name}
+            - if (executor.enabled)
+              span.badge.badge-enabled(style="font-size: 0.9em;") Active
+            - else
+              span.badge.badge-disabled(style="font-size: 0.9em;") Disabled
+          p(style="margin-top: 6px; color: #64748b;") #{executor.description.length > 0 ? executor.description : "No description provided."}
+        div(style="display: flex; gap: 8px;")
+          a.btn.btn-outline(href="/executors/") &larr; All Executors
+          a.btn.btn-primary(href="/executors/edit?id=#{executor.id}") Edit Configuration
+          form(action="/executors/toggle", method="POST", style="display:inline; margin: 0;")
+            input(type="hidden", name="id", value="#{executor.id}")
+            input(type="hidden", name="redirect_to", value="/executors/details?id=#{executor.id}")
+            - if (executor.enabled)
+              button.btn.btn-warning(type="submit") Disable Executor
+            - else
+              button.btn.btn-success(type="submit") Enable Executor
+
+    div.details-grid(style="margin-top: 25px;")
+      div.detail-item
+        strong Identifier:
+        div
+          code #{executor.id}
+      div.detail-item
+        strong Provider:
+        div
+          span.badge.badge-secondary #{executor.providerType}
+          - if (provider !is null)
+            span(style="margin-left: 6px; font-size: 0.9em; color: #475569;") #{provider.displayName}
+      div.detail-item
+        strong Status:
+        div
+          - if (executor.enabled)
+            span.badge.badge-enabled Active (Receiving Tasks)
+          - else
+            span.badge.badge-disabled Disabled (Safe Mode)
+      div.detail-item
+        strong Created At:
+        div #{executor.createdAt.length > 0 ? executor.createdAt : "—"}
+      div.detail-item
+        strong Last Updated:
+        div #{executor.updatedAt.length > 0 ? executor.updatedAt : "—"}
+
+    div.section-title-bar(style="margin-top: 25px;")
+      h2 Capabilities & Step Types
+
+    div.card(style="margin-top: 15px; padding: 18px;")
+      strong Supported Build Step Handlers:
+      div(style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;")
+        - if (executor.configuration.type == Json.Type.object && "allowedStepTypes" in executor.configuration && executor.configuration["allowedStepTypes"].type == Json.Type.array)
+          - foreach(step; executor.configuration["allowedStepTypes"])
+            span.badge.badge-info #{step.get!string}
+        - else if (provider !is null)
+          - foreach(step; provider.supportedStepTypes)
+            span.badge.badge-info #{step}
+        - else
+          span.badge.badge-info process
+          span.badge.badge-info bash
+          span.badge.badge-info powershell
+          span.badge.badge-info git
+
+    div.section-title-bar(style="margin-top: 25px;")
+      h2 Stored Configuration
+
+    div.card(style="margin-top: 15px; padding: 18px;")
+      pre(style="background-color: #1e293b; color: #f8fafc; padding: 16px; border-radius: 6px; overflow-x: auto; margin: 0; font-size: 0.9em;")
+        code #{configPrettyJson}
+
+    div(style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;")
+      div(style="color: #94a3b8; font-size: 0.85em;")
+        | Dangerous actions:
+      form(action="/executors/delete", method="POST", style="margin: 0;")
+        input(type="hidden", name="id", value="#{executor.id}")
+        button.btn.btn-danger(type="submit", onclick="return confirm('Permanently remove this executor configuration?');") Delete Executor

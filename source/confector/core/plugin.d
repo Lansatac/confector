@@ -2,6 +2,7 @@ module confector.core.plugin;
 
 import confector.core.model : TaskNode, BuildStep;
 import confector.core.system : InputResolverSystem, FingerprintContributionSystem, TaskExecutionSystem, ArtifactPublishingSystem, BuildStepSystem;
+import confector.core.executor : ExecutorProvider;
 
 /**
  * Base interface for all Confector plugins.
@@ -30,6 +31,7 @@ final class PluginRegistry
     private TaskExecutionSystem[] _executionSystems;
     private ArtifactPublishingSystem[] _artifactPublishers;
     private BuildStepSystem[] _stepSystems;
+    private ExecutorProvider[] _executorProviders;
 
     public static PluginRegistry instance()
     {
@@ -65,6 +67,10 @@ final class PluginRegistry
         if (auto stepSystem = cast(BuildStepSystem) plugin)
         {
             registerStepSystem(stepSystem);
+        }
+        if (auto provider = cast(ExecutorProvider) plugin)
+        {
+            registerExecutorProvider(provider);
         }
     }
 
@@ -113,6 +119,15 @@ final class PluginRegistry
         }
     }
 
+    public void registerExecutorProvider(ExecutorProvider provider)
+    {
+        import std.algorithm : canFind;
+        if (!_executorProviders.canFind(provider))
+        {
+            _executorProviders ~= provider;
+        }
+    }
+
     public InputResolverSystem[] getInputResolvers()
     {
         return _inputResolvers;
@@ -136,6 +151,23 @@ final class PluginRegistry
     public BuildStepSystem[] getStepSystems()
     {
         return _stepSystems;
+    }
+
+    public ExecutorProvider[] getExecutorProviders()
+    {
+        return _executorProviders;
+    }
+
+    public ExecutorProvider getExecutorProvider(string providerType)
+    {
+        foreach (p; _executorProviders)
+        {
+            if (p.providerType == providerType)
+            {
+                return p;
+            }
+        }
+        return null;
     }
 
     public BuildStepSystem findStepSystem(in BuildStep step)
@@ -199,6 +231,7 @@ final class PluginRegistry
         _executionSystems.length = 0;
         _artifactPublishers.length = 0;
         _stepSystems.length = 0;
+        _executorProviders.length = 0;
     }
 }
 
@@ -281,8 +314,38 @@ unittest
     bStep.type = "test-step";
     assert(registry.findStepSystem(bStep) is integrated);
 
+    // Test ExecutorProvider registration
+    import vibe.data.json : Json;
+    import confector.core.executor : ExecutorRecord, TaskExecutor;
+
+    class TestExecutorProvider : Plugin, ExecutorProvider
+    {
+        @property string name() const { return "test-exec-provider"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Test executor provider"; }
+        @property string providerType() const { return "test-type"; }
+        @property string displayName() const { return "Test Type"; }
+        @property string[] supportedStepTypes() const { return ["test-step"]; }
+
+        void initialize() {}
+        void shutdown() {}
+
+        Json defaultConfig() const { return Json.emptyObject; }
+        string[] validateConfig(in Json config) const { return null; }
+        string renderConfigFormHtml(in Json currentConfig) const { return "<div>Test</div>"; }
+        TaskExecutor createExecutor(in ExecutorRecord record) const { return null; }
+    }
+
+    auto execProvider = new TestExecutorProvider();
+    registry.registerPlugin(execProvider);
+
+    assert(registry.getExecutorProviders().length == 1);
+    assert(registry.getExecutorProvider("test-type") is execProvider);
+    assert(registry.getExecutorProvider("non-existent") is null);
+
     registry.shutdownAll();
     assert(registry.getInputResolvers().length == 0);
     assert(registry.getExecutionSystems().length == 0);
     assert(registry.getStepSystems().length == 0);
+    assert(registry.getExecutorProviders().length == 0);
 }

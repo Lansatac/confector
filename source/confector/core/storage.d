@@ -1,6 +1,7 @@
 module confector.core.storage;
 
 import confector.core.model;
+import confector.core.executor : ExecutorRecord;
 import std.file : exists, isFile, isDir, mkdirRecurse, read, write, copy;
 import std.path : buildPath, dirName, baseName;
 import std.format : format;
@@ -280,6 +281,26 @@ interface BuildStateRepository
      * Deletes a repository record by name.
      */
     bool deleteRepository(string name);
+
+    /**
+     * Saves or updates an executor record.
+     */
+    void saveExecutor(in ExecutorRecord executor);
+
+    /**
+     * Retrieves an executor record by ID.
+     */
+    bool getExecutor(string id, out ExecutorRecord executor);
+
+    /**
+     * Lists all configured executors.
+     */
+    ExecutorRecord[] listExecutors();
+
+    /**
+     * Deletes an executor record by ID.
+     */
+    bool deleteExecutor(string id);
 }
 
 /**
@@ -300,6 +321,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private TriggerRuleRecord[string] m_triggerRules;
     private ProjectRecord[string] m_projects;
     private RepositoryRecord[string] m_repositories;
+    private ExecutorRecord[string] m_executors;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -487,6 +509,43 @@ class InMemoryBuildStateRepository : BuildStateRepository
         }
         return false;
     }
+
+    override void saveExecutor(in ExecutorRecord executor)
+    {
+        m_executors[executor.id] = cast()executor;
+    }
+
+    override bool getExecutor(string id, out ExecutorRecord executor)
+    {
+        auto p = id in m_executors;
+        if (p !is null)
+        {
+            executor = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override ExecutorRecord[] listExecutors()
+    {
+        ExecutorRecord[] list;
+        foreach (e; m_executors)
+        {
+            list ~= e;
+        }
+        return list;
+    }
+
+    override bool deleteExecutor(string id)
+    {
+        auto p = id in m_executors;
+        if (p !is null)
+        {
+            m_executors.remove(id);
+            return true;
+        }
+        return false;
+    }
 }
 
 unittest
@@ -583,4 +642,36 @@ unittest
     assert(fetchedRepo.address == "https://github.com/confector/confector.git");
     assert(stateRepo.deleteRepository("confector-core"));
     assert(stateRepo.listRepositories().length == 0);
+
+    // Executor persistence in InMemoryBuildStateRepository
+    import vibe.data.json : Json;
+    ExecutorRecord exec;
+    exec.id = "exec-local-1";
+    exec.name = "Local Executor 1";
+    exec.providerType = "local";
+    exec.description = "Primary local runner";
+    exec.enabled = false;
+    exec.configuration = Json.emptyObject;
+    exec.configuration["maxConcurrency"] = 8;
+    exec.createdAt = "2026-09-30T12:00:00Z";
+    exec.updatedAt = "2026-09-30T12:00:00Z";
+
+    stateRepo.saveExecutor(exec);
+    assert(stateRepo.listExecutors().length == 1);
+    ExecutorRecord fetchedExec;
+    assert(stateRepo.getExecutor("exec-local-1", fetchedExec));
+    assert(fetchedExec.name == "Local Executor 1");
+    assert(!fetchedExec.enabled);
+    assert(fetchedExec.configuration["maxConcurrency"].get!int == 8);
+
+    // Toggle enabled
+    fetchedExec.enabled = true;
+    stateRepo.saveExecutor(fetchedExec);
+    ExecutorRecord updatedExec;
+    assert(stateRepo.getExecutor("exec-local-1", updatedExec));
+    assert(updatedExec.enabled);
+
+    assert(stateRepo.deleteExecutor("exec-local-1"));
+    assert(stateRepo.listExecutors().length == 0);
+    assert(!stateRepo.getExecutor("exec-local-1", fetchedExec));
 }

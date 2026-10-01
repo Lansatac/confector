@@ -2,6 +2,7 @@ module confector.storage.mongo_repository;
 
 import confector.core.model;
 import confector.core.storage;
+import confector.core.executor : ExecutorRecord;
 
 import vibe.db.mongo.client : MongoClient;
 import vibe.db.mongo.collection : MongoCollection, FindOptions, UpdateOptions;
@@ -23,6 +24,7 @@ class MongoBuildStateRepository : BuildStateRepository
     private MongoCollection m_triggersCollection;
     private MongoCollection m_projectsCollection;
     private MongoCollection m_repositoriesCollection;
+    private MongoCollection m_executorsCollection;
 
     this(MongoClient client, string dbName = "confector")
     {
@@ -33,6 +35,7 @@ class MongoBuildStateRepository : BuildStateRepository
         m_triggersCollection = client.getCollection(format("%s.triggers", dbName));
         m_projectsCollection = client.getCollection(format("%s.projects", dbName));
         m_repositoriesCollection = client.getCollection(format("%s.repositories", dbName));
+        m_executorsCollection = client.getCollection(format("%s.executors", dbName));
     }
 
     override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
@@ -489,6 +492,84 @@ class MongoBuildStateRepository : BuildStateRepository
             Bson query = Bson.emptyObject;
             query["name"] = Bson(name);
             auto res = m_repositoriesCollection.deleteOne(query);
+            return res.deletedCount > 0;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override void saveExecutor(in ExecutorRecord executor)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(executor.id);
+
+            Bson update = Bson.emptyObject;
+            Bson setFields = serializeToBson(executor);
+            update["$set"] = setFields;
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_executorsCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+        }
+    }
+
+    override bool getExecutor(string id, out ExecutorRecord executor)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(id);
+
+            auto doc = m_executorsCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return false;
+            }
+
+            executor = deserializeBson!ExecutorRecord(doc);
+            return true;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    override ExecutorRecord[] listExecutors()
+    {
+        ExecutorRecord[] list;
+        try
+        {
+            auto cursor = m_executorsCollection.find();
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!ExecutorRecord(doc);
+                }
+                catch (Exception e) {}
+            }
+        }
+        catch (Exception e)
+        {
+        }
+        return list;
+    }
+
+    override bool deleteExecutor(string id)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["id"] = Bson(id);
+            auto res = m_executorsCollection.deleteOne(query);
             return res.deletedCount > 0;
         }
         catch (Exception e)

@@ -1,0 +1,49 @@
+extends layout
+
+block maincontent
+  div.executors-container
+    div.header-section
+      h1 Add Executor Instance
+      p Configure and provision a new task execution backend. All new executors remain disabled by default until verified.
+
+    - if (errorMessage.length > 0)
+      div.alert.alert-danger #{errorMessage}
+
+    div.card(style="max-width: 720px; margin-top: 20px;")
+      form(action="/executors/add", method="POST")
+        div.form-group
+          label(for="provider_type") Executor Provider:
+          select.form-control#provider_type(name="provider_type", onchange="window.location.href='/executors/add?provider=' + this.value;")
+            - foreach(p; providers)
+              - if (selectedProvider !is null && p.providerType == selectedProvider.providerType)
+                option(value="#{p.providerType}", selected) #{p.displayName} (#{p.providerType})
+              - else
+                option(value="#{p.providerType}") #{p.displayName} (#{p.providerType})
+
+        - if (selectedProvider !is null)
+          p(style="color: #475569; font-size: 0.9em; margin-bottom: 15px;") #{selectedProvider.description}
+
+        div.form-group
+          label(for="id") Executor Identifier (Unique Key):
+          input.form-control#id(type="text", name="id", placeholder="e.g. local-worker-1 (optional, auto-generated if empty)")
+
+        div.form-group
+          label(for="name") Display Name:
+          input.form-control#name(type="text", name="name", placeholder="e.g. Primary Host Runner", required)
+
+        div.form-group
+          label(for="description") Description:
+          textarea.form-control#description(name="description", rows="2", placeholder="Description of this executor instance and target tasks")
+
+        div(style="background-color: #f1f5f9; border-left: 4px solid #64748b; padding: 12px 16px; margin: 20px 0; border-radius: 4px;")
+          strong(style="color: #1e293b;") Disabled by Default Policy
+          p(style="margin: 4px 0 0 0; font-size: 0.9em; color: #475569;") This executor will be created in a disabled state to prevent untrusted execution. You can enable it in the dashboard once configured.
+
+        div.section-title-bar(style="margin-top: 20px; border-bottom: 1px solid #cbd5e1; padding-bottom: 6px;")
+          h3(style="margin: 0; font-size: 1.1em;") Provider-Specific Configuration
+
+        != configFormHtml
+
+        div(style="margin-top: 25px; display: flex; gap: 10px;")
+          button.btn.btn-primary(type="submit") Create Executor Instance
+          a.btn.btn-outline(href="/executors/") Cancel

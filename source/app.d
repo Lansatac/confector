@@ -4,6 +4,7 @@ import vibe.vibe;
 import controller.repositorycontroller;
 import controller.api_controller;
 import controller.dashboard_controller;
+import controller.executor_controller;
 import confector.core.plugin;
 import confector.core.storage;
 import confector.storage.mongo_repository;
@@ -14,6 +15,7 @@ import confector.plugins.git;
 import confector.plugins.process_runner;
 import confector.plugins.bash;
 import confector.plugins.powershell;
+import confector.plugins.local_executor;
 
 debug static import std.stdio;
 
@@ -63,6 +65,7 @@ void main()
   PluginRegistry.instance.registerPlugin(new ProcessTaskRunnerPlugin());
   PluginRegistry.instance.registerPlugin(new BashPlugin());
   PluginRegistry.instance.registerPlugin(new PowerShellPlugin());
+  PluginRegistry.instance.registerPlugin(new LocalExecutorPlugin());
   writeln("Initialized modular plugins.");
 
   // Initialize execution engine & storage
@@ -80,9 +83,11 @@ void main()
   // Mount API & serverless execution endpoints
   router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
 
-  // Mount dashboard, builds, and projects UI
+  // Mount dashboard, builds, projects, and executors UI
   router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance));
+  router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
   router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo));
 
   router.any("/repositories/*", repositoryRouter(client));
