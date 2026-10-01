@@ -5,19 +5,22 @@ import std.process;
 import std.stdio;
 import vibe.core.log;
 
+import confector.core.model;
 import confector.core.plugin;
+import confector.core.system : TaskExecutionSystem;
 import confector.core.executor;
 
 /**
  * Standard local process execution runner plugin.
- * Implements the TaskRunner interface for OS process execution.
+ * Implements the TaskRunner and TaskExecutionSystem interfaces for OS process execution.
  */
-class ProcessTaskRunnerPlugin : TaskRunner
+class ProcessTaskRunnerPlugin : TaskRunner, TaskExecutionSystem
 {
     @property string name() const { return "process-task-runner"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "Standard process execution runner plugin"; }
     @property string runnerType() const { return "process"; }
+    @property string systemName() const { return "process-task-runner"; }
 
     void initialize() {}
     void shutdown() {}
@@ -25,6 +28,11 @@ class ProcessTaskRunnerPlugin : TaskRunner
     bool canExecute(in ExecutionRequest request) const
     {
         return request.command.length > 0;
+    }
+
+    bool canExecute(in TaskNode task) const
+    {
+        return task.script.length > 0 || task.hasCustomComponent("process_execution");
     }
 
     ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
@@ -63,6 +71,11 @@ class ProcessTaskRunnerPlugin : TaskRunner
 
         return result;
     }
+
+    ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null)
+    {
+        return execute(request, logCallback);
+    }
 }
 
 unittest
@@ -70,13 +83,19 @@ unittest
     auto runner = new ProcessTaskRunnerPlugin();
     assert(runner.name == "process-task-runner");
     assert(runner.runnerType == "process");
+    assert(runner.systemName == "process-task-runner");
 
     ExecutionRequest req;
     req.command = "echo test_runner_output";
     assert(runner.canExecute(req));
 
+    TaskNode node;
+    node.id = "run-test";
+    node.script = "echo test_runner_output";
+    assert(runner.canExecute(node));
+
     string[] logged;
-    auto result = runner.execute(req, (line) @safe {
+    auto result = runner.executeTask(node, req, (line) @safe {
         // Log callback test
     });
     assert(result.success);

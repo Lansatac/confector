@@ -1,12 +1,15 @@
 module confector.core.fingerprinter;
 
 import confector.core.model;
+import confector.core.system : FingerprintContributionContext, FingerprintContributionSystem;
+import confector.core.plugin : PluginRegistry;
 import std.algorithm : sort;
 import std.array : appender;
 import std.digest.sha : SHA256, toHexString, LetterCase, digest;
 import std.file : exists, isFile, read, dirEntries, SpanMode;
 import std.format : format;
 import std.path : globMatch, relativePath, buildNormalizedPath;
+import vibe.data.json : serializeToJsonString;
 
 /**
  * Computes the SHA256 hex string of a byte slice or string.
@@ -114,6 +117,38 @@ string computeEnvDigest(in string[string] resolvedEnv) pure nothrow @trusted
 }
 
 /**
+ * Computes deterministic SHA256 digest of attached custom components.
+ */
+string computeCustomComponentsDigest(in TaskNode task) @trusted
+{
+    if (task.components is null || task.components.length == 0) return sha256Hex("");
+
+    string[] keys;
+    foreach (k; task.components.byKey)
+    {
+        keys ~= k;
+    }
+    keys.sort();
+
+    auto app = appender!string();
+    foreach (k; keys)
+    {
+        app.put(k);
+        app.put("=");
+        try
+        {
+            app.put(serializeToJsonString(task.components[k]));
+        }
+        catch (Exception e)
+        {
+            app.put(task.components[k].toString());
+        }
+        app.put("\n");
+    }
+    return sha256Hex(app.data);
+}
+
+/**
  * Computes deterministic SHA256 digest of task configuration metadata.
  */
 string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
@@ -135,6 +170,7 @@ string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
  *   + SortAndHash(UpstreamArtifactHashes)
  *   + SortAndHash(ResolvedEnvironmentVariables)
  *   + TaskConfigurationHash
+ *   + CustomComponentsHash
  * )
  */
 string computeNodeFingerprint(
@@ -142,7 +178,7 @@ string computeNodeFingerprint(
     in string[string] inputFileHashes,
     in string[string] upstreamArtifactHashes,
     in string[string] resolvedEnv
-) pure nothrow @safe
+) @trusted
 {
     auto app = appender!string();
     app.put("SCRIPT:");
@@ -155,6 +191,8 @@ string computeNodeFingerprint(
     app.put(computeEnvDigest(resolvedEnv));
     app.put("\nCONFIG:");
     app.put(computeTaskConfigDigest(task));
+    app.put("\nCOMPONENTS:");
+    app.put(computeCustomComponentsDigest(task));
 
     return sha256Hex(app.data);
 }
@@ -249,7 +287,34 @@ struct Fingerprinter
             }
         }
 
-        return .computeNodeFingerprint(task, fileHashes, relevantArtifacts, resolvedEnv);
+        string baseFp = .computeNodeFingerprint(task, fileHashes, relevantArtifacts, resolvedEnv);
+
+        // Incorporate registered FingerprintContributionSystem outputs if present
+        auto contributors = PluginRegistry.instance.getFingerprintContributors();
+        if (contributors.length > 0)
+        {
+            FingerprintContributionContext ctx;
+            ctx.workspaceDir = workspaceDir;
+            ctx.resolvedEnv = resolvedEnv;
+            ctx.upstreamArtifactHashes = relevantArtifacts;
+
+            auto app = appender!string();
+            app.put(baseFp);
+
+            foreach (contributor; contributors)
+            {
+                if (contributor.canContribute(task))
+                {
+                    app.put("\nSYS:");
+                    app.put(contributor.systemName);
+                    app.put("=");
+                    app.put(contributor.contributeFingerprint(task, ctx));
+                }
+            }
+            return sha256Hex(app.data);
+        }
+
+        return baseFp;
     }
 }
 
@@ -310,4 +375,29 @@ unittest
     envMod["DUB_ARGS"] = "-v";
     string fpModEnv = computeNodeFingerprint(task, fileHashes1, artifacts, envMod);
     assert(fpModEnv != fp1, "Fingerprint must change when environment variable changes");
+
+    // 6. Invalidation when custom component is added or modified
+    import vibe.data.json : Json;
+    TaskNode taskCustom = task;
+    taskCustom.setCustomComponent("s3_source", Json(["bucket": Json("artifacts-bucket"), "key": Json("item.zip")]));
+    string fpCustom = computeNodeFingerprint(taskCustom, fileHashes1, artifacts, env);
+    assert(fpCustom != fp1, "Fingerprint must change when custom component is added");
+
+    // 7. System contribution
+    class CustomFingerprintSystem : FingerprintContributionSystem
+    {
+        @property string systemName() const { return "custom-hash-system"; }
+        bool canContribute(in TaskNode t) const { return t.id == "build"; }
+        string contributeFingerprint(in TaskNode t, in FingerprintContributionContext ctx) const
+        {
+            return "system_hash_12345";
+        }
+    }
+
+    auto sys = new CustomFingerprintSystem();
+    PluginRegistry.instance.registerFingerprintContributor(sys);
+    string fpWithSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts);
+    PluginRegistry.instance.shutdownAll();
+    string fpWithoutSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts);
+    assert(fpWithSys != fpWithoutSys);
 }

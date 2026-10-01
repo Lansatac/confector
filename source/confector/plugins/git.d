@@ -4,22 +4,27 @@ import std.format;
 import std.process;
 import std.stdio;
 import std.file;
+import std.path : buildPath, baseName;
 import vibe.core.log;
+import vibe.data.json : Json;
 
+import confector.core.model;
 import confector.core.plugin;
 import confector.core.vcs;
+import confector.core.system : InputResolverSystem, InputResolutionContext;
 import confector.core.executor : LogDelegate;
 
 /**
- * Git repository provider plugin.
- * Encapsulates all Git-specific cloning and command operations.
+ * Git repository provider and input resolution plugin.
+ * Encapsulates Git-specific cloning, command operations, and input staging.
  */
-class GitRepositoryPlugin : RepositoryProvider
+class GitRepositoryPlugin : RepositoryProvider, InputResolverSystem
 {
     @property string name() const { return "git-provider"; }
     @property string versionString() const { return "1.0.0"; }
-    @property string description() const { return "Git version control provider plugin"; }
+    @property string description() const { return "Git version control provider and input resolution plugin"; }
     @property string providerType() const { return "git"; }
+    @property string systemName() const { return "git-input-resolver"; }
 
     void initialize() {}
     void shutdown() {}
@@ -57,6 +62,47 @@ class GitRepositoryPlugin : RepositoryProvider
         }
         logInfo("Git clone completed successfully via GitRepositoryPlugin");
     }
+
+    bool canResolve(in TaskNode task) const
+    {
+        if (task.inputs.repositories.length > 0)
+        {
+            foreach (repo; task.inputs.repositories)
+            {
+                if (canHandle(repo)) return true;
+            }
+        }
+        if (task.hasCustomComponent("git_source"))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    void resolveInputs(in TaskNode task, ref InputResolutionContext context)
+    {
+        foreach (repo; task.inputs.repositories)
+        {
+            if (canHandle(repo))
+            {
+                string targetDir = buildPath(context.effectiveWorkingDir, baseName(repo));
+                cloneRepository(repo, targetDir, context.logCallback);
+            }
+        }
+
+        if (task.hasCustomComponent("git_source"))
+        {
+            auto comp = task.getCustomComponent("git_source");
+            if (comp.type == Json.Type.object && "url" in comp)
+            {
+                string url = comp["url"].get!string;
+                string targetDir = "target_dir" in comp
+                    ? buildPath(context.effectiveWorkingDir, comp["target_dir"].get!string)
+                    : buildPath(context.effectiveWorkingDir, baseName(url));
+                cloneRepository(url, targetDir, context.logCallback);
+            }
+        }
+    }
 }
 
 unittest
@@ -64,7 +110,17 @@ unittest
     auto plugin = new GitRepositoryPlugin();
     assert(plugin.name == "git-provider");
     assert(plugin.providerType == "git");
+    assert(plugin.systemName == "git-input-resolver");
     assert(plugin.canHandle("https://github.com/user/repo.git"));
     assert(plugin.canHandle("git@github.com:user/repo.git"));
     assert(!plugin.canHandle("ftp://unknown-protocol/repo"));
+
+    TaskNode node;
+    node.id = "git-task";
+    node.inputs.repositories = ["https://github.com/example/repo.git"];
+    assert(plugin.canResolve(node));
+
+    TaskNode nonGitNode;
+    nonGitNode.id = "local-task";
+    assert(!plugin.canResolve(nonGitNode));
 }

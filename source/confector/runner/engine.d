@@ -4,6 +4,7 @@ import confector.core.model;
 import confector.core.dag;
 import confector.core.fingerprinter;
 import confector.core.executor;
+import confector.core.system;
 import confector.core.plugin;
 import confector.core.storage;
 
@@ -132,7 +133,27 @@ class TaskEngine
             ? (isAbsolute(task.workingDirectory) ? task.workingDirectory : buildPath(workspaceDir, task.workingDirectory))
             : workspaceDir;
 
-        // 4. Retrieve any upstream artifacts required into workspace
+        // 4. Input Resolution Systems pass
+        InputResolutionContext inputCtx;
+        inputCtx.buildId = buildId;
+        inputCtx.workspaceDir = workspaceDir;
+        inputCtx.effectiveWorkingDir = effectiveWorkingDir;
+        inputCtx.artifactStorage = m_artifactStorage;
+        inputCtx.logCallback = logCallback;
+        foreach (k, v; task.inputs.parameters)
+        {
+            inputCtx.parameters[k] = v;
+        }
+
+        foreach (resolver; PluginRegistry.instance.getInputResolvers())
+        {
+            if (resolver.canResolve(task))
+            {
+                resolver.resolveInputs(task, inputCtx);
+            }
+        }
+
+        // 5. Retrieve any upstream artifacts required into workspace
         if (task.inputs.upstreamArtifacts.length > 0)
         {
             if (m_artifactStorage is null)
@@ -177,24 +198,28 @@ class TaskEngine
             }
         }
 
-        // 5. Locate TaskRunner plugin
-        auto runners = PluginRegistry.instance.getPluginsOfType!TaskRunner();
-        if (runners.length == 0)
+        // 6. Locate TaskExecutionSystem or TaskRunner plugin
+        auto execSystem = PluginRegistry.instance.findExecutionSystem(task);
+        TaskRunner fallbackRunner = null;
+        if (execSystem is null)
         {
-            result.status = TaskStatus.failed;
-            result.errorMessage = "No TaskRunner plugin registered in PluginRegistry";
-            if (m_stateRepo !is null)
+            auto runners = PluginRegistry.instance.getPluginsOfType!TaskRunner();
+            if (runners.length == 0)
             {
-                m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                result.status = TaskStatus.failed;
+                result.errorMessage = "No TaskExecutionSystem or TaskRunner plugin registered in PluginRegistry";
+                if (m_stateRepo !is null)
+                {
+                    m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                }
+                sw.stop();
+                result.durationMs = sw.peek.total!"msecs";
+                return result;
             }
-            sw.stop();
-            result.durationMs = sw.peek.total!"msecs";
-            return result;
+            fallbackRunner = runners[0];
         }
 
-        TaskRunner runner = runners[0];
-
-        // 6. Prepare ExecutionRequest
+        // 7. Prepare ExecutionRequest
         ExecutionRequest req;
         req.command = task.script;
         req.workingDirectory = effectiveWorkingDir;
@@ -220,8 +245,17 @@ class TaskEngine
             }
         };
 
-        // 7. Execute task
-        ExecutionResult execResult = runner.execute(req, combinedLogger);
+        // 8. Execute task via system or runner
+        ExecutionResult execResult;
+        if (execSystem !is null)
+        {
+            execResult = execSystem.executeTask(task, req, combinedLogger);
+        }
+        else
+        {
+            execResult = fallbackRunner.execute(req, combinedLogger);
+        }
+
         result.exitCode = execResult.exitCode;
         result.logs = capturedLogs;
 
@@ -241,9 +275,20 @@ class TaskEngine
             return result;
         }
 
-        // 8. Capture and store declared output artifacts
+        // 9. Capture and store declared output artifacts via ArtifactPublishingSystem or default storage
         ArtifactMetadata[] producedArtifacts;
-        if (m_artifactStorage !is null)
+        bool publishedViaSystem = false;
+        foreach (pubSys; PluginRegistry.instance.getArtifactPublishers())
+        {
+            if (pubSys.canPublish(task))
+            {
+                auto metaList = pubSys.publishArtifacts(task, buildId, req.workingDirectory, m_artifactStorage, logCallback);
+                producedArtifacts ~= metaList;
+                publishedViaSystem = true;
+            }
+        }
+
+        if (!publishedViaSystem && m_artifactStorage !is null)
         {
             foreach (artDecl; task.outputs.artifacts)
             {

@@ -88,6 +88,79 @@ struct OutputArtifactDecl
 }
 
 /**
+ * File input component data.
+ */
+struct FileInputComponent
+{
+    @optional string[] files;
+}
+
+/**
+ * Repository input component data.
+ */
+struct RepositoryInputComponent
+{
+    @optional string[] repositories;
+    @optional string address;
+    @optional string targetDirectory;
+    @optional string branch;
+    @optional string tag;
+}
+
+/**
+ * Environment variable input component data.
+ */
+struct EnvInputComponent
+{
+    @optional string[] env;
+}
+
+/**
+ * Upstream artifact input component data.
+ */
+struct UpstreamArtifactInputComponent
+{
+    @optional UpstreamArtifactRef[] upstreamArtifacts;
+}
+
+/**
+ * Parameter input component data.
+ */
+struct ParameterInputComponent
+{
+    @optional string[string] parameters;
+}
+
+/**
+ * Process execution component data.
+ */
+struct ProcessExecutionComponent
+{
+    @optional string script;
+    @optional string command;
+    @optional string[] arguments;
+    @optional string workingDirectory;
+    @optional string[string] environment;
+    @optional size_t timeoutSeconds = 900;
+}
+
+/**
+ * Artifact output component data.
+ */
+struct ArtifactOutputComponent
+{
+    @optional OutputArtifactDecl[] artifacts;
+}
+
+/**
+ * Trigger rule component data.
+ */
+struct TriggerRuleComponent
+{
+    @optional TriggerRule[] rules;
+}
+
+/**
  * Outputs produced by a task execution.
  */
 struct TaskOutputs
@@ -96,7 +169,8 @@ struct TaskOutputs
 }
 
 /**
- * Represents a discrete task node in the Directed Acyclic Graph (DAG).
+ * Represents a discrete task node in the Directed Acyclic Graph (DAG)
+ * modeled as an entity with composable components.
  */
 struct TaskNode
 {
@@ -110,6 +184,63 @@ struct TaskNode
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
     @optional @asName("working_directory") string workingDirectory;
     @optional string[string] environment;
+    @optional Json[string] components;
+
+    bool hasCustomComponent(string componentName) const @safe
+    {
+        if (components is null) return false;
+        return (componentName in components) !is null;
+    }
+
+    Json getCustomComponent(string componentName) const @safe
+    {
+        if (components is null) return Json.undefined;
+        auto p = componentName in components;
+        return p !is null ? *p : Json.undefined;
+    }
+
+    void setCustomComponent(string componentName, Json data) @safe
+    {
+        components[componentName] = data;
+    }
+
+    FileInputComponent getFileInputComponent() const pure nothrow @safe
+    {
+        return FileInputComponent(inputs.files.dup);
+    }
+
+    RepositoryInputComponent getRepositoryInputComponent() const pure nothrow @safe
+    {
+        return RepositoryInputComponent(inputs.repositories.dup);
+    }
+
+    EnvInputComponent getEnvInputComponent() const pure nothrow @safe
+    {
+        return EnvInputComponent(inputs.env.dup);
+    }
+
+    UpstreamArtifactInputComponent getUpstreamArtifactInputComponent() const pure nothrow @safe
+    {
+        return UpstreamArtifactInputComponent(inputs.upstreamArtifacts.dup);
+    }
+
+    ProcessExecutionComponent getProcessExecutionComponent() const pure nothrow @safe
+    {
+        ProcessExecutionComponent comp;
+        comp.script = script;
+        comp.workingDirectory = workingDirectory;
+        comp.timeoutSeconds = timeoutSeconds;
+        foreach (k, v; environment)
+        {
+            comp.environment[k] = v;
+        }
+        return comp;
+    }
+
+    ArtifactOutputComponent getArtifactOutputComponent() const pure nothrow @safe
+    {
+        return ArtifactOutputComponent(outputs.artifacts.dup);
+    }
 }
 
 /**
@@ -286,4 +417,17 @@ unittest
     TaskNode[] taskArray = deserializeJson!(TaskNode[])(arrayParsed);
     assert(taskArray.length == 1);
     assert(taskArray[0].id == "task-1");
+
+    // Test ECS component helpers
+    assert(node.getFileInputComponent().files == ["source/**/*.d", "dub.json"]);
+    assert(node.getRepositoryInputComponent().repositories == ["confector-repo", "common-utils"]);
+    assert(node.getEnvInputComponent().env == ["DUB_ARGS"]);
+    assert(node.getUpstreamArtifactInputComponent().upstreamArtifacts.length == 1);
+    assert(node.getProcessExecutionComponent().script == "dub build");
+    assert(node.getArtifactOutputComponent().artifacts.length == 1);
+
+    node.setCustomComponent("s3_source", Json(["bucket": Json("my-bucket"), "key": Json("data.tar.gz")]));
+    assert(node.hasCustomComponent("s3_source"));
+    assert(node.getCustomComponent("s3_source")["bucket"].get!string == "my-bucket");
+    assert(!node.hasCustomComponent("non_existent"));
 }
