@@ -1,7 +1,7 @@
 module confector.core.plugin;
 
-import confector.core.model : TaskNode;
-import confector.core.system : InputResolverSystem, FingerprintContributionSystem, TaskExecutionSystem, ArtifactPublishingSystem;
+import confector.core.model : TaskNode, BuildStep;
+import confector.core.system : InputResolverSystem, FingerprintContributionSystem, TaskExecutionSystem, ArtifactPublishingSystem, BuildStepSystem;
 
 /**
  * Base interface for all Confector plugins.
@@ -29,6 +29,7 @@ final class PluginRegistry
     private FingerprintContributionSystem[] _fingerprintContributors;
     private TaskExecutionSystem[] _executionSystems;
     private ArtifactPublishingSystem[] _artifactPublishers;
+    private BuildStepSystem[] _stepSystems;
 
     public static PluginRegistry instance()
     {
@@ -60,6 +61,10 @@ final class PluginRegistry
         if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
         {
             registerArtifactPublisher(pubSystem);
+        }
+        if (auto stepSystem = cast(BuildStepSystem) plugin)
+        {
+            registerStepSystem(stepSystem);
         }
     }
 
@@ -99,6 +104,15 @@ final class PluginRegistry
         }
     }
 
+    public void registerStepSystem(BuildStepSystem system)
+    {
+        import std.algorithm : canFind;
+        if (!_stepSystems.canFind(system))
+        {
+            _stepSystems ~= system;
+        }
+    }
+
     public InputResolverSystem[] getInputResolvers()
     {
         return _inputResolvers;
@@ -117,6 +131,23 @@ final class PluginRegistry
     public ArtifactPublishingSystem[] getArtifactPublishers()
     {
         return _artifactPublishers;
+    }
+
+    public BuildStepSystem[] getStepSystems()
+    {
+        return _stepSystems;
+    }
+
+    public BuildStepSystem findStepSystem(in BuildStep step)
+    {
+        foreach (sys; _stepSystems)
+        {
+            if (sys.canExecuteStep(step))
+            {
+                return sys;
+            }
+        }
+        return null;
     }
 
     public TaskExecutionSystem findExecutionSystem(in TaskNode task)
@@ -167,6 +198,7 @@ final class PluginRegistry
         _fingerprintContributors.length = 0;
         _executionSystems.length = 0;
         _artifactPublishers.length = 0;
+        _stepSystems.length = 0;
     }
 }
 
@@ -199,15 +231,16 @@ unittest
     assert(registry.getPlugin("mock-plugin") is null);
 
     // Test system registration via plugin
-    import confector.core.system : InputResolutionContext;
+    import confector.core.system : InputResolutionContext, StepExecutionContext, StepExecutionResult, BuildStepSystem;
     import confector.core.executor : ExecutionRequest, ExecutionResult, LogDelegate;
 
-    class IntegratedPlugin : Plugin, InputResolverSystem, TaskExecutionSystem
+    class IntegratedPlugin : Plugin, InputResolverSystem, TaskExecutionSystem, BuildStepSystem
     {
         @property string name() const { return "integrated-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Integrated test plugin"; }
         @property string systemName() const { return "integrated-system"; }
+        @property string stepType() const { return "test-step"; }
 
         void initialize() {}
         void shutdown() {}
@@ -222,6 +255,14 @@ unittest
             res.success = true;
             return res;
         }
+
+        bool canExecuteStep(in BuildStep step) const { return step.type == "test-step"; }
+        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+        {
+            StepExecutionResult res;
+            res.success = true;
+            return res;
+        }
     }
 
     auto integrated = new IntegratedPlugin();
@@ -229,13 +270,19 @@ unittest
 
     assert(registry.getInputResolvers().length == 1);
     assert(registry.getExecutionSystems().length == 1);
+    assert(registry.getStepSystems().length == 1);
 
     TaskNode testNode;
     testNode.id = "task-resolved";
     testNode.script = "echo hello";
     assert(registry.findExecutionSystem(testNode) is integrated);
 
+    BuildStep bStep;
+    bStep.type = "test-step";
+    assert(registry.findStepSystem(bStep) is integrated);
+
     registry.shutdownAll();
     assert(registry.getInputResolvers().length == 0);
     assert(registry.getExecutionSystems().length == 0);
+    assert(registry.getStepSystems().length == 0);
 }

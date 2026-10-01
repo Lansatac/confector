@@ -4,27 +4,28 @@ import std.format;
 import std.process;
 import std.stdio;
 import std.file;
-import std.path : buildPath, baseName;
+import std.path : buildPath, baseName, isAbsolute;
 import vibe.core.log;
 import vibe.data.json : Json;
 
 import confector.core.model;
 import confector.core.plugin;
 import confector.core.vcs;
-import confector.core.system : InputResolverSystem, InputResolutionContext;
+import confector.core.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult;
 import confector.core.executor : LogDelegate;
 
 /**
- * Git repository provider and input resolution plugin.
+ * Git repository provider, input resolution, and build step execution plugin.
  * Encapsulates Git-specific cloning, command operations, and input staging.
  */
-class GitRepositoryPlugin : RepositoryProvider, InputResolverSystem
+class GitRepositoryPlugin : RepositoryProvider, InputResolverSystem, BuildStepSystem
 {
     @property string name() const { return "git-provider"; }
     @property string versionString() const { return "1.0.0"; }
-    @property string description() const { return "Git version control provider and input resolution plugin"; }
+    @property string description() const { return "Git version control provider, input resolution, and build step plugin"; }
     @property string providerType() const { return "git"; }
     @property string systemName() const { return "git-input-resolver"; }
+    @property string stepType() const { return "clone_repository"; }
 
     void initialize() {}
     void shutdown() {}
@@ -103,6 +104,115 @@ class GitRepositoryPlugin : RepositoryProvider, InputResolverSystem
             }
         }
     }
+
+    bool canExecuteStep(in BuildStep step) const
+    {
+        return step.type == "clone_repository"
+            || step.type == "git_clone"
+            || step.type == "checkout_repository"
+            || step.type == "git:clone"
+            || step.type == "git";
+    }
+
+    StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+    {
+        StepExecutionResult res;
+        string repoUrl = "";
+        if ("repository" in step.parameters) repoUrl = step.parameters["repository"];
+        else if ("url" in step.parameters) repoUrl = step.parameters["url"];
+        else if ("address" in step.parameters) repoUrl = step.parameters["address"];
+        else if (step.script.length > 0) repoUrl = step.script;
+        else if (step.properties.type == Json.Type.object && "url" in step.properties) repoUrl = step.properties["url"].get!string;
+        else if (step.properties.type == Json.Type.object && "repository" in step.properties) repoUrl = step.properties["repository"].get!string;
+
+        if (repoUrl.length == 0)
+        {
+            res.success = false;
+            res.exitCode = 1;
+            res.errorMessage = "Missing repository URL/address in clone repository build step";
+            return res;
+        }
+
+        string targetDir = context.workingDirectory;
+        if ("target_dir" in step.parameters)
+        {
+            string td = step.parameters["target_dir"];
+            targetDir = isAbsolute(td) ? td : buildPath(context.workingDirectory, td);
+        }
+        else if ("targetDirectory" in step.parameters)
+        {
+            string td = step.parameters["targetDirectory"];
+            targetDir = isAbsolute(td) ? td : buildPath(context.workingDirectory, td);
+        }
+        else if ("target" in step.parameters)
+        {
+            string td = step.parameters["target"];
+            targetDir = isAbsolute(td) ? td : buildPath(context.workingDirectory, td);
+        }
+        else if (step.properties.type == Json.Type.object && "target_dir" in step.properties)
+        {
+            string td = step.properties["target_dir"].get!string;
+            targetDir = isAbsolute(td) ? td : buildPath(context.workingDirectory, td);
+        }
+        else
+        {
+            targetDir = buildPath(context.workingDirectory, baseName(repoUrl));
+        }
+
+        string branch = "";
+        if ("branch" in step.parameters) branch = step.parameters["branch"];
+        else if (step.properties.type == Json.Type.object && "branch" in step.properties) branch = step.properties["branch"].get!string;
+
+        try
+        {
+            mkdirRecurse(targetDir);
+            string cmd = format("git clone %s", repoUrl);
+            if (branch.length > 0)
+            {
+                cmd ~= format(" -b %s", branch);
+            }
+            cmd ~= format(" \"%s\"", targetDir);
+
+            if (context.logCallback !is null)
+            {
+                context.logCallback(format("[git] Executing %s", cmd));
+            }
+
+            auto pipe = pipeShell(cmd,
+                Redirect.stdout | Redirect.stderrToStdout,
+                null,
+                Config.retainStderr,
+                targetDir);
+
+            foreach (line; pipe.stdout.byLineCopy)
+            {
+                res.outputLines ~= line;
+                if (context.logCallback !is null)
+                {
+                    context.logCallback(line);
+                }
+            }
+
+            res.exitCode = wait(pipe.pid);
+            res.success = (res.exitCode == 0);
+            if (!res.success)
+            {
+                res.errorMessage = format("git clone exited with code %d", res.exitCode);
+            }
+        }
+        catch (Exception e)
+        {
+            res.exitCode = -1;
+            res.success = false;
+            res.errorMessage = e.msg;
+            if (context.logCallback !is null)
+            {
+                context.logCallback(format("Git step error: %s", e.msg));
+            }
+        }
+
+        return res;
+    }
 }
 
 unittest
@@ -111,9 +221,17 @@ unittest
     assert(plugin.name == "git-provider");
     assert(plugin.providerType == "git");
     assert(plugin.systemName == "git-input-resolver");
+    assert(plugin.stepType == "clone_repository");
     assert(plugin.canHandle("https://github.com/user/repo.git"));
     assert(plugin.canHandle("git@github.com:user/repo.git"));
     assert(!plugin.canHandle("ftp://unknown-protocol/repo"));
+
+    BuildStep bStep;
+    bStep.type = "clone_repository";
+    assert(plugin.canExecuteStep(bStep));
+    BuildStep bStepAlias;
+    bStepAlias.type = "checkout_repository";
+    assert(plugin.canExecuteStep(bStepAlias));
 
     TaskNode node;
     node.id = "git-task";

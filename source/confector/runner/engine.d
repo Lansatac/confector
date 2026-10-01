@@ -198,40 +198,7 @@ class TaskEngine
             }
         }
 
-        // 6. Locate TaskExecutionSystem or TaskRunner plugin
-        auto execSystem = PluginRegistry.instance.findExecutionSystem(task);
-        TaskRunner fallbackRunner = null;
-        if (execSystem is null)
-        {
-            auto runners = PluginRegistry.instance.getPluginsOfType!TaskRunner();
-            if (runners.length == 0)
-            {
-                result.status = TaskStatus.failed;
-                result.errorMessage = "No TaskExecutionSystem or TaskRunner plugin registered in PluginRegistry";
-                if (m_stateRepo !is null)
-                {
-                    m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
-                }
-                sw.stop();
-                result.durationMs = sw.peek.total!"msecs";
-                return result;
-            }
-            fallbackRunner = runners[0];
-        }
-
-        // 7. Prepare ExecutionRequest
-        ExecutionRequest req;
-        req.command = task.script;
-        req.workingDirectory = effectiveWorkingDir;
-
-        // Build environment
-        foreach (k, v; task.environment)
-        {
-            req.environmentVariables[k] = v;
-        }
-        req.timeoutSeconds = task.timeoutSeconds;
-
-        // Log capture collector
+        // 6. Log capture collector
         string[] capturedLogs;
         LogDelegate combinedLogger = (string line) @trusted {
             capturedLogs ~= line;
@@ -245,26 +212,107 @@ class TaskEngine
             }
         };
 
-        // 8. Execute task via system or runner
-        ExecutionResult execResult;
-        if (execSystem !is null)
+        // 7. Execute task build steps or fallback script
+        int taskExitCode = 0;
+        bool taskSuccess = true;
+        string taskErrorMessage;
+
+        if (task.steps.length > 0)
         {
-            execResult = execSystem.executeTask(task, req, combinedLogger);
+            StepExecutionContext stepCtx;
+            stepCtx.buildId = buildId;
+            stepCtx.taskId = task.id;
+            stepCtx.workspaceDir = workspaceDir;
+            stepCtx.workingDirectory = effectiveWorkingDir;
+            stepCtx.artifactStorage = m_artifactStorage;
+            stepCtx.logCallback = combinedLogger;
+            foreach (k, v; task.environment) stepCtx.environment[k] = v;
+            foreach (k, v; task.inputs.parameters) stepCtx.taskParameters[k] = v;
+
+            foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
+            {
+                string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
+                combinedLogger(format("[confector] Running build step [%d/%d]: %s", stepIdx + 1, task.steps.length, stepLabel));
+
+                auto stepSystem = PluginRegistry.instance.findStepSystem(step);
+                if (stepSystem is null)
+                {
+                    taskSuccess = false;
+                    taskExitCode = 1;
+                    taskErrorMessage = format("No plugin registered to handle build step type '%s' (step: '%s')", step.type, stepLabel);
+                    combinedLogger(format("[confector] Error: %s", taskErrorMessage));
+                    break;
+                }
+
+                auto stepResult = stepSystem.executeStep(step, stepCtx);
+                if (!stepResult.success)
+                {
+                    taskSuccess = false;
+                    taskExitCode = stepResult.exitCode != 0 ? stepResult.exitCode : 1;
+                    taskErrorMessage = stepResult.errorMessage.length > 0
+                        ? stepResult.errorMessage
+                        : format("Build step '%s' failed with exit code %d", stepLabel, taskExitCode);
+                    combinedLogger(format("[confector] Build step '%s' failed: %s", stepLabel, taskErrorMessage));
+                    break;
+                }
+            }
         }
         else
         {
-            execResult = fallbackRunner.execute(req, combinedLogger);
+            // Fallback script execution via TaskExecutionSystem or TaskRunner
+            auto execSystem = PluginRegistry.instance.findExecutionSystem(task);
+            TaskRunner fallbackRunner = null;
+            if (execSystem is null)
+            {
+                auto runners = PluginRegistry.instance.getPluginsOfType!TaskRunner();
+                if (runners.length == 0)
+                {
+                    result.status = TaskStatus.failed;
+                    result.errorMessage = "No TaskExecutionSystem or TaskRunner plugin registered in PluginRegistry";
+                    if (m_stateRepo !is null)
+                    {
+                        m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                    }
+                    sw.stop();
+                    result.durationMs = sw.peek.total!"msecs";
+                    return result;
+                }
+                fallbackRunner = runners[0];
+            }
+
+            ExecutionRequest req;
+            req.command = task.script;
+            req.workingDirectory = effectiveWorkingDir;
+            foreach (k, v; task.environment)
+            {
+                req.environmentVariables[k] = v;
+            }
+            req.timeoutSeconds = task.timeoutSeconds;
+
+            ExecutionResult execResult;
+            if (execSystem !is null)
+            {
+                execResult = execSystem.executeTask(task, req, combinedLogger);
+            }
+            else
+            {
+                execResult = fallbackRunner.execute(req, combinedLogger);
+            }
+
+            taskExitCode = execResult.exitCode;
+            taskSuccess = execResult.success;
+            taskErrorMessage = execResult.errorMessage;
         }
 
-        result.exitCode = execResult.exitCode;
+        result.exitCode = taskExitCode;
         result.logs = capturedLogs;
 
-        if (!execResult.success)
+        if (!taskSuccess)
         {
             result.status = TaskStatus.failed;
-            result.errorMessage = execResult.errorMessage.length > 0
-                ? execResult.errorMessage
-                : format("Task execution exited with code %d", execResult.exitCode);
+            result.errorMessage = taskErrorMessage.length > 0
+                ? taskErrorMessage
+                : format("Task execution exited with code %d", taskExitCode);
 
             if (m_stateRepo !is null)
             {
@@ -275,14 +323,14 @@ class TaskEngine
             return result;
         }
 
-        // 9. Capture and store declared output artifacts via ArtifactPublishingSystem or default storage
+        // 8. Capture and store declared output artifacts via ArtifactPublishingSystem or default storage
         ArtifactMetadata[] producedArtifacts;
         bool publishedViaSystem = false;
         foreach (pubSys; PluginRegistry.instance.getArtifactPublishers())
         {
             if (pubSys.canPublish(task))
             {
-                auto metaList = pubSys.publishArtifacts(task, buildId, req.workingDirectory, m_artifactStorage, logCallback);
+                auto metaList = pubSys.publishArtifacts(task, buildId, effectiveWorkingDir, m_artifactStorage, logCallback);
                 producedArtifacts ~= metaList;
                 publishedViaSystem = true;
             }
@@ -292,7 +340,7 @@ class TaskEngine
         {
             foreach (artDecl; task.outputs.artifacts)
             {
-                string localArtifactPath = buildPath(req.workingDirectory, artDecl.path);
+                string localArtifactPath = buildPath(effectiveWorkingDir, artDecl.path);
                 if (exists(localArtifactPath) && isFile(localArtifactPath))
                 {
                     auto meta = m_artifactStorage.storeArtifact(buildId, task.id, localArtifactPath, artDecl.type);
@@ -539,4 +587,60 @@ unittest
     auto badRes = engine.executeTask("build_bad", nodeBad, testDir);
     assert(badRes.status == TaskStatus.failed);
     assert(badRes.errorMessage.length > 0);
+
+    // Multi-step ordered execution test
+    TaskNode stepTask;
+    stepTask.id = "multi_step_task";
+    stepTask.name = "Ordered Steps Task";
+    version(Windows)
+    {
+        stepTask.steps = [
+            BuildStep("Step 1", "process", null, "cmd /c \"echo first_step > seq.txt\""),
+            BuildStep("Step 2", "process", null, "cmd /c \"echo second_step >> seq.txt\"")
+        ];
+    }
+    else
+    {
+        stepTask.steps = [
+            BuildStep("Step 1", "process", null, "echo first_step > seq.txt"),
+            BuildStep("Step 2", "process", null, "echo second_step >> seq.txt")
+        ];
+    }
+    stepTask.outputs.artifacts = [OutputArtifactDecl("seq.txt", "file")];
+
+    auto stepRes = engine.executeTask("build_steps_1", stepTask, testDir);
+    assert(stepRes.status == TaskStatus.succeeded);
+    assert(stepRes.producedArtifacts.length == 1);
+    assert(storage.artifactExists("build_steps_1", "multi_step_task", "seq.txt"));
+
+    // Step failure halting execution test
+    TaskNode failingStepTask;
+    failingStepTask.id = "failing_step_task";
+    version(Windows)
+    {
+        failingStepTask.steps = [
+            BuildStep("Fail Step", "process", null, "cmd /c \"exit 1\""),
+            BuildStep("Never Run Step", "process", null, "cmd /c \"echo should_not_exist > never.txt\"")
+        ];
+    }
+    else
+    {
+        failingStepTask.steps = [
+            BuildStep("Fail Step", "process", null, "exit 1"),
+            BuildStep("Never Run Step", "process", null, "echo should_not_exist > never.txt")
+        ];
+    }
+    auto failStepRes = engine.executeTask("build_steps_fail", failingStepTask, testDir);
+    assert(failStepRes.status == TaskStatus.failed);
+    assert(!exists(buildPath(testDir, "never.txt")));
+
+    // Unknown step system failure test
+    TaskNode unknownStepTask;
+    unknownStepTask.id = "unknown_step_task";
+    unknownStepTask.steps = [
+        BuildStep("Unknown Step", "non_existent_plugin_step")
+    ];
+    auto unknownStepRes = engine.executeTask("build_unknown_step", unknownStepTask, testDir);
+    assert(unknownStepRes.status == TaskStatus.failed);
+    assert(unknownStepRes.errorMessage.length > 0);
 }

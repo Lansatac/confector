@@ -110,7 +110,11 @@ block maincontent
                       strong Triggers: 
                       span #{t.triggers.length} rule(s)
               td
-                code(style="font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; display: inline-block;") #{t.script}
+                - if (t.steps.length > 0)
+                  div
+                    span.badge.badge-primary #{t.steps.length} step(s)
+                - else
+                  code(style="font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; display: inline-block;") #{t.script}
               td
                 div(style="display: flex; gap: 5px;")
                   form(action="/projects/run", method="POST", style="display:inline;")

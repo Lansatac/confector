@@ -85,6 +85,50 @@ interface TaskExecutionSystem
 }
 
 /**
+ * Context payload provided to a build step system during step execution.
+ */
+struct StepExecutionContext
+{
+    string buildId;
+    string taskId;
+    string workspaceDir;
+    string workingDirectory;
+    string[string] environment;
+    ArtifactStorage artifactStorage;
+    LogDelegate logCallback;
+    string[string] taskParameters;
+}
+
+/**
+ * Result of executing an individual build step.
+ */
+struct StepExecutionResult
+{
+    bool success = true;
+    int exitCode = 0;
+    string errorMessage;
+    string[] outputLines;
+}
+
+/**
+ * Stateless system interface for executing plugin-defined build steps.
+ */
+interface BuildStepSystem
+{
+    @property string stepType() const;
+
+    /**
+     * Determines whether this system can execute the given build step.
+     */
+    bool canExecuteStep(in BuildStep step) const;
+
+    /**
+     * Executes the build step and returns the result.
+     */
+    StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context);
+}
+
+/**
  * Stateless system interface for publishing and persisting output artifacts.
  */
 interface ArtifactPublishingSystem
@@ -123,4 +167,27 @@ unittest
     TaskNode node;
     node.id = "test";
     assert(mock.canResolve(node));
+
+    class MockStepSystem : BuildStepSystem
+    {
+        @property string stepType() const { return "mock-step"; }
+        bool canExecuteStep(in BuildStep step) const { return step.type == "mock-step"; }
+        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+        {
+            StepExecutionResult res;
+            res.success = true;
+            res.outputLines = ["mock-step executed"];
+            return res;
+        }
+    }
+
+    auto stepSys = new MockStepSystem();
+    assert(stepSys.stepType == "mock-step");
+    BuildStep bStep;
+    bStep.type = "mock-step";
+    assert(stepSys.canExecuteStep(bStep));
+    StepExecutionContext sCtx;
+    auto sRes = stepSys.executeStep(bStep, sCtx);
+    assert(sRes.success);
+    assert(sRes.outputLines == ["mock-step executed"]);
 }

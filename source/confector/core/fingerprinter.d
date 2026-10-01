@@ -8,7 +8,7 @@ import std.array : appender;
 import std.digest.sha : SHA256, toHexString, LetterCase, digest;
 import std.file : exists, isFile, read;
 import std.format : format;
-import vibe.data.json : serializeToJsonString;
+import vibe.data.json : serializeToJsonString, Json;
 
 /**
  * Computes the SHA256 hex string of a byte slice or string.
@@ -123,6 +123,50 @@ string computeCustomComponentsDigest(in TaskNode task) @trusted
 }
 
 /**
+ * Computes deterministic SHA256 digest of task build steps.
+ */
+string computeBuildStepsDigest(in TaskNode task) @trusted
+{
+    if (task.steps.length == 0) return sha256Hex("");
+
+    auto app = appender!string();
+    foreach (size_t i, step; task.steps)
+    {
+        app.put(format("[%d]TYPE:%s|NAME:%s|SCRIPT:%s|CMD:%s|DIR:%s\n",
+            i, step.type, step.name, step.script, step.command, step.workingDirectory));
+
+        if (step.parameters.length > 0)
+        {
+            string[] paramKeys;
+            foreach (k; step.parameters.byKey) paramKeys ~= k;
+            paramKeys.sort();
+            foreach (k; paramKeys)
+            {
+                app.put(format("P:%s=%s\n", k, step.parameters[k]));
+            }
+        }
+
+        if (step.environment.length > 0)
+        {
+            app.put(computeEnvDigest(step.environment));
+        }
+
+        if (step.properties.type != Json.Type.undefined && step.properties.type != Json.Type.null_)
+        {
+            try
+            {
+                app.put(serializeToJsonString(step.properties));
+            }
+            catch (Exception e)
+            {
+                app.put(step.properties.toString());
+            }
+        }
+    }
+    return sha256Hex(app.data);
+}
+
+/**
  * Computes deterministic SHA256 digest of task configuration metadata.
  */
 string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
@@ -140,6 +184,7 @@ string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
  * Computes the full Node Fingerprint according to the specification:
  * NodeFingerprint = SHA256(
  *     TaskScriptContent
+ *   + BuildStepsHash
  *   + SortAndHash(UpstreamArtifactHashes)
  *   + TaskConfigurationHash
  *   + CustomComponentsHash
@@ -153,6 +198,8 @@ string computeNodeFingerprint(
     auto app = appender!string();
     app.put("SCRIPT:");
     app.put(task.script);
+    app.put("\nSTEPS:");
+    app.put(computeBuildStepsDigest(task));
     app.put("\nARTIFACTS:");
     app.put(computeArtifactHashesDigest(upstreamArtifactHashes));
     app.put("\nCONFIG:");
@@ -285,7 +332,24 @@ unittest
     string fpCustom = computeNodeFingerprint(taskCustom, artifacts1);
     assert(fpCustom != fp1, "Fingerprint must change when custom component is added");
 
-    // 6. System contribution
+    // 6. Invalidation when build steps are added or modified
+    TaskNode taskSteps = task;
+    taskSteps.steps = [
+        BuildStep("Clone", "clone_repository", ["repository": "https://github.com/example/repo.git"]),
+        BuildStep("Build", "process", null, "dub build")
+    ];
+    string fpSteps = computeNodeFingerprint(taskSteps, artifacts1);
+    assert(fpSteps != fp1, "Fingerprint must change when build steps are added");
+
+    TaskNode taskStepsMod = taskSteps;
+    taskStepsMod.steps = [
+        BuildStep("Clone", "clone_repository", ["repository": "https://github.com/example/repo.git"]),
+        BuildStep("Build", "process", null, "dub test")
+    ];
+    string fpStepsMod = computeNodeFingerprint(taskStepsMod, artifacts1);
+    assert(fpStepsMod != fpSteps, "Fingerprint must change when build step script changes");
+
+    // 7. System contribution
     class CustomFingerprintSystem : FingerprintContributionSystem
     {
         @property string systemName() const { return "custom-hash-system"; }

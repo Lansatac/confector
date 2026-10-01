@@ -35,8 +35,8 @@ Events (commits, webhooks, cron, or manual actions) can trigger any specific nod
 ### 4. Elastic & Serverless Topologies
 Run workloads anywhere—from local development environments and serverless runtimes to ephemeral container clusters—without changing pipeline definitions.
 
-### 5. Modular Plugin Architecture
-Execution runtimes, version control providers, and storage backends are decoupled from the core graph engine, enabling custom runners and tools without modifying pipeline logic.
+### 5. Modular Plugin & Build Step Architecture
+Execution runtimes, version control providers, and storage backends are decoupled from the core graph engine. Tasks can compose arbitrary ordered build steps (e.g. Git clone repository, process runner steps) provided by pluggable systems.
 
 ---
 

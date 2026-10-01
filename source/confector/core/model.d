@@ -106,6 +106,21 @@ struct UpstreamArtifactInputComponent
 }
 
 /**
+ * Represents an individual plugin-defined build step within a TaskNode.
+ */
+struct BuildStep
+{
+    @optional string name;
+    string type; // e.g. "clone_repository", "git_clone", "process", "script", "command"
+    @optional string[string] parameters;
+    @optional string script;
+    @optional string command;
+    @optional @asName("working_directory") string workingDirectory;
+    @optional string[string] environment;
+    @optional Json properties;
+}
+
+/**
  * Parameter input component data.
  */
 struct ParameterInputComponent
@@ -162,6 +177,7 @@ struct TaskNode
     @optional TaskInputs inputs;
     @optional TaskOutputs outputs;
     @optional string script;
+    @optional @asName("steps") BuildStep[] steps;
     @optional TriggerRule[] triggers;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
     @optional @asName("working_directory") string workingDirectory;
@@ -398,4 +414,25 @@ unittest
     assert(node.hasCustomComponent("s3_source"));
     assert(node.getCustomComponent("s3_source")["bucket"].get!string == "my-bucket");
     assert(!node.hasCustomComponent("non_existent"));
+
+    // Test BuildStep serialization on TaskNode
+    TaskNode stepNode;
+    stepNode.id = "pipeline-task";
+    BuildStep step1;
+    step1.name = "Clone Code";
+    step1.type = "clone_repository";
+    step1.parameters = ["repository": "https://github.com/example/repo.git", "branch": "main"];
+    BuildStep step2;
+    step2.name = "Build App";
+    step2.type = "process";
+    step2.script = "dub build";
+    stepNode.steps = [step1, step2];
+
+    Json stepNodeJson = serializeToJson(stepNode);
+    TaskNode deserializedStepNode = deserializeJson!TaskNode(stepNodeJson);
+    assert(deserializedStepNode.steps.length == 2);
+    assert(deserializedStepNode.steps[0].type == "clone_repository");
+    assert(deserializedStepNode.steps[0].parameters["repository"] == "https://github.com/example/repo.git");
+    assert(deserializedStepNode.steps[1].type == "process");
+    assert(deserializedStepNode.steps[1].script == "dub build");
 }

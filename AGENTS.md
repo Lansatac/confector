@@ -34,6 +34,10 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Decision**: Task nodes are modeled as entity identities with attached, composable data components (inputs, execution specifications, outputs, and triggers), processed by stateless, decoupled systems.
 - **Rationale**: Prevents central domain model bloat when introducing exotic input types, heterogeneous storage layers, or custom execution targets. Eliminates rigid inheritance hierarchies in favor of data/logic separation, maximizing composability, modularity, and extensibility across plugins.
 
+### 1.8 Plugin-Defined Ordered Build Steps
+- **Decision**: Task execution consists of an arbitrary ordered list of plugin-defined build steps (such as the Git plugin's `clone_repository` step or the process runner's `process` step).
+- **Rationale**: Replaces rigid, monolithic script execution with composable, sequentially executed step systems. Each plugin exposes step handlers dynamically via `BuildStepSystem`, maximizing reusability and fine-grained error isolation.
+
 ---
 
 ## 2. Subsystem Boundaries & Responsibilities
