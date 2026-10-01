@@ -22,12 +22,12 @@ block maincontent
 
     div.section-title-bar
       h2 Recent Builds
-      a.btn.btn-primary(href="/pipelines/") Run Pipeline
+      a.btn.btn-primary(href="/projects/") Projects & Tasks
 
     - if (builds.length == 0)
       div.empty-state
         p No builds executed yet.
-        a.btn.btn-outline(href="/pipelines/") Launch a pipeline
+        a.btn.btn-outline(href="/projects/") Run Tasks
     - else
       table.data-table
         thead
@@ -62,12 +62,10 @@ block maincontent
 
     div.section-title-bar(style="margin-top: 30px;")
       h2 Active Trigger Rules
-      a.btn.btn-sm.btn-secondary(href="/triggers/") Configure Triggers
 
     - if (triggers.length == 0)
       div.empty-state
         p No trigger rules configured.
-        a.btn.btn-sm(href="/triggers/") Add Trigger Rule
     - else
       table.data-table
         thead

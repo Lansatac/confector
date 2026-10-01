@@ -7,8 +7,4 @@ div.menu-item
 div.menu-item
   a.item-link(href="/builds/") Builds
 div.menu-item
-  a.item-link(href="/pipelines/") Pipelines
-div.menu-item
-  a.item-link(href="/triggers/") Triggers
-div.menu-item
   a.item-link(href="/repositories/") Repositories

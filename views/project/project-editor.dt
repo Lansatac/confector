@@ -1,0 +1,74 @@
+extends layout
+
+block maincontent
+  div.projects-container
+    div.header-section
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 Edit Project & Task Graph: #{project.name}
+          p Configure project repository settings and author arbitrary discrete task DAG nodes.
+        div
+          a.btn.btn-outline(href="/projects/details?id=#{project.id}") Back to Project
+
+    div.section-title-bar(style="margin-top: 15px;")
+      h2 Visual DAG Preview
+    div#project-canvas-container.dag-visualizer
+      canvas#dag-editor-canvas(width="800", height="220")
+
+    form#project-form(action="/projects/save", method="POST", style="margin-top: 20px;")
+      div.grid-2col
+        div.card
+          h3 Project Settings
+          div.form-group
+            label(for="id") Project Identifier:
+            input.form-control#id(type="text", name="id", value="#{project.id}", readonly)
+
+          div.form-group
+            label(for="name") Project Name:
+            input.form-control#name(type="text", name="name", value="#{project.name}", required)
+
+          div.form-group
+            label(for="description") Description:
+            textarea.form-control#description(name="description", rows="2") #{project.description}
+
+          div.form-group
+            label(for="workspace_dir") Workspace Directory:
+            input.form-control#workspace_dir(type="text", name="workspace_dir", value="#{project.workspaceDir}", placeholder="e.g. . or /path/to/repo")
+
+          div.form-group
+            label(for="repository_url") Repository URL:
+            input.form-control#repository_url(type="text", name="repository_url", value="#{project.repositoryUrl}", placeholder="https://github.com/org/repo")
+
+        div.card
+          h3 Task Graph Definition (JSON)
+          p Define discrete tasks, dependencies, inputs, and outputs as a JSON array of TaskNodes.
+          div.form-group
+            textarea.form-control#tasks_json(name="tasks_json", rows="14", style="font-family: monospace; font-size: 0.88em;") #{tasksJson}
+
+      div(style="margin-top: 20px; display: flex; gap: 10px;")
+        button.btn.btn-primary(type="submit") Save Project & Tasks
+        button.btn.btn-outline#btn-preview-dag(type="button") Update Visual Preview
+        a.btn.btn-outline(href="/projects/details?id=#{project.id}") Cancel
+
+  script(src="/static/scripts/dag_visualizer.js")
+  script.
+    function updatePreview() {
+      try {
+        var text = document.getElementById("tasks_json").value;
+        var parsed = JSON.parse(text);
+        var tasks = Array.isArray(parsed) ? parsed : (parsed.tasks || []);
+        if (window.renderTaskGraph) {
+          window.renderTaskGraph("dag-editor-canvas", tasks);
+        }
+      } catch(e) {
+        console.error("Invalid task JSON:", e);
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", function() {
+      updatePreview();
+      var btn = document.getElementById("btn-preview-dag");
+      if (btn) btn.addEventListener("click", updatePreview);
+      var textarea = document.getElementById("tasks_json");
+      if (textarea) textarea.addEventListener("blur", updatePreview);
+    });

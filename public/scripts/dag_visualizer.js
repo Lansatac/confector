@@ -120,7 +120,7 @@
     });
   }
 
-  window.renderPipelineDAG = function(canvasId, tasks, taskStatuses) {
+  window.renderTaskGraph = function(canvasId, tasks, taskStatuses) {
     if (!tasks || !tasks.length) return;
     taskStatuses = taskStatuses || {};
 
@@ -209,7 +209,9 @@
     renderGraph(canvasId, nodes, edges);
   };
 
-  window.renderSamplePipeline = function(canvasId) {
+  window.renderDAG = window.renderTaskGraph;
+
+  window.renderSampleDAG = function(canvasId) {
     var nodes = [
       { id: "lint", name: "lint", x: 40, y: 90, status: "ready" },
       { id: "build", name: "build", x: 190, y: 90, status: "ready" },
@@ -228,11 +230,4 @@
 
     renderGraph(canvasId, nodes, edges);
   };
-
-  document.addEventListener("DOMContentLoaded", function() {
-    var dagCanvas = document.getElementById("dag-canvas");
-    if (dagCanvas) {
-      window.renderSamplePipeline("dag-canvas");
-    }
-  });
 })();

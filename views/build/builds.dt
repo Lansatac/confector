@@ -3,19 +3,19 @@ extends layout
 block maincontent
   div.builds-container
     div.header-section
-      h1 Pipeline Builds
-      p Track execution history, cache hits, durations, and graph subgraphs.
+      h1 Builds
+      p Track execution history, cache hits, durations, and task graphs.
 
     - if (builds.length == 0)
       div.empty-state
         p No builds executed yet.
-        a.btn.btn-primary(href="/pipelines/") Launch a pipeline
+        a.btn.btn-primary(href="/projects/") Run Project Tasks
     - else
       table.data-table
         thead
           tr
             th Build ID
-            th Pipeline
+            th Project
             th Status
             th Trigger Source
             th Started
@@ -28,7 +28,7 @@ block maincontent
             tr
               td
                 a.build-link(href="/builds/details?id=#{b.buildId}") #{b.buildId}
-              td #{b.pipelineName}
+              td #{b.projectName}
               td
                 - if (b.status == "succeeded")
                   span.badge.badge-success SUCCESS

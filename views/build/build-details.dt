@@ -19,8 +19,8 @@ block maincontent
 
     div.details-grid
       div.detail-item
-        strong Pipeline:
-        span  #{build.pipelineName}
+        strong Project:
+        span  #{build.projectName}
       div.detail-item
         strong Trigger Source:
         span  #{build.triggerSource}
@@ -43,7 +43,7 @@ block maincontent
         span #{build.errorMessage}
 
     div.section-title-bar(style="margin-top: 30px;")
-      h2 DAG Pipeline Graph
+      h2 Task Execution Graph
       div.graph-legend
         span.legend-item
           span.dot.dot-success
@@ -65,9 +65,25 @@ block maincontent
           div.dag-node-card(data-task="#{taskId}")
             div.node-header
               span.node-id #{taskId}
-              span.badge.badge-sm.badge-success OK
+              - auto pStatus = taskId in taskStatuses;
+              - auto statusStr = pStatus !is null ? *pStatus : (build.status == "cached" ? "cached" : (build.status == "failed" ? "failed" : "succeeded"));
+              - if (statusStr == "succeeded" || statusStr == "success")
+                span.badge.badge-sm.badge-success OK
+              - else if (statusStr == "cached")
+                span.badge.badge-sm.badge-cached CACHED
+              - else if (statusStr == "failed")
+                span.badge.badge-sm.badge-danger FAILED
+              - else if (statusStr == "running")
+                span.badge.badge-sm.badge-warning RUNNING
+              - else
+                span.badge.badge-sm.badge-secondary #{statusStr}
             div.node-meta
-              span Executed
+              - if (statusStr == "cached")
+                span Cached
+              - else if (statusStr == "failed")
+                span Failed
+              - else
+                span Executed
 
     div.section-title-bar(style="margin-top: 30px;")
       h2 Live Execution Logs
@@ -83,4 +99,12 @@ block maincontent
           div.log-line #{line}
 
   script(src="/static/scripts/dag_visualizer.js")
+  script.
+    document.addEventListener("DOMContentLoaded", function() {
+      var tasksData = !{tasksJson};
+      var taskStatusesData = !{taskStatusesJson};
+      if (tasksData && tasksData.length && window.renderTaskGraph) {
+        window.renderTaskGraph("dag-canvas", tasksData, taskStatusesData);
+      }
+    });
   script(src="/static/scripts/live_logs.js")

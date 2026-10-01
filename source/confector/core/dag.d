@@ -17,11 +17,11 @@ class TaskGraph
     private string[][string] m_dependents;   // taskId -> array of downstream tasks depending on it
 
     /**
-     * Constructs a TaskGraph from a PipelineDefinition.
+     * Constructs a TaskGraph from a ProjectRecord.
      */
-    this(in PipelineDefinition pipeline)
+    this(in ProjectRecord project)
     {
-        this(pipeline.tasks);
+        this(project.tasks);
     }
 
     /**
@@ -33,7 +33,7 @@ class TaskGraph
         {
             if (task.id in m_tasks)
             {
-                throw new DAGValidationException(format("Duplicate task id defined in pipeline: '%s'", task.id));
+                throw new DAGValidationException(format("Duplicate task id defined in graph: '%s'", task.id));
             }
             m_tasks[task.id] = cast(TaskNode) task;
             m_dependencies[task.id] = [];

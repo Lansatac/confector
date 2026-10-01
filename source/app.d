@@ -76,11 +76,9 @@ void main()
   // Mount API & serverless execution endpoints
   router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
 
-  // Mount dashboard, builds, pipelines, and trigger UI
+  // Mount dashboard, builds, and projects UI
   router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
-  router.any("/pipelines/*", dashboardRouter(taskEngine, workQueue, stateRepo));
-  router.any("/triggers/*", dashboardRouter(taskEngine, workQueue, stateRepo));
   router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo));
 
   router.any("/repositories/*", repositoryRouter(client));

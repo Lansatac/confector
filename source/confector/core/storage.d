@@ -260,31 +260,6 @@ interface BuildStateRepository
      * Deletes a project record by ID.
      */
     bool deleteProject(string projectId);
-
-    /**
-     * Saves or updates a pipeline record.
-     */
-    void savePipeline(in PipelineRecord pipeline);
-
-    /**
-     * Retrieves a pipeline record by ID.
-     */
-    bool getPipeline(string pipelineId, out PipelineRecord pipeline);
-
-    /**
-     * Lists all pipelines belonging to a project.
-     */
-    PipelineRecord[] listPipelinesForProject(string projectId);
-
-    /**
-     * Lists all pipelines across all projects.
-     */
-    PipelineRecord[] listAllPipelines();
-
-    /**
-     * Deletes a pipeline record by ID.
-     */
-    bool deletePipeline(string pipelineId);
 }
 
 /**
@@ -304,7 +279,6 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private string[][string] m_buildLogs;
     private TriggerRuleRecord[string] m_triggerRules;
     private ProjectRecord[string] m_projects;
-    private PipelineRecord[string] m_pipelines;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -455,56 +429,6 @@ class InMemoryBuildStateRepository : BuildStateRepository
         }
         return false;
     }
-
-    override void savePipeline(in PipelineRecord pipeline)
-    {
-        m_pipelines[pipeline.id] = cast()pipeline;
-    }
-
-    override bool getPipeline(string pipelineId, out PipelineRecord pipeline)
-    {
-        auto p = pipelineId in m_pipelines;
-        if (p !is null)
-        {
-            pipeline = *p;
-            return true;
-        }
-        return false;
-    }
-
-    override PipelineRecord[] listPipelinesForProject(string projectId)
-    {
-        PipelineRecord[] list;
-        foreach (p; m_pipelines)
-        {
-            if (p.projectId == projectId)
-            {
-                list ~= p;
-            }
-        }
-        return list;
-    }
-
-    override PipelineRecord[] listAllPipelines()
-    {
-        PipelineRecord[] list;
-        foreach (p; m_pipelines)
-        {
-            list ~= p;
-        }
-        return list;
-    }
-
-    override bool deletePipeline(string pipelineId)
-    {
-        auto p = pipelineId in m_pipelines;
-        if (p !is null)
-        {
-            m_pipelines.remove(pipelineId);
-            return true;
-        }
-        return false;
-    }
 }
 
 unittest
@@ -543,13 +467,13 @@ unittest
     // Build recording and logging
     BuildRecord bRecord;
     bRecord.buildId = "b1";
-    bRecord.pipelineName = "test_pipe";
+    bRecord.projectName = "test_project";
     bRecord.status = "succeeded";
     stateRepo.recordBuild(bRecord);
 
     BuildRecord fetchedBuild;
     assert(stateRepo.getBuild("b1", fetchedBuild));
-    assert(fetchedBuild.pipelineName == "test_pipe");
+    assert(fetchedBuild.projectName == "test_project");
     assert(stateRepo.listBuilds().length == 1);
 
     stateRepo.appendBuildLog("b1", "[step1] Building application");
@@ -567,11 +491,15 @@ unittest
     assert(stateRepo.deleteTriggerRule("trig_1"));
     assert(stateRepo.listTriggerRules().length == 0);
 
-    // Project and Pipeline persistence in InMemoryBuildStateRepository
+    // Project persistence in InMemoryBuildStateRepository
     ProjectRecord proj;
     proj.id = "proj-confector";
     proj.name = "Confector";
     proj.workspaceDir = ".";
+    TaskNode node;
+    node.id = "build";
+    node.script = "dub build";
+    proj.tasks = [node];
     proj.createdAt = "2026-09-30T12:00:00Z";
     proj.updatedAt = "2026-09-30T12:00:00Z";
 
@@ -580,29 +508,9 @@ unittest
     ProjectRecord fetchedProj;
     assert(stateRepo.getProject("proj-confector", fetchedProj));
     assert(fetchedProj.name == "Confector");
+    assert(fetchedProj.tasks.length == 1);
+    assert(fetchedProj.tasks[0].id == "build");
 
-    PipelineRecord pipe;
-    pipe.id = "pipe-build";
-    pipe.projectId = "proj-confector";
-    pipe.name = "Build Pipeline";
-    TaskNode node;
-    node.id = "build";
-    node.script = "dub build";
-    pipe.definition.tasks = [node];
-    pipe.createdAt = "2026-09-30T12:00:00Z";
-    pipe.updatedAt = "2026-09-30T12:00:00Z";
-
-    stateRepo.savePipeline(pipe);
-    assert(stateRepo.listAllPipelines().length == 1);
-    assert(stateRepo.listPipelinesForProject("proj-confector").length == 1);
-    assert(stateRepo.listPipelinesForProject("other-project").length == 0);
-    PipelineRecord fetchedPipe;
-    assert(stateRepo.getPipeline("pipe-build", fetchedPipe));
-    assert(fetchedPipe.definition.tasks.length == 1);
-    assert(fetchedPipe.definition.tasks[0].id == "build");
-
-    assert(stateRepo.deletePipeline("pipe-build"));
-    assert(stateRepo.listAllPipelines().length == 0);
     assert(stateRepo.deleteProject("proj-confector"));
     assert(stateRepo.listProjects().length == 0);
 }

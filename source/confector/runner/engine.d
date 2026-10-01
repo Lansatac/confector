@@ -29,9 +29,9 @@ struct TaskExecutionResult
 }
 
 /**
- * Result of a pipeline execution.
+ * Result of a task graph or build execution.
  */
-struct PipelineExecutionResult
+struct GraphExecutionResult
 {
     string buildId;
     bool success;
@@ -275,13 +275,16 @@ class TaskEngine
     }
 
     /**
-     * Executes a pipeline or subgraph slice according to an ExecutionPlan.
+     * Executes a task graph or subgraph slice according to an ExecutionPlan.
      */
-    PipelineExecutionResult executePipeline(
+    GraphExecutionResult executeTasks(
         string buildId,
-        in PipelineDefinition pipeline,
+        in TaskNode[] tasks,
         in ExecutionPlan plan,
         string workspaceDir,
+        string projectId = null,
+        string projectName = null,
+        string targetTaskId = null,
         bool force = false,
         LogDelegate logCallback = null
     )
@@ -289,24 +292,26 @@ class TaskEngine
         import std.datetime.systime : Clock;
 
         auto totalSw = StopWatch(AutoStart.yes);
-        PipelineExecutionResult pipelineResult;
-        pipelineResult.buildId = buildId;
-        pipelineResult.success = true;
+        GraphExecutionResult graphResult;
+        graphResult.buildId = buildId;
+        graphResult.success = true;
 
         BuildRecord buildRec;
         buildRec.buildId = buildId;
-        buildRec.pipelineName = "default";
+        buildRec.projectId = projectId;
+        buildRec.projectName = projectName.length > 0 ? projectName : "default";
+        buildRec.targetTaskId = targetTaskId;
         buildRec.status = "running";
         buildRec.workspaceDir = workspaceDir;
         buildRec.startedAt = Clock.currTime.toISOString();
         if (m_stateRepo !is null)
         {
             m_stateRepo.recordBuild(buildRec);
-            m_stateRepo.appendBuildLog(buildId, format("[pipeline] Starting build %s with %d tasks", buildId, plan.orderedTaskIds.length));
+            m_stateRepo.appendBuildLog(buildId, format("[engine] Starting build %s with %d tasks", buildId, plan.orderedTaskIds.length));
         }
 
         const(TaskNode)*[string] taskMap;
-        foreach (ref task; pipeline.tasks)
+        foreach (ref task; tasks)
         {
             taskMap[task.id] = &task;
         }
@@ -316,11 +321,11 @@ class TaskEngine
 
         foreach (taskId; plan.orderedTaskIds)
         {
-            pipelineResult.executedOrder ~= taskId;
+            graphResult.executedOrder ~= taskId;
             auto pTask = taskId in taskMap;
             if (pTask is null)
             {
-                pipelineResult.success = false;
+                graphResult.success = false;
                 break;
             }
 
@@ -344,7 +349,7 @@ class TaskEngine
                 logCallback
             );
 
-            pipelineResult.taskResults[taskId] = taskRes;
+            graphResult.taskResults[taskId] = taskRes;
 
             if (taskRes.status != TaskStatus.cached)
             {
@@ -363,10 +368,10 @@ class TaskEngine
 
             if (taskRes.status == TaskStatus.failed)
             {
-                pipelineResult.success = false;
+                graphResult.success = false;
                 if (m_stateRepo !is null)
                 {
-                    m_stateRepo.appendBuildLog(buildId, format("[pipeline] Build failed at task '%s': %s", taskId, taskRes.errorMessage));
+                    m_stateRepo.appendBuildLog(buildId, format("[engine] Build failed at task '%s': %s", taskId, taskRes.errorMessage));
                 }
                 break;
             }
@@ -375,14 +380,14 @@ class TaskEngine
         totalSw.stop();
         buildRec.finishedAt = Clock.currTime.toISOString();
         buildRec.durationMs = totalSw.peek.total!"msecs";
-        buildRec.executedTasks = pipelineResult.executedOrder;
+        buildRec.executedTasks = graphResult.executedOrder;
 
-        if (!pipelineResult.success)
+        if (!graphResult.success)
         {
             buildRec.status = "failed";
             buildRec.errorMessage = "One or more tasks failed execution";
         }
-        else if (allCached && pipelineResult.executedOrder.length > 0)
+        else if (allCached && graphResult.executedOrder.length > 0)
         {
             buildRec.status = "cached";
         }
@@ -394,10 +399,10 @@ class TaskEngine
         if (m_stateRepo !is null)
         {
             m_stateRepo.recordBuild(buildRec);
-            m_stateRepo.appendBuildLog(buildId, format("[pipeline] Build completed with status '%s' in %d ms", buildRec.status, buildRec.durationMs));
+            m_stateRepo.appendBuildLog(buildId, format("[engine] Build completed with status '%s' in %d ms", buildRec.status, buildRec.durationMs));
         }
 
-        return pipelineResult;
+        return graphResult;
     }
 }
 
@@ -447,7 +452,7 @@ unittest
     auto res3 = engine.executeTask("build_3", node1, testDir, null, true);
     assert(res3.status == TaskStatus.succeeded);
 
-    // Multi-node pipeline test with artifact staging
+    // Multi-node task graph test with artifact staging
     TaskNode node2;
     node2.id = "step2";
     node2.name = "Step 2";
@@ -463,24 +468,23 @@ unittest
     }
     node2.outputs.artifacts = [OutputArtifactDecl("result.txt", "file")];
 
-    PipelineDefinition pipelineDef;
-    pipelineDef.tasks = [node1, node2];
+    TaskNode[] taskList = [node1, node2];
 
     ExecutionPlan plan;
     plan.orderedTaskIds = ["step1", "step2"];
 
-    // Execute full pipeline
-    auto pipeRes1 = engine.executePipeline("build_pipe_1", pipelineDef, plan, testDir);
-    assert(pipeRes1.success);
-    assert(pipeRes1.executedOrder == ["step1", "step2"]);
-    assert(pipeRes1.taskResults["step2"].status == TaskStatus.succeeded);
-    assert(storage.artifactExists("build_pipe_1", "step2", "result.txt"));
+    // Execute full graph
+    auto graphRes1 = engine.executeTasks("build_graph_1", taskList, plan, testDir, "proj-1", "My Project");
+    assert(graphRes1.success);
+    assert(graphRes1.executedOrder == ["step1", "step2"]);
+    assert(graphRes1.taskResults["step2"].status == TaskStatus.succeeded);
+    assert(storage.artifactExists("build_graph_1", "step2", "result.txt"));
 
-    // Second pipeline execution without changes: all nodes should be cached
-    auto pipeRes2 = engine.executePipeline("build_pipe_2", pipelineDef, plan, testDir);
-    assert(pipeRes2.success);
-    assert(pipeRes2.taskResults["step1"].status == TaskStatus.cached);
-    assert(pipeRes2.taskResults["step2"].status == TaskStatus.cached);
+    // Second execution without changes: all nodes should be cached
+    auto graphRes2 = engine.executeTasks("build_graph_2", taskList, plan, testDir, "proj-1", "My Project");
+    assert(graphRes2.success);
+    assert(graphRes2.taskResults["step1"].status == TaskStatus.cached);
+    assert(graphRes2.taskResults["step2"].status == TaskStatus.cached);
 
     // Missing upstream artifact failure test
     TaskNode nodeBad;

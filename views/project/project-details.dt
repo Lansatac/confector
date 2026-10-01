@@ -8,7 +8,11 @@ block maincontent
           h1 #{project.name}
           p #{project.description.length > 0 ? project.description : "No description provided."}
         div(style="display: flex; gap: 10px;")
-          a.btn.btn-primary(href="/pipelines/edit?project_id=#{project.id}") + Author Pipeline
+          a.btn.btn-primary(href="/projects/tasks/edit?project_id=#{project.id}") + Add Task
+          form(action="/projects/run", method="POST", style="display:inline;")
+            input(type="hidden", name="id", value="#{project.id}")
+            button.btn.btn-success(type="submit") Execute All Tasks
+          a.btn.btn-secondary(href="/projects/edit?id=#{project.id}") Edit JSON Graph
           a.btn.btn-outline(href="/projects/") Back to Projects
 
     div.grid-2col(style="margin-top: 20px;")
@@ -35,44 +39,84 @@ block maincontent
 
       div.card
         h3 Quick Actions
-        p Author custom arbitrary DAG execution pipelines for this workspace.
+        p Manage discrete DAG tasks and execute targeted workflow slices.
         div(style="display: flex; flex-direction: column; gap: 10px;")
-          a.btn.btn-primary(href="/pipelines/edit?project_id=#{project.id}") Author New Pipeline DAG
+          a.btn.btn-primary(href="/projects/tasks/edit?project_id=#{project.id}") Add New Discrete Task
+          a.btn.btn-outline(href="/projects/edit?id=#{project.id}") Edit Project & Tasks JSON
           form(action="/projects/delete", method="POST")
             input(type="hidden", name="id", value="#{project.id}")
-            button.btn.btn-danger(type="submit", onclick="return confirm('Delete this project and all its pipelines?');") Delete Project
+            button.btn.btn-danger(type="submit", onclick="return confirm('Delete this project and all its tasks?');") Delete Project
+
+    - if (project.tasks.length > 0)
+      div.section-title-bar(style="margin-top: 30px;")
+        h2 Visual Task Graph Preview
+      div#project-dag-container.dag-visualizer
+        canvas#project-dag-canvas(width="800", height="220")
 
     div.section-title-bar(style="margin-top: 30px;")
-      h2 Pipelines for #{project.name}
+      h2 Task Registry for #{project.name}
 
-    - if (pipelines.length == 0)
+    - if (project.tasks.length == 0)
       div.empty-state
-        p No pipelines configured for this project yet.
-        a.btn.btn-primary(href="/pipelines/edit?project_id=#{project.id}") Author Pipeline
+        p No tasks configured for this project yet.
+        a.btn.btn-primary(href="/projects/tasks/edit?project_id=#{project.id}") Add Your First Task
     - else
       table.data-table
         thead
           tr
-            th Pipeline ID
+            th Task ID
             th Name
-            th Tasks (Nodes)
-            th Description
+            th Depends On
+            th Inputs / Artifacts
+            th Script / Command
             th Actions
         tbody
-          - foreach(pipe; pipelines)
+          - foreach(t; project.tasks)
             tr
               td
-                code #{pipe.id}
+                code #{t.id}
               td
-                strong #{pipe.name}
+                strong #{t.name.length > 0 ? t.name : t.id}
               td
-                span.badge.badge-info #{pipe.definition.tasks.length} node(s)
-              td #{pipe.description}
+                - if (t.dependsOn.length > 0)
+                  div(style="display: flex; flex-wrap: wrap; gap: 4px;")
+                    - foreach(dep; t.dependsOn)
+                      span.badge.badge-secondary #{dep}
+                - else
+                  span(style="color: #6c757d; font-size: 0.85em;") Root node (None)
               td
-                a.btn.btn-sm.btn-outline(href="/pipelines/edit?id=#{pipe.id}&project_id=#{project.id}", style="margin-right: 5px;") Edit DAG
-                form(action="/pipelines/run", method="POST", style="display:inline; margin-right: 5px;")
-                  input(type="hidden", name="id", value="#{pipe.id}")
-                  button.btn.btn-sm.btn-primary(type="submit") Execute
-                form(action="/pipelines/delete", method="POST", style="display:inline;")
-                  input(type="hidden", name="id", value="#{pipe.id}")
-                  button.btn.btn-sm.btn-danger(type="submit", onclick="return confirm('Delete pipeline?');") Delete
+                div(style="font-size: 0.85em;")
+                  - if (t.inputs.files.length > 0)
+                    div
+                      strong Files: 
+                      span #{t.inputs.files.length} pattern(s)
+                  - if (t.inputs.upstreamArtifacts.length > 0)
+                    div
+                      strong Upstream: 
+                      span #{t.inputs.upstreamArtifacts.length} artifact(s)
+                  - if (t.outputs.artifacts.length > 0)
+                    div
+                      strong Outputs: 
+                      span #{t.outputs.artifacts.length} artifact(s)
+              td
+                code(style="font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; display: inline-block;") #{t.script}
+              td
+                div(style="display: flex; gap: 5px;")
+                  form(action="/projects/run", method="POST", style="display:inline;")
+                    input(type="hidden", name="id", value="#{project.id}")
+                    input(type="hidden", name="target_task_id", value="#{t.id}")
+                    button.btn.btn-sm.btn-primary(type="submit", title="Execute this task and upstream dependencies") Run
+                  a.btn.btn-sm.btn-outline(href="/projects/tasks/edit?project_id=#{project.id}&task_id=#{t.id}") Edit
+                  form(action="/projects/tasks/delete", method="POST", style="display:inline;")
+                    input(type="hidden", name="project_id", value="#{project.id}")
+                    input(type="hidden", name="task_id", value="#{t.id}")
+                    button.btn.btn-sm.btn-danger(type="submit", onclick="return confirm('Delete task #{t.id}?');") Delete
+
+  script(src="/static/scripts/dag_visualizer.js")
+  script.
+    document.addEventListener("DOMContentLoaded", function() {
+      var tasksData = !{tasksJson};
+      if (tasksData && tasksData.length && window.renderTaskGraph) {
+        window.renderTaskGraph("project-dag-canvas", tasksData);
+      }
+    });

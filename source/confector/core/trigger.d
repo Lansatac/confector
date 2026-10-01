@@ -56,14 +56,14 @@ struct TriggerMatcher
     }
 
     /**
-     * Finds all task IDs in a pipeline that are triggered by the specified event.
+     * Finds all task IDs in a task list that are triggered by the specified event.
      */
-    static string[] findMatchingTasks(in PipelineDefinition pipeline, in TriggerEvent event) @safe
+    static string[] findMatchingTasks(in TaskNode[] tasks, in TriggerEvent event) @safe
     {
         // If an explicit target task was specified (e.g. manual dispatch to a specific node)
         if (event.targetTaskId.length > 0)
         {
-            foreach (task; pipeline.tasks)
+            foreach (task; tasks)
             {
                 if (task.id == event.targetTaskId)
                 {
@@ -74,7 +74,7 @@ struct TriggerMatcher
         }
 
         string[] matchingTaskIds;
-        foreach (task; pipeline.tasks)
+        foreach (task; tasks)
         {
             foreach (rule; task.triggers)
             {
@@ -141,7 +141,7 @@ unittest
     hookEvent2.endpoint = "/api/v1/triggers/other";
     assert(!TriggerMatcher.matches(hookRule, hookEvent2));
 
-    // Test pipeline matching
+    // Test task matching
     TaskNode lintNode;
     lintNode.id = "lint";
     lintNode.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
@@ -150,20 +150,19 @@ unittest
     deployNode.id = "deploy";
     deployNode.triggers = [TriggerRule(TriggerType.webhook, [], [], "/api/v1/deploy")];
 
-    PipelineDefinition pipeline;
-    pipeline.tasks = [lintNode, deployNode];
+    TaskNode[] tasks = [lintNode, deployNode];
 
-    assert(TriggerMatcher.findMatchingTasks(pipeline, event2) == ["lint"]);
-    assert(TriggerMatcher.findMatchingTasks(pipeline, hookEvent1) == []);
+    assert(TriggerMatcher.findMatchingTasks(tasks, event2) == ["lint"]);
+    assert(TriggerMatcher.findMatchingTasks(tasks, hookEvent1) == []);
 
     TriggerEvent deployHook;
     deployHook.type = TriggerType.webhook;
     deployHook.endpoint = "/api/v1/deploy";
-    assert(TriggerMatcher.findMatchingTasks(pipeline, deployHook) == ["deploy"]);
+    assert(TriggerMatcher.findMatchingTasks(tasks, deployHook) == ["deploy"]);
 
     // Test explicit targetTaskId
     TriggerEvent targeted;
     targeted.type = TriggerType.manual;
     targeted.targetTaskId = "deploy";
-    assert(TriggerMatcher.findMatchingTasks(pipeline, targeted) == ["deploy"]);
+    assert(TriggerMatcher.findMatchingTasks(tasks, targeted) == ["deploy"]);
 }
