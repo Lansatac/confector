@@ -30,14 +30,18 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Decision**: Execution environments, version control integrations, and runner backends are modeled as decoupled plugins managed by a centralized lifecycle registry.
 - **Rationale**: Isolates the core DAG scheduler from external toolchains and cloud providers, allowing new capabilities to be registered dynamically without altering core graph logic.
 
+### 1.7 Data-Oriented System Isolation (ECS-Inspired Model)
+- **Decision**: Task nodes are modeled as entity identities with attached, composable data components (inputs, execution specifications, outputs, and triggers), processed by stateless, decoupled systems.
+- **Rationale**: Prevents central domain model bloat when introducing exotic input types, heterogeneous storage layers, or custom execution targets. Eliminates rigid inheritance hierarchies in favor of data/logic separation, maximizing composability, modularity, and extensibility across plugins.
+
 ---
 
 ## 2. Subsystem Boundaries & Responsibilities
 
-- **`source/confector/core/`**: Stateless core library containing domain models (`model.d`), DAG cycle detection & sorting (`dag.d`), fingerprint calculation (`fingerprinter.d`), trigger evaluation (`trigger.d`), and plugin lifecycle interfaces (`plugin.d`, `executor.d`, `vcs.d`). Must have no persistent database or HTTP server dependencies.
+- **`source/confector/core/`**: Stateless core library containing domain models and entity definitions (`model.d`), DAG cycle detection & sorting (`dag.d`), fingerprint calculation (`fingerprinter.d`), trigger evaluation (`trigger.d`), plugin lifecycle interfaces (`plugin.d`, `executor.d`, `vcs.d`), and decoupled system contracts (`system.d`). Must have no persistent database or HTTP server dependencies.
 - **`source/confector/runner/`**: Execution runners for evaluating task payloads locally via child processes (`process_runner.d`) or serverless invocation handlers (`serverless_runner.d`).
 - **`source/confector/queue/`**: Work queue abstractions (`queue.d`) and storage implementations (MongoDB collection queue, cloud queue driver).
-- **`source/confector/plugins/`**: Built-in plugin implementations for execution (`process_runner.d`) and VCS providers (`git.d`).
+- **`source/confector/plugins/`**: Built-in plugin implementations containing component data definitions and stateless processing systems for execution (`process_runner.d`) and VCS providers (`git.d`).
 - **`source/controller/` & `source/app.d`**: Persistent Vibe.d web service handling HTTP routing, webhooks, UI rendering, and database persistence.
 
 ---
@@ -46,8 +50,8 @@ This document outlines the architectural principles, key design decisions, subsy
 
 1. **Stateless Core Invariant**:
    - `confector.core` modules must remain pure and stateless. External state and storage systems must be passed via abstractions.
-2. **Plugin Extensibility**:
-   - New execution environments or version control integrations must implement domain plugin interfaces (`TaskRunner`, `RepositoryProvider`) and register via `PluginRegistry`.
+2. **Plugin Extensibility & Component-System Isolation**:
+   - New execution environments, input resolvers, or version control integrations should model data as passive components and logic as stateless systems, registering via `PluginRegistry`.
 3. **Explicit Error Diagnostics**:
    - Prefer domain-specific exceptions (e.g., `DAGValidationException`, `FingerprintException`) with descriptive diagnostics (such as exact cycle paths in cyclic graphs).
 4. **D Idioms & Safety**:
