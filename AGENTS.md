@@ -38,15 +38,21 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Decision**: Task execution consists of an arbitrary ordered list of plugin-defined build steps (such as the Git plugin's `clone_repository` step or the process runner's `process` step).
 - **Rationale**: Replaces rigid, monolithic script execution with composable, sequentially executed step systems. Each plugin exposes step handlers dynamically via `BuildStepSystem`, maximizing reusability and fine-grained error isolation.
 
+### 1.9 Unified Build Orchestration & Contained Artifact Directory
+- **Decision**: The multi-package build (server executable, dynamic plugin libraries, Diet-NG views, and static assets) is orchestrated via Reggae generating a Ninja build graph targeting a single contained `bin/` directory.
+- **Rationale**: Provides fast, deterministic, parallel builds and ensures all runtime components (`bin/confector`, `bin/plugins/`, `bin/views/`, `bin/public/`) reside in a single self-contained artifact directory for deployment and local execution.
+
 ---
 
 ## 2. Subsystem Boundaries & Responsibilities
 
-- **`source/confector/core/`**: Stateless core library containing domain models and entity definitions (`model.d`), DAG cycle detection & sorting (`dag.d`), fingerprint calculation (`fingerprinter.d`), trigger evaluation (`trigger.d`), plugin lifecycle interfaces (`plugin.d`, `executor.d`, `vcs.d`), and decoupled system contracts (`system.d`). Must have no persistent database or HTTP server dependencies.
+- **`source/confector/core/`**: Stateless core library containing domain models and entity definitions (`model.d`), DAG cycle detection & sorting (`dag.d`), fingerprint calculation (`fingerprinter.d`), trigger evaluation (`trigger.d`), plugin lifecycle interfaces (`plugin.d`, `executor.d`, `vcs.d`), dynamic plugin loading (`plugin_loader.d`), and decoupled system contracts (`system.d`). Must have no persistent database or HTTP server dependencies.
 - **`source/confector/runner/`**: Execution runners for evaluating task payloads locally via child processes (`process_runner.d`) or serverless invocation handlers (`serverless_runner.d`).
 - **`source/confector/queue/`**: Work queue abstractions (`queue.d`) and storage implementations (MongoDB collection queue, cloud queue driver).
-- **`source/confector/plugins/`**: Built-in plugin implementations containing component data definitions and stateless processing systems for execution (`process_runner.d`) and VCS providers (`git.d`).
+- **`plugins/`**: Built-in plugin packages (`bash`, `git`, `local_executor`, `powershell`) containing component data definitions, Diet-NG view templates, and processing systems, compiled as dynamic libraries (`bin/plugins/*.dll` or `*.so`).
 - **`source/controller/` & `source/app.d`**: Persistent Vibe.d web service handling HTTP routing, webhooks, UI rendering, and database persistence.
+- **`reggaefile.d`**: Top-level Reggae build script coordinating DUB package compilation, dynamic plugin builds, and file synchronization into the `bin/` artifact directory.
+- **`bin/`**: Self-contained runtime artifact directory containing the executable, `plugins/` directory, `views/`, and `public/` web assets.
 
 ---
 
@@ -61,8 +67,13 @@ This document outlines the architectural principles, key design decisions, subsy
 4. **D Idioms & Safety**:
    - Use standard D type qualifiers (`immutable`, `const`, `pure`, `@safe` / `@trusted` where appropriate).
    - Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.
-5. **Unit Testing**:
-   - Every core algorithm (DAG resolution, cycle detection, fingerprinting, trigger matching, plugin registration) must be accompanied by comprehensive unit tests (`unittest { ... }`).
+5. **Build & Execution Workflow**:
+   - Generate Ninja build configuration: `reggae -b ninja .`
+   - Build all targets (app, plugins, assets): `ninja`
+   - Build specific components: `ninja app`, `ninja plugins`, `ninja plugin-<name>`
+   - Run the server: `./bin/confector` (Linux) or `.\bin\confector.exe` (Windows)
+6. **Unit Testing**:
+   - Every core algorithm (DAG resolution, cycle detection, fingerprinting, trigger matching, plugin registration) must be accompanied by comprehensive unit tests (`dub test confector:core`).
 
 ---
 

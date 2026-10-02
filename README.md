@@ -45,6 +45,7 @@ Execution runtimes, version control providers, and storage backends are decouple
 ### Prerequisites
 - [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/)
 - [VS Code Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) (recommended)
+- [DMD / LDC](https://dlang.org/download.html), [DUB](https://dub.pm/), [Reggae](https://github.com/atilaneves/reggae), and [Ninja](https://ninja-build.org/) (included in the dev container)
 
 ### Local Development
 
@@ -55,14 +56,33 @@ Execution runtimes, version control providers, and storage backends are decouple
    - MongoDB: `localhost:27017`
    - Mongo Express UI: `http://localhost:8081`
 
-2. **Build and test:**
-Connect VS Code to the development container, then run:
+2. **Generate build files & compile:**
    ```bash
-   dub build
-   dub test
-   dub run
+   reggae -b ninja .
+   ninja
    ```
-   Once running, connect via http://localhost:8083
+   This builds the server executable (`bin/confector`), compiles all plugin shared libraries (`bin/plugins/`), and copies required `views/` and `public/` assets into the `bin/` artifact directory.
+
+   **Granular build targets:**
+   - `ninja app` — Compile the main server and synchronize assets
+   - `ninja plugins` — Compile all dynamic plugins (`bash`, `git`, `local_executor`, `powershell`)
+   - `ninja plugin-<name>` — Compile a specific plugin (e.g., `ninja plugin-git`)
+
+3. **Run the server:**
+   - **Linux / Dev Container:**
+     ```bash
+     ./bin/confector
+     ```
+   - **Windows:**
+     ```powershell
+     .\bin\confector.exe
+     ```
+   Once running, open [http://localhost:8083](http://localhost:8083) in your browser.
+
+4. **Run tests:**
+   ```bash
+   dub test confector:core
+   ```
 
 ---
 
