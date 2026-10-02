@@ -1,4 +1,4 @@
-module clonestatus;
+module controller.clonestatus;
 
 import vibe.vibe;
 

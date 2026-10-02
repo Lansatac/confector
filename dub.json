@@ -11,6 +11,7 @@
 	"description": "A build system.",
 	"license": "The Unlicense",
 	"name": "confector",
+	"targetPath": "bin",
 	"subPackages": [
 		{
 			"name": "core",

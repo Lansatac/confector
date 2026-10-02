@@ -24,6 +24,13 @@
 docs.json
 __dummy.html
 docs/
+__dub_cache__/
+
+#build
+bin/
+.reggae
+*.ninja*
+compile_commands.json
 
 confector-test-library
 
@@ -33,3 +40,4 @@ confector-test-library
 
 # LLMs
 .junie/plans
+.output.txt

@@ -5,7 +5,7 @@ import std.algorithm;
 import std.range;
 import std.typecons;
 
-import clonestatus;
+import controller.clonestatus;
 import confector.core.plugin;
 import confector.core.vcs;
 import confector.core.executor;
