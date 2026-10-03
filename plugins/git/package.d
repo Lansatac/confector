@@ -173,7 +173,7 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             m_context.info(format("Executing git clone via GitRepositoryPlugin for %s into %s", address, targetDirectory));
         }
 
-        auto pipe = pipeShell(format("git clone %s", address),
+        auto pipe = pipeShell(format("git clone %s .", address),
             Redirect.stdout | Redirect.stderrToStdout,
             null,
             Config.retainStderr,
@@ -395,8 +395,15 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
         else if ("targetDirectory" in step.parameters) specifiedTarget = step.parameters["targetDirectory"];
         else if ("target" in step.parameters) specifiedTarget = step.parameters["target"];
         else if (step.properties.type == JSONType.object && "target_dir" in step.properties) specifiedTarget = step.properties["target_dir"].str;
+        else if (step.properties.type == JSONType.object && "targetDirectory" in step.properties) specifiedTarget = step.properties["targetDirectory"].str;
+        else if (step.properties.type == JSONType.object && "target" in step.properties) specifiedTarget = step.properties["target"].str;
 
-        if (specifiedTarget.length > 0 && specifiedTarget != ".")
+        if (specifiedTarget.length == 0)
+        {
+            specifiedTarget = ".";
+        }
+
+        if (specifiedTarget != ".")
         {
             targetDir = isAbsolute(specifiedTarget) ? specifiedTarget : buildPath(context.workingDirectory, specifiedTarget);
         }
@@ -411,13 +418,20 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
 
         try
         {
-            mkdirRecurse(targetDir);
+            mkdirRecurse(context.workingDirectory);
             string cmd = format("git clone %s", repoUrl);
             if (branch.length > 0)
             {
                 cmd ~= format(" -b %s", branch);
             }
-            cmd ~= format(" \"%s\"", targetDir);
+            if (specifiedTarget == ".")
+            {
+                cmd ~= " .";
+            }
+            else
+            {
+                cmd ~= format(" \"%s\"", specifiedTarget);
+            }
 
             if (context.logCallback !is null)
             {
@@ -428,7 +442,7 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
                 Redirect.stdout | Redirect.stderrToStdout,
                 null,
                 Config.retainStderr,
-                targetDir);
+                context.workingDirectory);
 
             foreach (line; pipe.stdout.byLineCopy)
             {
@@ -504,6 +518,7 @@ unittest
     // BuildStepProvider testing
     assert(plugin.displayName == "Clone Git Repository");
     assert(plugin.defaultParameters()["repository"].str == "");
+    assert(plugin.defaultParameters()["target_dir"].str == ".");
     auto html = plugin.renderStepFormHtml(JSONValue(string[string].init));
     assert(html.length > 0);
     assert(plugin.validateParameters(JSONValue(string[string].init)).length == 0);
