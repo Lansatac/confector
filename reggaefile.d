@@ -68,13 +68,10 @@ Build reggaeBuild() {
     
     auto plugins = Target.phony("plugins", "", [bash, git, localExec, powershell]);
 
-    // Assets & Views copied to output bin directory
-    Target[] assetTargets = copyDirectoryFiles("public", "bin/public") ~ copyDirectoryFiles("views", "bin/views");
-
     // Default 'all' target grouping application, plugins, and static/view assets
-    auto all = Target.phony("all", "", [appTarget, plugins] ~ assetTargets);
+    auto all = Target.phony("all", "", [appTarget, plugins]);
 
-    Target[] allTargets = [all, appTarget, plugins, bash, git, localExec, powershell] ~ assetTargets;
+    Target[] allTargets = [all, appTarget, plugins, bash, git, localExec, powershell];
 
     return Build(allTargets);
 }

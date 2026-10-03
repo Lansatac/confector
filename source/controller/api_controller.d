@@ -811,7 +811,7 @@ unittest
         @property string name() const { return "mock-api-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock api plugin"; }
-        void initialize() {}
+        void initialize(PluginContext context = null) {}
         void shutdown() {}
     }
 

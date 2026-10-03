@@ -122,7 +122,9 @@ void main()
 
   // Mount dashboard, builds, projects, executors, and admin UI
   router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
   router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/builds/"); });
   router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance));
   router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
   router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
@@ -130,6 +132,7 @@ void main()
   router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo));
 
   router.any("/repositories/*", repositoryRouter(client));
+  router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 	
 	auto settings = new HTTPServerSettings;
 	//settings.port = 8080;
@@ -139,7 +142,7 @@ void main()
 
   debug settings.options = HTTPServerOption.defaults | HTTPServerOption.errorStackTraces;
   //debug settings.accessLogToConsole = true;
-  //debug setLogLevel(LogLevel.debugV);
+  debug setLogLevel(vibe.core.log.LogLevel.info);
 	
 	listenHTTP(settings, router);
 	

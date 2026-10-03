@@ -48,7 +48,7 @@ RUN if id -u $USER_UID >/dev/null 2>&1; then \
     fi \
     && groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME \
-    && mkdir -p /code /home/$USERNAME/.dub \
+    && mkdir -p /code/.dub /code/.reggae /code/bin /home/$USERNAME/.dub \
     && chown -R $USERNAME:$USERNAME /code /home/$USERNAME/.dub
 
 WORKDIR /code

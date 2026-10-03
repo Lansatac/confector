@@ -1,7 +1,7 @@
 extends layout
 
 block maincontent
-  - import vibe.data.json : Json;
+  - import std.json : JSONValue, JSONType;
   div.executors-container
     div.header-section
       div(style="display: flex; justify-content: space-between; align-items: center;")
@@ -55,9 +55,9 @@ block maincontent
     div.card(style="margin-top: 15px; padding: 18px;")
       strong Supported Build Step Handlers:
       div(style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;")
-        - if (executor.configuration.type == Json.Type.object && "allowedStepTypes" in executor.configuration && executor.configuration["allowedStepTypes"].type == Json.Type.array)
-          - foreach(step; executor.configuration["allowedStepTypes"])
-            span.badge.badge-info #{step.get!string}
+        - if (executor.configuration.type == JSONType.object && "allowedStepTypes" in executor.configuration && executor.configuration["allowedStepTypes"].type == JSONType.array)
+          - foreach(step; executor.configuration["allowedStepTypes"].array)
+            span.badge.badge-info #{step.str}
         - else if (provider !is null)
           - foreach(step; provider.supportedStepTypes)
             span.badge.badge-info #{step}

@@ -5,14 +5,13 @@ import std.process;
 import std.stdio;
 import std.file;
 import std.path : buildPath, baseName, isAbsolute;
-import vibe.core.log;
-import vibe.data.json : Json;
+import std.json : JSONValue, JSONType, parseJSON;
 
-import confector.core.model;
-import confector.core.plugin;
-import confector.core.vcs;
-import confector.core.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
-import confector.core.executor : LogDelegate;
+import confector.plugin_api.model;
+import confector.plugin_api.plugin;
+import confector.plugin_api.vcs;
+import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
+import confector.plugin_api.executor : LogDelegate;
 
 /**
  * Git repository provider, input resolution, and build step execution plugin.
@@ -20,6 +19,8 @@ import confector.core.executor : LogDelegate;
  */
 class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, BuildStepSystem, BuildStepProvider
 {
+    private PluginContext m_context;
+
     @property string name() const { return "git-provider"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "Git version control provider, input resolution, and build step plugin"; }
@@ -28,22 +29,33 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
     @property string stepType() const { return "clone_repository"; }
     @property string displayName() const { return "Clone Git Repository"; }
 
-    void initialize() {}
-    void shutdown() {}
-
-    Json defaultParameters() const
+    void initialize(PluginContext context = null)
     {
-        Json p = Json.emptyObject;
-        p["repository"] = "";
-        p["branch"] = "";
-        p["target_dir"] = "";
+        m_context = context;
+        if (m_context !is null)
+        {
+            m_context.info("GitRepositoryPlugin initialized");
+        }
+    }
+
+    void shutdown()
+    {
+        if (m_context !is null)
+        {
+            m_context.info("GitRepositoryPlugin shut down");
+        }
+    }
+
+    JSONValue defaultParameters() const
+    {
+        JSONValue p = JSONValue(["repository": JSONValue(""), "branch": JSONValue(""), "target_dir": JSONValue("")]);
         return p;
     }
 
-    string[] validateParameters(in Json parameters) const
+    string[] validateParameters(in JSONValue parameters) const
     {
         string[] errors;
-        if (parameters.type != Json.Type.object)
+        if (parameters.type != JSONType.object)
         {
             errors ~= "Parameters must be a JSON object";
             return errors;
@@ -51,16 +63,16 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
         auto pRepo = "repository" in parameters;
         auto pUrl = "url" in parameters;
         auto pAddress = "address" in parameters;
-        if ((pRepo is null || pRepo.get!string.length == 0) &&
-            (pUrl is null || pUrl.get!string.length == 0) &&
-            (pAddress is null || pAddress.get!string.length == 0))
+        if ((pRepo is null || pRepo.str.length == 0) &&
+            (pUrl is null || pUrl.str.length == 0) &&
+            (pAddress is null || pAddress.str.length == 0))
         {
             errors ~= "Repository URL or address cannot be empty";
         }
         return errors;
     }
 
-    string renderStepFormHtml(in Json currentParameters) const
+    string renderStepFormHtml(in JSONValue currentParameters) const
     {
         import diet.html : compileHTMLDietFile;
         import std.array : appender;
@@ -70,16 +82,16 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
         string branch = "";
         string targetDir = "";
 
-        if (currentParameters.type == Json.Type.object)
+        if (currentParameters.type == JSONType.object)
         {
-            if (auto p = "repository" in currentParameters) repoUrl = p.get!string;
-            else if (auto p = "url" in currentParameters) repoUrl = p.get!string;
-            else if (auto p = "address" in currentParameters) repoUrl = p.get!string;
+            if (auto p = "repository" in currentParameters) repoUrl = p.str;
+            else if (auto p = "url" in currentParameters) repoUrl = p.str;
+            else if (auto p = "address" in currentParameters) repoUrl = p.str;
 
-            if (auto p = "branch" in currentParameters) branch = p.get!string;
-            if (auto p = "target_dir" in currentParameters) targetDir = p.get!string;
-            else if (auto p = "targetDirectory" in currentParameters) targetDir = p.get!string;
-            else if (auto p = "target" in currentParameters) targetDir = p.get!string;
+            if (auto p = "branch" in currentParameters) branch = p.str;
+            if (auto p = "target_dir" in currentParameters) targetDir = p.str;
+            else if (auto p = "targetDirectory" in currentParameters) targetDir = p.str;
+            else if (auto p = "target" in currentParameters) targetDir = p.str;
         }
 
         compileHTMLDietFile!("step.dt", repoUrl, branch, targetDir)(html);
@@ -101,7 +113,11 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
     {
         mkdirRecurse(targetDirectory);
 
-        logInfo("Executing git clone via GitRepositoryPlugin for %s into %s", address, targetDirectory);
+        if (m_context !is null)
+        {
+            m_context.info(format("Executing git clone via GitRepositoryPlugin for %s into %s", address, targetDirectory));
+        }
+
         auto pipe = pipeShell(format("git clone %s", address),
             Redirect.stdout | Redirect.stderrToStdout,
             null,
@@ -112,13 +128,19 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
 
         foreach (line; pipe.stdout.byLineCopy)
         {
-            logInfo(line);
+            if (m_context !is null)
+            {
+                m_context.debug_(line);
+            }
             if (logCallback !is null)
             {
                 logCallback(line);
             }
         }
-        logInfo("Git clone completed successfully via GitRepositoryPlugin");
+        if (m_context !is null)
+        {
+            m_context.info("Git clone completed successfully via GitRepositoryPlugin");
+        }
     }
 
     bool canResolve(in TaskNode task) const
@@ -151,11 +173,11 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
         if (task.hasCustomComponent("git_source"))
         {
             auto comp = task.getCustomComponent("git_source");
-            if (comp.type == Json.Type.object && "url" in comp)
+            if (comp.type == JSONType.object && "url" in comp)
             {
-                string url = comp["url"].get!string;
+                string url = comp["url"].str;
                 string targetDir = "target_dir" in comp
-                    ? buildPath(context.effectiveWorkingDir, comp["target_dir"].get!string)
+                    ? buildPath(context.effectiveWorkingDir, comp["target_dir"].str)
                     : buildPath(context.effectiveWorkingDir, baseName(url));
                 cloneRepository(url, targetDir, context.logCallback);
             }
@@ -179,8 +201,8 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
         else if ("url" in step.parameters) repoUrl = step.parameters["url"];
         else if ("address" in step.parameters) repoUrl = step.parameters["address"];
         else if (step.script.length > 0) repoUrl = step.script;
-        else if (step.properties.type == Json.Type.object && "url" in step.properties) repoUrl = step.properties["url"].get!string;
-        else if (step.properties.type == Json.Type.object && "repository" in step.properties) repoUrl = step.properties["repository"].get!string;
+        else if (step.properties.type == JSONType.object && "url" in step.properties) repoUrl = step.properties["url"].str;
+        else if (step.properties.type == JSONType.object && "repository" in step.properties) repoUrl = step.properties["repository"].str;
 
         if (repoUrl.length == 0)
         {
@@ -206,9 +228,9 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             string td = step.parameters["target"];
             targetDir = isAbsolute(td) ? td : buildPath(context.workingDirectory, td);
         }
-        else if (step.properties.type == Json.Type.object && "target_dir" in step.properties)
+        else if (step.properties.type == JSONType.object && "target_dir" in step.properties)
         {
-            string td = step.properties["target_dir"].get!string;
+            string td = step.properties["target_dir"].str;
             targetDir = isAbsolute(td) ? td : buildPath(context.workingDirectory, td);
         }
         else
@@ -218,7 +240,7 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
 
         string branch = "";
         if ("branch" in step.parameters) branch = step.parameters["branch"];
-        else if (step.properties.type == Json.Type.object && "branch" in step.properties) branch = step.properties["branch"].get!string;
+        else if (step.properties.type == JSONType.object && "branch" in step.properties) branch = step.properties["branch"].str;
 
         try
         {
@@ -283,6 +305,7 @@ extern(C) export Plugin confector_create_plugin()
 unittest
 {
     auto plugin = new GitRepositoryPlugin();
+    plugin.initialize(new NullPluginContext("git-provider"));
     assert(plugin.name == "git-provider");
     assert(plugin.providerType == "git");
     assert(plugin.systemName == "git-input-resolver");
@@ -309,12 +332,11 @@ unittest
 
     // BuildStepProvider testing
     assert(plugin.displayName == "Clone Git Repository");
-    assert(plugin.defaultParameters()["repository"].get!string == "");
-    auto html = plugin.renderStepFormHtml(Json.emptyObject);
+    assert(plugin.defaultParameters()["repository"].str == "");
+    auto html = plugin.renderStepFormHtml(JSONValue(string[string].init));
     assert(html.length > 0);
-    assert(plugin.validateParameters(Json.emptyObject).length > 0);
+    assert(plugin.validateParameters(JSONValue(string[string].init)).length > 0);
 
-    Json validParams = Json.emptyObject;
-    validParams["repository"] = "https://github.com/org/repo.git";
+    JSONValue validParams = JSONValue(["repository": JSONValue("https://github.com/org/repo.git")]);
     assert(plugin.validateParameters(validParams).length == 0);
 }

@@ -4,13 +4,12 @@ import std.format;
 import std.process;
 import std.stdio;
 import std.path : buildPath, isAbsolute;
-import vibe.core.log;
-import vibe.data.json : Json;
+import std.json : JSONValue, JSONType, parseJSON;
 
-import confector.core.model;
-import confector.core.plugin;
-import confector.core.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
-import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
+import confector.plugin_api.model;
+import confector.plugin_api.plugin;
+import confector.plugin_api.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
+import confector.plugin_api.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
 
 /**
  * Bash script execution plugin.
@@ -18,6 +17,8 @@ import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, 
  */
 class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
 {
+    private PluginContext m_context;
+
     @property string name() const { return "bash-plugin"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "Bash script execution build step and runner plugin"; }
@@ -26,37 +27,48 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
     @property string stepType() const { return "bash"; }
     @property string displayName() const { return "Bash Script"; }
 
-    void initialize() {}
-    void shutdown() {}
-
-    Json defaultParameters() const
+    void initialize(PluginContext context = null)
     {
-        Json p = Json.emptyObject;
-        p["script"] = "";
-        p["workingDirectory"] = "";
-        p["executable"] = "bash";
+        m_context = context;
+        if (m_context !is null)
+        {
+            m_context.info("BashPlugin initialized");
+        }
+    }
+
+    void shutdown()
+    {
+        if (m_context !is null)
+        {
+            m_context.info("BashPlugin shut down");
+        }
+    }
+
+    JSONValue defaultParameters() const
+    {
+        JSONValue p = JSONValue(["script": JSONValue(""), "workingDirectory": JSONValue(""), "executable": JSONValue("bash")]);
         return p;
     }
 
-    string[] validateParameters(in Json parameters) const
+    string[] validateParameters(in JSONValue parameters) const
     {
         string[] errors;
-        if (parameters.type != Json.Type.object)
+        if (parameters.type != JSONType.object)
         {
             errors ~= "Parameters must be a JSON object";
             return errors;
         }
         auto pScript = "script" in parameters;
         auto pCommand = "command" in parameters;
-        if ((pScript is null || pScript.get!string.length == 0) &&
-            (pCommand is null || pCommand.get!string.length == 0))
+        if ((pScript is null || pScript.str.length == 0) &&
+            (pCommand is null || pCommand.str.length == 0))
         {
             errors ~= "Bash script or command cannot be empty";
         }
         return errors;
     }
 
-    string renderStepFormHtml(in Json currentParameters) const
+    string renderStepFormHtml(in JSONValue currentParameters) const
     {
         import diet.html : compileHTMLDietFile;
         import std.array : appender;
@@ -66,15 +78,15 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
         string workingDir = "";
         string executable = "bash";
 
-        if (currentParameters.type == Json.Type.object)
+        if (currentParameters.type == JSONType.object)
         {
-            if (auto p = "script" in currentParameters) script = p.get!string;
-            else if (auto p = "command" in currentParameters) script = p.get!string;
+            if (auto p = "script" in currentParameters) script = p.str;
+            else if (auto p = "command" in currentParameters) script = p.str;
 
-            if (auto p = "workingDirectory" in currentParameters) workingDir = p.get!string;
-            else if (auto p = "working_directory" in currentParameters) workingDir = p.get!string;
+            if (auto p = "workingDirectory" in currentParameters) workingDir = p.str;
+            else if (auto p = "working_directory" in currentParameters) workingDir = p.str;
 
-            if (auto p = "executable" in currentParameters) executable = p.get!string;
+            if (auto p = "executable" in currentParameters) executable = p.str;
         }
 
         compileHTMLDietFile!("step.dt", script, workingDir, executable)(html);
@@ -95,7 +107,7 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
             if (task.hasCustomComponent("shell"))
             {
                 auto shellComp = task.getCustomComponent("shell");
-                if (shellComp.type == Json.Type.string && (shellComp.get!string == "bash" || shellComp.get!string == "sh"))
+                if (shellComp.type == JSONType.string && (shellComp.str == "bash" || shellComp.str == "sh"))
                 {
                     return true;
                 }
@@ -103,7 +115,7 @@ class BashPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, Bui
             if (task.hasCustomComponent("runner"))
             {
                 auto runnerComp = task.getCustomComponent("runner");
-                if (runnerComp.type == Json.Type.string && runnerComp.get!string == "bash")
+                if (runnerComp.type == JSONType.string && runnerComp.str == "bash")
                 {
                     return true;
                 }
@@ -255,6 +267,7 @@ extern(C) export Plugin confector_create_plugin()
 unittest
 {
     auto plugin = new BashPlugin();
+    plugin.initialize(new NullPluginContext("bash-plugin"));
     assert(plugin.name == "bash-plugin");
     assert(plugin.runnerType == "bash");
     assert(plugin.systemName == "bash-step-system");
@@ -279,7 +292,7 @@ unittest
     taskNode.script = "echo hello";
     assert(!plugin.canExecute(taskNode));
 
-    taskNode.setCustomComponent("shell", Json("bash"));
+    taskNode.setCustomComponent("shell", JSONValue("bash"));
     assert(plugin.canExecute(taskNode));
 
     StepExecutionContext sCtx;
@@ -297,12 +310,11 @@ unittest
 
     // BuildStepProvider testing
     assert(plugin.displayName == "Bash Script");
-    assert(plugin.defaultParameters()["executable"].get!string == "bash");
-    auto html = plugin.renderStepFormHtml(Json.emptyObject);
+    assert(plugin.defaultParameters()["executable"].str == "bash");
+    auto html = plugin.renderStepFormHtml(JSONValue(string[string].init));
     assert(html.length > 0);
-    assert(plugin.validateParameters(Json.emptyObject).length > 0);
+    assert(plugin.validateParameters(JSONValue(string[string].init)).length > 0);
 
-    Json validParams = Json.emptyObject;
-    validParams["script"] = "echo 'hello bash'";
+    JSONValue validParams = JSONValue(["script": JSONValue("echo 'hello bash'")]);
     assert(plugin.validateParameters(validParams).length == 0);
 }

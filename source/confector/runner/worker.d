@@ -204,7 +204,7 @@ unittest
         @property string runnerType() const { return "process"; }
         @property string systemName() const { return "mock-worker-system"; }
 
-        void initialize() {}
+        void initialize(PluginContext context = null) {}
         void shutdown() {}
 
         bool canExecute(in ExecutionRequest request) const { return true; }

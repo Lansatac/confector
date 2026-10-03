@@ -4,13 +4,12 @@ import std.format;
 import std.process;
 import std.stdio;
 import std.path : buildPath, isAbsolute;
-import vibe.core.log;
-import vibe.data.json : Json;
+import std.json : JSONValue, JSONType, parseJSON;
 
-import confector.core.model;
-import confector.core.plugin;
-import confector.core.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
-import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
+import confector.plugin_api.model;
+import confector.plugin_api.plugin;
+import confector.plugin_api.system : TaskExecutionSystem, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
+import confector.plugin_api.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
 
 /**
  * PowerShell script execution plugin.
@@ -18,6 +17,8 @@ import confector.core.executor : TaskRunner, ExecutionRequest, ExecutionResult, 
  */
 class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
 {
+    private PluginContext m_context;
+
     @property string name() const { return "powershell-plugin"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "PowerShell script execution build step and runner plugin"; }
@@ -26,44 +27,57 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
     @property string stepType() const { return "powershell"; }
     @property string displayName() const { return "PowerShell Script"; }
 
-    void initialize() {}
-    void shutdown() {}
-
-    Json defaultParameters() const
+    void initialize(PluginContext context = null)
     {
-        Json p = Json.emptyObject;
-        p["script"] = "";
-        p["workingDirectory"] = "";
+        m_context = context;
+        if (m_context !is null)
+        {
+            m_context.info("PowerShellPlugin initialized");
+        }
+    }
+
+    void shutdown()
+    {
+        if (m_context !is null)
+        {
+            m_context.info("PowerShellPlugin shut down");
+        }
+    }
+
+    JSONValue defaultParameters() const
+    {
+        string defaultExe;
         version(Windows)
         {
-            p["executable"] = "powershell";
+            defaultExe = "powershell";
         }
         else
         {
-            p["executable"] = "pwsh";
+            defaultExe = "pwsh";
         }
+        JSONValue p = JSONValue(["script": JSONValue(""), "workingDirectory": JSONValue(""), "executable": JSONValue(defaultExe)]);
         return p;
     }
 
-    string[] validateParameters(in Json parameters) const
+    string[] validateParameters(in JSONValue parameters) const
     {
         string[] errors;
-        if (parameters.type != Json.Type.object)
+        if (parameters.type != JSONType.object)
         {
             errors ~= "Parameters must be a JSON object";
             return errors;
         }
         auto pScript = "script" in parameters;
         auto pCommand = "command" in parameters;
-        if ((pScript is null || pScript.get!string.length == 0) &&
-            (pCommand is null || pCommand.get!string.length == 0))
+        if ((pScript is null || pScript.str.length == 0) &&
+            (pCommand is null || pCommand.str.length == 0))
         {
             errors ~= "PowerShell script or command cannot be empty";
         }
         return errors;
     }
 
-    string renderStepFormHtml(in Json currentParameters) const
+    string renderStepFormHtml(in JSONValue currentParameters) const
     {
         import diet.html : compileHTMLDietFile;
         import std.array : appender;
@@ -81,15 +95,15 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
             executable = "pwsh";
         }
 
-        if (currentParameters.type == Json.Type.object)
+        if (currentParameters.type == JSONType.object)
         {
-            if (auto p = "script" in currentParameters) script = p.get!string;
-            else if (auto p = "command" in currentParameters) script = p.get!string;
+            if (auto p = "script" in currentParameters) script = p.str;
+            else if (auto p = "command" in currentParameters) script = p.str;
 
-            if (auto p = "workingDirectory" in currentParameters) workingDir = p.get!string;
-            else if (auto p = "working_directory" in currentParameters) workingDir = p.get!string;
+            if (auto p = "workingDirectory" in currentParameters) workingDir = p.str;
+            else if (auto p = "working_directory" in currentParameters) workingDir = p.str;
 
-            if (auto p = "executable" in currentParameters) executable = p.get!string;
+            if (auto p = "executable" in currentParameters) executable = p.str;
         }
 
         compileHTMLDietFile!("step.dt", script, workingDir, executable)(html);
@@ -144,8 +158,8 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
             if (task.hasCustomComponent("shell"))
             {
                 auto shellComp = task.getCustomComponent("shell");
-                if (shellComp.type == Json.Type.string &&
-                    (shellComp.get!string == "powershell" || shellComp.get!string == "pwsh" || shellComp.get!string == "ps1"))
+                if (shellComp.type == JSONType.string &&
+                    (shellComp.str == "powershell" || shellComp.str == "pwsh" || shellComp.str == "ps1"))
                 {
                     return true;
                 }
@@ -153,8 +167,8 @@ class PowerShellPlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSyste
             if (task.hasCustomComponent("runner"))
             {
                 auto runnerComp = task.getCustomComponent("runner");
-                if (runnerComp.type == Json.Type.string &&
-                    (runnerComp.get!string == "powershell" || runnerComp.get!string == "pwsh"))
+                if (runnerComp.type == JSONType.string &&
+                    (runnerComp.str == "powershell" || runnerComp.str == "pwsh"))
                 {
                     return true;
                 }
@@ -305,6 +319,7 @@ extern(C) export Plugin confector_create_plugin()
 unittest
 {
     auto plugin = new PowerShellPlugin();
+    plugin.initialize(new NullPluginContext("powershell-plugin"));
     assert(plugin.name == "powershell-plugin");
     assert(plugin.runnerType == "powershell");
     assert(plugin.systemName == "powershell-step-system");
@@ -329,7 +344,7 @@ unittest
     taskNode.script = "Write-Output hello";
     assert(!plugin.canExecute(taskNode));
 
-    taskNode.setCustomComponent("shell", Json("powershell"));
+    taskNode.setCustomComponent("shell", JSONValue("powershell"));
     assert(plugin.canExecute(taskNode));
 
     StepExecutionContext sCtx;
@@ -347,12 +362,11 @@ unittest
 
     // BuildStepProvider testing
     assert(plugin.displayName == "PowerShell Script");
-    assert(plugin.defaultParameters()["executable"].get!string.length > 0);
-    auto html = plugin.renderStepFormHtml(Json.emptyObject);
+    assert(plugin.defaultParameters()["executable"].str.length > 0);
+    auto html = plugin.renderStepFormHtml(JSONValue(string[string].init));
     assert(html.length > 0);
-    assert(plugin.validateParameters(Json.emptyObject).length > 0);
+    assert(plugin.validateParameters(JSONValue(string[string].init)).length > 0);
 
-    Json validParams = Json.emptyObject;
-    validParams["script"] = "Write-Output 'hello powershell'";
+    JSONValue validParams = JSONValue(["script": JSONValue("Write-Output 'hello powershell'")]);
     assert(plugin.validateParameters(validParams).length == 0);
 }

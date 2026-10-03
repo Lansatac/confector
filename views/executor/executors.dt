@@ -1,7 +1,7 @@
 extends layout
 
 block maincontent
-  - import vibe.data.json : Json;
+  - import std.json : JSONValue, JSONType;
   div.executors-container
     div.header-section
       div(style="display: flex; justify-content: space-between; align-items: center;")
@@ -62,20 +62,20 @@ block maincontent
               td
                 div
                   strong Concurrency: 
-                  - if (e.configuration.type == Json.Type.object && "maxConcurrency" in e.configuration)
+                  - if (e.configuration.type == JSONType.object && "maxConcurrency" in e.configuration)
                     span #{e.configuration["maxConcurrency"]}
                   - else
                     span Default
                 div(style="color: #64748b; font-size: 0.85em;")
-                  - if (e.configuration.type == Json.Type.object && "workspaceDir" in e.configuration)
-                    code #{e.configuration["workspaceDir"].get!string}
+                  - if (e.configuration.type == JSONType.object && "workspaceDir" in e.configuration)
+                    code #{e.configuration["workspaceDir"].str}
                   - else
                     span Default Workspace
               td
                 div(style="display: flex; flex-wrap: wrap; gap: 4px;")
-                  - if (e.configuration.type == Json.Type.object && "allowedStepTypes" in e.configuration && e.configuration["allowedStepTypes"].type == Json.Type.array)
-                    - foreach(step; e.configuration["allowedStepTypes"])
-                      span.badge.badge-info #{step.get!string}
+                  - if (e.configuration.type == JSONType.object && "allowedStepTypes" in e.configuration && e.configuration["allowedStepTypes"].type == JSONType.array)
+                    - foreach(step; e.configuration["allowedStepTypes"].array)
+                      span.badge.badge-info #{step.str}
                   - else
                     span.badge.badge-info process
                     span.badge.badge-info bash

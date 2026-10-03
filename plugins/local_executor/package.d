@@ -6,17 +6,14 @@ import std.stdio;
 import std.file : exists, mkdirRecurse;
 import std.parallelism : totalCPUs;
 import std.path : buildPath, isAbsolute;
+import std.json : JSONValue, JSONType, parseJSON;
 import core.sync.mutex : Mutex;
 import core.time : Duration, seconds, msecs, MonoTime;
 import core.thread : Thread;
 
-import vibe.data.json : Json;
-import vibe.core.log;
-import vibe.core.sync : TaskCondition;
-
-import confector.core.model;
-import confector.core.plugin : Plugin;
-import confector.core.executor : ExecutorProvider, TaskExecutor, ExecutorRecord, ExecutionRequest, ExecutionResult, LogDelegate;
+import confector.plugin_api.model;
+import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext;
+import confector.plugin_api.executor : ExecutorProvider, TaskExecutor, ExecutorRecord, ExecutionRequest, ExecutionResult, LogDelegate;
 
 /**
  * Concrete TaskExecutor executing commands locally on host infrastructure.
@@ -47,17 +44,17 @@ class LocalTaskExecutor : TaskExecutor
 
     @property string[] supportedStepTypes() const
     {
-        if (m_record.configuration.type == Json.Type.object)
+        if (m_record.configuration.type == JSONType.object)
         {
             auto pSteps = "allowedStepTypes" in m_record.configuration;
-            if (pSteps !is null && pSteps.type == Json.Type.array)
+            if (pSteps !is null && pSteps.type == JSONType.array)
             {
                 string[] types;
-                foreach (step; *pSteps)
+                foreach (step; pSteps.array)
                 {
-                    if (step.type == Json.Type.string)
+                    if (step.type == JSONType.string)
                     {
-                        types ~= step.get!string;
+                        types ~= step.str;
                     }
                 }
                 if (types.length > 0)
@@ -86,12 +83,12 @@ class LocalTaskExecutor : TaskExecutor
         }
 
         string effectiveWorkDir = request.workingDirectory;
-        if (effectiveWorkDir.length == 0 && m_record.configuration.type == Json.Type.object)
+        if (effectiveWorkDir.length == 0 && m_record.configuration.type == JSONType.object)
         {
             auto pWork = "workspaceDir" in m_record.configuration;
-            if (pWork !is null && pWork.type == Json.Type.string && pWork.get!string.length > 0)
+            if (pWork !is null && pWork.type == JSONType.string && pWork.str.length > 0)
             {
-                effectiveWorkDir = pWork.get!string;
+                effectiveWorkDir = pWork.str;
             }
         }
 
@@ -262,6 +259,8 @@ class LocalTaskExecutor : TaskExecutor
  */
 class LocalExecutorPlugin : Plugin, ExecutorProvider
 {
+    private PluginContext m_context;
+
     @property string name() const
     {
         return "local-executor-plugin";
@@ -292,35 +291,44 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
         return ["process", "bash", "powershell", "git"];
     }
 
-    void initialize()
+    void initialize(PluginContext context = null)
     {
+        m_context = context;
+        if (m_context !is null)
+        {
+            m_context.info("LocalExecutorPlugin initialized");
+        }
     }
 
     void shutdown()
     {
+        if (m_context !is null)
+        {
+            m_context.info("LocalExecutorPlugin shut down");
+        }
     }
 
-    Json defaultConfig() const
+    JSONValue defaultConfig() const
     {
-        Json config = Json.emptyObject;
-        config["maxConcurrency"] = cast(int) totalCPUs;
-        config["workspaceDir"] = ".confector/workspaces";
-        config["defaultShell"] = "powershell";
+        JSONValue[string] configMap;
+        configMap["maxConcurrency"] = JSONValue(cast(long) totalCPUs);
+        configMap["workspaceDir"] = JSONValue(".confector/workspaces");
+        configMap["defaultShell"] = JSONValue("powershell");
 
-        Json allowedSteps = Json.emptyArray;
+        JSONValue[] allowedSteps;
         foreach (st; supportedStepTypes)
         {
-            allowedSteps ~= Json(st);
+            allowedSteps ~= JSONValue(st);
         }
-        config["allowedStepTypes"] = allowedSteps;
+        configMap["allowedStepTypes"] = JSONValue(allowedSteps);
 
-        return config;
+        return JSONValue(configMap);
     }
 
-    string[] validateConfig(in Json config) const
+    string[] validateConfig(in JSONValue config) const
     {
         string[] errors;
-        if (config.type != Json.Type.object)
+        if (config.type != JSONType.object)
         {
             errors ~= "Configuration must be a JSON object";
             return errors;
@@ -329,18 +337,18 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
         auto pConcurrency = "maxConcurrency" in config;
         if (pConcurrency !is null)
         {
-            if (pConcurrency.type != Json.Type.int_ && pConcurrency.type != Json.Type.bigInt)
+            if (pConcurrency.type != JSONType.integer && pConcurrency.type != JSONType.uinteger)
             {
                 errors ~= "Max Concurrency must be an integer";
             }
-            else if (pConcurrency.get!int <= 0)
+            else if (pConcurrency.integer <= 0)
             {
                 errors ~= "Max Concurrency must be a positive integer (at least 1)";
             }
         }
 
         auto pWorkspace = "workspaceDir" in config;
-        if (pWorkspace !is null && pWorkspace.type != Json.Type.string)
+        if (pWorkspace !is null && pWorkspace.type != JSONType.string)
         {
             errors ~= "Workspace Directory must be a string";
         }
@@ -348,7 +356,7 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
         return errors;
     }
 
-    string renderConfigFormHtml(in Json currentConfig) const
+    string renderConfigFormHtml(in JSONValue currentConfig) const
     {
         import diet.html : compileHTMLDietFile;
         import std.array : appender;
@@ -361,33 +369,33 @@ class LocalExecutorPlugin : Plugin, ExecutorProvider
         string defaultShell = "powershell";
         string allowedStepsStr = "process, bash, powershell, git";
 
-        if (currentConfig.type == Json.Type.object)
+        if (currentConfig.type == JSONType.object)
         {
             auto pC = "maxConcurrency" in currentConfig;
-            if (pC !is null && (pC.type == Json.Type.int_ || pC.type == Json.Type.bigInt))
+            if (pC !is null && (pC.type == JSONType.integer || pC.type == JSONType.uinteger))
             {
-                concurrency = pC.get!int;
+                concurrency = cast(int) pC.integer;
             }
 
             auto pW = "workspaceDir" in currentConfig;
-            if (pW !is null && pW.type == Json.Type.string)
+            if (pW !is null && pW.type == JSONType.string)
             {
-                workspaceDir = pW.get!string;
+                workspaceDir = pW.str;
             }
 
             auto pS = "defaultShell" in currentConfig;
-            if (pS !is null && pS.type == Json.Type.string)
+            if (pS !is null && pS.type == JSONType.string)
             {
-                defaultShell = pS.get!string;
+                defaultShell = pS.str;
             }
 
             auto pSteps = "allowedStepTypes" in currentConfig;
-            if (pSteps !is null && pSteps.type == Json.Type.array)
+            if (pSteps !is null && pSteps.type == JSONType.array)
             {
                 string[] sArr;
-                foreach (step; *pSteps)
+                foreach (step; pSteps.array)
                 {
-                    if (step.type == Json.Type.string) sArr ~= step.get!string;
+                    if (step.type == JSONType.string) sArr ~= step.str;
                 }
                 if (sArr.length > 0)
                 {
@@ -419,21 +427,21 @@ extern(C) export Plugin confector_create_plugin()
 unittest
 {
     auto plugin = new LocalExecutorPlugin();
+    plugin.initialize(new NullPluginContext("local-executor-plugin"));
     assert(plugin.name == "local-executor-plugin");
     assert(plugin.providerType == "local");
     assert(plugin.displayName == "Local Process Executor");
     assert(plugin.supportedStepTypes.length >= 4);
 
     auto defConfig = plugin.defaultConfig();
-    assert(defConfig["maxConcurrency"].get!int >= 1);
-    assert(defConfig["workspaceDir"].get!string.length > 0);
-    assert(defConfig["allowedStepTypes"].get!(Json[]).length > 0);
+    assert(defConfig["maxConcurrency"].integer >= 1);
+    assert(defConfig["workspaceDir"].str.length > 0);
+    assert(defConfig["allowedStepTypes"].array.length > 0);
 
     // Validation testing
     assert(plugin.validateConfig(defConfig).length == 0);
 
-    Json invalidConf = Json.emptyObject;
-    invalidConf["maxConcurrency"] = -2;
+    JSONValue invalidConf = JSONValue(["maxConcurrency": JSONValue(-2)]);
     auto errors = plugin.validateConfig(invalidConf);
     assert(errors.length > 0);
 

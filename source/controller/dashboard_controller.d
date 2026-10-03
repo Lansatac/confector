@@ -319,11 +319,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
 
                     if (i < stepProps.length && stepProps[i].strip().length > 0)
                     {
-                        try
-                        {
-                            step.properties = parseJsonString(stepProps[i].strip());
-                        }
-                        catch (Exception) {}
+                        step.propertiesJson = stepProps[i].strip();
                     }
 
                     steps ~= step;

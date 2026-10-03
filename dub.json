@@ -12,13 +12,27 @@
 	"license": "The Unlicense",
 	"name": "confector",
 	"targetPath": "bin",
+  "workingDirectory": "bin",
+  "copyFiles": ["public"],
 	"subPackages": [
+		{
+			"name": "plugin_api",
+			"targetType": "library",
+			"sourcePaths": ["source/confector/plugin_api"],
+			"importPaths": ["source"],
+	    "targetPath": "lib",
+			"dependencies": {
+				"vibe-serialization": "~>1.2.0"
+			}
+		},
 		{
 			"name": "core",
 			"targetType": "library",
 			"sourcePaths": ["source/confector/core"],
 			"importPaths": ["source"],
+	    "targetPath": "lib",
 			"dependencies": {
+				"confector:plugin_api": "*",
 				"vibe-d": "~>0.10.3"
 			}
 		},

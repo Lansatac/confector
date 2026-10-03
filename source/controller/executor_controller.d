@@ -1,32 +1,36 @@
 module controller.executor_controller;
 
 import vibe.vibe;
-import vibe.core.log : logError, logInfo;
-import vibe.data.json : Json, serializeToJson;
-
-import confector.core.executor : ExecutorRecord, ExecutorProvider;
-import confector.core.plugin : PluginRegistry;
+import confector.core.model;
 import confector.core.storage : BuildStateRepository;
+import confector.core.plugin : PluginRegistry;
+import confector.core.executor : ExecutorProvider, ExecutorRecord, TaskExecutor;
+import confector.core.json_compat : toStdJson, toVibeJson;
 
 import std.algorithm : filter, count;
+import std.array : array;
 import std.conv : to;
 import std.datetime.systime : Clock;
 import std.format : format;
+import std.json : JSONValue, JSONType, parseJSON;
 import std.string : split, strip;
-import std.uuid : randomUUID;
 import std.uri : encodeComponent;
+import std.uuid : randomUUID;
 
+/**
+ * Creates the URL router for the /executors endpoints.
+ */
 URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry)
 {
     auto router = new URLRouter();
 
-    // 1. Inventory View
+    // 1. Executors List View
     router.get("/executors/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto executors = stateRepo !is null ? stateRepo.listExecutors() : [];
         auto providers = registry !is null ? registry.getExecutorProviders() : [];
 
-        ulong enabledCount = executors.filter!(e => e.enabled).count;
-        ulong disabledCount = executors.filter!(e => !e.enabled).count;
+        size_t enabledCount = executors.filter!(e => e.enabled).count;
+        size_t disabledCount = executors.length - enabledCount;
 
         res.render!("executor/executors.dt", executors, providers, enabledCount, disabledCount);
     });
@@ -59,7 +63,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     // Helper function to build Json configuration from form
     Json buildConfigFromForm(HTTPServerRequest req, ExecutorProvider provider)
     {
-        Json config = provider !is null ? provider.defaultConfig() : Json.emptyObject;
+        Json config = provider !is null ? provider.defaultConfig().toVibeJson : Json.emptyObject;
         if (config.type != Json.Type.object)
         {
             config = Json.emptyObject;
@@ -123,7 +127,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 
         if (provider !is null)
         {
-            string[] errors = provider.validateConfig(config);
+            string[] errors = provider.validateConfig(config.toStdJson);
             if (errors.length > 0)
             {
                 import std.string : join;
@@ -138,7 +142,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
         record.providerType = providerType;
         record.description = req.form.get("description", "").strip;
         record.enabled = false; // Strictly disabled by default
-        record.configuration = config;
+        record.configuration = config.toStdJson;
 
         string now = Clock.currTime.toISOString();
         record.createdAt = now;
@@ -162,7 +166,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
             executor.id = id;
             executor.name = "Unknown Executor";
             executor.providerType = "unknown";
-            executor.configuration = Json.emptyObject;
+            executor.configuration = JSONValue(string[string].init);
         }
 
         ExecutorProvider provider = registry !is null ? registry.getExecutorProvider(executor.providerType) : null;
@@ -194,7 +198,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 
         if (provider !is null)
         {
-            string[] errors = provider.validateConfig(config);
+            string[] errors = provider.validateConfig(config.toStdJson);
             if (errors.length > 0)
             {
                 import std.string : join;
@@ -212,7 +216,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
         record.providerType = providerType.length > 0 ? providerType : existing.providerType;
         record.description = req.form.get("description", existing.description).strip;
         record.enabled = req.form.get("enabled", "") == "true";
-        record.configuration = config;
+        record.configuration = config.toStdJson;
         record.createdAt = existing.createdAt.length > 0 ? existing.createdAt : Clock.currTime.toISOString();
         record.updatedAt = Clock.currTime.toISOString();
 
@@ -255,7 +259,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 unittest
 {
     import confector.core.storage : InMemoryBuildStateRepository;
-    import confector.core.plugin : Plugin;
+    import confector.core.plugin : Plugin, PluginContext;
     import confector.core.executor : ExecutorProvider, TaskExecutor;
 
     class MockExecutorProvider : Plugin, ExecutorProvider
@@ -267,19 +271,17 @@ unittest
         @property string displayName() const { return "Mock Local Executor"; }
         @property string[] supportedStepTypes() const { return ["process", "mock"]; }
 
-        void initialize() {}
+        void initialize(PluginContext context = null) {}
         void shutdown() {}
 
-        Json defaultConfig() const
+        JSONValue defaultConfig() const
         {
-            Json c = Json.emptyObject;
-            c["maxConcurrency"] = 2;
-            c["workspaceDir"] = ".workspaces";
+            JSONValue c = JSONValue(["maxConcurrency": JSONValue(2), "workspaceDir": JSONValue(".workspaces")]);
             return c;
         }
 
-        string[] validateConfig(in Json config) const { return null; }
-        string renderConfigFormHtml(in Json currentConfig) const { return "<div>Mock Config</div>"; }
+        string[] validateConfig(in JSONValue config) const { return null; }
+        string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Mock Config</div>"; }
         TaskExecutor createExecutor(in ExecutorRecord record) const { return null; }
     }
 

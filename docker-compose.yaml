@@ -12,7 +12,8 @@ services:
       - .:/code:cached
       # Mask .dub directory with an isolated named volume to prevent host/container conflicts
       - dub-build-cache:/code/.dub
-      - dub-packages:/home/dev/.dub
+      - reggae-build-cache:/code/.reggae
+      - code-bin:/code/bin
       # Docker socket for container-in-container workflows (if required by tasks)
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -57,6 +58,7 @@ secrets:
 
 volumes:
   dub-build-cache:
-  dub-packages:
+  reggae-build-cache:
+  code-bin:
   mongo-data:
 

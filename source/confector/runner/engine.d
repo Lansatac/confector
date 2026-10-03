@@ -511,7 +511,7 @@ unittest
         @property string systemName() const { return "mock-engine-system"; }
         @property string stepType() const { return "process"; }
 
-        void initialize() {}
+        void initialize(PluginContext context = null) {}
         void shutdown() {}
 
         bool canExecute(in ExecutionRequest request) const { return true; }
@@ -789,7 +789,7 @@ unittest
     // Executor Provider & Persistence Integration Test
     import confector.core.executor : ExecutorRecord, ExecutorProvider, TaskExecutor;
     import controller.executor_controller : executorRouter;
-    import vibe.data.json : Json;
+    import std.json : JSONValue;
 
     class MockEngineExecutorProvider : Plugin, ExecutorProvider
     {
@@ -800,20 +800,17 @@ unittest
         @property string displayName() const { return "Local Process Executor"; }
         @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
 
-        void initialize() {}
+        void initialize(PluginContext context = null) {}
         void shutdown() {}
 
-        Json defaultConfig() const
+        JSONValue defaultConfig() const
         {
-            Json c = Json.emptyObject;
-            c["maxConcurrency"] = 4;
-            c["workspaceDir"] = ".confector/workspaces";
-            c["defaultShell"] = "powershell";
+            JSONValue c = JSONValue(["maxConcurrency": JSONValue(4), "workspaceDir": JSONValue(".confector/workspaces"), "defaultShell": JSONValue("powershell")]);
             return c;
         }
 
-        string[] validateConfig(in Json config) const { return null; }
-        string renderConfigFormHtml(in Json currentConfig) const { return "<div>Local Config</div>"; }
+        string[] validateConfig(in JSONValue config) const { return null; }
+        string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Local Config</div>"; }
 
         TaskExecutor createExecutor(in ExecutorRecord record) const
         {

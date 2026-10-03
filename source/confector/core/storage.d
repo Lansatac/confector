@@ -7,31 +7,6 @@ import std.path : buildPath, dirName, baseName;
 import std.format : format;
 import std.datetime.systime : Clock;
 
-/**
- * Interface for artifact storage backends (e.g. Local filesystem, S3-compatible object storage).
- */
-interface ArtifactStorage
-{
-    /**
-     * Stores an artifact produced by a task build.
-     */
-    ArtifactMetadata storeArtifact(string buildId, string taskId, string localFilePath, string artifactType = "file");
-
-    /**
-     * Retrieves an artifact from storage and writes it to a target local path.
-     */
-    void retrieveArtifact(string buildId, string taskId, string artifactPath, string targetLocalPath);
-
-    /**
-     * Checks if an artifact exists in storage.
-     */
-    bool artifactExists(string buildId, string taskId, string artifactPath);
-
-    /**
-     * Gets metadata for a stored artifact if present.
-     */
-    bool getArtifactMetadata(string buildId, string taskId, string artifactPath, out ArtifactMetadata metadata);
-}
 
 /**
  * Local filesystem implementation of ArtifactStorage.
@@ -643,15 +618,14 @@ unittest
     assert(stateRepo.listRepositories().length == 0);
 
     // Executor persistence in InMemoryBuildStateRepository
-    import vibe.data.json : Json;
+    import std.json : JSONValue;
     ExecutorRecord exec;
     exec.id = "exec-local-1";
     exec.name = "Local Executor 1";
     exec.providerType = "local";
     exec.description = "Primary local runner";
     exec.enabled = false;
-    exec.configuration = Json.emptyObject;
-    exec.configuration["maxConcurrency"] = 8;
+    exec.configuration = JSONValue(["maxConcurrency": JSONValue(8)]);
     exec.createdAt = "2026-09-30T12:00:00Z";
     exec.updatedAt = "2026-09-30T12:00:00Z";
 
@@ -661,7 +635,7 @@ unittest
     assert(stateRepo.getExecutor("exec-local-1", fetchedExec));
     assert(fetchedExec.name == "Local Executor 1");
     assert(!fetchedExec.enabled);
-    assert(fetchedExec.configuration["maxConcurrency"].get!int == 8);
+    assert(fetchedExec.configuration["maxConcurrency"].integer == 8);
 
     // Toggle enabled
     fetchedExec.enabled = true;

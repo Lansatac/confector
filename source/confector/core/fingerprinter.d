@@ -1,49 +1,55 @@
 module confector.core.fingerprinter;
 
 import confector.core.model;
-import confector.core.system : FingerprintContributionContext, FingerprintContributionSystem;
-import confector.core.plugin : PluginRegistry;
-import std.algorithm : sort;
+import confector.core.plugin;
+import confector.core.system : FingerprintContributionSystem, FingerprintContributionContext;
+
+import std.digest.sha : SHA256;
+import std.algorithm.sorting : sort;
 import std.array : appender;
-import std.digest.sha : SHA256, toHexString, LetterCase, digest;
-import std.file : exists, isFile, read;
 import std.format : format;
-import vibe.data.json : serializeToJsonString, Json;
+import std.file : exists, isFile, read;
+import std.json : JSONValue, JSONType, toJSON;
 
 /**
- * Computes the SHA256 hex string of a byte slice or string.
+ * Computes deterministic SHA256 hex digest for a string payload.
  */
-string sha256Hex(in void[] data) pure nothrow @safe
+string sha256Hex(in string input) pure nothrow @safe
 {
-    ubyte[32] hash = digest!SHA256(data);
-    return toHexString!(LetterCase.lower)(hash).idup;
+    SHA256 sha;
+    sha.start();
+    sha.put(cast(const(ubyte)[]) input);
+    auto digest = sha.finish();
+
+    import std.digest : toHexString, LetterCase;
+    return toHexString!(LetterCase.lower)(digest).idup;
 }
 
 /**
- * Computes the SHA256 hash of a file on disk.
+ * Computes deterministic SHA256 hex digest for file content.
  */
-string computeFileSha256(string filePath) @trusted
+string computeFileSha256(in string filePath) @trusted
 {
     if (!exists(filePath) || !isFile(filePath))
     {
-        throw new FingerprintException(format("File not found or is not a regular file: %s", filePath));
+        throw new FingerprintException(format("Cannot compute hash: file does not exist or is not regular file: %s", filePath));
     }
 
-    try
-    {
-        auto content = read(filePath);
-        return sha256Hex(content);
-    }
-    catch (Exception e)
-    {
-        throw new FingerprintException(format("Failed to read file for hashing '%s': %s", filePath, e.msg));
-    }
+    auto content = cast(ubyte[]) read(filePath);
+    SHA256 sha;
+    sha.start();
+    sha.put(content);
+    auto digest = sha.finish();
+
+    import std.digest : toHexString, LetterCase;
+    return toHexString!(LetterCase.lower)(digest).idup;
 }
 
 /**
  * Computes deterministic SHA256 digest of upstream artifact hashes.
+ * Ensures associative array keys are sorted lexicographically before hashing.
  */
-string computeArtifactHashesDigest(in string[string] artifactHashes) pure nothrow @trusted
+string computeArtifactHashesDigest(in string[string] artifactHashes) pure nothrow @safe
 {
     if (artifactHashes.length == 0) return sha256Hex("");
 
@@ -58,7 +64,7 @@ string computeArtifactHashesDigest(in string[string] artifactHashes) pure nothro
     foreach (k; keys)
     {
         app.put(k);
-        app.put(":");
+        app.put("=");
         app.put(artifactHashes[k]);
         app.put("\n");
     }
@@ -66,14 +72,14 @@ string computeArtifactHashesDigest(in string[string] artifactHashes) pure nothro
 }
 
 /**
- * Computes deterministic SHA256 digest of resolved environment variables.
+ * Computes deterministic SHA256 digest of environment key-value pairs.
  */
-string computeEnvDigest(in string[string] resolvedEnv) pure nothrow @trusted
+string computeEnvDigest(in string[string] environment) pure nothrow @safe
 {
-    if (resolvedEnv.length == 0) return sha256Hex("");
+    if (environment.length == 0) return sha256Hex("");
 
     string[] keys;
-    foreach (k; resolvedEnv.byKey)
+    foreach (k; environment.byKey)
     {
         keys ~= k;
     }
@@ -84,7 +90,7 @@ string computeEnvDigest(in string[string] resolvedEnv) pure nothrow @trusted
     {
         app.put(k);
         app.put("=");
-        app.put(resolvedEnv[k]);
+        app.put(environment[k]);
         app.put("\n");
     }
     return sha256Hex(app.data);
@@ -109,14 +115,7 @@ string computeCustomComponentsDigest(in TaskNode task) @trusted
     {
         app.put(k);
         app.put("=");
-        try
-        {
-            app.put(serializeToJsonString(task.components[k]));
-        }
-        catch (Exception e)
-        {
-            app.put(task.components[k].toString());
-        }
+        app.put(task.components[k]);
         app.put("\n");
     }
     return sha256Hex(app.data);
@@ -151,16 +150,9 @@ string computeBuildStepsDigest(in TaskNode task) @trusted
             app.put(computeEnvDigest(step.environment));
         }
 
-        if (step.properties.type != Json.Type.undefined && step.properties.type != Json.Type.null_)
+        if (step.propertiesJson.length > 0)
         {
-            try
-            {
-                app.put(serializeToJsonString(step.properties));
-            }
-            catch (Exception e)
-            {
-                app.put(step.properties.toString());
-            }
+            app.put(step.propertiesJson);
         }
     }
     return sha256Hex(app.data);
@@ -323,9 +315,9 @@ unittest
     assert(fpModEnv != fp1, "Fingerprint must change when task environment configuration changes");
 
     // 5. Invalidation when custom component is added or modified
-    import vibe.data.json : Json;
+    import std.json : JSONValue;
     TaskNode taskCustom = task;
-    taskCustom.setCustomComponent("s3_source", Json(["bucket": Json("artifacts-bucket"), "key": Json("item.zip")]));
+    taskCustom.setCustomComponent("s3_source", JSONValue(["bucket": JSONValue("artifacts-bucket"), "key": JSONValue("item.zip")]));
     string fpCustom = computeNodeFingerprint(taskCustom, artifacts1);
     assert(fpCustom != fp1, "Fingerprint must change when custom component is added");
 

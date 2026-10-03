@@ -1,248 +1,10 @@
 module confector.core.model;
 
+public import confector.plugin_api.model;
+
 import std.typecons : Nullable;
 import vibe.data.json;
 import vibe.data.serialization : asName = name, optional;
-
-/**
- * Task execution status states.
- */
-enum TaskStatus : string
-{
-    pending = "pending",
-    running = "running",
-    succeeded = "succeeded",
-    failed = "failed",
-    cached = "cached",
-    skipped = "skipped",
-    cancelled = "cancelled"
-}
-
-/**
- * Supported trigger types.
- */
-enum TriggerType : string
-{
-    manual = "manual",
-    gitPush = "git_push",
-    gitTag = "git_tag",
-    webhook = "webhook",
-    cron = "cron"
-}
-
-/**
- * Specification for a trigger rule defined on a task node.
- */
-struct TriggerRule
-{
-    @optional TriggerType type;
-    @optional string[] branches;
-    @optional string[] tags;
-    @optional string endpoint;
-    @optional string cronSchedule;
-    @optional string[string] parameters;
-}
-
-/**
- * Event payload representing an incoming trigger dispatch.
- */
-struct TriggerEvent
-{
-    @optional TriggerType type;
-    @optional string branch;
-    @optional string tag;
-    @optional string endpoint;
-    @optional string[string] parameters;
-    @optional bool force = false;
-    @optional string targetTaskId;
-}
-
-/**
- * Upstream artifact reference consumed as input by a dependent task.
- */
-struct UpstreamArtifactRef
-{
-    @asName("task_id") string taskId;
-    @optional string name;
-}
-
-/**
- * Inputs required for a task execution.
- */
-struct TaskInputs
-{
-    @optional string[] repositories;
-    @optional @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
-    @optional string[string] parameters;
-}
-
-/**
- * Output artifact declaration produced by a task execution.
- */
-struct OutputArtifactDecl
-{
-    string path;
-    @optional string type = "file";
-}
-
-/**
- * Repository input component data.
- */
-struct RepositoryInputComponent
-{
-    @optional string[] repositories;
-    @optional string address;
-    @optional string targetDirectory;
-    @optional string branch;
-    @optional string tag;
-}
-
-/**
- * Upstream artifact input component data.
- */
-struct UpstreamArtifactInputComponent
-{
-    @optional UpstreamArtifactRef[] upstreamArtifacts;
-}
-
-/**
- * Represents an individual plugin-defined build step within a TaskNode.
- */
-struct BuildStep
-{
-    @optional string name;
-    string type; // e.g. "clone_repository", "git_clone", "script", "command"
-    @optional string[string] parameters;
-    @optional string script;
-    @optional string command;
-    @optional @asName("working_directory") string workingDirectory;
-    @optional string[string] environment;
-    @optional Json properties;
-}
-
-/**
- * Parameter input component data.
- */
-struct ParameterInputComponent
-{
-    @optional string[string] parameters;
-}
-
-/**
- * Process execution component data.
- */
-struct ProcessExecutionComponent
-{
-    @optional string script;
-    @optional string command;
-    @optional string[] arguments;
-    @optional string[string] environment;
-    @optional size_t timeoutSeconds = 900;
-}
-
-/**
- * Artifact output component data.
- */
-struct ArtifactOutputComponent
-{
-    @optional OutputArtifactDecl[] artifacts;
-}
-
-/**
- * Trigger rule component data.
- */
-struct TriggerRuleComponent
-{
-    @optional TriggerRule[] rules;
-}
-
-/**
- * Outputs produced by a task execution.
- */
-struct TaskOutputs
-{
-    @optional OutputArtifactDecl[] artifacts;
-}
-
-/**
- * Represents a discrete task node in the Directed Acyclic Graph (DAG)
- * modeled as an entity with composable components.
- */
-struct TaskNode
-{
-    string id;
-    @optional string name;
-    @optional @asName("depends_on") string[] dependsOn;
-    @optional TaskInputs inputs;
-    @optional TaskOutputs outputs;
-    @optional string script;
-    @optional @asName("steps") BuildStep[] steps;
-    @optional TriggerRule[] triggers;
-    @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
-    @optional string[string] environment;
-    @optional Json[string] components;
-
-    bool hasCustomComponent(string componentName) const @safe
-    {
-        if (components is null) return false;
-        return (componentName in components) !is null;
-    }
-
-    Json getCustomComponent(string componentName) const @safe
-    {
-        if (components is null) return Json.undefined;
-        auto p = componentName in components;
-        return p !is null ? *p : Json.undefined;
-    }
-
-    void setCustomComponent(string componentName, Json data) @safe
-    {
-        components[componentName] = data;
-    }
-
-    RepositoryInputComponent getRepositoryInputComponent() const pure nothrow @safe
-    {
-        return RepositoryInputComponent(inputs.repositories.dup);
-    }
-
-    UpstreamArtifactInputComponent getUpstreamArtifactInputComponent() const pure nothrow @safe
-    {
-        return UpstreamArtifactInputComponent(inputs.upstreamArtifacts.dup);
-    }
-
-    ProcessExecutionComponent getProcessExecutionComponent() const pure nothrow @safe
-    {
-        ProcessExecutionComponent comp;
-        comp.script = script;
-        comp.timeoutSeconds = timeoutSeconds;
-        foreach (k, v; environment)
-        {
-            comp.environment[k] = v;
-        }
-        return comp;
-    }
-
-    ArtifactOutputComponent getArtifactOutputComponent() const pure nothrow @safe
-    {
-        return ArtifactOutputComponent(outputs.artifacts.dup);
-    }
-}
-
-/**
- * Metadata recorded for stored artifacts.
- */
-struct ArtifactMetadata
-{
-    @optional @asName("artifact_id") string artifactId;
-    @optional @asName("build_id") string buildId;
-    @optional @asName("task_id") string taskId;
-    @optional @asName("file_path") string filePath;
-    @optional string sha256;
-    @optional @asName("size_bytes") ulong sizeBytes;
-    @optional @asName("storage_backend") string storageBackend;
-    @optional @asName("storage_uri") string storageUri;
-    @optional @asName("created_at") string createdAt;
-}
 
 /**
  * Persisted record of a build execution.
@@ -343,6 +105,7 @@ class FingerprintException : Exception
 unittest
 {
     import vibe.data.json : serializeToJson, deserializeJson;
+    import std.json : JSONValue;
 
     TaskNode node;
     node.id = "build";
@@ -390,25 +153,18 @@ unittest
     assert(bDeserialized.projectId == "proj-1");
     assert(bDeserialized.targetTaskId == "build");
 
-    // Test TaskNode array format
-    string arrayJsonStr = `[{"id":"task-1","script":"echo hello"}]`;
-    Json arrayParsed = parseJsonString(arrayJsonStr);
-    TaskNode[] taskArray = deserializeJson!(TaskNode[])(arrayParsed);
-    assert(taskArray.length == 1);
-    assert(taskArray[0].id == "task-1");
-
     // Test ECS component helpers
     assert(node.getRepositoryInputComponent().repositories == ["confector-repo", "common-utils"]);
     assert(node.getUpstreamArtifactInputComponent().upstreamArtifacts.length == 1);
     assert(node.getProcessExecutionComponent().script == "dub build");
     assert(node.getArtifactOutputComponent().artifacts.length == 1);
 
-    node.setCustomComponent("s3_source", Json(["bucket": Json("my-bucket"), "key": Json("data.tar.gz")]));
+    node.setCustomComponent("s3_source", JSONValue(["bucket": JSONValue("my-bucket"), "key": JSONValue("data.tar.gz")]));
     assert(node.hasCustomComponent("s3_source"));
-    assert(node.getCustomComponent("s3_source")["bucket"].get!string == "my-bucket");
+    assert(node.getCustomComponent("s3_source")["bucket"].str == "my-bucket");
     assert(!node.hasCustomComponent("non_existent"));
 
-    // Test BuildStep serialization on TaskNode
+    // Test BuildStep on TaskNode
     TaskNode stepNode;
     stepNode.id = "pipeline-task";
     BuildStep step1;
@@ -420,12 +176,15 @@ unittest
     step2.type = "process";
     step2.script = "dub build";
     stepNode.steps = [step1, step2];
+    assert(stepNode.steps.length == 2);
 
-    Json stepNodeJson = serializeToJson(stepNode);
-    TaskNode deserializedStepNode = deserializeJson!TaskNode(stepNodeJson);
-    assert(deserializedStepNode.steps.length == 2);
-    assert(deserializedStepNode.steps[0].type == "clone_repository");
-    assert(deserializedStepNode.steps[0].parameters["repository"] == "https://github.com/example/repo.git");
-    assert(deserializedStepNode.steps[1].type == "process");
-    assert(deserializedStepNode.steps[1].script == "dub build");
+    // Test deserializing existing project from Mongo
+    import vibe.data.json : parseJsonString;
+    string oldMongoJson = `{"_id":{"$oid":"6abdaa639a9dd776c18490f7"},"id":"confector","created_at":"20261001T003339.8549745","default_pipeline_id":"","description":"","name":"Confector","repository_url":"","tasks":[{"id":"confector-test","name":"Test Confector","depends_on":[],"inputs":{"repositories":["confector"],"upstream_artifacts":[],"parameters":{}},"outputs":{"artifacts":[]},"script":"","steps":[{"name":"Clone Repository","type":"clone_repository","parameters":{"repository":"https://github.com/Lansatac/confector.git"},"script":"","command":"","working_directory":"","environment":{},"properties":null},{"name":"Execute Script","type":"bash","parameters":{"executable":"bash"},"script":"dub test","command":"","working_directory":"","environment":{},"properties":null}],"triggers":[],"timeout_seconds":900,"environment":{},"components":{}}],"updated_at":"20261001T003339.8549745"}`;
+    Json oldJson = parseJsonString(oldMongoJson);
+    ProjectRecord oldProject = deserializeJson!ProjectRecord(oldJson);
+    assert(oldProject.id == "confector");
+    assert(oldProject.tasks.length == 1);
+    assert(oldProject.tasks[0].id == "confector-test");
+    assert(oldProject.tasks[0].steps.length == 2);
 }

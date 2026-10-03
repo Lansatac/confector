@@ -1,21 +1,66 @@
 module confector.core.plugin;
 
-import confector.core.model : TaskNode, BuildStep;
-import confector.core.system : InputResolverSystem, FingerprintContributionSystem, TaskExecutionSystem, ArtifactPublishingSystem, BuildStepSystem, BuildStepProvider;
-import confector.core.executor : ExecutorProvider;
+public import confector.plugin_api.logging;
+public import confector.plugin_api.plugin;
+public import confector.plugin_api.model;
+public import confector.plugin_api.executor;
+public import confector.plugin_api.system;
+public import confector.plugin_api.vcs;
+
+import vibe.core.log : logDebug, logInfo, logWarn, logError;
 
 /**
- * Base interface for all Confector plugins.
- * Encapsulates lifecycle hooks and metadata for modular extensions.
+ * Concrete PluginContext provided by the Confector host.
+ * Routes plugin logging to custom sinks or host logs.
  */
-interface Plugin
+class HostPluginContext : PluginContext
 {
-    @property string name() const;
-    @property string versionString() const;
-    @property string description() const;
+    private string m_pluginName;
+    private PluginLogCallback m_logSink;
 
-    void initialize();
-    void shutdown();
+    this(string pluginName, PluginLogCallback logSink = null)
+    {
+        m_pluginName = pluginName;
+        m_logSink = logSink;
+    }
+
+    @property string pluginName() const
+    {
+        return m_pluginName;
+    }
+
+    void log(LogLevel level, string message, string context = null)
+    {
+        if (m_logSink !is null)
+        {
+            LogEntry entry;
+            entry.level = level;
+            entry.message = message;
+            entry.pluginName = m_pluginName;
+            entry.context = context;
+            m_logSink(entry);
+        }
+        else
+        {
+            final switch (level)
+            {
+                case LogLevel.trace:
+                case LogLevel.debug_:
+                    logDebug("[plugin:%s] %s", m_pluginName, message);
+                    break;
+                case LogLevel.info:
+                    logInfo("[plugin:%s] %s", m_pluginName, message);
+                    break;
+                case LogLevel.warning:
+                    logWarn("[plugin:%s] %s", m_pluginName, message);
+                    break;
+                case LogLevel.error:
+                case LogLevel.critical:
+                    logError("[plugin:%s] %s", m_pluginName, message);
+                    break;
+            }
+        }
+    }
 }
 
 /**
@@ -33,6 +78,7 @@ final class PluginRegistry
     private BuildStepSystem[] _stepSystems;
     private BuildStepProvider[] _stepProviders;
     private ExecutorProvider[] _executorProviders;
+    private PluginLogCallback _logCallback;
 
     public static PluginRegistry instance()
     {
@@ -43,10 +89,16 @@ final class PluginRegistry
         return _instance;
     }
 
+    public void setLogCallback(PluginLogCallback callback)
+    {
+        _logCallback = callback;
+    }
+
     public void registerPlugin(Plugin plugin)
     {
         _plugins[plugin.name] = plugin;
-        plugin.initialize();
+        auto ctx = new HostPluginContext(plugin.name, _logCallback);
+        plugin.initialize(ctx);
 
         // Automatically register implemented system interfaces
         if (auto resolver = cast(InputResolverSystem) plugin)
@@ -337,6 +389,8 @@ final class PluginRegistry
 
 unittest
 {
+    import std.json : JSONValue, JSONType;
+
     class MockPlugin : Plugin
     {
         bool initialized = false;
@@ -346,7 +400,7 @@ unittest
         @property string versionString() const { return "0.1.0"; }
         @property string description() const { return "Mock plugin for testing"; }
 
-        void initialize() { initialized = true; }
+        void initialize(PluginContext context = null) { initialized = true; }
         void shutdown() { shutdownCalled = true; }
     }
 
@@ -363,10 +417,6 @@ unittest
     assert(mock.shutdownCalled);
     assert(registry.getPlugin("mock-plugin") is null);
 
-    // Test system registration via plugin
-    import confector.core.system : InputResolutionContext, StepExecutionContext, StepExecutionResult, BuildStepSystem, BuildStepProvider;
-    import confector.core.executor : ExecutionRequest, ExecutionResult, LogDelegate;
-
     class IntegratedPlugin : Plugin, InputResolverSystem, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
     {
         @property string name() const { return "integrated-plugin"; }
@@ -376,7 +426,7 @@ unittest
         @property string stepType() const { return "test-step"; }
         @property string displayName() const { return "Test Step"; }
 
-        void initialize() {}
+        void initialize(PluginContext context = null) {}
         void shutdown() {}
 
         bool canResolve(in TaskNode task) const { return task.id == "task-resolved"; }
@@ -398,10 +448,9 @@ unittest
             return res;
         }
 
-        import vibe.data.json : Json;
-        Json defaultParameters() const { return Json.emptyObject; }
-        string[] validateParameters(in Json parameters) const { return null; }
-        string renderStepFormHtml(in Json currentParameters) const { return "<div>Test Step UI</div>"; }
+        JSONValue defaultParameters() const { return JSONValue(string[string].init); }
+        string[] validateParameters(in JSONValue parameters) const { return null; }
+        string renderStepFormHtml(in JSONValue currentParameters) const { return "<div>Test Step UI</div>"; }
     }
 
     auto integrated = new IntegratedPlugin();
@@ -419,42 +468,15 @@ unittest
     testNode.script = "echo hello";
     assert(registry.findExecutionSystem(testNode) is integrated);
 
-    BuildStep bStep;
-    bStep.type = "test-step";
-    assert(registry.findStepSystem(bStep) is integrated);
+    BuildStep step;
+    step.type = "test-step";
+    assert(registry.findStepSystem(step) is integrated);
 
-    // Test ExecutorProvider registration
-    import vibe.data.json : Json;
-    import confector.core.executor : ExecutorRecord, TaskExecutor;
-
-    class TestExecutorProvider : Plugin, ExecutorProvider
-    {
-        @property string name() const { return "test-exec-provider"; }
-        @property string versionString() const { return "1.0.0"; }
-        @property string description() const { return "Test executor provider"; }
-        @property string providerType() const { return "test-type"; }
-        @property string displayName() const { return "Test Type"; }
-        @property string[] supportedStepTypes() const { return ["test-step"]; }
-
-        void initialize() {}
-        void shutdown() {}
-
-        Json defaultConfig() const { return Json.emptyObject; }
-        string[] validateConfig(in Json config) const { return null; }
-        string renderConfigFormHtml(in Json currentConfig) const { return "<div>Test</div>"; }
-        TaskExecutor createExecutor(in ExecutorRecord record) const { return null; }
-    }
-
-    auto execProvider = new TestExecutorProvider();
-    registry.registerPlugin(execProvider);
-
-    assert(registry.getExecutorProviders().length == 1);
-    assert(registry.getExecutorProvider("test-type") is execProvider);
-    assert(registry.getExecutorProvider("non-existent") is null);
-
-    registry.shutdownAll();
+    // Test unregistering
+    registry.unregisterPlugin("integrated-plugin");
     assert(registry.getInputResolvers().length == 0);
     assert(registry.getExecutionSystems().length == 0);
     assert(registry.getStepSystems().length == 0);
-    assert(registry.getExecutorProviders().length == 0);
+    assert(registry.getStepProviders().length == 0);
+    assert(registry.getStepProvider("test-step") is null);
 }

@@ -3,11 +3,13 @@ module confector.storage.mongo_repository;
 import confector.core.model;
 import confector.core.storage;
 import confector.core.executor : ExecutorRecord;
+import confector.core.json_compat : sanitizeBson;
 
 import vibe.db.mongo.client : MongoClient;
 import vibe.db.mongo.collection : MongoCollection, FindOptions, UpdateOptions;
 import vibe.data.json;
 import vibe.data.bson;
+import vibe.core.log : logError, logWarn, logDebug;
 
 import std.format : format;
 import std.datetime.systime : Clock;
@@ -64,7 +66,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
-            // Fallback or log if mongo communication fails
+            logError("Failed to set task status (buildId=%s, taskId=%s): %s", buildId, taskId, e.msg);
         }
     }
 
@@ -91,6 +93,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logWarn("Failed to get task status (buildId=%s, taskId=%s): %s", buildId, taskId, e.msg);
         }
         return false;
     }
@@ -117,6 +120,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to save cached fingerprint (taskId=%s): %s", taskId, e.msg);
         }
     }
 
@@ -143,6 +147,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logWarn("Failed to get cached fingerprint (taskId=%s): %s", taskId, e.msg);
         }
         return false;
     }
@@ -163,6 +168,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to record build (buildId=%s): %s", build.buildId, e.msg);
         }
     }
 
@@ -179,11 +185,12 @@ class MongoBuildStateRepository : BuildStateRepository
                 return false;
             }
 
-            build = deserializeBson!BuildRecord(doc);
+            build = deserializeBson!BuildRecord(sanitizeBson(doc));
             return true;
         }
         catch (Exception e)
         {
+            logWarn("Failed to get build (buildId=%s): %s", buildId, e.msg);
             return false;
         }
     }
@@ -201,13 +208,17 @@ class MongoBuildStateRepository : BuildStateRepository
             {
                 try
                 {
-                    list ~= deserializeBson!BuildRecord(doc);
+                    list ~= deserializeBson!BuildRecord(sanitizeBson(doc));
                 }
-                catch (Exception e) {}
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize build record: %s", e.msg);
+                }
             }
         }
         catch (Exception e)
         {
+            logError("Failed to list builds: %s", e.msg);
         }
         return list;
     }
@@ -235,6 +246,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to append build log (buildId=%s): %s", buildId, e.msg);
         }
     }
 
@@ -267,6 +279,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logWarn("Failed to get build logs (buildId=%s): %s", buildId, e.msg);
         }
         return [];
     }
@@ -287,6 +300,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to save trigger rule (id=%s): %s", rule.id, e.msg);
         }
     }
 
@@ -300,13 +314,17 @@ class MongoBuildStateRepository : BuildStateRepository
             {
                 try
                 {
-                    list ~= deserializeBson!TriggerRuleRecord(doc);
+                    list ~= deserializeBson!TriggerRuleRecord(sanitizeBson(doc));
                 }
-                catch (Exception e) {}
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize trigger rule: %s", e.msg);
+                }
             }
         }
         catch (Exception e)
         {
+            logError("Failed to list trigger rules: %s", e.msg);
         }
         return list;
     }
@@ -322,6 +340,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to delete trigger rule (id=%s): %s", ruleId, e.msg);
             return false;
         }
     }
@@ -342,6 +361,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to save project (id=%s): %s", project.id, e.msg);
         }
     }
 
@@ -358,11 +378,12 @@ class MongoBuildStateRepository : BuildStateRepository
                 return false;
             }
 
-            project = deserializeBson!ProjectRecord(doc);
+            project = deserializeBson!ProjectRecord(sanitizeBson(doc));
             return true;
         }
         catch (Exception e)
         {
+            logWarn("Failed to get project (id=%s): %s", projectId, e.msg);
             return false;
         }
     }
@@ -377,13 +398,17 @@ class MongoBuildStateRepository : BuildStateRepository
             {
                 try
                 {
-                    list ~= deserializeBson!ProjectRecord(doc);
+                    list ~= deserializeBson!ProjectRecord(sanitizeBson(doc));
                 }
-                catch (Exception e) {}
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize project record: %s", e.msg);
+                }
             }
         }
         catch (Exception e)
         {
+            logError("Failed to list projects from MongoDB: %s", e.msg);
         }
         return list;
     }
@@ -399,6 +424,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to delete project (id=%s): %s", projectId, e.msg);
             return false;
         }
     }
@@ -426,6 +452,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to save repository (name=%s): %s", repo.name, e.msg);
         }
     }
 
@@ -447,6 +474,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logWarn("Failed to get repository (name=%s): %s", name, e.msg);
             return false;
         }
     }
@@ -476,11 +504,15 @@ class MongoBuildStateRepository : BuildStateRepository
                         list ~= r;
                     }
                 }
-                catch (Exception e) {}
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize repository: %s", e.msg);
+                }
             }
         }
         catch (Exception e)
         {
+            logError("Failed to list repositories: %s", e.msg);
         }
         return list;
     }
@@ -496,6 +528,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to delete repository (name=%s): %s", name, e.msg);
             return false;
         }
     }
@@ -517,6 +550,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to save executor (id=%s): %s", executor.id, e.msg);
         }
     }
 
@@ -533,11 +567,12 @@ class MongoBuildStateRepository : BuildStateRepository
                 return false;
             }
 
-            executor = deserializeBson!ExecutorRecord(doc);
+            executor = deserializeBson!ExecutorRecord(sanitizeBson(doc));
             return true;
         }
         catch (Exception e)
         {
+            logWarn("Failed to get executor (id=%s): %s", id, e.msg);
             return false;
         }
     }
@@ -552,13 +587,17 @@ class MongoBuildStateRepository : BuildStateRepository
             {
                 try
                 {
-                    list ~= deserializeBson!ExecutorRecord(doc);
+                    list ~= deserializeBson!ExecutorRecord(sanitizeBson(doc));
                 }
-                catch (Exception e) {}
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize executor record: %s", e.msg);
+                }
             }
         }
         catch (Exception e)
         {
+            logError("Failed to list executors: %s", e.msg);
         }
         return list;
     }
@@ -574,7 +613,52 @@ class MongoBuildStateRepository : BuildStateRepository
         }
         catch (Exception e)
         {
+            logError("Failed to delete executor (id=%s): %s", id, e.msg);
             return false;
         }
     }
+}
+
+unittest
+{
+    import vibe.data.bson : serializeToBson, deserializeBson;
+    import vibe.data.json : parseJsonString;
+    import vibe.db.mongo.client : parseJsonToBson = serializeToBson;
+
+    string oldMongoJson = `{"_id":{"$oid":"6abdaa639a9dd776c18490f7"},"id":"confector","created_at":"20261001T003339.8549745","default_pipeline_id":"","description":"","name":"Confector","repository_url":"","tasks":[{"id":"confector-test","name":"Test Confector","depends_on":[],"inputs":{"repositories":["confector"],"upstream_artifacts":[],"parameters":{}},"outputs":{"artifacts":[]},"script":"","steps":[{"name":"Clone Repository","type":"clone_repository","parameters":{"repository":"https://github.com/Lansatac/confector.git"},"script":"","command":"","working_directory":"","environment":{},"properties":null},{"name":"Execute Script","type":"bash","parameters":{"executable":"bash"},"script":"dub test","command":"","working_directory":"","environment":{},"properties":null}],"triggers":[],"timeout_seconds":900,"environment":{},"components":{}}],"updated_at":"20261001T003339.8549745"}`;
+    auto jsonVal = parseJsonString(oldMongoJson);
+    Bson bsonDoc = serializeToBson(jsonVal);
+    ProjectRecord project = deserializeBson!ProjectRecord(bsonDoc);
+    assert(project.id == "confector");
+    assert(project.name == "Confector");
+    assert(project.tasks.length == 1);
+    assert(project.tasks[0].id == "confector-test");
+    assert(project.tasks[0].steps.length == 2);
+    assert(project.tasks[0].steps[0].type == "clone_repository");
+    assert(project.tasks[0].steps[1].type == "bash");
+
+    // Test Bson with undefined properties and sanitization
+    Bson stepBson = Bson.emptyObject;
+    stepBson["name"] = Bson("Clone");
+    stepBson["type"] = Bson("git");
+    stepBson["properties"] = Bson(Bson.Type.undefined, null);
+    BuildStep step = deserializeBson!BuildStep(sanitizeBson(stepBson));
+    assert(step.type == "git");
+
+    // Test Bson with object properties sanitized to JSON string
+    Bson stepBson2 = Bson.emptyObject;
+    stepBson2["name"] = Bson("Build");
+    stepBson2["type"] = Bson("bash");
+    Bson propsObj = Bson.emptyObject;
+    propsObj["flags"] = Bson("-v");
+    stepBson2["properties"] = propsObj;
+    BuildStep step2 = deserializeBson!BuildStep(sanitizeBson(stepBson2));
+    assert(step2.type == "bash");
+    assert(step2.propertiesJson.length > 0);
+
+    // Re-serialize to BSON and deserialize
+    Bson reBson = serializeToBson(project);
+    ProjectRecord reProject = deserializeBson!ProjectRecord(reBson);
+    assert(reProject.id == "confector");
+    assert(reProject.tasks.length == 1);
 }
