@@ -168,7 +168,43 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         });
     }
 
-    // Remote Worker Task Completion Callback endpoint
+    // Remote Worker Task Completion Callback endpoints
+    router.post("/tasks/:fingerprint/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string fingerprint = req.params["fingerprint"];
+            TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
+            if (result.fingerprint.length == 0 || result.fingerprint == "unknown")
+            {
+                result.fingerprint = fingerprint;
+            }
+
+            if (coordinator !is null)
+            {
+                coordinator.onTaskCompleted(fingerprint, result);
+            }
+            else if (engine.stateRepository !is null)
+            {
+                if (result.buildId.length > 0 && result.taskId.length > 0)
+                {
+                    engine.stateRepository.setTaskStatus(result.buildId, result.taskId, result.status, result.errorMessage);
+                }
+            }
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("recorded");
+            resp["fingerprint"] = Json(fingerprint);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
     router.post("/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {

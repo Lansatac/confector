@@ -44,17 +44,27 @@ class TaskEngine
     @property BuildStateRepository stateRepository() { return m_stateRepo; }
 
     /**
-     * Executes a single task node with fingerprint checking and artifact handling.
+     * Executes a single task node with fingerprint checking and optional artifact handling.
+     *
+     * Params:
+     *   upstreamFingerprints = Map of upstream taskId -> task fingerprint (content-addressed).
+     *   precomputedFingerprint = When non-empty, used as the authoritative node fingerprint
+     *                            (e.g. coordinator/graph fingerprint) instead of recomputing.
+     *   manageArtifacts = When true, engine stages upstream artifacts and packs outputs.
+     *                     When false (queued worker path), caller owns artifact I/O and
+     *                     engine acts purely as a step/script execution helper.
      */
     TaskExecutionResult executeTask(
         string buildId,
         in TaskNode task,
         string workspaceDir,
-        in string[string] upstreamArtifactHashes = null,
+        in string[string] upstreamFingerprints = null,
         bool force = false,
         LogDelegate logCallback = null,
         in string[] allowedRepositories = null,
-        in string[string] repositoryMap = null
+        in string[string] repositoryMap = null,
+        string precomputedFingerprint = null,
+        bool manageArtifacts = true
     )
     {
         auto sw = StopWatch(AutoStart.yes);
@@ -62,17 +72,25 @@ class TaskEngine
         result.taskId = task.id;
         result.buildId = buildId;
 
-        logInfo("[engine] Starting executeTask for task '%s' (build '%s', workspace '%s', force=%s)", task.id, buildId, workspaceDir, force);
+        logInfo("[engine] Starting executeTask for task '%s' (build '%s', workspace '%s', force=%s, manageArtifacts=%s)",
+            task.id, buildId, workspaceDir, force, manageArtifacts);
 
-        // 1. Calculate input fingerprint
+        // 1. Resolve input fingerprint (prefer coordinator/graph precomputed value)
         string fingerprint;
-        try
+        if (precomputedFingerprint.length > 0 && precomputedFingerprint != "unknown")
         {
-            fingerprint = Fingerprinter.computeNodeFingerprint(task, workspaceDir, upstreamArtifactHashes);
+            fingerprint = precomputedFingerprint;
         }
-        catch (Exception e)
+        else
         {
-            fingerprint = "unknown";
+            try
+            {
+                fingerprint = Fingerprinter.computeNodeFingerprint(task, workspaceDir, upstreamFingerprints);
+            }
+            catch (Exception e)
+            {
+                fingerprint = "unknown";
+            }
         }
         result.fingerprint = fingerprint;
 
@@ -82,14 +100,19 @@ class TaskEngine
             ArtifactMetadata[] cachedArtifacts;
             if (m_stateRepo !is null && m_stateRepo.getCachedFingerprint(task.id, fingerprint, cachedArtifacts))
             {
-                // Verify all artifacts exist in storage
+                // Verify all artifacts exist in stream storage by (taskFingerprint, artifactId)
                 bool allArtifactsValid = true;
                 foreach (meta; cachedArtifacts)
                 {
-                    if (m_artifactStorage !is null && !m_artifactStorage.artifactExists(meta.buildId, meta.taskId, meta.filePath))
+                    if (m_artifactStorage !is null)
                     {
-                        allArtifactsValid = false;
-                        break;
+                        string effectiveFp = meta.taskFingerprint.length > 0 ? meta.taskFingerprint : fingerprint;
+                        string effectiveArtId = meta.artifactId.length > 0 ? meta.artifactId : meta.filePath;
+                        if (!m_artifactStorage.artifactExists(effectiveFp, effectiveArtId))
+                        {
+                            allArtifactsValid = false;
+                            break;
+                        }
                     }
                 }
 
@@ -141,8 +164,8 @@ class TaskEngine
             }
         }
 
-        // 5. Retrieve any upstream artifacts required into workspace
-        if (task.inputs.upstreamArtifacts.length > 0)
+        // 5. Retrieve upstream artifacts into workspace (only when engine owns artifact I/O)
+        if (manageArtifacts && task.inputs.upstreamArtifacts.length > 0)
         {
             if (m_artifactStorage is null)
             {
@@ -157,12 +180,37 @@ class TaskEngine
                 return result;
             }
 
+            import confector.core.zip_packager : ZipPackager;
+            import std.array : Appender;
+
             foreach (refArt; task.inputs.upstreamArtifacts)
             {
-                if (!m_artifactStorage.artifactExists(buildId, refArt.taskId, refArt.name))
+                string artId = refArt.effectiveArtifactId;
+                // Empty destination means unpack into workspace root
+                string targetLocal = refArt.destination.length > 0
+                    ? buildPath(effectiveWorkingDir, refArt.destination)
+                    : effectiveWorkingDir;
+
+                string upFp;
+                if (upstreamFingerprints !is null && refArt.taskId in upstreamFingerprints)
+                {
+                    upFp = upstreamFingerprints[refArt.taskId];
+                }
+                if (upFp.length == 0 && m_stateRepo !is null)
+                {
+                    TaskExecutionRecord depRec;
+                    if (m_stateRepo.getTaskExecution(buildId, refArt.taskId, depRec) && depRec.fingerprint.length > 0)
+                    {
+                        upFp = depRec.fingerprint;
+                    }
+                }
+
+                if (upFp.length == 0 || !m_artifactStorage.artifactExists(upFp, artId))
                 {
                     result.status = TaskStatus.failed;
-                    result.errorMessage = format("Missing upstream artifact '%s' from task '%s'", refArt.name, refArt.taskId);
+                    result.errorMessage = format(
+                        "Missing upstream artifact '%s' from task '%s' (fingerprint: %s)",
+                        artId, refArt.taskId, upFp.length > 0 ? upFp : "<unknown>");
                     if (m_stateRepo !is null)
                     {
                         m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
@@ -177,11 +225,30 @@ class TaskEngine
                     return result;
                 }
 
-                string targetLocal = buildPath(effectiveWorkingDir, refArt.name);
-                m_artifactStorage.retrieveArtifact(buildId, refArt.taskId, refArt.name, targetLocal);
-                if (logCallback !is null)
+                try
                 {
-                    logCallback(format("[confector] Staged upstream artifact '%s' from task '%s' to '%s'", refArt.name, refArt.taskId, targetLocal));
+                    Appender!(ubyte[]) zipBuf;
+                    m_artifactStorage.retrieveArtifactStream(upFp, artId, (const(ubyte)[] chunk) {
+                        zipBuf.put(chunk);
+                    });
+                    ZipPackager.unpack(zipBuf.data, targetLocal);
+                    if (logCallback !is null)
+                    {
+                        auto fpPreview = upFp.length >= 8 ? upFp[0 .. 8] : upFp;
+                        logCallback(format("[confector] Unpacked upstream artifact '%s' (fp: %s) to '%s'", artId, fpPreview, targetLocal));
+                    }
+                }
+                catch (Exception e)
+                {
+                    result.status = TaskStatus.failed;
+                    result.errorMessage = format("Failed unpacking upstream artifact '%s' from task '%s': %s", artId, refArt.taskId, e.msg);
+                    if (m_stateRepo !is null)
+                    {
+                        m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                    }
+                    sw.stop();
+                    result.durationMs = sw.peek.total!"msecs";
+                    return result;
                 }
             }
         }
@@ -355,41 +422,85 @@ class TaskEngine
             return result;
         }
 
-        // 8. Capture and store declared output artifacts via ArtifactPublishingSystem or default storage
+        // 8. Capture and store declared output artifacts (only when engine owns artifact I/O)
         ArtifactMetadata[] producedArtifacts;
-        bool publishedViaSystem = false;
-        foreach (pubSys; PluginRegistry.instance.getArtifactPublishers())
+        if (manageArtifacts)
         {
-            if (pubSys.canPublish(task))
+            bool publishedViaSystem = false;
+            foreach (pubSys; PluginRegistry.instance.getArtifactPublishers())
             {
-                auto metaList = pubSys.publishArtifacts(task, buildId, effectiveWorkingDir, m_artifactStorage, logCallback);
-                producedArtifacts ~= metaList;
-                publishedViaSystem = true;
-            }
-        }
-
-        if (!publishedViaSystem && m_artifactStorage !is null)
-        {
-            foreach (artDecl; task.outputs.artifacts)
-            {
-                string localArtifactPath = buildPath(effectiveWorkingDir, artDecl.path);
-                if (exists(localArtifactPath) && isFile(localArtifactPath))
+                if (pubSys.canPublish(task))
                 {
-                    auto meta = m_artifactStorage.storeArtifact(buildId, task.id, localArtifactPath, artDecl.type);
-                    producedArtifacts ~= meta;
-                    if (logCallback !is null)
+                    auto metaList = pubSys.publishArtifacts(task, buildId, effectiveWorkingDir, m_artifactStorage, logCallback);
+                    producedArtifacts ~= metaList;
+                    publishedViaSystem = true;
+                }
+            }
+
+            if (!publishedViaSystem && m_artifactStorage !is null)
+            {
+                import confector.core.zip_packager : ZipPackager;
+                import std.datetime.systime : Clock;
+
+                foreach (artDecl; task.outputs.artifacts)
+                {
+                    string artId = artDecl.effectiveId;
+                    string artPath = artDecl.effectivePath;
+
+                    if (fingerprint.length == 0 || fingerprint == "unknown")
                     {
-                        logCallback(format("[confector] Stored output artifact '%s' (SHA256: %s)", artDecl.path, meta.sha256[0 .. 8]));
+                        continue;
+                    }
+
+                    try
+                    {
+                        m_artifactStorage.storeArtifactStream(fingerprint, artId, (void delegate(const(ubyte)[]) sink) {
+                            ZipPackager.pack(effectiveWorkingDir, artPath, sink);
+                        });
+
+                        ArtifactMetadata meta;
+                        meta.artifactId = artId;
+                        meta.taskFingerprint = fingerprint;
+                        meta.buildId = buildId;
+                        meta.taskId = task.id;
+                        meta.filePath = artPath;
+                        meta.storageBackend = "local";
+                        meta.storageUri = format(".confector/artifacts/%s/%s.zip", fingerprint, artId);
+                        meta.createdAt = Clock.currTime.toISOString();
+                        producedArtifacts ~= meta;
+
+                        if (logCallback !is null)
+                        {
+                            logCallback(format("[confector] Stored output artifact '%s' (ID: %s, fp: %s)", artPath, artId, fingerprint[0 .. (fingerprint.length >= 8 ? 8 : fingerprint.length)]));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        result.status = TaskStatus.failed;
+                        result.errorMessage = format("Failed packaging output artifact '%s' (%s): %s", artId, artPath, e.msg);
+                        if (m_stateRepo !is null)
+                        {
+                            m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
+                        }
+                        sw.stop();
+                        result.durationMs = sw.peek.total!"msecs";
+                        return result;
                     }
                 }
             }
+
+            // Save cached fingerprint only when this layer produced/owns artifacts
+            if (m_stateRepo !is null && fingerprint.length > 0 && fingerprint != "unknown")
+            {
+                m_stateRepo.saveCachedFingerprint(task.id, fingerprint, producedArtifacts);
+            }
         }
+
         result.producedArtifacts = producedArtifacts;
 
-        // 9. Save cached fingerprint
-        if (m_stateRepo !is null && fingerprint.length > 0 && fingerprint != "unknown")
+        // 9. Mark succeeded
+        if (m_stateRepo !is null)
         {
-            m_stateRepo.saveCachedFingerprint(task.id, fingerprint, producedArtifacts);
             m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.succeeded);
         }
 
@@ -466,7 +577,8 @@ class TaskEngine
         TaskGraph taskGraph = null;
         try { taskGraph = new TaskGraph(tasks); } catch (Exception) {}
 
-        string[string] currentArtifactHashes;
+        // Upstream taskId -> fingerprint map for content-addressed artifact lookup
+        string[string] currentUpstreamFingerprints;
         bool allCached = true;
 
         foreach (taskId; plan.orderedTaskIds)
@@ -523,15 +635,28 @@ class TaskEngine
                 catch (Exception) {}
             }
 
+            // Prefer graph-computed fingerprint when available so engine and coordinator agree
+            string graphFp;
+            if (taskGraph !is null)
+            {
+                try
+                {
+                    graphFp = taskGraph.getFingerprint(taskId);
+                }
+                catch (Exception) {}
+            }
+
             auto taskRes = executeTask(
                 buildId,
                 **pTask,
                 workspaceDir,
-                currentArtifactHashes,
+                currentUpstreamFingerprints,
                 force ? true : false,
                 logCallback,
                 taskAllowedRepos,
-                effectiveRepoMap
+                effectiveRepoMap,
+                graphFp,
+                true // manageArtifacts: direct engine path owns packaging
             );
 
             graphResult.taskResults[taskId] = taskRes;
@@ -541,14 +666,10 @@ class TaskEngine
                 allCached = false;
             }
 
-            // Track produced artifact hashes for downstream tasks
-            foreach (art; taskRes.producedArtifacts)
+            // Track upstream task fingerprints for downstream content-addressed lookup
+            if (taskRes.fingerprint.length > 0 && taskRes.fingerprint != "unknown")
             {
-                import std.path : baseName;
-                currentArtifactHashes[art.filePath] = art.sha256;
-                currentArtifactHashes[baseName(art.filePath)] = art.sha256;
-                currentArtifactHashes[format("%s:%s", art.taskId, baseName(art.filePath))] = art.sha256;
-                currentArtifactHashes[format("%s:%s", art.taskId, art.filePath)] = art.sha256;
+                currentUpstreamFingerprints[taskId] = taskRes.fingerprint;
             }
 
             if (taskRes.status == TaskStatus.failed)
@@ -738,22 +859,27 @@ unittest
     {
         node1.script = "echo hello > output.txt";
     }
-    node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "file")];
+    node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 
     // First execution: should execute and succeed
     auto res1 = engine.executeTask("build_1", node1, testDir);
     assert(res1.status == TaskStatus.succeeded);
     assert(res1.producedArtifacts.length == 1);
-    assert(storage.artifactExists("build_1", "step1", "output.txt"));
+    assert(res1.fingerprint.length > 0 && res1.fingerprint != "unknown");
+    assert(storage.artifactExists(res1.fingerprint, "output.txt"));
+    assert(res1.producedArtifacts[0].taskFingerprint == res1.fingerprint);
+    assert(res1.producedArtifacts[0].artifactId == "output.txt");
 
     // Second execution (same buildId or new buildId): should be cached
     auto res2 = engine.executeTask("build_2", node1, testDir);
     assert(res2.status == TaskStatus.cached);
     assert(res2.producedArtifacts.length == 1);
+    assert(res2.fingerprint == res1.fingerprint);
 
     // Forced execution: should re-run
     auto res3 = engine.executeTask("build_3", node1, testDir, null, true);
     assert(res3.status == TaskStatus.succeeded);
+    assert(storage.artifactExists(res3.fingerprint, "output.txt"));
 
     // Multi-node task graph test with artifact staging
     TaskNode node2;
@@ -769,25 +895,32 @@ unittest
     {
         node2.script = "cat output.txt > result.txt";
     }
-    node2.outputs.artifacts = [OutputArtifactDecl("result.txt", "file")];
+    node2.outputs.artifacts = [OutputArtifactDecl("result.txt", "result.txt")];
 
     TaskNode[] taskList = [node1, node2];
 
     ExecutionPlan plan;
     plan.orderedTaskIds = ["step1", "step2"];
 
-    // Execute full graph
-    auto graphRes1 = engine.executeTasks("build_graph_1", taskList, plan, testDir, "proj-1", "My Project");
+    // Execute full graph in a fresh workspace so step2 must retrieve from stream storage
+    string graphWs = buildPath(testDir, "graph_ws");
+    mkdirRecurse(graphWs);
+    auto graphRes1 = engine.executeTasks("build_graph_1", taskList, plan, graphWs, "proj-1", "My Project");
     assert(graphRes1.success);
     assert(graphRes1.executedOrder == ["step1", "step2"]);
     assert(graphRes1.taskResults["step2"].status == TaskStatus.succeeded);
-    assert(storage.artifactExists("build_graph_1", "step2", "result.txt"));
+    auto step1Fp = graphRes1.taskResults["step1"].fingerprint;
+    auto step2Fp = graphRes1.taskResults["step2"].fingerprint;
+    assert(storage.artifactExists(step1Fp, "output.txt"));
+    assert(storage.artifactExists(step2Fp, "result.txt"));
 
     // Second execution without changes: all nodes should be cached
-    auto graphRes2 = engine.executeTasks("build_graph_2", taskList, plan, testDir, "proj-1", "My Project");
+    auto graphRes2 = engine.executeTasks("build_graph_2", taskList, plan, graphWs, "proj-1", "My Project");
     assert(graphRes2.success);
     assert(graphRes2.taskResults["step1"].status == TaskStatus.cached);
     assert(graphRes2.taskResults["step2"].status == TaskStatus.cached);
+    assert(graphRes2.taskResults["step1"].fingerprint == step1Fp);
+    assert(graphRes2.taskResults["step2"].fingerprint == step2Fp);
 
     // Missing upstream artifact failure test
     TaskNode nodeBad;
@@ -816,12 +949,12 @@ unittest
             BuildStep("Step 2", "process", null, "echo second_step >> seq.txt")
         ];
     }
-    stepTask.outputs.artifacts = [OutputArtifactDecl("seq.txt", "file")];
+    stepTask.outputs.artifacts = [OutputArtifactDecl("seq.txt", "seq.txt")];
 
     auto stepRes = engine.executeTask("build_steps_1", stepTask, testDir);
     assert(stepRes.status == TaskStatus.succeeded);
     assert(stepRes.producedArtifacts.length == 1);
-    assert(storage.artifactExists("build_steps_1", "multi_step_task", "seq.txt"));
+    assert(storage.artifactExists(stepRes.fingerprint, "seq.txt"));
 
     // Step failure halting execution test
     TaskNode failingStepTask;
@@ -870,7 +1003,7 @@ unittest
             BuildStep("Bash Step", "bash", null, "echo bash_output > bash.txt")
         ];
     }
-    scriptPluginTask.outputs.artifacts = [OutputArtifactDecl("bash.txt", "file")];
+    scriptPluginTask.outputs.artifacts = [OutputArtifactDecl("bash.txt", "bash.txt")];
 
     auto scriptPluginRes = engine.executeTask("build_script_plugins", scriptPluginTask, testDir);
     assert(scriptPluginRes.status == TaskStatus.succeeded);

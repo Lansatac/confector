@@ -73,15 +73,25 @@ struct TriggerEvent
 struct UpstreamArtifactRef
 {
     @asName("task_id") string taskId;
+    @optional @asName("artifact_id") string artifactId;
+    @optional @asName("destination") string destination;
     @optional string name;
     @optional string path;
-    @optional string destination;
 
-    this(string taskId, string name = null) pure nothrow @safe
+    this(string taskId, string artifactId, string destination = "") pure nothrow @safe
     {
         this.taskId = taskId;
-        this.name = name;
-        this.path = name;
+        this.artifactId = artifactId;
+        this.destination = destination;
+        this.name = artifactId;
+        this.path = artifactId;
+    }
+
+    @property string effectiveArtifactId() const pure nothrow @safe
+    {
+        if (artifactId.length > 0) return artifactId;
+        if (name.length > 0) return name;
+        return path;
     }
 }
 
@@ -111,15 +121,37 @@ struct TaskInputs
  */
 struct OutputArtifactDecl
 {
-    string path;
+    @optional @asName("id") string id;
+    @optional @asName("path") string path;
     @optional string name;
     @optional string type = "file";
 
-    this(string path, string type = "file") pure nothrow @safe
+    this(string path) pure nothrow @safe
     {
+        this.id = path;
         this.path = path;
         this.name = path;
-        this.type = type;
+    }
+
+    this(string id, string path) pure nothrow @safe
+    {
+        this.id = id;
+        this.path = path;
+        this.name = id;
+    }
+
+    @property string effectiveId() const pure nothrow @safe
+    {
+        if (id.length > 0) return id;
+        if (name.length > 0) return name;
+        return path;
+    }
+
+    @property string effectivePath() const pure nothrow @safe
+    {
+        if (path.length > 0) return path;
+        if (name.length > 0) return name;
+        return id;
     }
 }
 
@@ -304,6 +336,7 @@ struct TaskNode
 struct ArtifactMetadata
 {
     @optional @asName("artifact_id") string artifactId;
+    @optional @asName("task_fingerprint") string taskFingerprint;
     @optional @asName("build_id") string buildId;
     @optional @asName("task_id") string taskId;
     @optional @asName("file_path") string filePath;
@@ -315,13 +348,48 @@ struct ArtifactMetadata
 }
 
 /**
- * Abstract storage interface for artifacts.
+ * Abstract storage interface for content-addressed artifacts and archive streams.
  */
 interface ArtifactStorage
 {
+    /**
+     * Stores an artifact by streaming bytes from writer into storage, addressed by task fingerprint and artifact ID.
+     */
+    void storeArtifactStream(string taskFingerprint, string artifactId, void delegate(void delegate(const(ubyte)[])) writer);
+
+    /**
+     * Retrieves an artifact from storage and streams chunks of bytes into sink.
+     */
+    void retrieveArtifactStream(string taskFingerprint, string artifactId, void delegate(const(ubyte)[]) sink);
+
+    /**
+     * Checks if an artifact exists in storage by task fingerprint and artifact ID.
+     */
+    bool artifactExists(string taskFingerprint, string artifactId);
+
+    /**
+     * Deletes an artifact from storage by task fingerprint and artifact ID.
+     */
+    void deleteArtifact(string taskFingerprint, string artifactId);
+
+    /**
+     * Legacy store method (buildId, taskId, localFilePath).
+     */
     ArtifactMetadata storeArtifact(string buildId, string taskId, string localFilePath, string artifactType = "file");
+
+    /**
+     * Legacy retrieve method.
+     */
     void retrieveArtifact(string buildId, string taskId, string artifactPath, string targetLocalPath);
+
+    /**
+     * Legacy artifact existence check.
+     */
     bool artifactExists(string buildId, string taskId, string artifactPath);
+
+    /**
+     * Legacy metadata lookup.
+     */
     bool getArtifactMetadata(string buildId, string taskId, string artifactPath, out ArtifactMetadata metadata);
 }
 

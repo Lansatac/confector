@@ -148,8 +148,8 @@ unittest
     node.dependsOn = ["lint"];
     node.script = "dub build";
     node.inputs.repositories = ["confector-repo", "common-utils"];
-    node.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports/lint.json")];
-    node.outputs.artifacts = [OutputArtifactDecl("bin/confector", "binary")];
+    node.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports/lint.json", "reports")];
+    node.outputs.artifacts = [OutputArtifactDecl("binary", "bin/confector")];
     node.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
 
     // Test ProjectRecord serialization with Tasks

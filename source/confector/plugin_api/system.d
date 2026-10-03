@@ -3,6 +3,7 @@ module confector.plugin_api.system;
 import confector.plugin_api.model;
 import confector.plugin_api.executor : ExecutionRequest, ExecutionResult, LogDelegate;
 import std.json : JSONValue, JSONType;
+import vibe.data.serialization : optional;
 
 /**
  * Context payload provided to input resolution systems during workflow preparation.
@@ -35,6 +36,7 @@ struct FingerprintContributionContext
 {
     string workspaceDir;
     string[string] upstreamArtifactHashes;
+    @optional string[string] upstreamFingerprints;
     string[string] parameters;
 }
 

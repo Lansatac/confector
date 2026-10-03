@@ -15,6 +15,7 @@ class TaskGraph
     private TaskNode[string] m_tasks;
     private string[][string] m_dependencies; // taskId -> array of upstream tasks it depends on
     private string[][string] m_dependents;   // taskId -> array of downstream tasks depending on it
+    private string[string] m_fingerprints;   // taskId -> deterministic upfront fingerprint
 
     /**
      * Constructs a TaskGraph from a ProjectRecord.
@@ -77,6 +78,62 @@ class TaskGraph
         }
 
         validate();
+        computeFingerprints();
+    }
+
+    /**
+     * Precomputes deterministic node fingerprints in topological execution order.
+     */
+    void computeFingerprints(string workspaceDir = "")
+    {
+        import confector.core.fingerprinter : Fingerprinter;
+
+        m_fingerprints.clear();
+        auto order = topologicalSort();
+        foreach (taskId; order)
+        {
+            TaskNode node = m_tasks[taskId];
+            string[string] upstreamFps;
+            auto deps = m_dependencies.get(taskId, []);
+            foreach (depId; deps)
+            {
+                if (depId in m_fingerprints)
+                {
+                    upstreamFps[depId] = m_fingerprints[depId];
+                }
+            }
+            foreach (art; node.inputs.upstreamArtifacts)
+            {
+                if (art.taskId in m_fingerprints)
+                {
+                    upstreamFps[art.taskId] = m_fingerprints[art.taskId];
+                }
+            }
+
+            string fp = Fingerprinter.computeNodeFingerprint(node, workspaceDir, upstreamFps);
+            m_fingerprints[taskId] = fp;
+        }
+    }
+
+    /**
+     * Returns the precalculated deterministic fingerprint for a given task ID.
+     */
+    string getFingerprint(string taskId) const
+    {
+        auto p = taskId in m_fingerprints;
+        if (p is null)
+        {
+            throw new DAGValidationException(format("Task '%s' not found or fingerprint not computed in graph", taskId));
+        }
+        return *p;
+    }
+
+    /**
+     * Returns a copy of all precalculated task fingerprints keyed by task ID.
+     */
+    string[string] allFingerprints() const
+    {
+        return m_fingerprints.dup;
     }
 
     /**
@@ -509,4 +566,38 @@ unittest
     assert(graph.resolveSubgraph("B") == ["A", "B"]);
     // Subgraph for D only includes C and D
     assert(graph.resolveSubgraph("D") == ["C", "D"]);
+}
+
+unittest
+{
+    // 9. Test deterministic upfront fingerprint calculation and propagation
+    TaskNode a; a.id = "compile"; a.script = "dub build";
+    a.outputs.artifacts = [OutputArtifactDecl("binaries", "bin/*")];
+
+    TaskNode b; b.id = "test"; b.dependsOn = ["compile"];
+    b.inputs.upstreamArtifacts = [UpstreamArtifactRef("compile", "binaries", "dist")];
+    b.script = "dub test";
+
+    TaskNode c; c.id = "docs"; c.script = "dub build --build=docs";
+
+    auto graph1 = new TaskGraph([a, b, c]);
+    auto graph2 = new TaskGraph([a, b, c]);
+
+    // All fingerprints must be computed upfront and match identically across evaluations
+    assert(graph1.getFingerprint("compile") == graph2.getFingerprint("compile"));
+    assert(graph1.getFingerprint("test") == graph2.getFingerprint("test"));
+    assert(graph1.getFingerprint("docs") == graph2.getFingerprint("docs"));
+    assert(graph1.getFingerprint("compile").length == 64);
+    assert(graph1.getFingerprint("test").length == 64);
+
+    // 10. Modifying upstream task changes downstream fingerprint
+    TaskNode aMod = a;
+    aMod.script = "dub build --build=release";
+    auto graphMod = new TaskGraph([aMod, b, c]);
+
+    // compile and test fingerprints must change
+    assert(graphMod.getFingerprint("compile") != graph1.getFingerprint("compile"));
+    assert(graphMod.getFingerprint("test") != graph1.getFingerprint("test"));
+    // Unrelated task C (docs) fingerprint must remain unchanged
+    assert(graphMod.getFingerprint("docs") == graph1.getFingerprint("docs"));
 }

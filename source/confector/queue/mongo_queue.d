@@ -453,6 +453,8 @@ class MongoWorkQueue : WorkQueue
 
 unittest
 {
+    import std.json : parseJSON;
+
     // Test TaskQueueMessage BSON serialization & deserialization with complex TaskNode
     TaskQueueMessage msg;
     msg.messageId = "test-msg-1";
@@ -471,7 +473,7 @@ unittest
     msg.taskNode = node;
 
     msg.executionPayload.script = "echo payload";
-    msg.executionPayload.expectedOutputs = [OutputArtifactDecl("bin/app", "file")];
+    msg.executionPayload.expectedOutputs = [OutputArtifactDecl("app", "bin/app")];
 
     Bson payloadBson = serializeToBson(msg.executionPayload);
     Bson nodeBson = serializeToBson(msg.taskNode);

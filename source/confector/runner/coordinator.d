@@ -29,6 +29,165 @@ struct ActiveBuild
 }
 
 /**
+ * Subscription of a build and task to an in-flight execution.
+ */
+struct InFlightSubscription
+{
+    string buildId;
+    string taskId;
+}
+
+/**
+ * Registry tracking actively queued or running task executions by fingerprint,
+ * supporting multi-build subscription and in-flight deduplication (single-flight pattern).
+ */
+class InFlightTaskRegistry
+{
+    private InFlightSubscription[][string] m_inFlight; // fingerprint -> subscriptions
+    private string[string] m_taskToFingerprint;         // "buildId:taskId" -> fingerprint
+
+    private static string taskKey(string buildId, string taskId) pure nothrow @safe
+    {
+        return buildId ~ ":" ~ taskId;
+    }
+
+    /**
+     * Checks whether a task with the given fingerprint is currently in flight.
+     */
+    bool isInFlight(string fingerprint) const pure nothrow @safe
+    {
+        if (fingerprint.length == 0 || fingerprint == "unknown") return false;
+        auto p = fingerprint in m_inFlight;
+        return p !is null && p.length > 0;
+    }
+
+    /**
+     * Registers a build task execution or attaches it to an existing in-flight execution.
+     * Returns true if newly registered (caller must enqueue work),
+     * or false if already in flight (coalesced; caller attaches without duplicate work).
+     */
+    bool registerOrSubscribe(string fingerprint, string buildId, string taskId)
+    {
+        m_taskToFingerprint[taskKey(buildId, taskId)] = fingerprint;
+
+        if (fingerprint.length == 0 || fingerprint == "unknown")
+        {
+            m_inFlight[fingerprint] ~= InFlightSubscription(buildId, taskId);
+            return true;
+        }
+
+        if (auto pSubs = fingerprint in m_inFlight)
+        {
+            bool found = false;
+            foreach (sub; *pSubs)
+            {
+                if (sub.buildId == buildId && sub.taskId == taskId)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                *pSubs ~= InFlightSubscription(buildId, taskId);
+            }
+            return false;
+        }
+        else
+        {
+            m_inFlight[fingerprint] = [InFlightSubscription(buildId, taskId)];
+            return true;
+        }
+    }
+
+    /**
+     * Retrieves all current subscribers for a given fingerprint.
+     */
+    InFlightSubscription[] getSubscribers(string fingerprint) const
+    {
+        if (auto p = fingerprint in m_inFlight)
+        {
+            return (*p).dup;
+        }
+        return [];
+    }
+
+    /**
+     * Looks up the registered fingerprint for a specific build task.
+     */
+    bool getFingerprintForTask(string buildId, string taskId, out string fingerprint) const
+    {
+        if (auto p = taskKey(buildId, taskId) in m_taskToFingerprint)
+        {
+            fingerprint = *p;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Completes and removes an in-flight execution, returning all subscribed builds and tasks.
+     */
+    InFlightSubscription[] completeTask(string fingerprint)
+    {
+        InFlightSubscription[] subs;
+        if (auto p = fingerprint in m_inFlight)
+        {
+            subs = *p;
+            m_inFlight.remove(fingerprint);
+            foreach (sub; subs)
+            {
+                m_taskToFingerprint.remove(taskKey(sub.buildId, sub.taskId));
+            }
+        }
+        return subs;
+    }
+
+    /**
+     * Unsubscribes a build from all in-flight tasks upon cancellation.
+     */
+    void unsubscribeBuild(string buildId)
+    {
+        string[] emptyFingerprints;
+        foreach (fp, ref subs; m_inFlight)
+        {
+            InFlightSubscription[] remaining;
+            foreach (sub; subs)
+            {
+                if (sub.buildId == buildId)
+                {
+                    m_taskToFingerprint.remove(taskKey(sub.buildId, sub.taskId));
+                }
+                else
+                {
+                    remaining ~= sub;
+                }
+            }
+            if (remaining.length == 0)
+            {
+                emptyFingerprints ~= fp;
+            }
+            else
+            {
+                subs = remaining;
+            }
+        }
+        foreach (fp; emptyFingerprints)
+        {
+            m_inFlight.remove(fp);
+        }
+    }
+
+    /**
+     * Returns count of currently in-flight unique task fingerprints.
+     */
+    size_t inFlightCount() const pure nothrow @safe
+    {
+        return m_inFlight.length;
+    }
+}
+
+/**
  * Centralized Build Coordinator that orchestrates dynamic DAG progression,
  * evaluates task readiness, enqueues self-contained task work units to WorkQueue,
  * and processes asynchronous task completions over network-safe boundaries.
@@ -41,6 +200,7 @@ class BuildCoordinator
     private string m_callbackBaseUrl;
     private Mutex m_mutex;
     private ActiveBuild[string] m_activeBuilds;
+    private InFlightTaskRegistry m_inFlightRegistry;
 
     this(
         ArtifactStorage artifactStorage,
@@ -54,11 +214,13 @@ class BuildCoordinator
         m_workQueue = workQueue;
         m_callbackBaseUrl = callbackBaseUrl;
         m_mutex = new Mutex();
+        m_inFlightRegistry = new InFlightTaskRegistry();
     }
 
     @property ArtifactStorage artifactStorage() { return m_artifactStorage; }
     @property BuildStateRepository stateRepository() { return m_stateRepo; }
     @property WorkQueue workQueue() { return m_workQueue; }
+    @property InFlightTaskRegistry inFlightRegistry() { return m_inFlightRegistry; }
     @property string callbackBaseUrl() const { return m_callbackBaseUrl; }
     @property void callbackBaseUrl(string url) { m_callbackBaseUrl = url; }
 
@@ -79,6 +241,10 @@ class BuildCoordinator
         {
             string buildId = "bld_" ~ randomUUID().toString()[0 .. 8];
             TaskGraph graph = new TaskGraph(project);
+            if (workspaceDir.length > 0)
+            {
+                graph.computeFingerprints(workspaceDir);
+            }
 
             string[] targetTaskIds;
             if (targetTaskId.length > 0)
@@ -129,7 +295,7 @@ class BuildCoordinator
 
             logInfo("[coordinator] Starting build '%s' for project '%s' (target: %s, %d tasks in DAG)", buildId, project.name.length > 0 ? project.name : (project.id.length > 0 ? project.id : "default"), targetTaskId.length > 0 ? targetTaskId : "all", targetTaskIds.length);
 
-            // Evaluate initial root tasks
+            // Evaluate initial root tasks & resolve cached nodes upfront
             evaluateReadyTasksLocked(buildId);
 
             return buildId;
@@ -138,8 +304,23 @@ class BuildCoordinator
 
     /**
      * Handles task completion results from local or remote workers.
-     * Updates task and build status, saves cached fingerprints, and advances downstream dependents.
+     * Updates task and build status, saves cached fingerprints, and advances downstream dependents
+     * for all builds subscribed to the completed task execution.
      */
+    void onTaskCompleted(string fingerprint, TaskExecutionResult result)
+    {
+        if (result.fingerprint.length == 0 || result.fingerprint == "unknown")
+        {
+            result.fingerprint = fingerprint;
+        }
+        onTaskCompleted(result.buildId, result.taskId, result);
+    }
+
+    void onTaskCompleted(TaskExecutionResult result)
+    {
+        onTaskCompleted(result.buildId, result.taskId, result);
+    }
+
     void onTaskCompleted(string buildId, string taskId, TaskExecutionResult result)
     {
         synchronized (m_mutex)
@@ -148,49 +329,100 @@ class BuildCoordinator
 
             try
             {
-                // Record task execution record
-                TaskExecutionRecord rec;
-                rec.buildId = buildId;
-                rec.taskId = taskId;
-                rec.status = cast(string)result.status;
-                rec.fingerprint = result.fingerprint;
-                rec.exitCode = result.exitCode;
-                rec.errorMessage = result.errorMessage;
-                rec.durationMs = result.durationMs;
-                rec.producedArtifacts = result.producedArtifacts;
-                rec.finishedAt = Clock.currTime.toISOString();
-
-                if (m_stateRepo !is null)
+                string fingerprint = result.fingerprint;
+                if (fingerprint.length == 0 || fingerprint == "unknown")
                 {
-                    m_stateRepo.recordTaskExecution(rec);
-                    m_stateRepo.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
-
-                    foreach (line; result.logs)
+                    m_inFlightRegistry.getFingerprintForTask(buildId, taskId, fingerprint);
+                }
+                if ((fingerprint.length == 0 || fingerprint == "unknown") && (buildId in m_activeBuilds))
+                {
+                    try
                     {
-                        m_stateRepo.appendBuildLog(buildId, line);
+                        fingerprint = m_activeBuilds[buildId].graph.getFingerprint(taskId);
                     }
+                    catch (Exception) {}
+                }
 
-                    // If fingerprint is valid and artifacts exist, save to cache
-                    if ((result.status == TaskStatus.succeeded || result.status == TaskStatus.cached)
-                        && result.fingerprint.length > 0 && result.fingerprint != "unknown")
+                // Retrieve all subscribed builds/tasks for this fingerprint
+                InFlightSubscription[] subscribers;
+                if (fingerprint.length > 0 && fingerprint != "unknown")
+                {
+                    subscribers = m_inFlightRegistry.completeTask(fingerprint);
+                }
+                
+                // Only use fallback for legacy/unknown-fingerprint completions if the original build is still non-terminal
+                if (subscribers.length == 0)
+                {
+                    BuildRecord origBuild;
+                    bool origBuildExists = (m_stateRepo !is null && m_stateRepo.getBuild(buildId, origBuild));
+                    bool origBuildNonTerminal = origBuildExists && 
+                        (origBuild.status != "cancelled" && origBuild.status != "failed" && origBuild.status != "succeeded");
+                    
+                    if (origBuildNonTerminal)
                     {
-                        m_stateRepo.saveCachedFingerprint(taskId, result.fingerprint, result.producedArtifacts);
-                    }
-
-                    // Update build executedTasks list
-                    BuildRecord b;
-                    if (m_stateRepo.getBuild(buildId, b))
-                    {
-                        if (!b.executedTasks.canFind(taskId))
-                        {
-                            b.executedTasks ~= taskId;
-                            m_stateRepo.recordBuild(b);
-                        }
+                        subscribers = [InFlightSubscription(buildId, taskId)];
                     }
                 }
 
-                // Advance DAG progression
-                evaluateReadyTasksLocked(buildId);
+                string[] buildsToEvaluate;
+
+                foreach (sub; subscribers)
+                {
+                    string subBuildId = sub.buildId;
+                    string subTaskId = sub.taskId;
+
+                    // Record task execution record
+                    TaskExecutionRecord rec;
+                    rec.buildId = subBuildId;
+                    rec.taskId = subTaskId;
+                    rec.status = cast(string)result.status;
+                    rec.fingerprint = (result.fingerprint.length > 0 && result.fingerprint != "unknown") ? result.fingerprint : fingerprint;
+                    rec.exitCode = result.exitCode;
+                    rec.errorMessage = result.errorMessage;
+                    rec.durationMs = result.durationMs;
+                    rec.producedArtifacts = result.producedArtifacts;
+                    rec.finishedAt = Clock.currTime.toISOString();
+
+                    if (m_stateRepo !is null)
+                    {
+                        m_stateRepo.recordTaskExecution(rec);
+                        m_stateRepo.setTaskStatus(subBuildId, subTaskId, result.status, result.errorMessage);
+
+                        foreach (line; result.logs)
+                        {
+                            m_stateRepo.appendBuildLog(subBuildId, line);
+                        }
+
+                        // If fingerprint is valid and artifacts exist/succeeded, save to cache
+                        if ((result.status == TaskStatus.succeeded || result.status == TaskStatus.cached)
+                            && rec.fingerprint.length > 0 && rec.fingerprint != "unknown")
+                        {
+                            m_stateRepo.saveCachedFingerprint(subTaskId, rec.fingerprint, result.producedArtifacts);
+                        }
+
+                        // Update build executedTasks list
+                        BuildRecord b;
+                        if (m_stateRepo.getBuild(subBuildId, b))
+                        {
+                            if (!b.executedTasks.canFind(subTaskId))
+                            {
+                                b.executedTasks ~= subTaskId;
+                                m_stateRepo.recordBuild(b);
+                            }
+                        }
+                    }
+
+                    if (!buildsToEvaluate.canFind(subBuildId))
+                    {
+                        buildsToEvaluate ~= subBuildId;
+                    }
+                }
+
+                // Advance DAG progression for all subscribed builds
+                foreach (bId; buildsToEvaluate)
+                {
+                    evaluateReadyTasksLocked(bId);
+                }
             }
             catch (Exception e)
             {
@@ -226,6 +458,7 @@ class BuildCoordinator
                 }
             }
 
+            m_inFlightRegistry.unsubscribeBuild(buildId);
             m_activeBuilds.remove(buildId);
         }
     }
@@ -244,6 +477,10 @@ class BuildCoordinator
                 BuildRecord b;
                 if (m_stateRepo.getBuild(buildId, b))
                 {
+                    if (b.status == "cancelled" || b.status == "failed" || b.status == "succeeded")
+                    {
+                        return;
+                    }
                     ProjectRecord proj;
                     if (m_stateRepo.getProject(b.projectId, proj))
                     {
@@ -251,6 +488,10 @@ class BuildCoordinator
                         act.buildId = buildId;
                         act.project = proj;
                         act.graph = new TaskGraph(proj);
+                        if (b.workspaceDir.length > 0)
+                        {
+                            act.graph.computeFingerprints(b.workspaceDir);
+                        }
                         if (b.targetTaskId.length > 0)
                         {
                             act.targetTaskIds = act.graph.resolveSubgraph(b.targetTaskId);
@@ -330,6 +571,7 @@ class BuildCoordinator
                 }
             }
 
+            m_inFlightRegistry.unsubscribeBuild(buildId);
             m_activeBuilds.remove(buildId);
             return;
         }
@@ -379,15 +621,19 @@ class BuildCoordinator
                         break;
                     }
 
-                    // Collect upstream artifact hashes if present
-                    if (m_stateRepo !is null)
+                    // Collect upstream task fingerprints for content-addressed artifact lookup
+                    try
                     {
-                        TaskExecutionRecord depRec;
-                        if (m_stateRepo.getTaskExecution(buildId, depId, depRec))
+                        upstreamHashes[depId] = active.graph.getFingerprint(depId);
+                    }
+                    catch (Exception)
+                    {
+                        if (m_stateRepo !is null)
                         {
-                            foreach (art; depRec.producedArtifacts)
+                            TaskExecutionRecord depRec;
+                            if (m_stateRepo.getTaskExecution(buildId, depId, depRec) && depRec.fingerprint.length > 0)
                             {
-                                upstreamHashes[art.filePath] = art.sha256;
+                                upstreamHashes[depId] = depRec.fingerprint;
                             }
                         }
                     }
@@ -400,69 +646,80 @@ class BuildCoordinator
 
                 TaskNode node = active.graph.getTask(tId);
 
-                // 3. Cache check
-                if (!active.force)
+                // 3. Cache check using precomputed deterministic fingerprint
+                string fingerprint;
+                try
                 {
-                    string fingerprint;
-                    try
-                    {
-                        fingerprint = Fingerprinter.computeNodeFingerprint(node, active.workspaceDir, upstreamHashes);
-                    }
-                    catch (Exception)
-                    {
-                        fingerprint = "unknown";
-                    }
+                    fingerprint = active.graph.getFingerprint(tId);
+                }
+                catch (Exception)
+                {
+                    fingerprint = "unknown";
+                }
 
-                    if (fingerprint.length > 0 && fingerprint != "unknown" && m_stateRepo !is null)
+                if (!active.force && fingerprint.length > 0 && fingerprint != "unknown" && m_stateRepo !is null)
+                {
+                    ArtifactMetadata[] cachedArtifacts;
+                    if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedArtifacts))
                     {
-                        ArtifactMetadata[] cachedArtifacts;
-                        if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedArtifacts))
+                        // Verify artifacts exist in stream storage by (taskFingerprint, artifactId)
+                        bool allValid = true;
+                        foreach (meta; cachedArtifacts)
                         {
-                            // Verify artifacts exist in storage
-                            bool allValid = true;
-                            foreach (meta; cachedArtifacts)
+                            if (m_artifactStorage !is null)
                             {
-                                if (m_artifactStorage !is null && !m_artifactStorage.artifactExists(meta.buildId, meta.taskId, meta.filePath))
+                                string effectiveFp = meta.taskFingerprint.length > 0 ? meta.taskFingerprint : fingerprint;
+                                string effectiveArtId = meta.artifactId.length > 0 ? meta.artifactId : meta.filePath;
+                                if (!m_artifactStorage.artifactExists(effectiveFp, effectiveArtId))
                                 {
                                     allValid = false;
                                     break;
                                 }
                             }
+                        }
 
-                            if (allValid)
+                        if (allValid)
+                        {
+                            logInfo("[coordinator] Build '%s': Task '%s' resolved from cache (fingerprint: %s)", buildId, tId, fingerprint);
+
+                            // Resolve immediately as cached
+                            TaskExecutionRecord cacheRec;
+                            cacheRec.buildId = buildId;
+                            cacheRec.taskId = tId;
+                            cacheRec.status = "cached";
+                            cacheRec.fingerprint = fingerprint;
+                            cacheRec.producedArtifacts = cachedArtifacts;
+                            cacheRec.finishedAt = Clock.currTime.toISOString();
+
+                            m_stateRepo.recordTaskExecution(cacheRec);
+                            m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cached);
+
+                            BuildRecord b;
+                            if (m_stateRepo.getBuild(buildId, b))
                             {
-                                logInfo("[coordinator] Build '%s': Task '%s' resolved from cache (fingerprint: %s)", buildId, tId, fingerprint);
-
-                                // Resolve immediately as cached
-                                TaskExecutionRecord cacheRec;
-                                cacheRec.buildId = buildId;
-                                cacheRec.taskId = tId;
-                                cacheRec.status = "cached";
-                                cacheRec.fingerprint = fingerprint;
-                                cacheRec.producedArtifacts = cachedArtifacts;
-                                cacheRec.finishedAt = Clock.currTime.toISOString();
-
-                                m_stateRepo.recordTaskExecution(cacheRec);
-                                m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cached);
-
-                                BuildRecord b;
-                                if (m_stateRepo.getBuild(buildId, b))
+                                if (!b.executedTasks.canFind(tId))
                                 {
-                                    if (!b.executedTasks.canFind(tId))
-                                    {
-                                        b.executedTasks ~= tId;
-                                        m_stateRepo.recordBuild(b);
-                                    }
+                                    b.executedTasks ~= tId;
+                                    m_stateRepo.recordBuild(b);
                                 }
-
-                                stateChanged = true;
-                                continue;
                             }
+
+                            stateChanged = true;
+                            continue;
                         }
                     }
                 }
 
-                // 4. Enqueue to WorkQueue
+                // 4. In-Flight Coalescing & Enqueue to WorkQueue
+                bool shouldEnqueue = m_inFlightRegistry.registerOrSubscribe(fingerprint, buildId, tId);
+                pActive.enqueuedTasks[tId] = true;
+
+                if (!shouldEnqueue)
+                {
+                    logInfo("[coordinator] Build '%s': Task '%s' coalesced with in-flight execution (fingerprint: %s)", buildId, tId, fingerprint);
+                    continue;
+                }
+
                 string[] allowedRepos;
                 string[string] repoMap;
 
@@ -548,50 +805,50 @@ class BuildCoordinator
                 payload.force = active.force;
                 payload.expectedOutputs = node.outputs.artifacts.dup;
                 payload.upstreamArtifactHashes = upstreamHashes;
+                payload.nodeFingerprint = fingerprint;
 
                 if (m_callbackBaseUrl.length > 0)
                 {
                     payload.callbackUrl = format("%s/api/v1/builds/%s/tasks/%s/complete", m_callbackBaseUrl, buildId, tId);
                 }
 
-                // Resolve upstream artifact input locations
+                // Single authoritative upstream artifact list: (taskFingerprint, artifactId, destination)
                 foreach (artRef; node.inputs.upstreamArtifacts)
                 {
-                    string target = artRef.path.length > 0 ? artRef.path : artRef.name;
-                    InputArtifactRef inArt;
-                    inArt.taskId = artRef.taskId;
-                    inArt.targetPath = target;
-                    payload.inputArtifacts ~= inArt;
-
-                    UpstreamArtifactLocation loc;
-                    loc.taskId = artRef.taskId;
-                    loc.artifactPath = target;
-                    loc.targetPath = target;
-                    if (m_artifactStorage !is null)
+                    string artId = artRef.effectiveArtifactId;
+                    string upFp;
+                    try
                     {
-                        ArtifactMetadata meta;
-                        if (m_artifactStorage.getArtifactMetadata(buildId, artRef.taskId, target, meta))
+                        upFp = active.graph.getFingerprint(artRef.taskId);
+                    }
+                    catch (Exception)
+                    {
+                        if (artRef.taskId in upstreamHashes)
                         {
-                            loc.storageBackend = meta.storageBackend;
-                            loc.storageUri = meta.storageUri;
-                            loc.sha256 = meta.sha256;
+                            upFp = upstreamHashes[artRef.taskId];
                         }
                     }
-                    payload.upstreamArtifactLocations ~= loc;
+
+                    InputArtifactRef inArt;
+                    inArt.taskId = artRef.taskId;
+                    inArt.taskFingerprint = upFp;
+                    inArt.artifactId = artId;
+                    // Empty destination means unpack into workspace root
+                    inArt.destination = artRef.destination;
+                    payload.inputArtifacts ~= inArt;
                 }
 
                 TaskQueueMessage msg;
                 msg.messageId = "msg_" ~ randomUUID().toString();
                 msg.buildId = buildId;
                 msg.taskId = tId;
+                msg.nodeFingerprint = fingerprint;
                 msg.taskNode = node;
                 msg.executionPayload = payload;
                 msg.timeoutSeconds = node.timeoutSeconds;
                 msg.createdAt = Clock.currTime.toISOString();
 
-                pActive.enqueuedTasks[tId] = true;
-
-                logInfo("[coordinator] Build '%s': Enqueuing ready task '%s' to work queue (timeout: %ds)", buildId, tId, node.timeoutSeconds);
+                logInfo("[coordinator] Build '%s': Enqueuing ready task '%s' to work queue (fingerprint: %s, timeout: %ds)", buildId, tId, fingerprint, node.timeoutSeconds);
 
                 if (m_workQueue !is null)
                 {
@@ -640,6 +897,7 @@ class BuildCoordinator
                 }
             }
 
+            m_inFlightRegistry.unsubscribeBuild(buildId);
             m_activeBuilds.remove(buildId);
         }
     }
@@ -833,4 +1091,214 @@ unittest
     TaskStatus statusB;
     assert(stateRepo.getTaskStatus(bFail, "B", statusB));
     assert(statusB == TaskStatus.cancelled);
+
+    // 5. In-Flight Task Coalescing & Multi-Build Notification
+    {
+        auto coord5 = new BuildCoordinator(storage, stateRepo, queue);
+
+        TaskNode taskRoot;
+        taskRoot.id = "fetch";
+        taskRoot.script = "echo fetching data";
+
+        TaskNode taskProc;
+        taskProc.id = "process";
+        taskProc.dependsOn = ["fetch"];
+        taskProc.script = "echo processing";
+
+        ProjectRecord projCoalesce;
+        projCoalesce.id = "proj_coalesce";
+        projCoalesce.tasks = [taskRoot, taskProc];
+
+        // Start Build 1 targeting entire pipeline (fetch -> process)
+        string b1_coalesce = coord5.startBuild(projCoalesce, null, true);
+        assert(queue.getPendingCount() == 1); // "fetch" is enqueued for b1
+
+        // Start Build 2 targeting only "fetch" while "fetch" is still in-flight
+        string b2_coalesce = coord5.startBuild(projCoalesce, "fetch", true);
+        // Deduplication check: queue should STILL have pending count == 1, not 2!
+        assert(queue.getPendingCount() == 1);
+
+        auto deqFetch = queue.dequeue(1);
+        assert(deqFetch.length == 1);
+        assert(deqFetch[0].taskId == "fetch");
+
+        // Complete "fetch" task
+        TaskExecutionResult resFetch;
+        resFetch.taskId = "fetch";
+        resFetch.buildId = deqFetch[0].buildId;
+        resFetch.status = TaskStatus.succeeded;
+        resFetch.fingerprint = deqFetch[0].nodeFingerprint;
+        coord5.onTaskCompleted(deqFetch[0].buildId, "fetch", resFetch);
+
+        // Build 2 (targeting only "fetch") should now be completed!
+        BuildRecord b2Rec;
+        assert(stateRepo.getBuild(b2_coalesce, b2Rec));
+        assert(b2Rec.status == "succeeded");
+        assert(b2Rec.executedTasks.canFind("fetch"));
+
+        // Build 1 should now have "process" unblocked and enqueued in WorkQueue
+        assert(queue.getPendingCount() == 1);
+        auto deqProc = queue.dequeue(1);
+        assert(deqProc[0].taskId == "process");
+        assert(deqProc[0].buildId == b1_coalesce);
+
+        TaskExecutionResult resProc;
+        resProc.taskId = "process";
+        resProc.buildId = b1_coalesce;
+        resProc.status = TaskStatus.succeeded;
+        resProc.fingerprint = deqProc[0].nodeFingerprint;
+        coord5.onTaskCompleted(b1_coalesce, "process", resProc);
+
+        BuildRecord b1Rec_c;
+        assert(stateRepo.getBuild(b1_coalesce, b1Rec_c));
+        assert(b1Rec_c.status == "succeeded");
+        assert(b1Rec_c.executedTasks.length == 2);
+    }
+
+    // 6. Cache Hit Subgraph Short-Circuiting
+    {
+        auto coord6 = new BuildCoordinator(storage, stateRepo, queue);
+
+        TaskNode taskAlpha;
+        taskAlpha.id = "alpha";
+        taskAlpha.script = "echo alpha source";
+
+        TaskNode taskBeta;
+        taskBeta.id = "beta";
+        taskBeta.dependsOn = ["alpha"];
+        taskBeta.script = "echo beta build";
+
+        ProjectRecord projCache;
+        projCache.id = "proj_cache_test";
+        projCache.tasks = [taskAlpha, taskBeta];
+
+        // First run: execute both tasks to populate cache
+        string bFirst = coord6.startBuild(projCache, null, false);
+        assert(queue.getPendingCount() == 1);
+
+        auto deqAlpha = queue.dequeue(1);
+        assert(deqAlpha[0].taskId == "alpha");
+        TaskExecutionResult resAlpha;
+        resAlpha.taskId = "alpha";
+        resAlpha.buildId = bFirst;
+        resAlpha.status = TaskStatus.succeeded;
+        resAlpha.fingerprint = deqAlpha[0].nodeFingerprint;
+        coord6.onTaskCompleted(bFirst, "alpha", resAlpha);
+
+        assert(queue.getPendingCount() == 1);
+        auto deqBeta = queue.dequeue(1);
+        assert(deqBeta[0].taskId == "beta");
+        TaskExecutionResult resBeta;
+        resBeta.taskId = "beta";
+        resBeta.buildId = bFirst;
+        resBeta.status = TaskStatus.succeeded;
+        resBeta.fingerprint = deqBeta[0].nodeFingerprint;
+        coord6.onTaskCompleted(bFirst, "beta", resBeta);
+
+        BuildRecord bFirstRec;
+        assert(stateRepo.getBuild(bFirst, bFirstRec));
+        assert(bFirstRec.status == "succeeded");
+
+        // Second run with identical inputs and force=false: full cache hit!
+        string bCached = coord6.startBuild(projCache, null, false);
+        // Zero tasks should be placed in WorkQueue
+        assert(queue.getPendingCount() == 0);
+
+        BuildRecord bCachedRec;
+        assert(stateRepo.getBuild(bCached, bCachedRec));
+        assert(bCachedRec.status == "cached");
+
+        TaskStatus stAlpha, stBeta;
+        assert(stateRepo.getTaskStatus(bCached, "alpha", stAlpha));
+        assert(stAlpha == TaskStatus.cached);
+        assert(stateRepo.getTaskStatus(bCached, "beta", stBeta));
+        assert(stBeta == TaskStatus.cached);
+    }
+
+    // 7. Multi-Build In-Flight Cancellation Isolation
+    {
+        auto coord7 = new BuildCoordinator(storage, stateRepo, queue);
+
+        TaskNode taskShared;
+        taskShared.id = "shared_task";
+        taskShared.script = "echo shared";
+
+        ProjectRecord projCancel;
+        projCancel.id = "proj_cancel_test";
+        projCancel.tasks = [taskShared];
+
+        string bCancel1 = coord7.startBuild(projCancel, null, true);
+        string bCancel2 = coord7.startBuild(projCancel, null, true);
+
+        assert(queue.getPendingCount() == 1);
+        auto deqShared = queue.dequeue(1);
+
+        // Cancel build 1 while task is in flight
+        coord7.cancelBuild(bCancel1);
+
+        BuildRecord bCancel1Rec;
+        assert(stateRepo.getBuild(bCancel1, bCancel1Rec));
+        assert(bCancel1Rec.status == "cancelled");
+
+        // Complete shared task
+        TaskExecutionResult resShared;
+        resShared.taskId = "shared_task";
+        resShared.buildId = deqShared[0].buildId;
+        resShared.status = TaskStatus.succeeded;
+        resShared.fingerprint = deqShared[0].nodeFingerprint;
+        coord7.onTaskCompleted(deqShared[0].buildId, "shared_task", resShared);
+
+        // Build 1 was NOT cancelled and should receive completion successfully
+        BuildRecord bCancel2Rec;
+        assert(stateRepo.getBuild(bCancel2, bCancel2Rec));
+        assert(bCancel2Rec.status == "succeeded");
+
+        // Build 1 must remain cancelled
+        BuildRecord bCancel1RecAfter;
+        assert(stateRepo.getBuild(bCancel1, bCancel1RecAfter));
+        assert(bCancel1RecAfter.status == "cancelled");
+    }
+
+    // 8. Only-Subscriber Cancellation Edge Case: Cancelled build should not be overwritten by completion
+    {
+        auto coord8 = new BuildCoordinator(storage, stateRepo, queue);
+
+        TaskNode taskSolo;
+        taskSolo.id = "solo_task";
+        taskSolo.script = "echo solo";
+
+        ProjectRecord projSolo;
+        projSolo.id = "proj_solo_cancel_test";
+        projSolo.tasks = [taskSolo];
+
+        // Start a single build
+        string bSolo = coord8.startBuild(projSolo, null, true);
+        assert(queue.getPendingCount() == 1);
+        auto deqSolo = queue.dequeue(1);
+
+        // Cancel the only build while task is in flight
+        coord8.cancelBuild(bSolo);
+
+        BuildRecord bSoloRecCancelled;
+        assert(stateRepo.getBuild(bSolo, bSoloRecCancelled));
+        assert(bSoloRecCancelled.status == "cancelled");
+
+        // Worker reports completion for the task
+        TaskExecutionResult resSolo;
+        resSolo.taskId = "solo_task";
+        resSolo.buildId = deqSolo[0].buildId;
+        resSolo.status = TaskStatus.succeeded;
+        resSolo.fingerprint = deqSolo[0].nodeFingerprint;
+        coord8.onTaskCompleted(deqSolo[0].buildId, "solo_task", resSolo);
+
+        // Build must remain cancelled, not be overwritten to succeeded
+        BuildRecord bSoloRecAfter;
+        assert(stateRepo.getBuild(bSolo, bSoloRecAfter));
+        assert(bSoloRecAfter.status == "cancelled", "Cancelled build should remain cancelled after task completion");
+
+        // Task status should also remain cancelled, not be overwritten to succeeded
+        TaskStatus taskStatusAfter;
+        assert(stateRepo.getTaskStatus(bSolo, "solo_task", taskStatusAfter));
+        assert(taskStatusAfter == TaskStatus.cancelled, "Task status should remain cancelled for cancelled build");
+    }
 }

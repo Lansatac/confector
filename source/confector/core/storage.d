@@ -2,7 +2,7 @@ module confector.core.storage;
 
 import confector.core.model;
 import confector.core.executor : ExecutorRecord;
-import std.file : exists, isFile, isDir, mkdirRecurse, read, write, copy;
+import std.file : exists, isFile, isDir, mkdirRecurse, read, write, copy, remove, rename, rmdir, dirEntries, SpanMode;
 import std.path : buildPath, dirName, baseName;
 import std.format : format;
 import std.datetime.systime : Clock;
@@ -21,6 +21,146 @@ class LocalArtifactStorage : ArtifactStorage
         if (!exists(m_baseStorageDir))
         {
             mkdirRecurse(m_baseStorageDir);
+        }
+    }
+
+    private static void validateStorageKey(string key, string paramName)
+    {
+        if (key.length == 0)
+        {
+            throw new Exception(format("Invalid %s: key cannot be empty", paramName));
+        }
+        import std.algorithm.searching : canFind;
+        if (key.canFind("..") || key.canFind('/') || key.canFind('\\') || key.canFind(':') || key.canFind('\0'))
+        {
+            throw new Exception(format("Invalid %s '%s': contains illegal path characters or traversal sequence", paramName, key));
+        }
+    }
+
+    override void storeArtifactStream(string taskFingerprint, string artifactId, void delegate(void delegate(const(ubyte)[])) writer)
+    {
+        if (writer is null)
+        {
+            throw new Exception("Writer delegate cannot be null");
+        }
+        validateStorageKey(taskFingerprint, "taskFingerprint");
+        validateStorageKey(artifactId, "artifactId");
+
+        string destDir = buildPath(m_baseStorageDir, taskFingerprint);
+        if (!exists(destDir))
+        {
+            mkdirRecurse(destDir);
+        }
+
+        string destPath = buildPath(destDir, artifactId ~ ".zip");
+
+        import std.process : thisProcessID;
+        import std.random : unpredictableSeed;
+        string tempPath = format("%s.tmp.%d.%d", destPath, thisProcessID, unpredictableSeed);
+
+        import std.stdio : File;
+        {
+            auto f = File(tempPath, "wb");
+            scope(failure)
+            {
+                if (exists(tempPath))
+                {
+                    try { remove(tempPath); } catch (Exception) {}
+                }
+            }
+
+            writer((const(ubyte)[] chunk) {
+                if (chunk.length > 0)
+                {
+                    f.rawWrite(chunk);
+                }
+            });
+            f.flush();
+            f.close();
+        }
+
+        import std.file : rename, remove;
+        if (exists(destPath))
+        {
+            remove(destPath);
+        }
+        rename(tempPath, destPath);
+    }
+
+    override void retrieveArtifactStream(string taskFingerprint, string artifactId, void delegate(const(ubyte)[]) sink)
+    {
+        if (sink is null)
+        {
+            throw new Exception("Sink delegate cannot be null");
+        }
+        validateStorageKey(taskFingerprint, "taskFingerprint");
+        validateStorageKey(artifactId, "artifactId");
+
+        string sourcePath = buildPath(m_baseStorageDir, taskFingerprint, artifactId ~ ".zip");
+        if (!exists(sourcePath) || !isFile(sourcePath))
+        {
+            throw new Exception(format("Artifact not found in storage: fingerprint='%s', artifactId='%s' (looked at %s)", taskFingerprint, artifactId, sourcePath));
+        }
+
+        import std.stdio : File;
+        auto f = File(sourcePath, "rb");
+        ubyte[64 * 1024] buffer;
+        while (!f.eof)
+        {
+            ubyte[] chunk = f.rawRead(buffer[]);
+            if (chunk.length > 0)
+            {
+                sink(chunk);
+            }
+        }
+    }
+
+    override bool artifactExists(string taskFingerprint, string artifactId)
+    {
+        if (taskFingerprint.length == 0 || artifactId.length == 0) return false;
+        try
+        {
+            validateStorageKey(taskFingerprint, "taskFingerprint");
+            validateStorageKey(artifactId, "artifactId");
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+
+        string filePath = buildPath(m_baseStorageDir, taskFingerprint, artifactId ~ ".zip");
+        return exists(filePath) && isFile(filePath);
+    }
+
+    override void deleteArtifact(string taskFingerprint, string artifactId)
+    {
+        validateStorageKey(taskFingerprint, "taskFingerprint");
+        validateStorageKey(artifactId, "artifactId");
+
+        string filePath = buildPath(m_baseStorageDir, taskFingerprint, artifactId ~ ".zip");
+        if (exists(filePath))
+        {
+            import std.file : remove, rmdir, dirEntries, SpanMode;
+            remove(filePath);
+
+            string parentDir = buildPath(m_baseStorageDir, taskFingerprint);
+            try
+            {
+                if (exists(parentDir))
+                {
+                    bool empty = true;
+                    foreach (entry; dirEntries(parentDir, SpanMode.shallow))
+                    {
+                        empty = false;
+                        break;
+                    }
+                    if (empty)
+                    {
+                        rmdir(parentDir);
+                    }
+                }
+            }
+            catch (Exception) {}
         }
     }
 
@@ -777,4 +917,86 @@ unittest
     auto buildStatuses2 = stateRepo.getTaskStatusesForBuild("b1");
     assert(buildStatuses2.length == 2);
     assert(buildStatuses2["t2"] == TaskStatus.running);
+
+    // ==========================================
+    // Stream-based Content-Addressed Storage Tests
+    // ==========================================
+    import confector.core.zip_packager : ZipPackager;
+    import std.array : Appender;
+
+    string fp1 = "fingerprint_node_100";
+    string art1 = "bin_app";
+
+    assert(!storage.artifactExists(fp1, art1));
+
+    // Test stream storage write
+    storage.storeArtifactStream(fp1, art1, (sink) {
+        sink(cast(const(ubyte)[]) "zip payload chunk 1; ");
+        sink(cast(const(ubyte)[]) "zip payload chunk 2;");
+    });
+
+    assert(storage.artifactExists(fp1, art1));
+    assert(exists(buildPath(testDir, fp1, art1 ~ ".zip")));
+
+    // Test stream storage read
+    Appender!(ubyte[]) retrievedBytes;
+    storage.retrieveArtifactStream(fp1, art1, (const(ubyte)[] chunk) {
+        retrievedBytes.put(chunk);
+    });
+    assert(cast(string) retrievedBytes.data == "zip payload chunk 1; zip payload chunk 2;");
+
+    // Test ZipPackager round-trip with LocalArtifactStorage
+    string wsDir = buildPath(testDir, "ws_source");
+    string unpackDir = buildPath(testDir, "ws_unpacked");
+    mkdirRecurse(buildPath(wsDir, "dist"));
+    write(buildPath(wsDir, "dist", "bundle.js"), "console.log('hello');");
+    write(buildPath(wsDir, "dist", "style.css"), "body { margin: 0; }");
+
+    string fp2 = "fingerprint_node_200";
+    string art2 = "dist_assets";
+
+    storage.storeArtifactStream(fp2, art2, (sink) {
+        ZipPackager.pack(wsDir, ["dist/*"], sink);
+    });
+
+    assert(storage.artifactExists(fp2, art2));
+
+    ZipPackager.unpackStream((sink) {
+        storage.retrieveArtifactStream(fp2, art2, sink);
+    }, unpackDir);
+
+    assert(exists(buildPath(unpackDir, "dist", "bundle.js")));
+    assert(exists(buildPath(unpackDir, "dist", "style.css")));
+    assert(cast(string) read(buildPath(unpackDir, "dist", "bundle.js")) == "console.log('hello');");
+    assert(cast(string) read(buildPath(unpackDir, "dist", "style.css")) == "body { margin: 0; }");
+
+    // Test deletion
+    storage.deleteArtifact(fp1, art1);
+    assert(!storage.artifactExists(fp1, art1));
+    assert(!exists(buildPath(testDir, fp1, art1 ~ ".zip")));
+
+    // Test key traversal validation
+    bool caughtBadKey = false;
+    try
+    {
+        storage.storeArtifactStream("../escape", "art", (sink) { sink([1, 2, 3]); });
+    }
+    catch (Exception)
+    {
+        caughtBadKey = true;
+    }
+    assert(caughtBadKey);
+    assert(!storage.artifactExists("../escape", "art"));
+
+    // Test retrieval of nonexistent artifact
+    bool caughtNotFound = false;
+    try
+    {
+        storage.retrieveArtifactStream("no_such_fp", "no_such_art", (chunk) {});
+    }
+    catch (Exception)
+    {
+        caughtNotFound = true;
+    }
+    assert(caughtNotFound);
 }

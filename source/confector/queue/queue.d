@@ -9,22 +9,30 @@ import std.format : format;
 import std.uuid : randomUUID;
 
 /**
- * Artifact reference to fetch before task execution.
+ * Authoritative upstream artifact reference for worker staging.
+ * Addressed by (taskFingerprint, artifactId) with optional unpack destination.
  */
 struct InputArtifactRef
 {
     @asName("task_id") string taskId;
-    @asName("storage_uri") string storageUri;
-    @asName("target_path") string targetPath;
+    @optional @asName("task_fingerprint") string taskFingerprint;
+    @optional @asName("artifact_id") string artifactId;
+    @optional @asName("storage_uri") string storageUri;
+    @optional @asName("target_path") string targetPath; // deprecated legacy alias
+    @optional @asName("destination") string destination;
 }
 
 /**
- * Detailed upstream artifact location for remote worker fetching.
+ * Deprecated dual representation retained only for serialization compatibility.
+ * New code must use InputArtifactRef via TaskExecutionPayload.inputArtifacts.
  */
 struct UpstreamArtifactLocation
 {
     @asName("task_id") string taskId;
-    @asName("artifact_path") string artifactPath;
+    @optional @asName("task_fingerprint") string taskFingerprint;
+    @optional @asName("artifact_id") string artifactId;
+    @optional @asName("artifact_path") string artifactPath;
+    @optional @asName("destination") string destination;
     @optional @asName("storage_backend") string storageBackend = "local";
     @optional @asName("storage_uri") string storageUri;
     @optional @asName("sha256") string sha256;
@@ -42,12 +50,16 @@ struct TaskExecutionPayload
     @optional @asName("repository_map") string[string] repositoryMap;
     @optional string script;
     @optional string[string] environment;
+    /// Single authoritative list of upstream artifacts to unpack before execution.
     @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
+    /// Deprecated: no longer populated by coordinator; kept for wire compatibility.
     @optional @asName("upstream_artifact_locations") UpstreamArtifactLocation[] upstreamArtifactLocations;
+    /// Map of upstream taskId -> task fingerprint (content-addressed).
     @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
     @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
     @optional @asName("workspace_dir") string workspaceDir;
     @optional @asName("callback_url") string callbackUrl;
+    @optional @asName("node_fingerprint") string nodeFingerprint;
     @optional @asName("force") bool force = false;
 }
 

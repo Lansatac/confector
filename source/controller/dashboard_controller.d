@@ -391,7 +391,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 }
                 else
                 {
-                    outDecls ~= OutputArtifactDecl(parts[0].strip(), "file");
+                    outDecls ~= OutputArtifactDecl(parts[0].strip(), parts[0].strip());
                 }
             }
             task.outputs.artifacts = outDecls;
