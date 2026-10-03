@@ -4,8 +4,8 @@ import std.format;
 import std.process;
 import std.stdio;
 import std.file;
-import std.path : buildPath, baseName, isAbsolute;
-import std.algorithm.searching : canFind;
+import std.path : buildPath, baseName, isAbsolute, buildNormalizedPath, absolutePath, relativePath, dirSeparator;
+import std.algorithm.searching : canFind, startsWith, endsWith;
 import std.json : JSONValue, JSONType, parseJSON;
 
 import confector.plugin_api.model;
@@ -13,6 +13,27 @@ import confector.plugin_api.plugin;
 import confector.plugin_api.vcs;
 import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, BuildStepProvider, StepExecutionContext, StepExecutionResult;
 import confector.plugin_api.executor : LogDelegate;
+
+private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
+{
+    if (baseDir.length == 0 || targetPath.length == 0)
+        return false;
+
+    string normBase = buildNormalizedPath(absolutePath(baseDir));
+    string normTarget = buildNormalizedPath(absolutePath(targetPath));
+
+    string rel = relativePath(normTarget, normBase);
+
+    // If target is the same directory, relativePath returns "." or empty
+    if (rel == "." || rel.length == 0)
+        return true;
+
+    // If target escapes baseDir, rel will start with ".." or be an absolute path (e.g. on different Windows drives)
+    if (isAbsolute(rel) || rel == ".." || rel.startsWith(".." ~ dirSeparator) || rel.startsWith("../") || rel.startsWith("..\\"))
+        return false;
+
+    return true;
+}
 
 private string normalizeRepoUrl(string url) pure @safe
 {
@@ -124,6 +145,22 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             errors ~= "Parameters must be a JSON object";
             return errors;
         }
+
+        string target = "";
+        if (auto p = "target_dir" in parameters) target = p.str;
+        else if (auto p = "targetDirectory" in parameters) target = p.str;
+        else if (auto p = "target" in parameters) target = p.str;
+
+        if (target.length > 0 && target != ".")
+        {
+            import std.algorithm.searching : startsWith;
+            string norm = buildNormalizedPath(target);
+            if (isAbsolute(norm) || norm == ".." || norm.startsWith(".." ~ dirSeparator) || norm.startsWith("../") || norm.startsWith("..\\"))
+            {
+                errors ~= "Target directory cannot be an absolute path or escape the workspace directory";
+            }
+        }
+
         return errors;
     }
 
@@ -226,7 +263,14 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             if (canHandle(repo))
             {
                 string targetDir = buildPath(context.effectiveWorkingDir, baseName(repo));
-                cloneRepository(repo, targetDir, context.logCallback);
+                if (isWithinDirectory(targetDir, context.effectiveWorkingDir))
+                {
+                    cloneRepository(repo, targetDir, context.logCallback);
+                }
+                else if (context.logCallback !is null)
+                {
+                    context.logCallback(format("[git] Security Error: Clone target '%s' escapes effective working directory '%s'", targetDir, context.effectiveWorkingDir));
+                }
             }
         }
 
@@ -237,9 +281,16 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             {
                 string url = comp["url"].str;
                 string targetDir = "target_dir" in comp
-                    ? buildPath(context.effectiveWorkingDir, comp["target_dir"].str)
+                    ? (isAbsolute(comp["target_dir"].str) ? comp["target_dir"].str : buildPath(context.effectiveWorkingDir, comp["target_dir"].str))
                     : buildPath(context.effectiveWorkingDir, baseName(url));
-                cloneRepository(url, targetDir, context.logCallback);
+                if (isWithinDirectory(targetDir, context.effectiveWorkingDir))
+                {
+                    cloneRepository(url, targetDir, context.logCallback);
+                }
+                else if (context.logCallback !is null)
+                {
+                    context.logCallback(format("[git] Security Error: Clone target '%s' escapes effective working directory '%s'", targetDir, context.effectiveWorkingDir));
+                }
             }
         }
     }
@@ -398,18 +449,27 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
         else if (step.properties.type == JSONType.object && "targetDirectory" in step.properties) specifiedTarget = step.properties["targetDirectory"].str;
         else if (step.properties.type == JSONType.object && "target" in step.properties) specifiedTarget = step.properties["target"].str;
 
-        if (specifiedTarget.length == 0)
+        if (specifiedTarget.length == 0 || specifiedTarget == ".")
         {
             specifiedTarget = ".";
-        }
-
-        if (specifiedTarget != ".")
-        {
-            targetDir = isAbsolute(specifiedTarget) ? specifiedTarget : buildPath(context.workingDirectory, specifiedTarget);
+            targetDir = context.workingDirectory;
         }
         else
         {
-            targetDir = context.workingDirectory;
+            targetDir = isAbsolute(specifiedTarget) ? specifiedTarget : buildPath(context.workingDirectory, specifiedTarget);
+        }
+
+        // Verify that targetDir is strictly within context.workingDirectory
+        if (!isWithinDirectory(targetDir, context.workingDirectory))
+        {
+            res.success = false;
+            res.exitCode = 1;
+            res.errorMessage = format("Target directory '%s' escapes the task working directory '%s'", specifiedTarget, context.workingDirectory);
+            if (context.logCallback !is null)
+            {
+                context.logCallback(format("[git] Security Error: %s", res.errorMessage));
+            }
+            return res;
         }
 
         string branch = "";
@@ -430,7 +490,16 @@ class GitRepositoryPlugin : Plugin, RepositoryProvider, InputResolverSystem, Bui
             }
             else
             {
-                cmd ~= format(" \"%s\"", specifiedTarget);
+                string cloneRel = relativePath(buildNormalizedPath(absolutePath(targetDir, context.workingDirectory)),
+                    buildNormalizedPath(absolutePath(context.workingDirectory)));
+                if (cloneRel == "." || cloneRel.length == 0)
+                {
+                    cmd ~= " .";
+                }
+                else
+                {
+                    cmd ~= format(" \"%s\"", cloneRel);
+                }
             }
 
             if (context.logCallback !is null)
@@ -518,20 +587,41 @@ unittest
     // BuildStepProvider testing
     assert(plugin.displayName == "Clone Git Repository");
     assert(plugin.defaultParameters()["repository"].str == "");
-    assert(plugin.defaultParameters()["target_dir"].str == ".");
+    assert(plugin.defaultParameters()["target_dir"].str == "");
     auto html = plugin.renderStepFormHtml(JSONValue(string[string].init));
     assert(html.length > 0);
     assert(plugin.validateParameters(JSONValue(string[string].init)).length == 0);
     assert(plugin.validateParameters(JSONValue("invalid-not-object")).length > 0);
 
-    JSONValue validParams = JSONValue(["repository": JSONValue("https://github.com/org/repo.git")]);
+    JSONValue validParams = JSONValue(["repository": JSONValue("https://github.com/org/repo.git"), "target_dir": JSONValue("src/repo")]);
     assert(plugin.validateParameters(validParams).length == 0);
+
+    JSONValue escapeParams = JSONValue(["repository": JSONValue("https://github.com/org/repo.git"), "target_dir": JSONValue("../escape")]);
+    assert(plugin.validateParameters(escapeParams).length > 0);
+
+    // Path boundary checking helper tests
+    assert(isWithinDirectory("workspace", "workspace"));
+    assert(isWithinDirectory(buildPath("workspace", "sub"), "workspace"));
+    assert(isWithinDirectory(buildPath("workspace", "sub", "nested"), "workspace"));
+    assert(!isWithinDirectory("other_dir", "workspace"));
+    assert(!isWithinDirectory(buildPath("workspace", "..", "escape"), "workspace"));
+    assert(!isWithinDirectory(buildPath("workspace", "sub", "..", "..", "escape"), "workspace"));
 
     // Test authorization enforcement
     StepExecutionContext ctx;
     ctx.workspaceDir = "test_workspace";
     ctx.workingDirectory = "test_workspace";
     ctx.allowedRepositories = ["https://github.com/org/declared-repo.git"];
+
+    // Target directory escaping workspace boundary
+    BuildStep escapeStep;
+    escapeStep.type = "clone_repository";
+    escapeStep.parameters["repository"] = "https://github.com/org/declared-repo.git";
+    escapeStep.parameters["target_dir"] = "../escaped_dir";
+    auto escapeRes = plugin.executeStep(escapeStep, ctx);
+    assert(!escapeRes.success);
+    assert(escapeRes.errorMessage.length > 0);
+    assert(escapeRes.errorMessage.canFind("escapes"));
 
     // Unauthorized repository
     BuildStep unauthStep;
