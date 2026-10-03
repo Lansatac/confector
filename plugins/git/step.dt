@@ -1,11 +1,14 @@
 div.step-subform.step-subform-git
   div.form-group
-    label Repository URL / Address
-    input.form-control.step-field-repository(type="text", name="step_param_repository", placeholder="e.g. https://github.com/org/repo.git or git@github.com:...", value=repoUrl, required)
-    small.form-help-text Git clone URL for HTTPS, SSH, or local repository path.
+    label Repository
+    select.form-control.step-field-repository(name="step_param_repository")
+      - if (repoUrl.length > 0)
+        option(value=repoUrl, selected) #{repoUrl}
+    small.form-help-text Select the linked repository to clone.
   div.form-group
     label Branch / Tag / Ref (Optional)
     input.form-control.step-field-branch(type="text", name="step_param_branch", placeholder="e.g. main, master, v1.0.0 (default branch if empty)", value=branch)
   div.form-group
     label Target Subdirectory (Optional)
-    input.form-control.step-field-target-dir(type="text", name="step_param_target_dir", placeholder="Subdirectory inside workspace (defaults to repository name)", value=targetDir)
+    input.form-control.step-field-target-dir(type="text", name="step_param_target_dir", placeholder="Subdirectory inside workspace (defaults to root workspace directory)", value=targetDir)
+    small.form-help-text Relative subdirectory path. Leave empty to check out directly into the workspace root.

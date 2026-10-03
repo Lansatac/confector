@@ -38,6 +38,8 @@ struct TaskExecutionPayload
 {
     @optional @asName("repository_url") string repositoryUrl;
     @optional @asName("commit_sha") string commitSha;
+    @optional @asName("allowed_repositories") string[] allowedRepositories;
+    @optional @asName("repository_map") string[string] repositoryMap;
     @optional string script;
     @optional string[string] environment;
     @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;

@@ -52,7 +52,9 @@ class TaskEngine
         string workspaceDir,
         in string[string] upstreamArtifactHashes = null,
         bool force = false,
-        LogDelegate logCallback = null
+        LogDelegate logCallback = null,
+        in string[] allowedRepositories = null,
+        in string[string] repositoryMap = null
     )
     {
         auto sw = StopWatch(AutoStart.yes);
@@ -215,6 +217,50 @@ class TaskEngine
             foreach (k, v; task.environment) stepCtx.environment[k] = v;
             foreach (k, v; task.inputs.parameters) stepCtx.taskParameters[k] = v;
 
+            import std.algorithm.searching : canFind;
+            import std.json : JSONType;
+            string[] effectiveAllowedRepos;
+            string[string] effectiveRepoMap;
+            if (repositoryMap !is null)
+            {
+                foreach (k, v; repositoryMap)
+                {
+                    effectiveRepoMap[k] = v;
+                    if (!effectiveAllowedRepos.canFind(k)) effectiveAllowedRepos ~= k;
+                    if (!effectiveAllowedRepos.canFind(v)) effectiveAllowedRepos ~= v;
+                }
+            }
+            if (allowedRepositories !is null)
+            {
+                foreach (r; allowedRepositories)
+                {
+                    if (!effectiveAllowedRepos.canFind(r)) effectiveAllowedRepos ~= r;
+                    if (r in effectiveRepoMap && !effectiveAllowedRepos.canFind(effectiveRepoMap[r]))
+                    {
+                        effectiveAllowedRepos ~= effectiveRepoMap[r];
+                    }
+                }
+            }
+            foreach (r; task.inputs.repositories)
+            {
+                if (!effectiveAllowedRepos.canFind(r)) effectiveAllowedRepos ~= r;
+                if (r in effectiveRepoMap && !effectiveAllowedRepos.canFind(effectiveRepoMap[r]))
+                {
+                    effectiveAllowedRepos ~= effectiveRepoMap[r];
+                }
+            }
+            if (task.hasCustomComponent("git_source"))
+            {
+                auto comp = task.getCustomComponent("git_source");
+                if (comp.type == JSONType.object && "url" in comp)
+                {
+                    string u = comp["url"].str;
+                    if (!effectiveAllowedRepos.canFind(u)) effectiveAllowedRepos ~= u;
+                }
+            }
+            stepCtx.allowedRepositories = effectiveAllowedRepos;
+            stepCtx.repositoryMap = effectiveRepoMap;
+
             foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
             {
                 string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
@@ -366,7 +412,8 @@ class TaskEngine
         string projectName = null,
         string targetTaskId = null,
         bool force = false,
-        LogDelegate logCallback = null
+        LogDelegate logCallback = null,
+        in string[string] repositoryMap = null
     )
     {
         import std.datetime.systime : Clock;
@@ -390,11 +437,34 @@ class TaskEngine
             m_stateRepo.appendBuildLog(buildId, format("[engine] Starting build %s with %d tasks", buildId, plan.orderedTaskIds.length));
         }
 
+        string[string] effectiveRepoMap;
+        if (repositoryMap !is null)
+        {
+            foreach (k, v; repositoryMap) effectiveRepoMap[k] = v;
+        }
+        if (m_stateRepo !is null)
+        {
+            try
+            {
+                foreach (repoRec; m_stateRepo.listRepositories())
+                {
+                    if (repoRec.name.length > 0 && repoRec.address.length > 0)
+                    {
+                        effectiveRepoMap[repoRec.name] = repoRec.address;
+                    }
+                }
+            }
+            catch (Exception) {}
+        }
+
         const(TaskNode)*[string] taskMap;
         foreach (ref task; tasks)
         {
             taskMap[task.id] = &task;
         }
+
+        TaskGraph taskGraph = null;
+        try { taskGraph = new TaskGraph(tasks); } catch (Exception) {}
 
         string[string] currentArtifactHashes;
         bool allCached = true;
@@ -420,13 +490,48 @@ class TaskEngine
                 }
             }
 
+            import std.algorithm.searching : canFind;
+            string[] taskAllowedRepos;
+            if (taskGraph !is null)
+            {
+                try
+                {
+                    auto ancestors = taskGraph.resolveSubgraph(taskId);
+                    foreach (ancId; ancestors)
+                    {
+                        auto ancTask = taskGraph.getTask(ancId);
+                        foreach (r; ancTask.inputs.repositories)
+                        {
+                            if (!taskAllowedRepos.canFind(r)) taskAllowedRepos ~= r;
+                            if (r in effectiveRepoMap && !taskAllowedRepos.canFind(effectiveRepoMap[r]))
+                            {
+                                taskAllowedRepos ~= effectiveRepoMap[r];
+                            }
+                        }
+                        if (ancTask.hasCustomComponent("git_source"))
+                        {
+                            import std.json : JSONType;
+                            auto comp = ancTask.getCustomComponent("git_source");
+                            if (comp.type == JSONType.object && "url" in comp)
+                            {
+                                string u = comp["url"].str;
+                                if (!taskAllowedRepos.canFind(u)) taskAllowedRepos ~= u;
+                            }
+                        }
+                    }
+                }
+                catch (Exception) {}
+            }
+
             auto taskRes = executeTask(
                 buildId,
                 **pTask,
                 workspaceDir,
                 currentArtifactHashes,
                 force ? true : false,
-                logCallback
+                logCallback,
+                taskAllowedRepos,
+                effectiveRepoMap
             );
 
             graphResult.taskResults[taskId] = taskRes;

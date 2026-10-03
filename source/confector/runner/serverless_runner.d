@@ -21,6 +21,8 @@ struct ServerlessTaskRequest
     @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
     bool force = false;
     @asName("storage_base_dir") string storageBaseDir;
+    @optional @asName("allowed_repositories") string[] allowedRepositories;
+    @optional @asName("repository_map") string[string] repositoryMap;
 }
 
 /**
@@ -80,7 +82,10 @@ ServerlessTaskResponse executeServerlessTask(
         request.task,
         request.workspaceDir,
         request.upstreamArtifactHashes,
-        request.force
+        request.force,
+        null,
+        request.allowedRepositories,
+        request.repositoryMap
     );
 
     ServerlessTaskResponse response;

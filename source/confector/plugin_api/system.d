@@ -72,6 +72,8 @@ struct StepExecutionContext
     ArtifactStorage artifactStorage;
     LogDelegate logCallback;
     string[string] taskParameters;
+    string[] allowedRepositories;
+    string[string] repositoryMap;
 }
 
 /**

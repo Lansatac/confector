@@ -9,6 +9,7 @@ import confector.queue.queue;
 import std.file : exists, mkdirRecurse, write;
 import std.path : buildPath, dirName;
 import std.format : format;
+import std.algorithm.searching : canFind;
 import std.datetime.systime : Clock;
 import std.uuid : randomUUID;
 import vibe.core.log : logInfo, logError, logWarn, logDebug;
@@ -171,13 +172,22 @@ class WorkerRunner
 
             logInfo("[worker:%s] Task '%s': executing via TaskEngine (%d steps, script length: %d)", m_config.workerId, taskId, node.steps.length, node.script.length);
 
+            string[] allowedRepos = msg.executionPayload.allowedRepositories.dup;
+            if (msg.executionPayload.repositoryUrl.length > 0 && !allowedRepos.canFind(msg.executionPayload.repositoryUrl))
+            {
+                allowedRepos ~= msg.executionPayload.repositoryUrl;
+            }
+
             // Execute task
             auto execResult = m_engine.executeTask(
                 buildId,
                 node,
                 taskWorkspace,
                 upstreamHashes,
-                msg.executionPayload.force
+                msg.executionPayload.force,
+                null,
+                allowedRepos,
+                msg.executionPayload.repositoryMap
             );
 
             if (execResult.status == TaskStatus.succeeded || execResult.status == TaskStatus.cached)

@@ -463,8 +463,85 @@ class BuildCoordinator
                 }
 
                 // 4. Enqueue to WorkQueue
+                string[] allowedRepos;
+                string[string] repoMap;
+
+                if (m_stateRepo !is null)
+                {
+                    try
+                    {
+                        foreach (repoRec; m_stateRepo.listRepositories())
+                        {
+                            if (repoRec.name.length > 0 && repoRec.address.length > 0)
+                            {
+                                repoMap[repoRec.name] = repoRec.address;
+                            }
+                        }
+                    }
+                    catch (Exception) {}
+                }
+
+                if (active.project.repositoryUrl.length > 0)
+                {
+                    allowedRepos ~= active.project.repositoryUrl;
+                    if (active.project.id.length > 0 && active.project.id !in repoMap)
+                    {
+                        repoMap[active.project.id] = active.project.repositoryUrl;
+                    }
+                }
+                if (active.graph !is null)
+                {
+                    try
+                    {
+                        auto ancestors = active.graph.resolveSubgraph(tId);
+                        foreach (ancId; ancestors)
+                        {
+                            auto ancTask = active.graph.getTask(ancId);
+                            foreach (r; ancTask.inputs.repositories)
+                            {
+                                if (!allowedRepos.canFind(r)) allowedRepos ~= r;
+                                if (r in repoMap && !allowedRepos.canFind(repoMap[r]))
+                                {
+                                    allowedRepos ~= repoMap[r];
+                                }
+                            }
+                            if (ancTask.hasCustomComponent("git_source"))
+                            {
+                                import std.json : JSONType;
+                                auto comp = ancTask.getCustomComponent("git_source");
+                                if (comp.type == JSONType.object && "url" in comp)
+                                {
+                                    string u = comp["url"].str;
+                                    if (!allowedRepos.canFind(u)) allowedRepos ~= u;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception) {}
+                }
+                foreach (r; node.inputs.repositories)
+                {
+                    if (!allowedRepos.canFind(r)) allowedRepos ~= r;
+                    if (r in repoMap && !allowedRepos.canFind(repoMap[r]))
+                    {
+                        allowedRepos ~= repoMap[r];
+                    }
+                }
+                if (node.hasCustomComponent("git_source"))
+                {
+                    import std.json : JSONType;
+                    auto comp = node.getCustomComponent("git_source");
+                    if (comp.type == JSONType.object && "url" in comp)
+                    {
+                        string u = comp["url"].str;
+                        if (!allowedRepos.canFind(u)) allowedRepos ~= u;
+                    }
+                }
+
                 TaskExecutionPayload payload;
                 payload.repositoryUrl = active.project.repositoryUrl;
+                payload.allowedRepositories = allowedRepos;
+                payload.repositoryMap = repoMap;
                 payload.script = node.script;
                 payload.environment = node.environment;
                 payload.workspaceDir = active.workspaceDir;

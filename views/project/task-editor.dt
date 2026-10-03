@@ -8,6 +8,10 @@ block maincontent
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
   - string availableTasksJson = serializeToJson(availableTasksList).toString();
+  - struct ProjectTaskOpt { string id; string name; string[] repositories; }
+  - ProjectTaskOpt[] projectTasksList;
+  - foreach(t; project.tasks) { projectTasksList ~= ProjectTaskOpt(t.id, t.name, t.inputs.repositories); }
+  - string projectTasksJson = serializeToJson(projectTasksList).toString();
   - struct RepoOpt { string name; string address; }
   - RepoOpt[] availableReposList;
   - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
@@ -156,7 +160,10 @@ block maincontent
 
   script.
     var availableTasks = !{availableTasksJson};
+    var projectTasks = !{projectTasksJson};
     var availableRepos = !{availableReposJson};
+    var projectRepoUrl = "#{project.repositoryUrl}";
+    var projectId = "#{project.id}";
     var initialSteps = !{initialStepsJson} || [];
     var stepProviders = !{stepProvidersJson} || [];
 
@@ -168,6 +175,124 @@ block maincontent
     function escapeHtml(str) {
       if (!str) return '';
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function getValidRepositories() {
+      var repos = [];
+      var seen = {};
+
+      function addRepo(name, address) {
+        if (!name && !address) return;
+        var rName = name || '';
+        var rAddr = address || '';
+
+        // If name matches an available repo or address is missing, look it up in availableRepos
+        if (availableRepos) {
+          for (var i = 0; i < availableRepos.length; i++) {
+            if (availableRepos[i].name === rName || availableRepos[i].address === rAddr || (rName && availableRepos[i].address === rName)) {
+              if (!rName) rName = availableRepos[i].name;
+              if (!rAddr) rAddr = availableRepos[i].address;
+              break;
+            }
+          }
+        }
+        var key = rName || rAddr;
+        if (seen[key]) return;
+        seen[key] = true;
+        repos.push({ name: rName, address: rAddr });
+      }
+
+      // 1. Repositories declared in this task's Inputs tab
+      var repoSelects = document.querySelectorAll('#repo-dependencies-container select[name="repositories"]');
+      for (var i = 0; i < repoSelects.length; i++) {
+        var val = repoSelects[i].value;
+        if (val && val.length > 0) {
+          addRepo(val, '');
+        }
+      }
+
+      // 2. Repositories from upstream dependencies (selected in depends_on)
+      var depSelects = document.querySelectorAll('#dependencies-container select[name="depends_on"]');
+      var depTaskIds = [];
+      for (var i = 0; i < depSelects.length; i++) {
+        var dVal = depSelects[i].value;
+        if (dVal && dVal.length > 0) depTaskIds.push(dVal);
+      }
+
+      if (projectTasks) {
+        for (var i = 0; i < projectTasks.length; i++) {
+          if (depTaskIds.indexOf(projectTasks[i].id) !== -1) {
+            if (projectTasks[i].repositories) {
+              for (var r = 0; r < projectTasks[i].repositories.length; r++) {
+                addRepo(projectTasks[i].repositories[r], '');
+              }
+            }
+          }
+        }
+      }
+
+      // 3. Project repository (if configured)
+      if (projectRepoUrl && projectRepoUrl.length > 0) {
+        addRepo(projectId || 'project', projectRepoUrl);
+      }
+
+      // 4. Fallback: if no repositories linked in inputs, upstream, or project, list available registered repositories
+      if (repos.length === 0 && availableRepos && availableRepos.length > 0) {
+        for (var r = 0; r < availableRepos.length; r++) {
+          addRepo(availableRepos[r].name, availableRepos[r].address);
+        }
+      }
+
+      return repos;
+    }
+
+    function populateRepoSelect(selectElem, desiredValue) {
+      if (!selectElem) return;
+      var currentVal = desiredValue !== undefined ? desiredValue : selectElem.value;
+      selectElem.innerHTML = '';
+
+      var validRepos = getValidRepositories();
+      if (validRepos.length === 0) {
+        var emptyOpt = document.createElement('option');
+        emptyOpt.value = '';
+        emptyOpt.disabled = true;
+        emptyOpt.selected = true;
+        emptyOpt.textContent = 'No repositories available (add in Inputs tab)';
+        selectElem.appendChild(emptyOpt);
+        return;
+      }
+
+      var found = false;
+      for (var i = 0; i < validRepos.length; i++) {
+        var r = validRepos[i];
+        var opt = document.createElement('option');
+        opt.value = r.name || r.address;
+        opt.textContent = (r.name && r.address) ? (r.name + ' (' + r.address + ')') : (r.name || r.address);
+        if (currentVal && (opt.value === currentVal || r.name === currentVal || r.address === currentVal)) {
+          opt.selected = true;
+          found = true;
+        }
+        selectElem.appendChild(opt);
+      }
+
+      if (currentVal && currentVal.length > 0 && !found) {
+        var customOpt = document.createElement('option');
+        customOpt.value = currentVal;
+        customOpt.textContent = currentVal;
+        customOpt.selected = true;
+        selectElem.appendChild(customOpt);
+      } else if (!currentVal && validRepos.length > 0) {
+        selectElem.selectedIndex = 0;
+      }
+    }
+
+    function updateAllRepoDropdowns() {
+      var selects = document.querySelectorAll('.step-field-repository, select[name="step_param_repository"]');
+      for (var i = 0; i < selects.length; i++) {
+        if (selects[i].tagName.toLowerCase() === 'select') {
+          populateRepoSelect(selects[i]);
+        }
+      }
     }
 
     function updateStepIndices() {
@@ -223,42 +348,6 @@ block maincontent
         '</div>';
     }
 
-    function attachRepoHelpers(row) {
-      var repoInput = row.querySelector('.step-field-repository') || row.querySelector('[name="step_param_repository"]');
-      if (!repoInput) return;
-      if (row.querySelector('.step-repo-picker-wrapper')) return;
-      if (!availableRepos || availableRepos.length === 0) return;
-
-      var pickerDiv = document.createElement('div');
-      pickerDiv.className = 'step-repo-picker-wrapper';
-      pickerDiv.style.cssText = 'display: flex; gap: 8px; margin-bottom: 6px;';
-
-      var repoSelect = document.createElement('select');
-      repoSelect.className = 'form-control';
-      repoSelect.style.flex = '1';
-      var defaultOpt = document.createElement('option');
-      defaultOpt.value = '';
-      defaultOpt.textContent = '-- Or choose from registered repositories --';
-      repoSelect.appendChild(defaultOpt);
-
-      for (var r = 0; r < availableRepos.length; r++) {
-        var rAddr = availableRepos[r].address || availableRepos[r].name;
-        var opt = document.createElement('option');
-        opt.value = rAddr;
-        opt.textContent = availableRepos[r].name + (availableRepos[r].address ? ' (' + availableRepos[r].address + ')' : '');
-        repoSelect.appendChild(opt);
-      }
-
-      repoSelect.onchange = function() {
-        if (this.value && this.value.length > 0) {
-          repoInput.value = this.value;
-        }
-      };
-
-      pickerDiv.appendChild(repoSelect);
-      repoInput.parentNode.insertBefore(pickerDiv, repoInput);
-    }
-
     function onStepTypeChange(selectElem) {
       var row = selectElem.closest('.step-row');
       if (!row) return;
@@ -290,7 +379,10 @@ block maincontent
         if (newWorkDirElem) newWorkDirElem.value = prevWorkDir;
       }
 
-      attachRepoHelpers(row);
+      var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
+      if (repoElem && repoElem.tagName.toLowerCase() === 'select') {
+        populateRepoSelect(repoElem);
+      }
     }
 
     function addBuildStep(defaultType, stepData) {
@@ -441,7 +533,19 @@ block maincontent
       // Check common parameter aliases
       if (params.repository || params.url || params.address) {
         var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
-        if (repoElem) repoElem.value = params.repository || params.url || params.address;
+        if (repoElem) {
+          var desiredVal = params.repository || params.url || params.address;
+          if (repoElem.tagName.toLowerCase() === 'select') {
+            populateRepoSelect(repoElem, desiredVal);
+          } else {
+            repoElem.value = desiredVal;
+          }
+        }
+      } else {
+        var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
+        if (repoElem && repoElem.tagName.toLowerCase() === 'select') {
+          populateRepoSelect(repoElem);
+        }
       }
       if (params.branch) {
         var bElem = subformContainer.querySelector('.step-field-branch') || subformContainer.querySelector('[name="step_param_branch"]');
@@ -460,7 +564,6 @@ block maincontent
       row.appendChild(body);
       container.appendChild(row);
 
-      attachRepoHelpers(row);
       updateStepIndices();
     }
 
@@ -532,6 +635,7 @@ block maincontent
       var row = btn.closest('.dependency-row');
       if (row) {
         row.remove();
+        updateAllRepoDropdowns();
       }
     }
 
@@ -547,6 +651,7 @@ block maincontent
       select.name = 'depends_on';
       select.className = 'form-control';
       select.style.flex = '1';
+      select.onchange = function() { updateAllRepoDropdowns(); };
 
       var defaultOpt = document.createElement('option');
       defaultOpt.value = '';
@@ -584,12 +689,14 @@ block maincontent
       row.appendChild(select);
       row.appendChild(removeBtn);
       container.appendChild(row);
+      updateAllRepoDropdowns();
     }
 
     function removeRepoDependency(btn) {
       var row = btn.closest('.dependency-row');
       if (row) {
         row.remove();
+        updateAllRepoDropdowns();
       }
     }
 
@@ -605,6 +712,7 @@ block maincontent
       select.name = 'repositories';
       select.className = 'form-control';
       select.style.flex = '1';
+      select.onchange = function() { updateAllRepoDropdowns(); };
 
       var defaultOpt = document.createElement('option');
       defaultOpt.value = '';
@@ -642,6 +750,7 @@ block maincontent
       row.appendChild(select);
       row.appendChild(removeBtn);
       container.appendChild(row);
+      updateAllRepoDropdowns();
     }
 
     function switchTab(tabName, btn) {
@@ -659,6 +768,9 @@ block maincontent
       }
       if (btn) {
         btn.classList.add('active');
+      }
+      if (tabName === 'steps') {
+        updateAllRepoDropdowns();
       }
     }
 
@@ -774,4 +886,5 @@ block maincontent
           script: ''
         });
       }
+      updateAllRepoDropdowns();
     });
