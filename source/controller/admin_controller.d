@@ -13,6 +13,7 @@ struct PluginViewModel
     string versionString;
     string description;
     bool isDynamic;
+    bool isBundled;
     string path;
 }
 
@@ -47,12 +48,14 @@ URLRouter adminRouter(PluginRegistry registry, PluginLoader loader = null)
             if (auto rec = p.name in loadedRecords)
             {
                 vm.isDynamic = true;
+                vm.isBundled = rec.isBundled;
                 vm.path = rec.path;
                 dynamicCount++;
             }
             else
             {
                 vm.isDynamic = false;
+                vm.isBundled = false;
                 vm.path = "";
             }
             plugins ~= vm;

@@ -1,11 +1,12 @@
 module confector.core.plugin_loader;
 
 import confector.core.plugin;
-import std.string : toStringz, strip;
+import std.string : toStringz, strip, toLower;
 import std.path : isAbsolute, absolutePath;
-import std.file : exists, isFile;
+import std.file : exists, isFile, isDir, dirEntries, SpanMode, DirEntry;
 import std.format : format;
 import std.conv : to;
+import std.algorithm.searching : endsWith, canFind;
 
 version (Windows)
 {
@@ -47,6 +48,7 @@ struct LoadedPluginRecord
     string path;
     void* handle;
     Plugin plugin;
+    bool isBundled;
 }
 
 /**
@@ -95,11 +97,33 @@ final class PluginLoader
         return null;
     }
 
+    public bool isPluginBundled(string name)
+    {
+        if (auto p = name in _loadedPlugins)
+        {
+            return p.isBundled;
+        }
+        return false;
+    }
+
+    public @property LoadedPluginRecord[] bundledPluginRecords()
+    {
+        LoadedPluginRecord[] records;
+        foreach (rec; _loadedPlugins.values)
+        {
+            if (rec.isBundled)
+            {
+                records ~= rec;
+            }
+        }
+        return records;
+    }
+
     /**
      * Loads a shared dynamic library plugin from the given path, resolves its factory entrypoint,
      * instantiates the plugin, and registers it with PluginRegistry.
      */
-    public Plugin loadPlugin(string libraryPath)
+    public Plugin loadPlugin(string libraryPath, bool isBundled = false)
     {
         string trimmedPath = libraryPath.strip;
         if (trimmedPath.length == 0)
@@ -198,6 +222,7 @@ final class PluginLoader
         record.path = absPath;
         record.handle = handle;
         record.plugin = plugin;
+        record.isBundled = isBundled;
 
         _loadedPlugins[plugin.name] = record;
         _pathToPluginName[absPath] = plugin.name;
@@ -208,7 +233,7 @@ final class PluginLoader
     /**
      * Loads multiple plugin dynamic libraries from an array of file paths.
      */
-    public Plugin[] loadPlugins(in string[] libraryPaths)
+    public Plugin[] loadPlugins(in string[] libraryPaths, bool isBundled = false)
     {
         Plugin[] loaded;
         foreach (path; libraryPaths)
@@ -216,9 +241,62 @@ final class PluginLoader
             string trimmed = path.strip;
             if (trimmed.length > 0)
             {
-                loaded ~= loadPlugin(trimmed);
+                loaded ~= loadPlugin(trimmed, isBundled);
             }
         }
+        return loaded;
+    }
+
+    /**
+     * Scans a directory (defaulting to "./plugins") for plugin dynamic libraries,
+     * automatically loading and registering them as bundled plugins.
+     */
+    public Plugin[] loadBundledPlugins(string directory = "./plugins")
+    {
+        Plugin[] loaded;
+        if (!exists(directory) || !isDir(directory))
+        {
+            return loaded;
+        }
+
+        foreach (DirEntry entry; dirEntries(directory, SpanMode.depth))
+        {
+            if (entry.isFile)
+            {
+                string lowerName = entry.name.toLower;
+                bool isLib = false;
+
+                version (Windows)
+                {
+                    isLib = lowerName.endsWith(".dll");
+                }
+                else version (OSX)
+                {
+                    isLib = lowerName.endsWith(".dylib") || lowerName.endsWith(".so");
+                }
+                else
+                {
+                    isLib = lowerName.endsWith(".so") || lowerName.canFind(".so.");
+                }
+
+                if (isLib)
+                {
+                    try
+                    {
+                        auto p = loadPlugin(entry.name, true);
+                        if (p !is null)
+                        {
+                            loaded ~= p;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        // Non-plugin libraries or incompatible binaries in directory are skipped
+                    }
+                }
+            }
+        }
+
         return loaded;
     }
 
@@ -362,8 +440,27 @@ unittest
     assert(loader.loadedPlugins.length == 0);
     assert(loader.allLoadedRecords.length == 0);
     assert(loader.getLoadedPlugin("non_existent") is null);
+    assert(!loader.isPluginBundled("non_existent"));
+    assert(loader.bundledPluginRecords.length == 0);
 
-    // 7. Unload non-existent plugin does not throw
+    // 7. Bundled directory loader tests
+    assert(loader.loadBundledPlugins("non_existent_plugins_dir_99999").length == 0);
+
+    import std.file : mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    string testPluginsDir = buildPath(".test_confector_plugins_tmp");
+    if (exists(testPluginsDir)) rmdirRecurse(testPluginsDir);
+    mkdirRecurse(testPluginsDir);
+    scope(exit) { if (exists(testPluginsDir)) rmdirRecurse(testPluginsDir); }
+
+    // Directory without libs
+    assert(loader.loadBundledPlugins(testPluginsDir).length == 0);
+
+    // Directory with non-lib files
+    write(buildPath(testPluginsDir, "readme.txt"), "some docs");
+    assert(loader.loadBundledPlugins(testPluginsDir).length == 0);
+
+    // 8. Unload non-existent plugin does not throw
     loader.unloadPlugin("non_existent");
     loader.unloadAll();
 }

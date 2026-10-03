@@ -57,7 +57,21 @@ void main()
   }
   writeln("Connected to mongo.");
 	
-  // Dynamically load configured plugins
+  // Automatically load bundled plugins from ./plugins directory
+  auto bundledPlugins = PluginLoader.instance.loadBundledPlugins("./plugins");
+  if (bundledPlugins.length > 0)
+  {
+      foreach (p; bundledPlugins)
+      {
+          writefln("[plugins] Loaded bundled plugin '%s' v%s", p.name, p.versionString);
+      }
+  }
+  else
+  {
+      writeln("[plugins] No bundled plugins found in ./plugins.");
+  }
+
+  // Dynamically load additional configured plugins via CONFECTOR_PLUGINS
   import std.process : environment;
   import std.string : split, strip;
   import std.algorithm.searching : canFind;
@@ -89,7 +103,7 @@ void main()
           {
               try
               {
-                  auto p = PluginLoader.instance.loadPlugin(trimmed);
+                  auto p = PluginLoader.instance.loadPlugin(trimmed, false);
                   writefln("[plugins] Dynamically loaded plugin '%s' v%s from %s", p.name, p.versionString, trimmed);
               }
               catch (Exception e)
@@ -101,7 +115,7 @@ void main()
   }
   else
   {
-      writeln("[plugins] No external plugins configured via CONFECTOR_PLUGINS.");
+      writeln("[plugins] No additional external plugins configured via CONFECTOR_PLUGINS.");
   }
   writefln("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
 
