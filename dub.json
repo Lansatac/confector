@@ -39,6 +39,16 @@
 		"./plugins/bash",
 		"./plugins/git",
 		"./plugins/local_executor",
-		"./plugins/powershell"
+		"./plugins/powershell",
+    {
+      "name": "plugins",
+      "targetType": "none",
+      "dependencies": {
+        "confector:bash": "*",
+        "confector:git": "*",
+        "confector:local_executor": "*",
+        "confector:powershell": "*"
+      }
+    }
 	]
 }
