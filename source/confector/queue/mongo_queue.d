@@ -2,11 +2,13 @@ module confector.queue.mongo_queue;
 
 import confector.queue.queue;
 import confector.core.model;
+import confector.core.json_compat : sanitizeBson;
 
 import vibe.db.mongo.client : MongoClient;
 import vibe.db.mongo.collection : MongoCollection, FindOptions, UpdateOptions;
 import vibe.data.json;
 import vibe.data.bson;
+import vibe.core.log : logInfo, logError, logWarn, logDebug;
 
 import std.format : format;
 import std.datetime.systime : Clock;
@@ -54,8 +56,27 @@ class MongoWorkQueue : WorkQueue
         doc["build_id"] = Bson(message.buildId);
         doc["task_id"] = Bson(message.taskId);
         doc["node_fingerprint"] = Bson(message.nodeFingerprint);
-        doc["execution_payload"] = serializeToBson(message.executionPayload);
-        doc["task_node"] = serializeToBson(message.taskNode);
+
+        try
+        {
+            doc["execution_payload"] = serializeToBson(message.executionPayload);
+        }
+        catch (Exception e)
+        {
+            logError("Failed to serialize execution payload for task '%s' (build '%s'): %s", message.taskId, message.buildId, e.msg);
+            doc["execution_payload"] = Bson.emptyObject;
+        }
+
+        try
+        {
+            doc["task_node"] = serializeToBson(message.taskNode);
+        }
+        catch (Exception e)
+        {
+            logError("Failed to serialize task node for task '%s' (build '%s'): %s", message.taskId, message.buildId, e.msg);
+            doc["task_node"] = Bson.emptyObject;
+        }
+
         doc["created_at"] = Bson(message.createdAt);
         doc["attempt"] = Bson(message.attempt);
         doc["max_attempts"] = Bson(message.maxAttempts);
@@ -64,7 +85,16 @@ class MongoWorkQueue : WorkQueue
         doc["status"] = Bson("pending");
         doc["receipt_handle"] = Bson(cast(string)null);
 
-        m_queueCollection.insertOne(doc);
+        try
+        {
+            m_queueCollection.insertOne(doc);
+            logInfo("[mongo_queue] Enqueued task '%s' for build '%s' (messageId='%s', visible_after=%d)", message.taskId, message.buildId, message.messageId, visibleAfter);
+        }
+        catch (Exception e)
+        {
+            logError("[mongo_queue] Failed to insert task message into MongoDB queue (task '%s', build '%s'): %s\n%s", message.taskId, message.buildId, e.msg, e.toString());
+            throw e;
+        }
     }
 
     override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30)
@@ -75,37 +105,62 @@ class MongoWorkQueue : WorkQueue
         for (size_t i = 0; i < maxMessages; i++)
         {
             Bson query = Bson.emptyObject;
-            query["status"] = Bson.emptyObject;
-            query["status"]["$in"] = serializeToBson(["pending", "in_flight"]);
-            query["visible_after"] = Bson.emptyObject;
-            query["visible_after"]["$lte"] = Bson(now);
+            Bson statusFilter = Bson.emptyObject;
+            statusFilter["$in"] = serializeToBson(["pending", "in_flight"]);
+            query["status"] = statusFilter;
 
-            auto cursor = m_queueCollection.find(query, FindOptions.init);
-            if (cursor.empty)
+            Bson visFilter = Bson.emptyObject;
+            visFilter["$lte"] = Bson(now);
+            query["visible_after"] = visFilter;
+
+            Bson candidate;
+            try
             {
+                auto cursor = m_queueCollection.find(query, FindOptions.init);
+                if (cursor.empty)
+                {
+                    break;
+                }
+                candidate = cursor.front;
+            }
+            catch (Exception e)
+            {
+                logError("[mongo_queue] Failed to query MongoDB work queue during dequeue (now=%d): %s\n%s", now, e.msg, e.toString());
                 break;
             }
 
-            Bson candidate = cursor.front;
-            string msgId = candidate["message_id"].get!string;
-            int attempt = candidate["attempt"].to!int;
-            int maxAttempts = candidate["max_attempts"].to!int;
+            string msgId = candidate.tryIndex("message_id").isNull ? "" : candidate["message_id"].get!string;
+            string bId = candidate.tryIndex("build_id").isNull ? "" : candidate["build_id"].get!string;
+            string tId = candidate.tryIndex("task_id").isNull ? "" : candidate["task_id"].get!string;
+            string stat = candidate.tryIndex("status").isNull ? "" : candidate["status"].get!string;
+            long visAfter = candidate.tryIndex("visible_after").isNull ? 0 : candidate["visible_after"].to!long;
+            int attempt = candidate.tryIndex("attempt").isNull ? 1 : candidate["attempt"].to!int;
+            int maxAttempts = candidate.tryIndex("max_attempts").isNull ? 3 : candidate["max_attempts"].to!int;
+
+            logInfo("[mongo_queue] Dequeue candidate found: msgId='%s', task='%s', build='%s', status='%s', visible_after=%d, attempt=%d/%d", msgId, tId, bId, stat, visAfter, attempt, maxAttempts);
 
             // Check if max attempts exceeded on visibility timeout expiration
-            if (candidate["status"].get!string == "in_flight")
+            if (!candidate.tryIndex("status").isNull && candidate["status"].get!string == "in_flight")
             {
                 attempt++;
                 if (attempt > maxAttempts)
                 {
                     // Move to dead letter
+                    logWarn("[mongo_queue] Message '%s' exceeded max attempts (%d/%d), moving to dead letter queue", msgId, attempt, maxAttempts);
                     Bson dlDoc = candidate;
                     dlDoc["error_reason"] = Bson("Visibility timeout expired and max attempts reached");
                     dlDoc["dead_lettered_at"] = Bson(Clock.currTime.toISOString());
-                    m_deadLetterCollection.insertOne(dlDoc);
-
-                    Bson delQuery = Bson.emptyObject;
-                    delQuery["message_id"] = Bson(msgId);
-                    m_queueCollection.deleteOne(delQuery);
+                    try
+                    {
+                        m_deadLetterCollection.insertOne(dlDoc);
+                        Bson delQuery = Bson.emptyObject;
+                        delQuery["message_id"] = Bson(msgId);
+                        m_queueCollection.deleteOne(delQuery);
+                    }
+                    catch (Exception e)
+                    {
+                        logError("[mongo_queue] Failed to dead-letter message '%s' in MongoDB queue: %s\n%s", msgId, e.msg, e.toString());
+                    }
                     continue;
                 }
             }
@@ -115,8 +170,9 @@ class MongoWorkQueue : WorkQueue
 
             Bson updateQuery = Bson.emptyObject;
             updateQuery["message_id"] = Bson(msgId);
-            updateQuery["visible_after"] = Bson.emptyObject;
-            updateQuery["visible_after"]["$lte"] = Bson(now);
+            Bson updateVisFilter = Bson.emptyObject;
+            updateVisFilter["$lte"] = Bson(now);
+            updateQuery["visible_after"] = updateVisFilter;
 
             Bson update = Bson.emptyObject;
             Bson setFields = Bson.emptyObject;
@@ -126,24 +182,60 @@ class MongoWorkQueue : WorkQueue
             setFields["attempt"] = Bson(attempt);
             update["$set"] = setFields;
 
-            auto modRes = m_queueCollection.updateOne(updateQuery, update);
-            if (modRes.matchedCount > 0)
+            try
             {
-                TaskQueueMessage msg;
-                msg.messageId = msgId;
-                msg.receiptHandle = receiptHandle;
-                msg.buildId = candidate["build_id"].get!string;
-                msg.taskId = candidate["task_id"].get!string;
-                msg.nodeFingerprint = candidate["node_fingerprint"].get!string;
-                msg.executionPayload = deserializeBson!TaskExecutionPayload(candidate["execution_payload"]);
-                msg.taskNode = deserializeBson!TaskNode(candidate["task_node"]);
-                msg.createdAt = candidate["created_at"].get!string;
-                msg.attempt = attempt;
-                msg.maxAttempts = maxAttempts;
-                msg.timeoutSeconds = cast(size_t)candidate["timeout_seconds"].to!long;
-                msg.visibleAfterUnix = newVisibleAfter;
+                auto modRes = m_queueCollection.updateOne(updateQuery, update);
+                logInfo("[mongo_queue] Claim update for message '%s' (receiptHandle='%s'): matched=%d, modified=%d", msgId, receiptHandle, modRes.matchedCount, modRes.modifiedCount);
+                if (modRes.matchedCount > 0)
+                {
+                    TaskQueueMessage msg;
+                    msg.messageId = msgId;
+                    msg.receiptHandle = receiptHandle;
+                    msg.buildId = bId;
+                    msg.taskId = tId;
+                    msg.nodeFingerprint = candidate.tryIndex("node_fingerprint").isNull ? "" : candidate["node_fingerprint"].get!string;
 
-                result ~= msg;
+                    try
+                    {
+                        if (!candidate.tryIndex("execution_payload").isNull && candidate["execution_payload"].type != Bson.Type.null_)
+                        {
+                            msg.executionPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(candidate["execution_payload"]));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        logError("[mongo_queue] Failed to deserialize execution payload for task '%s' (msg '%s', build '%s'): %s\n%s", msg.taskId, msgId, msg.buildId, e.msg, e.toString());
+                    }
+
+                    try
+                    {
+                        if (!candidate.tryIndex("task_node").isNull && candidate["task_node"].type != Bson.Type.null_)
+                        {
+                            msg.taskNode = deserializeBson!TaskNode(sanitizeBson(candidate["task_node"]));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        logError("[mongo_queue] Failed to deserialize task node for task '%s' (msg '%s', build '%s'): %s\n%s", msg.taskId, msgId, msg.buildId, e.msg, e.toString());
+                    }
+
+                    msg.createdAt = candidate.tryIndex("created_at").isNull ? "" : candidate["created_at"].get!string;
+                    msg.attempt = attempt;
+                    msg.maxAttempts = maxAttempts;
+                    msg.timeoutSeconds = candidate.tryIndex("timeout_seconds").isNull ? 900 : cast(size_t)candidate["timeout_seconds"].to!long;
+                    msg.visibleAfterUnix = newVisibleAfter;
+
+                    result ~= msg;
+                    logInfo("[mongo_queue] Successfully claimed and delivered message '%s' for task '%s' (build '%s')", msgId, msg.taskId, msg.buildId);
+                }
+                else
+                {
+                    logWarn("[mongo_queue] Could not claim message '%s' (matchedCount=0, likely updated concurrently)", msgId);
+                }
+            }
+            catch (Exception e)
+            {
+                logError("[mongo_queue] Failed to update and claim message '%s' from MongoDB work queue: %s\n%s", msgId, e.msg, e.toString());
             }
         }
 
@@ -157,6 +249,7 @@ class MongoWorkQueue : WorkQueue
         query["status"] = Bson("in_flight");
 
         auto res = m_queueCollection.deleteOne(query);
+        logInfo("[mongo_queue] Ack receiptHandle '%s': deletedCount=%d", receiptHandle, res.deletedCount);
         if (res.deletedCount == 0)
         {
             throw new Exception(format("Message with receipt handle '%s' not found or already completed in MongoDB queue", receiptHandle));
@@ -165,6 +258,7 @@ class MongoWorkQueue : WorkQueue
 
     override void nack(string receiptHandle, bool requeue = true, string errorReason = null)
     {
+        logInfo("[mongo_queue] Nack receiptHandle '%s' (requeue=%s, reason='%s')", receiptHandle, requeue, errorReason);
         Bson query = Bson.emptyObject;
         query["receipt_handle"] = Bson(receiptHandle);
         query["status"] = Bson("in_flight");
@@ -236,15 +330,38 @@ class MongoWorkQueue : WorkQueue
             cursor.popFront();
 
             TaskQueueMessage msg;
-            msg.messageId = doc["message_id"].get!string;
-            msg.buildId = doc["build_id"].get!string;
-            msg.taskId = doc["task_id"].get!string;
-            msg.nodeFingerprint = doc["node_fingerprint"].get!string;
-            msg.executionPayload = deserializeBson!TaskExecutionPayload(doc["execution_payload"]);
-            msg.taskNode = deserializeBson!TaskNode(doc["task_node"]);
-            msg.createdAt = doc["created_at"].get!string;
-            msg.attempt = doc["attempt"].to!int;
-            msg.maxAttempts = doc["max_attempts"].to!int;
+            msg.messageId = doc.tryIndex("message_id").isNull ? "" : doc["message_id"].get!string;
+            msg.buildId = doc.tryIndex("build_id").isNull ? "" : doc["build_id"].get!string;
+            msg.taskId = doc.tryIndex("task_id").isNull ? "" : doc["task_id"].get!string;
+            msg.nodeFingerprint = doc.tryIndex("node_fingerprint").isNull ? "" : doc["node_fingerprint"].get!string;
+
+            try
+            {
+                if (!doc.tryIndex("execution_payload").isNull && doc["execution_payload"].type != Bson.Type.null_)
+                {
+                    msg.executionPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(doc["execution_payload"]));
+                }
+            }
+            catch (Exception e)
+            {
+                logError("Failed to deserialize dead-letter execution payload (msg '%s'): %s", msg.messageId, e.msg);
+            }
+
+            try
+            {
+                if (!doc.tryIndex("task_node").isNull && doc["task_node"].type != Bson.Type.null_)
+                {
+                    msg.taskNode = deserializeBson!TaskNode(sanitizeBson(doc["task_node"]));
+                }
+            }
+            catch (Exception e)
+            {
+                logError("Failed to deserialize dead-letter task node (msg '%s'): %s", msg.messageId, e.msg);
+            }
+
+            msg.createdAt = doc.tryIndex("created_at").isNull ? "" : doc["created_at"].get!string;
+            msg.attempt = doc.tryIndex("attempt").isNull ? 1 : doc["attempt"].to!int;
+            msg.maxAttempts = doc.tryIndex("max_attempts").isNull ? 3 : doc["max_attempts"].to!int;
             msg.errorReason = doc.tryIndex("error_reason").isNull ? "" : doc["error_reason"].get!string;
             result ~= msg;
         }
@@ -255,9 +372,138 @@ class MongoWorkQueue : WorkQueue
     {
         Bson query = Bson.emptyObject;
         query["status"] = Bson("pending");
-        query["visible_after"] = Bson.emptyObject;
-        query["visible_after"]["$lte"] = Bson(currentUnixTime());
+        Bson visFilter = Bson.emptyObject;
+        visFilter["$lte"] = Bson(currentUnixTime());
+        query["visible_after"] = visFilter;
 
         return m_queueCollection.countDocuments(query);
     }
+
+    override TaskQueueMessage[] getPendingMessages(size_t limit = 50)
+    {
+        TaskQueueMessage[] result;
+        try
+        {
+            Bson query = Bson.emptyObject;
+            Bson statusFilter = Bson.emptyObject;
+            statusFilter["$in"] = serializeToBson(["pending", "in_flight"]);
+            query["status"] = statusFilter;
+
+            Bson visFilter = Bson.emptyObject;
+            visFilter["$lte"] = Bson(currentUnixTime());
+            query["visible_after"] = visFilter;
+
+            FindOptions opts;
+            opts.limit = cast(int)limit;
+            auto cursor = m_queueCollection.find(query, opts);
+            while (!cursor.empty)
+            {
+                Bson candidate = cursor.front;
+                cursor.popFront();
+
+                TaskQueueMessage msg;
+                msg.messageId = candidate.tryIndex("message_id").isNull ? "" : candidate["message_id"].get!string;
+                if (!candidate.tryIndex("receipt_handle").isNull && candidate["receipt_handle"].type == Bson.Type.string)
+                    msg.receiptHandle = candidate["receipt_handle"].get!string;
+                msg.buildId = candidate.tryIndex("build_id").isNull ? "" : candidate["build_id"].get!string;
+                msg.taskId = candidate.tryIndex("task_id").isNull ? "" : candidate["task_id"].get!string;
+                if (!candidate.tryIndex("node_fingerprint").isNull && candidate["node_fingerprint"].type == Bson.Type.string)
+                    msg.nodeFingerprint = candidate["node_fingerprint"].get!string;
+
+                try
+                {
+                    if (!candidate.tryIndex("execution_payload").isNull && candidate["execution_payload"].type != Bson.Type.null_)
+                    {
+                        msg.executionPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(candidate["execution_payload"]));
+                    }
+                }
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize pending execution payload (msg '%s'): %s", msg.messageId, e.msg);
+                }
+
+                try
+                {
+                    if (!candidate.tryIndex("task_node").isNull && candidate["task_node"].type != Bson.Type.null_)
+                    {
+                        msg.taskNode = deserializeBson!TaskNode(sanitizeBson(candidate["task_node"]));
+                    }
+                }
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize pending task node (msg '%s'): %s", msg.messageId, e.msg);
+                }
+
+                if (!candidate.tryIndex("created_at").isNull && candidate["created_at"].type == Bson.Type.string)
+                    msg.createdAt = candidate["created_at"].get!string;
+                msg.attempt = candidate.tryIndex("attempt").isNull ? 1 : candidate["attempt"].to!int;
+                msg.maxAttempts = candidate.tryIndex("max_attempts").isNull ? 3 : candidate["max_attempts"].to!int;
+                msg.timeoutSeconds = candidate.tryIndex("timeout_seconds").isNull ? 900 : cast(size_t)candidate["timeout_seconds"].to!long;
+                msg.visibleAfterUnix = candidate.tryIndex("visible_after").isNull ? currentUnixTime() : candidate["visible_after"].to!long;
+                result ~= msg;
+            }
+        }
+        catch (Exception e)
+        {
+            logError("Failed to get pending messages from MongoDB queue: %s", e.msg);
+        }
+        return result;
+    }
+}
+
+unittest
+{
+    // Test TaskQueueMessage BSON serialization & deserialization with complex TaskNode
+    TaskQueueMessage msg;
+    msg.messageId = "test-msg-1";
+    msg.buildId = "bld-123";
+    msg.taskId = "build-task";
+
+    TaskNode node;
+    node.id = "build-task";
+    node.name = "Build Task";
+    node.script = "echo building";
+    node.steps = [
+        BuildStep("Clone", "clone_repository", ["repository": "https://example.com/repo.git"], "", "", "", ""),
+        BuildStep("Compile", "bash", ["executable": "bash"], "dub build", "", "", "{\"flags\": \"-v\"}")
+    ];
+    node.setCustomComponent("custom_prop", parseJSON("{\"enabled\": true}"));
+    msg.taskNode = node;
+
+    msg.executionPayload.script = "echo payload";
+    msg.executionPayload.expectedOutputs = [OutputArtifactDecl("bin/app", "file")];
+
+    Bson payloadBson = serializeToBson(msg.executionPayload);
+    Bson nodeBson = serializeToBson(msg.taskNode);
+
+    TaskExecutionPayload deserializedPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(payloadBson));
+    assert(deserializedPayload.script == "echo payload");
+    assert(deserializedPayload.expectedOutputs.length == 1);
+    assert(deserializedPayload.expectedOutputs[0].path == "bin/app");
+
+    TaskNode deserializedNode = deserializeBson!TaskNode(sanitizeBson(nodeBson));
+    assert(deserializedNode.id == "build-task");
+    assert(deserializedNode.steps.length == 2);
+    assert(deserializedNode.steps[0].type == "clone_repository");
+    assert(deserializedNode.steps[1].type == "bash");
+    assert(deserializedNode.hasCustomComponent("custom_prop"));
+
+    // Test dequeue query structure
+    long now = 1791006690;
+    Bson query = Bson.emptyObject;
+    Bson statusFilter = Bson.emptyObject;
+    statusFilter["$in"] = serializeToBson(["pending", "in_flight"]);
+    query["status"] = statusFilter;
+
+    Bson visFilter = Bson.emptyObject;
+    visFilter["$lte"] = Bson(now);
+    query["visible_after"] = visFilter;
+
+    assert(!query.tryIndex("status").isNull);
+    assert(!query["status"].tryIndex("$in").isNull);
+    assert(query["status"]["$in"].type == Bson.Type.array);
+    assert(query["status"]["$in"].length == 2);
+    assert(!query.tryIndex("visible_after").isNull);
+    assert(!query["visible_after"].tryIndex("$lte").isNull);
+    assert(query["visible_after"]["$lte"].get!long == now);
 }

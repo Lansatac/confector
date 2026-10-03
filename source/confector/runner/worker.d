@@ -11,6 +11,12 @@ import std.path : buildPath, dirName;
 import std.format : format;
 import std.datetime.systime : Clock;
 import std.uuid : randomUUID;
+import vibe.core.log : logInfo, logError, logWarn, logDebug;
+
+/**
+ * Delegate callback type for notifying build coordinator of task completions.
+ */
+alias TaskCompletionHandler = void delegate(string buildId, string taskId, TaskExecutionResult result);
 
 /**
  * Configuration for worker runner instances.
@@ -20,6 +26,7 @@ struct WorkerConfig
     string workerId;
     string workspaceDir = ".confector/worker_workspace";
     string storageDir = ".confector/artifacts";
+    string callbackBaseUrl;
     size_t pollIntervalSeconds = 2;
     size_t visibilityTimeoutSeconds = 60;
     size_t heartbeatIntervalSeconds = 15;
@@ -36,13 +43,15 @@ class WorkerRunner
     private TaskEngine m_engine;
     private ArtifactStorage m_storage;
     private BuildStateRepository m_stateRepo;
+    private TaskCompletionHandler m_completionHandler;
 
     this(
         WorkerConfig config,
         WorkQueue queue,
         TaskEngine engine,
         ArtifactStorage storage,
-        BuildStateRepository stateRepo
+        BuildStateRepository stateRepo = null,
+        TaskCompletionHandler completionHandler = null
     )
     {
         m_config = config;
@@ -54,6 +63,7 @@ class WorkerRunner
         m_engine = engine;
         m_storage = storage;
         m_stateRepo = stateRepo;
+        m_completionHandler = completionHandler;
 
         if (!exists(m_config.workspaceDir))
         {
@@ -61,13 +71,26 @@ class WorkerRunner
         }
     }
 
+    @property TaskCompletionHandler completionHandler() { return m_completionHandler; }
+    @property void completionHandler(TaskCompletionHandler handler) { m_completionHandler = handler; }
+
     /**
      * Attempts to dequeue and process a single task message.
      * Returns true if a task was processed, false if the queue was empty.
      */
     bool processNextTask()
     {
-        auto messages = m_queue.dequeue(1, m_config.visibilityTimeoutSeconds);
+        TaskQueueMessage[] messages;
+        try
+        {
+            messages = m_queue.dequeue(1, m_config.visibilityTimeoutSeconds);
+        }
+        catch (Exception e)
+        {
+            logError("[worker:%s] Error dequeuing task from work queue: %s\n%s", m_config.workerId, e.msg, e.toString());
+            return false;
+        }
+
         if (messages.length == 0)
         {
             return false;
@@ -77,8 +100,13 @@ class WorkerRunner
         string buildId = msg.buildId.length > 0 ? msg.buildId : "build_default";
         string taskId = msg.taskId;
 
-        // Record running status
-        m_stateRepo.setTaskStatus(buildId, taskId, TaskStatus.running);
+        logInfo("[worker:%s] Picked up task '%s' for build '%s' (messageId: '%s', receipt: '%s')", m_config.workerId, taskId, buildId, msg.messageId, msg.receiptHandle);
+
+        // Record running status if repository is available
+        if (m_stateRepo !is null)
+        {
+            m_stateRepo.setTaskStatus(buildId, taskId, TaskStatus.running);
+        }
 
         try
         {
@@ -88,13 +116,22 @@ class WorkerRunner
             {
                 mkdirRecurse(taskWorkspace);
             }
+            logInfo("[worker:%s] Task '%s' workspace prepared at '%s'", m_config.workerId, taskId, taskWorkspace);
 
             // Retrieve input artifacts if declared in execution payload
             string[string] upstreamHashes;
+            if (msg.executionPayload.upstreamArtifactHashes !is null)
+            {
+                foreach (k, v; msg.executionPayload.upstreamArtifactHashes)
+                {
+                    upstreamHashes[k] = v;
+                }
+            }
+
             foreach (inputArt; msg.executionPayload.inputArtifacts)
             {
                 string targetPath = buildPath(taskWorkspace, inputArt.targetPath);
-                if (m_storage.artifactExists(buildId, inputArt.taskId, inputArt.targetPath))
+                if (m_storage !is null && m_storage.artifactExists(buildId, inputArt.taskId, inputArt.targetPath))
                 {
                     m_storage.retrieveArtifact(buildId, inputArt.taskId, inputArt.targetPath, targetPath);
                     ArtifactMetadata meta;
@@ -102,6 +139,22 @@ class WorkerRunner
                     {
                         upstreamHashes[inputArt.targetPath] = meta.sha256;
                     }
+                    logInfo("[worker:%s] Task '%s' retrieved upstream artifact '%s' from task '%s'", m_config.workerId, taskId, inputArt.targetPath, inputArt.taskId);
+                }
+            }
+
+            foreach (loc; msg.executionPayload.upstreamArtifactLocations)
+            {
+                string targetPath = buildPath(taskWorkspace, loc.targetPath.length > 0 ? loc.targetPath : loc.artifactPath);
+                if (m_storage !is null && m_storage.artifactExists(buildId, loc.taskId, loc.artifactPath))
+                {
+                    m_storage.retrieveArtifact(buildId, loc.taskId, loc.artifactPath, targetPath);
+                    ArtifactMetadata meta;
+                    if (m_storage.getArtifactMetadata(buildId, loc.taskId, loc.artifactPath, meta))
+                    {
+                        upstreamHashes[loc.artifactPath] = meta.sha256;
+                    }
+                    logInfo("[worker:%s] Task '%s' retrieved upstream artifact '%s' from task '%s'", m_config.workerId, taskId, loc.artifactPath, loc.taskId);
                 }
             }
 
@@ -116,35 +169,96 @@ class WorkerRunner
                 node.outputs.artifacts = msg.executionPayload.expectedOutputs;
             }
 
+            logInfo("[worker:%s] Task '%s': executing via TaskEngine (%d steps, script length: %d)", m_config.workerId, taskId, node.steps.length, node.script.length);
+
             // Execute task
             auto execResult = m_engine.executeTask(
                 buildId,
                 node,
                 taskWorkspace,
                 upstreamHashes,
-                false
+                msg.executionPayload.force
             );
 
             if (execResult.status == TaskStatus.succeeded || execResult.status == TaskStatus.cached)
             {
+                logInfo("[worker:%s] Task '%s' (build '%s') %s in %d ms", m_config.workerId, taskId, buildId, execResult.status == TaskStatus.cached ? "resolved from cache" : "succeeded", execResult.durationMs);
                 // Acknowledge task from queue
                 m_queue.ack(msg.receiptHandle);
+                notifyCompletion(msg, execResult);
                 return true;
             }
             else
             {
                 // Negative acknowledge (retry or dead-letter)
                 string errorMsg = execResult.errorMessage.length > 0 ? execResult.errorMessage : format("Task failed with exit code %d", execResult.exitCode);
-                m_stateRepo.setTaskStatus(buildId, taskId, TaskStatus.failed, errorMsg);
-                m_queue.nack(msg.receiptHandle, true, errorMsg);
+                logWarn("[worker:%s] Task '%s' (build '%s') failed with exit code %d: %s", m_config.workerId, taskId, buildId, execResult.exitCode, errorMsg);
+                if (m_stateRepo !is null)
+                {
+                    m_stateRepo.setTaskStatus(buildId, taskId, TaskStatus.failed, errorMsg);
+                }
+                notifyCompletion(msg, execResult);
+                m_queue.nack(msg.receiptHandle, false, errorMsg);
                 return true;
             }
         }
         catch (Exception e)
         {
-            m_stateRepo.setTaskStatus(buildId, taskId, TaskStatus.failed, e.msg);
-            m_queue.nack(msg.receiptHandle, true, e.msg);
+            logError("[worker:%s] Task '%s' (build '%s') encountered error: %s\n%s", m_config.workerId, taskId, buildId, e.msg, e.toString());
+            TaskExecutionResult failResult;
+            failResult.buildId = buildId;
+            failResult.taskId = taskId;
+            failResult.status = TaskStatus.failed;
+            failResult.errorMessage = e.msg;
+
+            if (m_stateRepo !is null)
+            {
+                m_stateRepo.setTaskStatus(buildId, taskId, TaskStatus.failed, e.msg);
+            }
+            notifyCompletion(msg, failResult);
+            m_queue.nack(msg.receiptHandle, false, e.msg);
             return true;
+        }
+    }
+
+    private void notifyCompletion(in TaskQueueMessage msg, in TaskExecutionResult result)
+    {
+        if (m_completionHandler !is null)
+        {
+            try
+            {
+                m_completionHandler(msg.buildId, msg.taskId, cast(TaskExecutionResult)result);
+            }
+            catch (Exception e)
+            {
+                logWarn("Error in worker completion handler: %s", e.msg);
+            }
+        }
+
+        string callbackUrl = msg.executionPayload.callbackUrl;
+        if (callbackUrl.length == 0 && m_config.callbackBaseUrl.length > 0)
+        {
+            callbackUrl = format("%s/api/v1/builds/%s/tasks/%s/complete", m_config.callbackBaseUrl, msg.buildId, msg.taskId);
+        }
+
+        if (callbackUrl.length > 0)
+        {
+            try
+            {
+                import vibe.http.client : requestHTTP, HTTPMethod;
+                import vibe.inet.url : URL;
+
+                requestHTTP(URL(callbackUrl), (scope req) {
+                    req.method = HTTPMethod.POST;
+                    req.writeJsonBody(result);
+                }, (scope res) {
+                    // completion received
+                });
+            }
+            catch (Exception e)
+            {
+                logWarn("Failed to send HTTP completion callback to %s: %s", callbackUrl, e.msg);
+            }
         }
     }
 
@@ -155,6 +269,7 @@ class WorkerRunner
     size_t runWorkerLoop(bool delegate() shouldStop = null)
     {
         size_t processedCount = 0;
+        logInfo("[worker:%s] Background worker started, polling queue every %ds", m_config.workerId, m_config.pollIntervalSeconds > 0 ? m_config.pollIntervalSeconds : 1);
 
         while (true)
         {
@@ -163,24 +278,35 @@ class WorkerRunner
                 break;
             }
 
-            bool processed = processNextTask();
-            if (processed)
+            try
             {
-                processedCount++;
-                if (m_config.maxTasksToProcess > 0 && processedCount >= m_config.maxTasksToProcess)
+                bool processed = processNextTask();
+                if (processed)
                 {
-                    break;
+                    processedCount++;
+                    if (m_config.maxTasksToProcess > 0 && processedCount >= m_config.maxTasksToProcess)
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    if (m_config.maxTasksToProcess > 0)
+                    {
+                        // Ephemeral container with no ready tasks -> exit
+                        break;
+                    }
+                    import vibe.core.core : sleep;
+                    import core.time : dur;
+                    sleep(dur!"seconds"(m_config.pollIntervalSeconds > 0 ? m_config.pollIntervalSeconds : 1));
                 }
             }
-            else
+            catch (Exception e)
             {
-                if (m_config.maxTasksToProcess > 0)
-                {
-                    // Ephemeral container with no ready tasks -> exit
-                    break;
-                }
-                import core.thread : Thread, dur;
-                Thread.sleep(dur!"seconds"(m_config.pollIntervalSeconds > 0 ? m_config.pollIntervalSeconds : 1));
+                logError("[worker:%s] Unexpected error in worker loop: %s", m_config.workerId, e.msg);
+                import vibe.core.core : sleep;
+                import core.time : dur;
+                sleep(dur!"seconds"(m_config.pollIntervalSeconds > 0 ? m_config.pollIntervalSeconds : 1));
             }
         }
 
@@ -304,4 +430,74 @@ unittest
     TaskStatus status;
     assert(stateRepo.getTaskStatus("bld_work_1", "echo_worker_task", status));
     assert(status == TaskStatus.succeeded);
+
+    // Multi-Worker Parallel DAG Integration Test with BuildCoordinator
+    import confector.runner.coordinator : BuildCoordinator;
+
+    auto coord = new BuildCoordinator(storage, stateRepo, queue);
+
+    WorkerConfig w1Config;
+    w1Config.workerId = "worker_parallel_1";
+    w1Config.workspaceDir = buildPath(testDir, "w1_workspace");
+    auto worker1 = new WorkerRunner(w1Config, queue, engine, storage, stateRepo, (bId, tId, res) {
+        coord.onTaskCompleted(bId, tId, res);
+    });
+
+    WorkerConfig w2Config;
+    w2Config.workerId = "worker_parallel_2";
+    w2Config.workspaceDir = buildPath(testDir, "w2_workspace");
+    auto worker2 = new WorkerRunner(w2Config, queue, engine, storage, stateRepo, (bId, tId, res) {
+        coord.onTaskCompleted(bId, tId, res);
+    });
+
+    TaskNode rootT;
+    rootT.id = "root";
+    version(Windows) rootT.script = "cmd /c \"echo root done\"";
+    else rootT.script = "echo root done";
+
+    TaskNode parA;
+    parA.id = "parA";
+    parA.dependsOn = ["root"];
+    version(Windows) parA.script = "cmd /c \"echo parA done\"";
+    else parA.script = "echo parA done";
+
+    TaskNode parB;
+    parB.id = "parB";
+    parB.dependsOn = ["root"];
+    version(Windows) parB.script = "cmd /c \"echo parB done\"";
+    else parB.script = "echo parB done";
+
+    TaskNode finalT;
+    finalT.id = "final";
+    finalT.dependsOn = ["parA", "parB"];
+    version(Windows) finalT.script = "cmd /c \"echo final done\"";
+    else finalT.script = "echo final done";
+
+    ProjectRecord parProj;
+    parProj.id = "proj_par";
+    parProj.tasks = [rootT, parA, parB, finalT];
+
+    string parBuildId = coord.startBuild(parProj, null, true);
+
+    // Worker 1 processes root
+    assert(worker1.processNextTask());
+
+    // Now parA and parB are both queued
+    assert(queue.getPendingCount() == 2);
+
+    // Worker 1 processes parA, Worker 2 processes parB
+    assert(worker1.processNextTask());
+    assert(worker2.processNextTask());
+
+    // Both parallel tasks finished -> final task is now queued
+    assert(queue.getPendingCount() == 1);
+
+    // Worker 2 processes final
+    assert(worker2.processNextTask());
+    assert(queue.getPendingCount() == 0);
+
+    BuildRecord parBuildRec;
+    assert(stateRepo.getBuild(parBuildId, parBuildRec));
+    assert(parBuildRec.status == "succeeded");
+    assert(parBuildRec.executedTasks.length == 4);
 }

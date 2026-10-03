@@ -8,6 +8,7 @@ import confector.core.dag;
 import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
 import confector.runner.engine;
+import confector.runner.coordinator;
 import confector.queue.queue;
 
 import std.algorithm : filter, count, canFind;
@@ -24,7 +25,7 @@ struct StepProviderViewModel
     string defaultHtml;
 }
 
-URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateRepository stateRepo, PluginRegistry registry = null)
+URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
 {
     if (registry is null)
     {
@@ -521,27 +522,36 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             ProjectRecord proj;
             if (stateRepo !is null && stateRepo.getProject(projId, proj))
             {
-                string workspaceDir = ".";
-
-                auto graph = new TaskGraph(proj.tasks);
-                string[] orderedTasks;
-                if (targetTaskId.length > 0)
+                if (coordinator !is null)
                 {
-                    orderedTasks = graph.resolveSubgraph(targetTaskId);
+                    string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, false, "dashboard", ".");
+                    res.redirect("/builds/details?id=" ~ buildId);
+                    return;
                 }
                 else
                 {
-                    orderedTasks = graph.topologicalSort();
+                    string workspaceDir = ".";
+
+                    auto graph = new TaskGraph(proj.tasks);
+                    string[] orderedTasks;
+                    if (targetTaskId.length > 0)
+                    {
+                        orderedTasks = graph.resolveSubgraph(targetTaskId);
+                    }
+                    else
+                    {
+                        orderedTasks = graph.topologicalSort();
+                    }
+
+                    ExecutionPlan plan;
+                    plan.orderedTaskIds = orderedTasks;
+                    plan.toExecuteTaskIds = orderedTasks;
+
+                    string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
+                    engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, false);
+                    res.redirect("/builds/details?id=" ~ buildId);
+                    return;
                 }
-
-                ExecutionPlan plan;
-                plan.orderedTaskIds = orderedTasks;
-                plan.toExecuteTaskIds = orderedTasks;
-
-                string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
-                engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, false);
-                res.redirect("/builds/details?id=" ~ buildId);
-                return;
             }
         }
         catch (Exception e)
@@ -551,10 +561,11 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         res.redirect("/projects/");
     });
 
-    // Builds List
+    // Builds List & Active Work Queue
     router.get("/builds/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto builds = stateRepo !is null ? stateRepo.listBuilds(50) : [];
-        res.render!("build/builds.dt", builds);
+        auto queuedTasks = queue !is null ? queue.getPendingMessages(50) : [];
+        res.render!("build/builds.dt", builds, queuedTasks);
     });
 
     // Build Details & Task Graph Visualization
@@ -590,12 +601,12 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         }
 
         string[string] taskStatuses;
+        auto recordedStatuses = stateRepo !is null ? stateRepo.getTaskStatusesForBuild(build.buildId) : (TaskStatus[string]).init;
         foreach (t; tasks)
         {
-            TaskStatus st;
-            if (stateRepo !is null && stateRepo.getTaskStatus(build.buildId, t.id, st))
+            if (auto p = t.id in recordedStatuses)
             {
-                taskStatuses[t.id] = cast(string)st;
+                taskStatuses[t.id] = cast(string)*p;
             }
             else
             {
@@ -614,7 +625,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 }
                 else
                 {
-                    taskStatuses[t.id] = "ready";
+                    taskStatuses[t.id] = "pending";
                 }
             }
         }

@@ -12,22 +12,8 @@ import std.file : exists, isFile;
 import std.path : buildPath, isAbsolute;
 import std.format : format;
 import std.datetime.stopwatch : StopWatch, AutoStart;
+import vibe.core.log : logInfo, logError, logWarn, logDebug;
 
-/**
- * Result of a single task execution.
- */
-struct TaskExecutionResult
-{
-    string taskId;
-    string buildId;
-    TaskStatus status;
-    string fingerprint;
-    int exitCode = 0;
-    string[] logs;
-    string errorMessage;
-    ArtifactMetadata[] producedArtifacts;
-    ulong durationMs;
-}
 
 /**
  * Result of a task graph or build execution.
@@ -73,6 +59,8 @@ class TaskEngine
         TaskExecutionResult result;
         result.taskId = task.id;
         result.buildId = buildId;
+
+        logInfo("[engine] Starting executeTask for task '%s' (build '%s', workspace '%s', force=%s)", task.id, buildId, workspaceDir, force);
 
         // 1. Calculate input fingerprint
         string fingerprint;
@@ -362,6 +350,7 @@ class TaskEngine
         result.status = TaskStatus.succeeded;
         sw.stop();
         result.durationMs = sw.peek.total!"msecs";
+        logInfo("[engine] executeTask completed for task '%s' (build '%s', status: '%s', duration: %d ms, artifacts: %d)", task.id, buildId, result.status, result.durationMs, producedArtifacts.length);
         return result;
     }
 

@@ -158,6 +158,26 @@ class LocalArtifactStorage : ArtifactStorage
 interface BuildStateRepository
 {
     /**
+     * Records or updates the granular execution record of a task.
+     */
+    void recordTaskExecution(TaskExecutionRecord record);
+
+    /**
+     * Retrieves the granular execution record of a task.
+     */
+    bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record);
+
+    /**
+     * Retrieves all task execution records for a build.
+     */
+    TaskExecutionRecord[] getTaskExecutionsForBuild(string buildId);
+
+    /**
+     * Retrieves all recorded task statuses for a build.
+     */
+    TaskStatus[string] getTaskStatusesForBuild(string buildId);
+
+    /**
      * Records or updates the status of a task execution.
      */
     void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null);
@@ -290,6 +310,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
     }
 
     private TaskStatus[string] m_taskStatuses;
+    private TaskExecutionRecord[string] m_taskRecords;
     private CacheRecord[string] m_fingerprintCache;
     private BuildRecord[string] m_builds;
     private string[][string] m_buildLogs;
@@ -308,9 +329,85 @@ class InMemoryBuildStateRepository : BuildStateRepository
         return taskId ~ ":" ~ fingerprint;
     }
 
+    override void recordTaskExecution(TaskExecutionRecord record)
+    {
+        string key = statusKey(record.buildId, record.taskId);
+        m_taskRecords[key] = record;
+        m_taskStatuses[key] = cast(TaskStatus)record.status;
+        if (auto pb = record.buildId in m_builds)
+        {
+            pb.taskRecords[record.taskId] = record;
+        }
+    }
+
+    override bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record)
+    {
+        auto p = statusKey(buildId, taskId) in m_taskRecords;
+        if (p !is null)
+        {
+            record = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override TaskExecutionRecord[] getTaskExecutionsForBuild(string buildId)
+    {
+        TaskExecutionRecord[] list;
+        foreach (k, rec; m_taskRecords)
+        {
+            if (rec.buildId == buildId)
+            {
+                list ~= rec;
+            }
+        }
+        return list;
+    }
+
+    override TaskStatus[string] getTaskStatusesForBuild(string buildId)
+    {
+        TaskStatus[string] statuses;
+        string prefix = buildId ~ ":";
+        foreach (k, status; m_taskStatuses)
+        {
+            if (k.length > prefix.length && k[0 .. prefix.length] == prefix)
+            {
+                string taskId = k[prefix.length .. $];
+                statuses[taskId] = status;
+            }
+        }
+        return statuses;
+    }
+
     override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
     {
-        m_taskStatuses[statusKey(buildId, taskId)] = status;
+        string key = statusKey(buildId, taskId);
+        m_taskStatuses[key] = status;
+        if (auto p = key in m_taskRecords)
+        {
+            p.status = cast(string)status;
+            if (errorMessage.length > 0)
+            {
+                p.errorMessage = errorMessage;
+            }
+            if (auto pb = buildId in m_builds)
+            {
+                pb.taskRecords[taskId] = *p;
+            }
+        }
+        else
+        {
+            TaskExecutionRecord rec;
+            rec.buildId = buildId;
+            rec.taskId = taskId;
+            rec.status = cast(string)status;
+            rec.errorMessage = errorMessage;
+            m_taskRecords[key] = rec;
+            if (auto pb = buildId in m_builds)
+            {
+                pb.taskRecords[taskId] = rec;
+            }
+        }
     }
 
     override bool getTaskStatus(string buildId, string taskId, out TaskStatus status)
@@ -647,4 +744,37 @@ unittest
     assert(stateRepo.deleteExecutor("exec-local-1"));
     assert(stateRepo.listExecutors().length == 0);
     assert(!stateRepo.getExecutor("exec-local-1", fetchedExec));
+
+    // Granular task execution and status tracking
+    TaskExecutionRecord taskRec;
+    taskRec.buildId = "b1";
+    taskRec.taskId = "t1";
+    taskRec.status = "succeeded";
+    taskRec.fingerprint = "fp_t1";
+    taskRec.durationMs = 150;
+    taskRec.producedArtifacts = [meta];
+    taskRec.upstreamArtifactHashes = ["t0": "hash0"];
+    stateRepo.recordTaskExecution(taskRec);
+
+    TaskExecutionRecord fetchedTaskRec;
+    assert(stateRepo.getTaskExecution("b1", "t1", fetchedTaskRec));
+    assert(fetchedTaskRec.taskId == "t1");
+    assert(fetchedTaskRec.status == "succeeded");
+    assert(fetchedTaskRec.fingerprint == "fp_t1");
+    assert(fetchedTaskRec.durationMs == 150);
+    assert(fetchedTaskRec.producedArtifacts.length == 1);
+    assert(fetchedTaskRec.upstreamArtifactHashes["t0"] == "hash0");
+
+    auto buildTaskRecs = stateRepo.getTaskExecutionsForBuild("b1");
+    assert(buildTaskRecs.length == 1);
+    assert(buildTaskRecs[0].taskId == "t1");
+
+    auto buildStatuses = stateRepo.getTaskStatusesForBuild("b1");
+    assert("t1" in buildStatuses);
+    assert(buildStatuses["t1"] == TaskStatus.succeeded);
+
+    stateRepo.setTaskStatus("b1", "t2", TaskStatus.running);
+    auto buildStatuses2 = stateRepo.getTaskStatusesForBuild("b1");
+    assert(buildStatuses2.length == 2);
+    assert(buildStatuses2["t2"] == TaskStatus.running);
 }

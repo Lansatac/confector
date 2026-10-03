@@ -7,6 +7,40 @@ import vibe.data.json;
 import vibe.data.serialization : asName = name, optional;
 
 /**
+ * Persisted record of an individual task execution within a build.
+ */
+struct TaskExecutionRecord
+{
+    @optional @asName("task_id") string taskId;
+    @optional @asName("build_id") string buildId;
+    @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached, skipped, cancelled
+    @optional @asName("fingerprint") string fingerprint;
+    @optional @asName("exit_code") int exitCode = 0;
+    @optional @asName("error_message") string errorMessage;
+    @optional @asName("started_at") string startedAt;
+    @optional @asName("finished_at") string finishedAt;
+    @optional @asName("duration_ms") ulong durationMs = 0;
+    @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
+    @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
+}
+
+/**
+ * Result of a single task execution.
+ */
+struct TaskExecutionResult
+{
+    @optional @asName("task_id") string taskId;
+    @optional @asName("build_id") string buildId;
+    @optional @asName("status") TaskStatus status = TaskStatus.pending;
+    @optional @asName("fingerprint") string fingerprint;
+    @optional @asName("exit_code") int exitCode = 0;
+    @optional @asName("logs") string[] logs;
+    @optional @asName("error_message") string errorMessage;
+    @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
+    @optional @asName("duration_ms") ulong durationMs = 0;
+}
+
+/**
  * Persisted record of a build execution.
  */
 struct BuildRecord
@@ -14,7 +48,7 @@ struct BuildRecord
     @optional @asName("build_id") string buildId;
     @optional @asName("project_id") string projectId;
     @optional @asName("project_name") string projectName = "default";
-    @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached
+    @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached, cancelled
     @optional @asName("trigger_source") string triggerSource = "manual";
     @optional @asName("target_task_id") string targetTaskId;
     @optional @asName("workspace_dir") string workspaceDir;
@@ -22,6 +56,7 @@ struct BuildRecord
     @optional @asName("finished_at") string finishedAt;
     @optional @asName("duration_ms") ulong durationMs = 0;
     @optional @asName("executed_tasks") string[] executedTasks;
+    @optional @asName("task_records") TaskExecutionRecord[string] taskRecords;
     @optional @asName("error_message") string errorMessage;
 }
 

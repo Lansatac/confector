@@ -7,13 +7,14 @@ import confector.core.storage;
 import confector.core.trigger;
 import confector.runner.engine;
 import confector.runner.serverless_runner;
+import confector.runner.coordinator;
 import confector.queue.queue;
 
 import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
+URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null)
 {
     auto router = new URLRouter();
 
@@ -150,7 +151,109 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
             stats["dead_letter_count"] = Json(queue.getDeadLetterMessages().length);
             res.writeJsonBody(stats);
         });
+
+        router.get("/queue/pending", (HTTPServerRequest req, HTTPServerResponse res) {
+            try
+            {
+                auto msgs = queue.getPendingMessages(50);
+                res.writeJsonBody(msgs);
+            }
+            catch (Exception e)
+            {
+                res.statusCode = HTTPStatus.badRequest;
+                Json err = Json.emptyObject;
+                err["error"] = Json(e.msg);
+                res.writeJsonBody(err);
+            }
+        });
     }
+
+    // Remote Worker Task Completion Callback endpoint
+    router.post("/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string buildId = req.params["build_id"];
+            string taskId = req.params["task_id"];
+            TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
+            result.buildId = buildId;
+            result.taskId = taskId;
+
+            if (coordinator !is null)
+            {
+                coordinator.onTaskCompleted(buildId, taskId, result);
+            }
+            else if (engine.stateRepository !is null)
+            {
+                engine.stateRepository.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
+            }
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("recorded");
+            resp["build_id"] = Json(buildId);
+            resp["task_id"] = Json(taskId);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Run Project via Coordinator / Engine
+    router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string projectId = req.json["project_id"].get!string;
+            auto pTarget = "target_task_id" in req.json;
+            auto pForce = "force" in req.json;
+            auto pWorkspace = "workspace_dir" in req.json;
+            string targetTaskId = pTarget !is null ? pTarget.get!string : "";
+            bool force = pForce !is null ? pForce.get!bool : false;
+            string workspaceDir = pWorkspace !is null ? pWorkspace.get!string : "";
+
+            auto repo = engine.stateRepository;
+            ProjectRecord proj;
+            if (repo is null || !repo.getProject(projectId, proj))
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Project not found: " ~ projectId);
+                res.writeJsonBody(err);
+                return;
+            }
+
+            if (coordinator !is null)
+            {
+                string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, force, "api", workspaceDir);
+                Json resp = Json.emptyObject;
+                resp["build_id"] = Json(buildId);
+                resp["status"] = Json("running");
+                resp["project_id"] = Json(projectId);
+                res.writeJsonBody(resp);
+            }
+            else
+            {
+                auto graph = new TaskGraph(proj.tasks);
+                string[] sorted = targetTaskId.length > 0 ? graph.resolveSubgraph(targetTaskId) : graph.topologicalSort();
+                ExecutionPlan plan;
+                plan.orderedTaskIds = sorted;
+                plan.toExecuteTaskIds = sorted;
+                string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
+                auto result = engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, force);
+                res.writeJsonBody(result);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
 
     // Task Graph Trigger & Execution endpoint
     router.post("/tasks/execute", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -259,6 +362,11 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null)
             BuildRecord buildRec;
             if (repo.getBuild(buildId, buildRec))
             {
+                auto taskRecs = repo.getTaskExecutionsForBuild(buildId);
+                foreach (rec; taskRecs)
+                {
+                    buildRec.taskRecords[rec.taskId] = rec;
+                }
                 res.writeJsonBody(buildRec);
             }
             else
@@ -863,4 +971,36 @@ unittest
     assert(fetchedProj.name == "API Project");
     assert(fetchedProj.tasks.length == 1);
     assert(fetchedProj.tasks[0].id == "n1");
+
+    // Test BuildCoordinator integration with apiRouter
+    auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
+    auto routerWithCoord = apiRouter(engine, queue, coordinator);
+    assert(routerWithCoord !is null);
+
+    string bldId = coordinator.startBuild(proj, null, true);
+    assert(bldId.length > 0);
+    assert(queue.getPendingCount() == 1);
+
+    auto pendingMsgs = queue.getPendingMessages(10);
+    assert(pendingMsgs.length == 1);
+    assert(pendingMsgs[0].taskId == "n1");
+    assert(pendingMsgs[0].buildId == bldId);
+
+    // Simulate remote worker callback
+    TaskExecutionResult workerRes;
+    workerRes.buildId = bldId;
+    workerRes.taskId = "n1";
+    workerRes.status = TaskStatus.succeeded;
+    workerRes.exitCode = 0;
+    workerRes.durationMs = 85;
+    coordinator.onTaskCompleted(bldId, "n1", workerRes);
+
+    BuildRecord bldDetails;
+    assert(stateRepo.getBuild(bldId, bldDetails));
+    assert(bldDetails.status == "succeeded");
+
+    TaskExecutionRecord taskRec;
+    assert(stateRepo.getTaskExecution(bldId, "n1", taskRec));
+    assert(taskRec.status == "succeeded");
+    assert(taskRec.durationMs == 85);
 }

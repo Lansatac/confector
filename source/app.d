@@ -13,6 +13,8 @@ import confector.storage.mongo_repository;
 import confector.queue.queue;
 import confector.queue.mongo_queue;
 import confector.runner.engine;
+import confector.runner.coordinator;
+import confector.runner.worker;
 
 debug static import std.stdio;
 
@@ -119,10 +121,34 @@ void main()
   }
   writefln("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
 
-  // Initialize execution engine & storage
+  // Ensure info and error logs are printed to console
+  setLogLevel(vibe.core.log.LogLevel.info);
+
+  // Initialize execution engine, coordinator & storage
   auto artifactStorage = new LocalArtifactStorage(".confector/artifacts");
   auto taskEngine = new TaskEngine(artifactStorage, stateRepo);
-  writeln("Initialized Confector execution engine.");
+  auto buildCoordinator = new BuildCoordinator(artifactStorage, stateRepo, workQueue);
+  writeln("Initialized Confector execution engine and build coordinator.");
+
+  // Start background worker runner to process queue tasks
+  WorkerConfig workerConfig;
+  workerConfig.workerId = "worker_default";
+  auto worker = new WorkerRunner(workerConfig, workQueue, taskEngine, artifactStorage, stateRepo, (bId, tId, res) {
+      buildCoordinator.onTaskCompleted(bId, tId, res);
+  });
+  runTask({
+      try
+      {
+          logInfo("Background worker task fiber started.");
+          worker.runWorkerLoop();
+          logInfo("Background worker task fiber finished.");
+      }
+      catch (Exception e)
+      {
+          logError("Worker loop failed with exception: %s\n%s", e.msg, e.toString());
+      }
+  });
+  writeln("Started background worker runner.");
 
 	auto router = new URLRouter;
 
@@ -132,18 +158,18 @@ void main()
   router.get("/static/*", serveStaticFiles("public/", fsettings));
 
   // Mount API & serverless execution endpoints
-  router.any("/api/v1/*", apiRouter(taskEngine, workQueue));
+  router.any("/api/v1/*", apiRouter(taskEngine, workQueue, buildCoordinator));
 
   // Mount dashboard, builds, projects, executors, and admin UI
-  router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
   router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
-  router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
   router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/builds/"); });
   router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance));
   router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
   router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
   router.get("/admin", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/admin/plugins"); });
-  router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo));
+  router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
 
   router.any("/repositories/*", repositoryRouter(client));
   router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });

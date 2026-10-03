@@ -124,6 +124,11 @@ class CloudWorkQueue : WorkQueue
     {
         return m_localFallbackQueue.getPendingCount();
     }
+
+    override TaskQueueMessage[] getPendingMessages(size_t limit = 50)
+    {
+        return m_localFallbackQueue.getPendingMessages(limit);
+    }
 }
 
 unittest

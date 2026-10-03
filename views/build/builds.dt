@@ -3,8 +3,41 @@ extends layout
 block maincontent
   div.builds-container
     div.header-section
-      h1 Builds
-      p Track execution history, cache hits, durations, and task graphs.
+      h1 Builds & Work Queue
+      p Track active task queues, build execution history, cache hits, durations, and task graphs.
+
+    div.section-title-bar(style="margin-top: 10px; margin-bottom: 15px;")
+      h2 Active Build Queue
+      div
+        span.badge.badge-primary #{queuedTasks.length} queued task units
+
+    - if (queuedTasks.length == 0)
+      div.empty-state(style="margin-bottom: 30px; padding: 20px;")
+        p Build queue is empty. No tasks currently waiting for workers.
+    - else
+      table.data-table(style="margin-bottom: 30px;")
+        thead
+          tr
+            th Message ID
+            th Build ID
+            th Task ID
+            th Enqueued At
+            th Attempt
+            th Timeout
+        tbody
+          - foreach(msg; queuedTasks)
+            tr
+              td #{msg.messageId}
+              td
+                a.build-link(href="/builds/details?id=#{msg.buildId}") #{msg.buildId}
+              td
+                strong #{msg.taskId}
+              td #{msg.createdAt}
+              td #{msg.attempt} / #{msg.maxAttempts}
+              td #{msg.timeoutSeconds}s
+
+    div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")
+      h2 Build Execution History
 
     - if (builds.length == 0)
       div.empty-state

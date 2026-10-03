@@ -19,16 +19,34 @@ struct InputArtifactRef
 }
 
 /**
+ * Detailed upstream artifact location for remote worker fetching.
+ */
+struct UpstreamArtifactLocation
+{
+    @asName("task_id") string taskId;
+    @asName("artifact_path") string artifactPath;
+    @optional @asName("storage_backend") string storageBackend = "local";
+    @optional @asName("storage_uri") string storageUri;
+    @optional @asName("sha256") string sha256;
+    @optional @asName("target_path") string targetPath;
+}
+
+/**
  * Self-contained execution payload for worker tasks.
  */
 struct TaskExecutionPayload
 {
-    @asName("repository_url") string repositoryUrl;
-    @asName("commit_sha") string commitSha;
-    string script;
-    string[string] environment;
-    @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
-    @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
+    @optional @asName("repository_url") string repositoryUrl;
+    @optional @asName("commit_sha") string commitSha;
+    @optional string script;
+    @optional string[string] environment;
+    @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
+    @optional @asName("upstream_artifact_locations") UpstreamArtifactLocation[] upstreamArtifactLocations;
+    @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
+    @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
+    @optional @asName("workspace_dir") string workspaceDir;
+    @optional @asName("callback_url") string callbackUrl;
+    @optional @asName("force") bool force = false;
 }
 
 /**
@@ -92,6 +110,11 @@ interface WorkQueue
      * Returns count of ready/pending messages.
      */
     ulong getPendingCount();
+
+    /**
+     * Returns pending / ready messages for inspection or queue monitoring.
+     */
+    TaskQueueMessage[] getPendingMessages(size_t limit = 50);
 }
 
 /**
@@ -291,6 +314,21 @@ class InMemoryWorkQueue : WorkQueue
             }
         }
         return count;
+    }
+
+    override TaskQueueMessage[] getPendingMessages(size_t limit = 50)
+    {
+        long now = currentUnixTime();
+        TaskQueueMessage[] result;
+        foreach (ref entry; m_entries)
+        {
+            if (!entry.inFlight && entry.visibleAfterUnix <= now)
+            {
+                result ~= entry.message;
+                if (result.length >= limit) break;
+            }
+        }
+        return result;
     }
 }
 

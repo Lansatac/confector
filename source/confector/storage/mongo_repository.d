@@ -40,6 +40,107 @@ class MongoBuildStateRepository : BuildStateRepository
         m_executorsCollection = client.getCollection(format("%s.executors", dbName));
     }
 
+    override void recordTaskExecution(TaskExecutionRecord record)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(record.buildId);
+            query["task_id"] = Bson(record.taskId);
+
+            Bson update = Bson.emptyObject;
+            Bson setFields = serializeToBson(record);
+            setFields["updated_at"] = Bson(Clock.currTime.toISOString());
+            update["$set"] = setFields;
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_statusCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+            logError("Failed to record task execution (buildId=%s, taskId=%s): %s", record.buildId, record.taskId, e.msg);
+        }
+    }
+
+    override bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+            query["task_id"] = Bson(taskId);
+
+            auto doc = m_statusCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return false;
+            }
+
+            record = deserializeBson!TaskExecutionRecord(sanitizeBson(doc));
+            return true;
+        }
+        catch (Exception e)
+        {
+            logWarn("Failed to get task execution (buildId=%s, taskId=%s): %s", buildId, taskId, e.msg);
+            return false;
+        }
+    }
+
+    override TaskExecutionRecord[] getTaskExecutionsForBuild(string buildId)
+    {
+        TaskExecutionRecord[] list;
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+
+            auto cursor = m_statusCollection.find(query, FindOptions.init);
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!TaskExecutionRecord(sanitizeBson(doc));
+                }
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize task execution record: %s", e.msg);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logError("Failed to list task executions for build %s: %s", buildId, e.msg);
+        }
+        return list;
+    }
+
+    override TaskStatus[string] getTaskStatusesForBuild(string buildId)
+    {
+        TaskStatus[string] statuses;
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+
+            auto cursor = m_statusCollection.find(query, FindOptions.init);
+            foreach (doc; cursor)
+            {
+                auto pTaskId = doc.tryIndex("task_id");
+                auto pStatus = doc.tryIndex("status");
+                if (!pTaskId.isNull && !pStatus.isNull && pTaskId.get.type == Bson.Type.string && pStatus.get.type == Bson.Type.string)
+                {
+                    statuses[pTaskId.get.get!string] = cast(TaskStatus)pStatus.get.get!string;
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logError("Failed to get task statuses for build %s: %s", buildId, e.msg);
+        }
+        return statuses;
+    }
+
     override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
     {
         try
