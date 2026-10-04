@@ -1,13 +1,103 @@
-doctype 5
-html
+doctype html
+html(lang="en")
   head
-    title Confector
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1.0")
+    meta(http-equiv="X-UA-Compatible", content="IE=edge")
+    title Confector &mdash; Cloud-Native DAG CI/CD
+    link(rel="icon", type="image/png", sizes="32x32", href="/static/images/favicon-32x32.png")
+    link(rel="icon", type="image/png", sizes="16x16", href="/static/images/favicon-16x16.png")
     link(rel="stylesheet", href="/static/styles/style.css")
   body
-    div.container
-      div.menu
+    div.app-container
+      header.app-header
         include navbar.dt
-      div.content
+      main.main-content
         block maincontent
-      div.footer
+      footer.app-footer
         include footer.dt
+
+    script.
+      // Active route navigation highlighting
+      document.addEventListener("DOMContentLoaded", function() {
+        var currentPath = window.location.pathname;
+        var navLinks = document.querySelectorAll('.nav-item');
+        navLinks.forEach(function(link) {
+          var href = link.getAttribute('href');
+          var route = link.getAttribute('data-route');
+          var isActive = false;
+          if (href === '/' && (currentPath === '/' || currentPath === '')) {
+            isActive = true;
+          } else if (href !== '/' && currentPath.indexOf(href) === 0) {
+            isActive = true;
+          } else if (route === 'admin' && currentPath.indexOf('/admin') === 0) {
+            isActive = true;
+          }
+          if (isActive) {
+            link.classList.add('active');
+          }
+        });
+
+        // Restore accordion state from localStorage
+        document.querySelectorAll('.accordion-card, .project-card, .accordion-item').forEach(function(card) {
+          if (card.id) {
+            var savedState = localStorage.getItem('confector_accordion_' + card.id);
+            if (savedState === 'collapsed') {
+              var content = card.querySelector('.accordion-content, .card-body');
+              if (content) {
+                content.classList.add('collapsed');
+              }
+              card.classList.add('is-collapsed');
+              var toggleBtn = card.querySelector('.accordion-toggle, [data-toggle="accordion"]');
+              if (toggleBtn) {
+                toggleBtn.setAttribute('aria-expanded', 'false');
+              }
+            }
+          }
+        });
+
+        // Global accordion toggle handler (for toggle buttons)
+        document.querySelectorAll('.accordion-toggle, [data-toggle="accordion"]').forEach(function(toggleBtn) {
+          toggleBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            var targetId = this.getAttribute('data-target') || this.getAttribute('aria-controls');
+            var card = this.closest('.accordion-card, .project-card, .accordion-item');
+            var content = targetId ? document.getElementById(targetId) : (card ? card.querySelector('.accordion-content, .card-body') : null);
+            if (content) {
+              var isCollapsed = content.classList.toggle('collapsed');
+              if (card) {
+                card.classList.toggle('is-collapsed', isCollapsed);
+              }
+              this.setAttribute('aria-expanded', !isCollapsed);
+              // Save state in localStorage if card has id
+              if (card && card.id) {
+                localStorage.setItem('confector_accordion_' + card.id, isCollapsed ? 'collapsed' : 'expanded');
+              }
+            }
+          });
+        });
+
+        // Click anywhere on accordion-header to toggle, unless clicking on an interactive element
+        document.querySelectorAll('.accordion-header').forEach(function(header) {
+          header.addEventListener('click', function(e) {
+            if (e.target.closest('a, button, input, select, textarea, form, .accordion-actions, .accordion-toggle')) {
+              return;
+            }
+            var card = this.closest('.accordion-card, .project-card, .accordion-item');
+            var content = card ? card.querySelector('.accordion-content, .card-body') : null;
+            if (content) {
+              var isCollapsed = content.classList.toggle('collapsed');
+              if (card) {
+                card.classList.toggle('is-collapsed', isCollapsed);
+              }
+              var toggleBtn = card ? card.querySelector('.accordion-toggle') : null;
+              if (toggleBtn) {
+                toggleBtn.setAttribute('aria-expanded', !isCollapsed);
+              }
+              if (card && card.id) {
+                localStorage.setItem('confector_accordion_' + card.id, isCollapsed ? 'collapsed' : 'expanded');
+              }
+            }
+          });
+        });
+      });

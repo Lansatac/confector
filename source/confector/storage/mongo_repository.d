@@ -155,6 +155,44 @@ class MongoBuildStateRepository : BuildStateRepository
         return list;
     }
 
+    override TaskExecutionRecord[] listTaskExecutionsForTask(string projectId, string taskId, size_t limit = 20)
+    {
+        TaskExecutionRecord[] list;
+        try
+        {
+            Bson query = Bson.emptyObject;
+            if (taskId.length > 0)
+            {
+                query["task_id"] = Bson(taskId);
+            }
+            if (projectId.length > 0)
+            {
+                query["project_id"] = Bson(projectId);
+            }
+
+            FindOptions opts;
+            opts.sort = Bson(["started_at": Bson(-1), "updated_at": Bson(-1)]);
+            opts.limit = cast(int)limit;
+            auto cursor = m_statusCollection.find(query, opts);
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!TaskExecutionRecord(sanitizeBson(doc));
+                }
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize task execution record: %s", e.msg);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logError("Failed to list task executions for task %s (project %s): %s", taskId, projectId, e.msg);
+        }
+        return list;
+    }
+
     override void appendTaskLog(string buildId, string taskId, string line)
     {
         try

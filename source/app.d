@@ -15,9 +15,9 @@ import vibe.vibe;
 
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.storage : BuildStateRepository, InMemoryBuildStateRepository, LocalArtifactStorage;
+import confector.core.storage : BuildStateRepository, LocalArtifactStorage;
 import confector.queue.mongo_queue : MongoWorkQueue;
-import confector.queue.queue : InMemoryWorkQueue, WorkQueue;
+import confector.queue.queue : WorkQueue;
 import confector.runner.coordinator : BuildCoordinator;
 import confector.runner.engine : TaskEngine;
 import confector.storage.mongo_repository : MongoBuildStateRepository;
@@ -82,7 +82,7 @@ struct StorageContext
     WorkQueue workQueue;
 }
 
-/// Initializes MongoDB storage and queue with an in-memory fallback on connection failure.
+/// Initializes MongoDB storage and queue. Fails fast if MongoDB connection fails.
 StorageContext initStorage(string mongoHost = "mongo:27017/confector", string secretPath = "/run/secrets/mongo-readwrite-password")
 {
     StorageContext ctx;
@@ -109,9 +109,8 @@ StorageContext initStorage(string mongoHost = "mongo:27017/confector", string se
     }
     catch (Exception e)
     {
-        writeln("MongoDB connection failed, using in-memory state repository and queue: ", e.message);
-        ctx.stateRepo = new InMemoryBuildStateRepository();
-        ctx.workQueue = new InMemoryWorkQueue();
+        writefln("Fatal: Failed to connect to MongoDB at %s: %s", mongoUri, e.msg);
+        throw new Exception(format("Failed to connect to MongoDB at %s: %s", mongoUri, e.msg), e);
     }
 
     return ctx;

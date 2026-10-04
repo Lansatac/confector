@@ -25,6 +25,58 @@ struct StepProviderViewModel
     string defaultHtml;
 }
 
+// View model for task summary on dashboard
+struct DashboardTaskViewModel
+{
+    string id;
+    string name;
+    string[] dependsOn;
+    string lastStatus;          // "succeeded", "cached", "failed", "running", "never_run"
+    string changeStatus;        // "up_to_date", "pending_changes", "never_run" (stubbed)
+    string lastFingerprint;
+    string lastStartedAt;
+    ulong lastDurationMs;
+    string lastBuildId;
+}
+
+// View model for collapsible project panel on dashboard
+struct DashboardProjectViewModel
+{
+    ProjectRecord project;
+    DashboardTaskViewModel[] tasks;
+    ulong totalTasks;
+    ulong successfulTasks;
+    ulong failedTasks;
+}
+
+// View model for task execution history item
+struct TaskExecutionHistoryItem
+{
+    TaskExecutionRecord execution;
+    string buildId;
+    string projectName;
+}
+
+/**
+ * Stubbed change detection helper function.
+ * Evaluates whether a task was never run, has latest execution failures, or succeeded/cached.
+ * Returns: "up_to_date", "pending_changes", or "never_run".
+ */
+string computeStubTaskChangeStatus(const TaskNode task, const TaskExecutionRecord latestExec) pure nothrow @safe
+{
+    if (latestExec.buildId.length == 0 || latestExec.status.length == 0 || latestExec.status == "never_run")
+    {
+        return "never_run";
+    }
+
+    if (latestExec.status == "succeeded" || latestExec.status == "cached")
+    {
+        return "up_to_date";
+    }
+
+    return "pending_changes";
+}
+
 URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
 {
     if (registry is null)
@@ -35,6 +87,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
 
     // Home / Dashboard
     router.get("/", (HTTPServerRequest req, HTTPServerResponse res) {
+        auto projects = stateRepo !is null ? stateRepo.listProjects() : [];
         auto builds = stateRepo !is null ? stateRepo.listBuilds(10) : [];
         auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(10) : [];
         auto triggers = stateRepo !is null ? stateRepo.listTriggerRules() : [];
@@ -45,7 +98,69 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         ulong successfulBuilds = builds.filter!(b => b.status == "succeeded" || b.status == "cached").count;
         ulong failedBuilds = builds.filter!(b => b.status == "failed").count;
 
-        res.render!("dashboard/home.dt", builds, recentTasks, triggers, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds);
+        DashboardProjectViewModel[] dashboardProjects;
+        ulong totalProjects = projects.length;
+        ulong totalTasksAll = 0;
+        ulong successfulTasksAll = 0;
+        ulong failedTasksAll = 0;
+
+        foreach (proj; projects)
+        {
+            DashboardProjectViewModel pvm;
+            pvm.project = proj;
+            pvm.totalTasks = proj.tasks.length;
+            totalTasksAll += proj.tasks.length;
+
+            foreach (task; proj.tasks)
+            {
+                DashboardTaskViewModel tvm;
+                tvm.id = task.id;
+                tvm.name = task.name.length > 0 ? task.name : task.id;
+                tvm.dependsOn = task.dependsOn;
+
+                TaskExecutionRecord latestExec;
+                if (stateRepo !is null)
+                {
+                    auto execs = stateRepo.listTaskExecutionsForTask(proj.id, task.id, 1);
+                    if (execs.length > 0)
+                    {
+                        latestExec = execs[0];
+                    }
+                }
+
+                if (latestExec.status.length > 0)
+                {
+                    tvm.lastStatus = latestExec.status;
+                    tvm.lastFingerprint = latestExec.fingerprint;
+                    tvm.lastStartedAt = latestExec.startedAt;
+                    tvm.lastDurationMs = latestExec.durationMs;
+                    tvm.lastBuildId = latestExec.buildId;
+                }
+                else
+                {
+                    tvm.lastStatus = "never_run";
+                }
+
+                tvm.changeStatus = computeStubTaskChangeStatus(task, latestExec);
+
+                if (tvm.lastStatus == "succeeded" || tvm.lastStatus == "cached")
+                {
+                    pvm.successfulTasks++;
+                    successfulTasksAll++;
+                }
+                else if (tvm.lastStatus == "failed")
+                {
+                    pvm.failedTasks++;
+                    failedTasksAll++;
+                }
+
+                pvm.tasks ~= tvm;
+            }
+
+            dashboardProjects ~= pvm;
+        }
+
+        res.render!("dashboard/home.dt", dashboardProjects, builds, recentTasks, triggers, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds, totalProjects, totalTasksAll, successfulTasksAll, failedTasksAll);
     });
 
     // Projects Management
@@ -174,9 +289,17 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
     });
 
     // Task Editor within Project
+    router.get("/projects/tasks/add", (HTTPServerRequest req, HTTPServerResponse res) {
+        string projId = req.query.get("project_id", "");
+        if (projId.length == 0) projId = req.query.get("id", "");
+        res.redirect("/projects/tasks/edit?project_id=" ~ projId);
+    });
+
     router.get("/projects/tasks/edit", (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("project_id", "");
+        if (projId.length == 0) projId = req.query.get("id", "");
         string taskId = req.query.get("task_id", "");
+        if (taskId.length == 0) taskId = req.query.get("id", "");
 
         ProjectRecord project;
         if (stateRepo !is null && projId.length > 0)
@@ -519,7 +642,10 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         try
         {
             string projId = req.form.get("id", "");
+            if (projId.length == 0) projId = req.form.get("project_id", "");
             string targetTaskId = req.form.get("target_task_id", "");
+            if (targetTaskId.length == 0) targetTaskId = req.form.get("taskId", "");
+            if (targetTaskId.length == 0) targetTaskId = req.form.get("task_id", "");
             ProjectRecord proj;
             if (stateRepo !is null && stateRepo.getProject(projId, proj))
             {
@@ -555,8 +681,79 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         res.redirect("/tasks/");
     });
 
-    // Task Details View
+    // Task Details View (Static definition, configuration, steps, dependencies, and execution history)
     router.get("/tasks/details", (HTTPServerRequest req, HTTPServerResponse res) {
+        string buildId = req.query.get("build_id", "");
+        if (buildId.length == 0) buildId = req.query.get("build", "");
+        string projectId = req.query.get("project_id", "");
+        if (projectId.length == 0) projectId = req.query.get("project", "");
+        string taskId = req.query.get("task_id", "");
+        if (taskId.length == 0) taskId = req.query.get("id", "");
+
+        // Legacy redirect: if build_id is explicitly passed and no project_id is given,
+        // redirect to dedicated execution instance page.
+        if (buildId.length > 0 && projectId.length == 0)
+        {
+            res.redirect(format("/tasks/execution?build_id=%s&task_id=%s", buildId, taskId));
+            return;
+        }
+
+        ProjectRecord project;
+        TaskNode taskNode;
+        bool foundTask = false;
+
+        if (stateRepo !is null)
+        {
+            if (projectId.length > 0 && stateRepo.getProject(projectId, project))
+            {
+                foreach (t; project.tasks)
+                {
+                    if (t.id == taskId)
+                    {
+                        taskNode = t;
+                        foundTask = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!foundTask)
+            {
+                foreach (p; stateRepo.listProjects())
+                {
+                    foreach (t; p.tasks)
+                    {
+                        if (t.id == taskId)
+                        {
+                            project = p;
+                            projectId = p.id;
+                            taskNode = t;
+                            foundTask = true;
+                            break;
+                        }
+                    }
+                    if (foundTask) break;
+                }
+            }
+        }
+
+        if (!foundTask)
+        {
+            taskNode.id = taskId;
+            taskNode.name = taskId;
+            if (project.id.length == 0) project.id = projectId.length > 0 ? projectId : "default";
+            if (project.name.length == 0) project.name = project.id;
+        }
+
+        TaskExecutionRecord[] history = stateRepo !is null ? stateRepo.listTaskExecutionsForTask(projectId, taskId, 50) : [];
+        TaskExecutionRecord latestExec = history.length > 0 ? history[0] : TaskExecutionRecord.init;
+        string changeStatus = computeStubTaskChangeStatus(taskNode, latestExec);
+
+        res.render!("task/task-details.dt", project, taskNode, history, changeStatus);
+    });
+
+    // Dedicated Task Execution View (Runtime metrics, fingerprint, duration, exit code, produced artifacts, live logs)
+    router.get("/tasks/execution", (HTTPServerRequest req, HTTPServerResponse res) {
         string buildId = req.query.get("build_id", "");
         if (buildId.length == 0) buildId = req.query.get("build", "");
         string taskId = req.query.get("task_id", "");
@@ -592,21 +789,52 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             stateRepo.getBuild(buildId, build);
         }
 
-        TaskNode taskNode;
+        string projectId = taskRecord.projectId.length > 0 ? taskRecord.projectId : build.projectId;
         ProjectRecord project;
-        if (stateRepo !is null && build.projectId.length > 0 && stateRepo.getProject(build.projectId, project))
+        TaskNode taskNode;
+        bool foundTask = false;
+
+        if (stateRepo !is null)
         {
-            foreach (t; project.tasks)
+            if (projectId.length > 0 && stateRepo.getProject(projectId, project))
             {
-                if (t.id == taskId)
+                foreach (t; project.tasks)
                 {
-                    taskNode = t;
-                    break;
+                    if (t.id == taskId)
+                    {
+                        taskNode = t;
+                        foundTask = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!foundTask)
+            {
+                foreach (p; stateRepo.listProjects())
+                {
+                    foreach (t; p.tasks)
+                    {
+                        if (t.id == taskId)
+                        {
+                            project = p;
+                            taskNode = t;
+                            foundTask = true;
+                            break;
+                        }
+                    }
+                    if (foundTask) break;
                 }
             }
         }
 
-        res.render!("task/task-details.dt", taskRecord, logs, build, taskNode);
+        if (!foundTask)
+        {
+            taskNode.id = taskId;
+            taskNode.name = taskId;
+        }
+
+        res.render!("task/task-execution.dt", taskRecord, logs, build, taskNode, project);
     });
 
     // Builds List & Active Work Queue
@@ -780,6 +1008,151 @@ unittest
     auto recentTasks = stateRepo.listRecentTaskExecutions();
     assert(recentTasks.length >= 1);
     assert(stateRepo.getTaskLogs("b_dash_2", "test_node_2") == ["Task step log line 1"]);
+
+    // Test listTaskExecutionsForTask
+    auto taskExecs = stateRepo.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
+    assert(taskExecs.length >= 1);
+    assert(taskExecs[0].taskId == "test_node_2");
+
+    // Test computeStubTaskChangeStatus
+    TaskNode sampleNode;
+    sampleNode.id = "sample_task";
+
+    TaskExecutionRecord emptyExec;
+    assert(computeStubTaskChangeStatus(sampleNode, emptyExec) == "never_run");
+
+    TaskExecutionRecord succExec;
+    succExec.buildId = "b1";
+    succExec.taskId = "sample_task";
+    succExec.status = "succeeded";
+    assert(computeStubTaskChangeStatus(sampleNode, succExec) == "up_to_date");
+
+    TaskExecutionRecord cachedExec;
+    cachedExec.buildId = "b2";
+    cachedExec.taskId = "sample_task";
+    cachedExec.status = "cached";
+    assert(computeStubTaskChangeStatus(sampleNode, cachedExec) == "up_to_date");
+
+    TaskExecutionRecord failedExec;
+    failedExec.buildId = "b3";
+    failedExec.taskId = "sample_task";
+    failedExec.status = "failed";
+    assert(computeStubTaskChangeStatus(sampleNode, failedExec) == "pending_changes");
+
+    // Test Dashboard ViewModels
+    DashboardTaskViewModel taskVm;
+    taskVm.id = "test_node_1";
+    taskVm.name = "Test Node 1";
+    taskVm.lastStatus = "succeeded";
+    taskVm.changeStatus = "up_to_date";
+    taskVm.lastDurationMs = 120;
+    taskVm.lastBuildId = "b_dash_2";
+
+    DashboardProjectViewModel projVm;
+    projVm.project = fetchedProj;
+    projVm.tasks = [taskVm];
+    projVm.totalTasks = 1;
+    projVm.successfulTasks = 1;
+    projVm.failedTasks = 0;
+
+    assert(projVm.tasks.length == 1);
+    assert(projVm.tasks[0].id == "test_node_1");
+    assert(projVm.tasks[0].changeStatus == "up_to_date");
+
+    // Test dashboard project assembly loop logic
+    DashboardProjectViewModel[] testDashboardProjects;
+    foreach (proj; stateRepo.listProjects())
+    {
+        DashboardProjectViewModel pvm;
+        pvm.project = proj;
+        pvm.totalTasks = proj.tasks.length;
+
+        foreach (task; proj.tasks)
+        {
+            DashboardTaskViewModel tvm;
+            tvm.id = task.id;
+            tvm.name = task.name.length > 0 ? task.name : task.id;
+            tvm.dependsOn = task.dependsOn;
+
+            TaskExecutionRecord latestExec;
+            auto execs = stateRepo.listTaskExecutionsForTask(proj.id, task.id, 1);
+            if (execs.length > 0)
+            {
+                latestExec = execs[0];
+            }
+
+            if (latestExec.status.length > 0)
+            {
+                tvm.lastStatus = latestExec.status;
+                tvm.lastFingerprint = latestExec.fingerprint;
+                tvm.lastStartedAt = latestExec.startedAt;
+                tvm.lastDurationMs = latestExec.durationMs;
+                tvm.lastBuildId = latestExec.buildId;
+            }
+            else
+            {
+                tvm.lastStatus = "never_run";
+            }
+
+            tvm.changeStatus = computeStubTaskChangeStatus(task, latestExec);
+            if (tvm.lastStatus == "succeeded" || tvm.lastStatus == "cached")
+            {
+                pvm.successfulTasks++;
+            }
+            else if (tvm.lastStatus == "failed")
+            {
+                pvm.failedTasks++;
+            }
+
+            pvm.tasks ~= tvm;
+        }
+
+        testDashboardProjects ~= pvm;
+    }
+
+    assert(testDashboardProjects.length == 1);
+    assert(testDashboardProjects[0].tasks.length == 2);
+    assert(testDashboardProjects[0].tasks[0].id == "test_node_1");
+    assert(testDashboardProjects[0].tasks[0].changeStatus == "never_run");
+    assert(testDashboardProjects[0].tasks[1].id == "test_node_2");
+    assert(testDashboardProjects[0].tasks[1].changeStatus == "up_to_date");
+    assert(testDashboardProjects[0].tasks[1].lastStatus == "succeeded");
+    assert(testDashboardProjects[0].successfulTasks == 1);
+
+    // Test Task Details definition resolution and execution history retrieval
+    ProjectRecord detailProj;
+    TaskNode detailTask;
+    bool foundDetailTask = false;
+    assert(stateRepo.getProject("proj_dash_1", detailProj));
+    foreach (tsk; detailProj.tasks)
+    {
+        if (tsk.id == "test_node_2")
+        {
+            detailTask = tsk;
+            foundDetailTask = true;
+            break;
+        }
+    }
+    assert(foundDetailTask);
+    assert(detailTask.id == "test_node_2");
+    assert(detailTask.script == "echo dashboard test 2");
+    assert(detailTask.dependsOn == ["test_node_1"]);
+
+    auto node2History = stateRepo.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
+    assert(node2History.length == 1);
+    assert(node2History[0].buildId == "b_dash_2");
+    assert(node2History[0].status == "succeeded");
+    assert(node2History[0].durationMs == 45);
+    assert(node2History[0].fingerprint == "0123456789abcdef");
+
+    // Test Task Execution instance lookup and log retrieval
+    TaskExecutionRecord execRec;
+    assert(stateRepo.getTaskExecution("b_dash_2", "test_node_2", execRec));
+    assert(execRec.status == "succeeded");
+    assert(execRec.durationMs == 45);
+    auto execLogs = stateRepo.getTaskLogs("b_dash_2", "test_node_2");
+    assert(execLogs.length == 1);
+    assert(execLogs[0] == "Task step log line 1");
 
     import std.file : exists, rmdirRecurse;
     if (exists("test_dashboard_storage")) rmdirRecurse("test_dashboard_storage");

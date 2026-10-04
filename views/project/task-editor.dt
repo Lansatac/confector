@@ -25,7 +25,9 @@ block maincontent
         div
           h1 #{task.id.length > 0 ? "Edit Task: " ~ task.id : "Add New Task"}
           p Configure discrete DAG node inputs, dependencies, plugin build steps, and output declarations for project #{project.name}.
-        div
+        div(style="display: flex; gap: 8px;")
+          - if (task.id.length > 0)
+            a.btn.btn-outline(href="/tasks/details?project_id=#{project.id}&task_id=#{task.id}") Back to Task Details
           a.btn.btn-outline(href="/projects/details?id=#{project.id}") Back to Project
 
     form#task-form(action="/projects/tasks/save", method="POST", onsubmit="prepareTaskForm()", style="margin-top: 20px;")

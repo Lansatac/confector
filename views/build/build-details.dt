@@ -65,7 +65,7 @@ block maincontent
       canvas#dag-canvas(width="800", height="240")
       div.dag-node-list
         - foreach(taskId; build.executedTasks)
-          a.dag-node-card(href="/tasks/details?build_id=#{build.buildId}&task_id=#{taskId}", data-task="#{taskId}", style="text-decoration: none; color: inherit; display: block;")
+          a.dag-node-card(href="/tasks/execution?build_id=#{build.buildId}&task_id=#{taskId}", data-task="#{taskId}", style="text-decoration: none; color: inherit; display: block;")
             div.node-header
               span.node-id #{taskId}
               - auto pStatus = taskId in taskStatuses;

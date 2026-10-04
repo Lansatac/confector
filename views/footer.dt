@@ -1,1 +1,6 @@
-footer Copyright 2023 Jason Yegge
+div.footer-container
+  div.footer-text
+    strong.footer-title Confector
+    span.footer-separator &bull;
+    span.footer-desc Cloud-native DAG CI/CD engine with deterministic content caching
+  div.footer-copy &copy; 2026 Jason Yegge &bull; All rights reserved

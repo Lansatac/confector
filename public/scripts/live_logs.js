@@ -9,6 +9,7 @@
 
     var buildId = terminal.getAttribute("data-build-id");
     if (!buildId) return;
+    var taskId = terminal.getAttribute("data-task-id");
 
     var autoScroll = true;
     var autoscrollBtn = document.getElementById("btn-autoscroll");
@@ -25,7 +26,10 @@
     }
 
     function fetchLogs() {
-      fetch("/api/v1/builds/logs?id=" + encodeURIComponent(buildId))
+      var logsUrl = taskId
+        ? "/api/v1/builds/" + encodeURIComponent(buildId) + "/tasks/" + encodeURIComponent(taskId) + "/logs"
+        : "/api/v1/builds/logs?id=" + encodeURIComponent(buildId);
+      fetch(logsUrl)
         .then(function(res) {
           if (!res.ok) throw new Error("HTTP " + res.status);
           return res.json();

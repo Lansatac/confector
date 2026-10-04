@@ -77,9 +77,10 @@ block maincontent
           - foreach(t; project.tasks)
             tr
               td
-                code #{t.id}
+                a(href="/tasks/details?project_id=#{project.id}&task_id=#{t.id}")
+                  code #{t.id}
               td
-                strong #{t.name.length > 0 ? t.name : t.id}
+                a(href="/tasks/details?project_id=#{project.id}&task_id=#{t.id}", style="font-weight: 600; text-decoration: none; color: inherit;") #{t.name.length > 0 ? t.name : t.id}
               td
                 - if (t.dependsOn.length > 0)
                   div(style="display: flex; flex-wrap: wrap; gap: 4px;")
@@ -121,6 +122,7 @@ block maincontent
                     input(type="hidden", name="id", value="#{project.id}")
                     input(type="hidden", name="target_task_id", value="#{t.id}")
                     button.btn.btn-sm.btn-primary(type="submit", title="Execute this task and upstream dependencies") Run
+                  a.btn.btn-sm.btn-outline(href="/tasks/details?project_id=#{project.id}&task_id=#{t.id}") Details
                   a.btn.btn-sm.btn-outline(href="/projects/tasks/edit?project_id=#{project.id}&task_id=#{t.id}") Edit
                   form(action="/projects/tasks/delete", method="POST", style="display:inline;")
                     input(type="hidden", name="project_id", value="#{project.id}")

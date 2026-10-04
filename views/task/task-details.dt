@@ -3,61 +3,111 @@ extends layout
 block maincontent
   div.task-details-container
     div.header-section
+      div(style="margin-bottom: 8px; font-size: 0.9em;")
+        a(href="/projects/", style="color: var(--text-muted, #64748b); text-decoration: none;") Projects
+        span.text-muted(style="margin: 0 6px;") /
+        a(href="/projects/details?id=#{project.id}", style="color: var(--text-muted, #64748b); text-decoration: none;") #{project.name.length > 0 ? project.name : project.id}
+        span.text-muted(style="margin: 0 6px;") /
+        span.text-muted #{taskNode.name.length > 0 ? taskNode.name : taskNode.id}
       div.title-row
-        h1 Task Details: #{taskRecord.taskId}
+        div
+          h1 Task: #{taskNode.name.length > 0 ? taskNode.name : taskNode.id}
+          p.text-muted(style="margin: 4px 0 0 0;") Discrete DAG node definition in project #[a(href="/projects/details?id=#{project.id}") #{project.name.length > 0 ? project.name : project.id}] (#[code #{taskNode.id}])
         div.status-container
-          - if (taskRecord.status == "succeeded")
-            span.badge.badge-lg.badge-success SUCCESS
-          - else if (taskRecord.status == "cached")
-            span.badge.badge-lg.badge-cached CACHED
-          - else if (taskRecord.status == "failed")
-            span.badge.badge-lg.badge-danger FAILED
-          - else if (taskRecord.status == "running")
-            span.badge.badge-lg.badge-warning RUNNING
+          - if (changeStatus == "up_to_date")
+            span.badge.badge-lg.badge-success UP TO DATE
+          - else if (changeStatus == "pending_changes")
+            span.badge.badge-lg.badge-warning PENDING CHANGES
           - else
-            span.badge.badge-lg.badge-secondary #{taskRecord.status}
+            span.badge.badge-lg.badge-secondary NEVER RUN
 
-    div.details-grid
-      div.detail-item
-        strong Parent Build:
-        span 
-          a.build-link(href="/builds/details?id=#{taskRecord.buildId}") #{taskRecord.buildId}
-      div.detail-item
-        strong Project:
-        span  #{taskRecord.projectName.length > 0 ? taskRecord.projectName : (build.projectName.length > 0 ? build.projectName : "default")}
-      div.detail-item
-        strong Deterministic Fingerprint:
-        span 
-          - if (taskRecord.fingerprint.length > 0)
-            code #{taskRecord.fingerprint}
-          - else
-            span.text-muted unknown
-      div.detail-item
-        strong Exit Code:
-        span  #{taskRecord.exitCode}
-      div.detail-item
-        strong Started:
-        span  #{taskRecord.startedAt.length > 0 ? taskRecord.startedAt : "-"}
-      div.detail-item
-        strong Finished:
-        span  #{taskRecord.finishedAt.length > 0 ? taskRecord.finishedAt : "-"}
-      div.detail-item
-        strong Execution Duration:
-        span  #{taskRecord.durationMs} ms
+    div.toolbar-actions(style="margin-bottom: 24px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;")
+      form(action="/projects/run", method="POST", style="display:inline;")
+        input(type="hidden", name="id", value="#{project.id}")
+        input(type="hidden", name="target_task_id", value="#{taskNode.id}")
+        button.btn.btn-primary(type="submit", title="Execute this task and upstream dependencies") ⚡ Run Task
+      a.btn.btn-secondary(href="/projects/tasks/edit?project_id=#{project.id}&task_id=#{taskNode.id}") ⚙ Edit Task Settings
+      a.btn.btn-outline(href="/projects/details?id=#{project.id}") &larr; Back to Project
 
-    - if (taskRecord.errorMessage.length > 0)
-      div.alert.alert-danger(style="margin-top: 20px;")
-        strong Error: 
-        span #{taskRecord.errorMessage}
+    div.section-title-bar
+      h2 Task Configuration
+      div
+        span.badge.badge-primary #{taskNode.steps.length} step(s)
 
-    div.section-title-bar(style="margin-top: 30px;")
+    div.grid-2col(style="margin-bottom: 30px;")
+      div.card
+        h3 Dependencies & Inputs
+        table.data-table
+          tr
+            th(style="width: 140px;") Upstream Tasks
+            td
+              - if (taskNode.dependsOn.length > 0)
+                div(style="display: flex; flex-wrap: wrap; gap: 6px;")
+                  - foreach(dep; taskNode.dependsOn)
+                    a.badge.badge-secondary(href="/tasks/details?project_id=#{project.id}&task_id=#{dep}", style="text-decoration: none;") #{dep}
+              - else
+                span.text-muted Root task (No dependencies)
+          tr
+            th Repositories
+            td
+              - if (taskNode.inputs.repositories.length > 0)
+                div(style="display: flex; flex-wrap: wrap; gap: 6px;")
+                  - foreach(repo; taskNode.inputs.repositories)
+                    span.badge.badge-info #{repo}
+              - else
+                span.text-muted None
+          tr
+            th Upstream Artifacts
+            td
+              - if (taskNode.inputs.upstreamArtifacts.length > 0)
+                div(style="display: flex; flex-direction: column; gap: 4px;")
+                  - foreach(up; taskNode.inputs.upstreamArtifacts)
+                    div
+                      code #{up.taskId}:#{up.name}
+              - else
+                span.text-muted None
+
+      div.card
+        h3 Outputs & Triggers
+        table.data-table
+          tr
+            th(style="width: 140px;") Declared Outputs
+            td
+              - if (taskNode.outputs.artifacts.length > 0)
+                div(style="display: flex; flex-direction: column; gap: 4px;")
+                  - foreach(art; taskNode.outputs.artifacts)
+                    div
+                      strong #{art.effectiveId}: 
+                      code #{art.effectivePath}
+              - else
+                span.text-muted No output artifacts declared
+          tr
+            th Triggers
+            td
+              - if (taskNode.triggers.length > 0)
+                div(style="display: flex; flex-wrap: wrap; gap: 6px;")
+                  - foreach(trig; taskNode.triggers)
+                    span.badge.badge-primary #{trig.type}
+              - else
+                span.text-muted Manual dispatch only
+          tr
+            th Change Status
+            td
+              - if (changeStatus == "up_to_date")
+                span.badge.badge-success UP TO DATE
+              - else if (changeStatus == "pending_changes")
+                span.badge.badge-warning PENDING CHANGES
+              - else
+                span.badge.badge-secondary NEVER RUN
+
+    div.section-title-bar(style="margin-top: 20px;")
       h2 Build Step Breakdown
       div
-        span.badge.badge-primary #{taskNode.steps.length} steps configured
+        span.badge.badge-primary #{taskNode.steps.length} configured steps
 
     - if (taskNode.steps.length == 0)
-      div.empty-state(style="padding: 15px; margin-bottom: 20px;")
-        p No discrete build steps configured (task evaluated as no-op).
+      div.empty-state(style="padding: 15px; margin-bottom: 30px;")
+        p No discrete build steps configured.
     - else
       table.data-table(style="margin-bottom: 30px;")
         thead
@@ -87,45 +137,54 @@ block maincontent
                   span.text-muted -
               td #{step.workingDirectory.length > 0 ? step.workingDirectory : "."}
 
-    - if (taskRecord.producedArtifacts.length > 0 || taskNode.outputs.artifacts.length > 0)
-      div.section-title-bar(style="margin-top: 20px;")
-        h2 Artifacts
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Chronological Execution History
+      div
+        span.badge.badge-primary #{history.length} past run(s)
+
+    - if (history.length == 0)
+      div.empty-state(style="padding: 24px; margin-bottom: 20px;")
+        p No historical executions recorded for this task.
+        form(action="/projects/run", method="POST", style="margin-top: 10px; display:inline;")
+          input(type="hidden", name="id", value="#{project.id}")
+          input(type="hidden", name="target_task_id", value="#{taskNode.id}")
+          button.btn.btn-primary(type="submit") ⚡ Run Task Now
+    - else
       table.data-table(style="margin-bottom: 30px;")
         thead
           tr
-            th Artifact ID
-            th Declared Path
-            th Size
-            th SHA-256 Hash
+            th Parent Build
+            th Status
+            th Started
+            th Duration
+            th Fingerprint
+            th Exit Code
+            th Actions
         tbody
-          - foreach(art; taskRecord.producedArtifacts)
+          - foreach(h; history)
             tr
               td
-                strong #{art.artifactId}
-              td #{art.filePath}
-              td #{art.sizeBytes} B
+                a.build-link(href="/builds/details?id=#{h.buildId}") #{h.buildId}
               td
-                code #{art.sha256}
-          - if (taskRecord.producedArtifacts.length == 0)
-            - foreach(artDecl; taskNode.outputs.artifacts)
-              tr
-                td
-                  strong #{artDecl.effectiveId}
-                td #{artDecl.effectivePath}
-                td.text-muted -
-                td.text-muted pending
-
-    div.section-title-bar(style="margin-top: 30px;")
-      h2 Task Output Logs
-      div.log-controls
-        button.btn.btn-sm.btn-outline#btn-autoscroll Auto-scroll: ON
-        button.btn.btn-sm.btn-primary#btn-refresh-logs Refresh Logs
-
-    div.terminal-box#live-terminal(data-build-id="#{taskRecord.buildId}", data-task-id="#{taskRecord.taskId}")
-      - if (logs.length == 0)
-        div.log-empty No log output recorded for this task execution.
-      - else
-        - foreach(line; logs)
-          div.log-line #{line}
-
-  script(src="/static/scripts/live_logs.js")
+                - if (h.status == "succeeded")
+                  span.badge.badge-success SUCCESS
+                - else if (h.status == "cached")
+                  span.badge.badge-cached CACHED
+                - else if (h.status == "failed")
+                  span.badge.badge-danger FAILED
+                - else if (h.status == "running")
+                  span.badge.badge-warning RUNNING
+                - else
+                  span.badge.badge-secondary #{h.status}
+              td #{h.startedAt.length > 0 ? h.startedAt : "-"}
+              td #{h.durationMs} ms
+              td
+                - if (h.fingerprint.length >= 8)
+                  code #{h.fingerprint[0 .. 8]}...
+                - else if (h.fingerprint.length > 0)
+                  code #{h.fingerprint}
+                - else
+                  span.text-muted -
+              td #{h.exitCode}
+              td
+                a.btn.btn-sm.btn-primary(href="/tasks/execution?build_id=#{h.buildId}&task_id=#{taskNode.id}") View Execution &rarr;

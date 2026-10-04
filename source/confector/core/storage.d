@@ -313,6 +313,11 @@ interface BuildStateRepository
     TaskExecutionRecord[] listRecentTaskExecutions(size_t limit = 50, string statusFilter = null, string projectIdFilter = null);
 
     /**
+     * Lists execution records for a specific task (optionally scoped to a project).
+     */
+    TaskExecutionRecord[] listTaskExecutionsForTask(string projectId, string taskId, size_t limit = 20);
+
+    /**
      * Appends a log line to a task's isolated output stream.
      */
     void appendTaskLog(string buildId, string taskId, string line);
@@ -516,6 +521,24 @@ class InMemoryBuildStateRepository : BuildStateRepository
         if (list.length > limit)
         {
             list = list[$ - limit .. $];
+        }
+        return list;
+    }
+
+    override TaskExecutionRecord[] listTaskExecutionsForTask(string projectId, string taskId, size_t limit = 20)
+    {
+        TaskExecutionRecord[] list;
+        foreach (k, rec; m_taskRecords)
+        {
+            if (taskId.length > 0 && rec.taskId != taskId) continue;
+            if (projectId.length > 0 && rec.projectId != projectId) continue;
+            list ~= rec;
+        }
+        import std.algorithm.sorting : sort;
+        sort!((a, b) => a.startedAt > b.startedAt)(list);
+        if (list.length > limit)
+        {
+            list = list[0 .. limit];
         }
         return list;
     }
@@ -973,6 +996,35 @@ unittest
     auto buildStatuses2 = stateRepo.getTaskStatusesForBuild("b1");
     assert(buildStatuses2.length == 2);
     assert(buildStatuses2["t2"] == TaskStatus.running);
+
+    // Test listTaskExecutionsForTask
+    TaskExecutionRecord taskRec2;
+    taskRec2.buildId = "b2";
+    taskRec2.taskId = "t1";
+    taskRec2.projectId = "proj_test";
+    taskRec2.status = "cached";
+    taskRec2.startedAt = "2026-10-01T10:00:00Z";
+    stateRepo.recordTaskExecution(taskRec2);
+
+    TaskExecutionRecord taskRec3;
+    taskRec3.buildId = "b3";
+    taskRec3.taskId = "t1";
+    taskRec3.projectId = "proj_test";
+    taskRec3.status = "failed";
+    taskRec3.startedAt = "2026-10-02T10:00:00Z";
+    stateRepo.recordTaskExecution(taskRec3);
+
+    auto t1Execs = stateRepo.listTaskExecutionsForTask("proj_test", "t1");
+    assert(t1Execs.length == 2);
+    assert(t1Execs[0].buildId == "b3"); // sorted descending by startedAt
+    assert(t1Execs[1].buildId == "b2");
+
+    auto t1Limited = stateRepo.listTaskExecutionsForTask("proj_test", "t1", 1);
+    assert(t1Limited.length == 1);
+    assert(t1Limited[0].buildId == "b3");
+
+    auto t1OtherProj = stateRepo.listTaskExecutionsForTask("proj_other", "t1");
+    assert(t1OtherProj.length == 0);
 
     // ==========================================
     // Stream-based Content-Addressed Storage Tests

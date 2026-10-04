@@ -56,7 +56,7 @@ block maincontent
           - foreach(t; recentTasks)
             tr
               td
-                a.task-link(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}", style="font-weight: 600;") #{t.taskId}
+                a.task-link(href="/tasks/execution?build_id=#{t.buildId}&task_id=#{t.taskId}", style="font-weight: 600;") #{t.taskId}
               td
                 a.build-link(href="/builds/details?id=#{t.buildId}") #{t.buildId}
               td
@@ -80,7 +80,7 @@ block maincontent
               td #{t.durationMs} ms
               td #{t.startedAt}
               td
-                a.btn.btn-sm(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}") Steps & Logs
+                a.btn.btn-sm(href="/tasks/execution?build_id=#{t.buildId}&task_id=#{t.taskId}") Steps & Logs
 
     div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")
       h2 Build Execution History

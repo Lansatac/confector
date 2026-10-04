@@ -3,89 +3,151 @@ extends layout
 block maincontent
   div.dashboard-container
     div.header-section
-      h1 Confector Dashboard
-      p Cloud-native DAG CI/CD engine with deterministic content caching and decoupled workers.
+      div(style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;")
+        div
+          h1 Confector Dashboard
+          p Cloud-native DAG CI/CD engine with deterministic content caching and decoupled workers.
+        div.header-actions
+          a.btn.btn-primary(href="/projects/add") + New Project
+          a.btn.btn-outline(href="/builds/", style="margin-left: 8px;") Build History
 
     div.stats-grid
       div.stat-card
+        div.stat-label Total Projects
+        div.stat-value #{totalProjects}
+      div.stat-card
+        div.stat-label Total Tasks
+        div.stat-value #{totalTasksAll}
+      div.stat-card
+        div.stat-label Tasks Passed / Cached
+        div.stat-value.text-success #{successfulTasksAll}
+      div.stat-card
+        div.stat-label Tasks Failed
+        div.stat-value.text-danger #{failedTasksAll}
+      div.stat-card
         div.stat-label Total Builds
         div.stat-value #{totalBuilds}
-      div.stat-card
-        div.stat-label Successful / Cached
-        div.stat-value.text-success #{successfulBuilds}
-      div.stat-card
-        div.stat-label Failed
-        div.stat-value.text-danger #{failedBuilds}
       div.stat-card
         div.stat-label Queue Pending
         div.stat-value.text-info #{pendingTasks}
 
     div.section-title-bar
-      h2 Recent Task Executions
-      a.btn.btn-primary(href="/tasks/") All Tasks & Queue
+      div(style="display: flex; align-items: center; gap: 10px;")
+        h2 Projects & Tasks
+        span.badge.badge-secondary #{totalProjects} #{totalProjects == 1 ? "project" : "projects"}
+      div.section-actions
+        a.btn.btn-sm.btn-outline(href="/projects/") Manage Projects
+        a.btn.btn-sm.btn-primary(href="/projects/add", style="margin-left: 8px;") + Add Project
 
-    - if (recentTasks.length == 0)
+    - if (dashboardProjects.length == 0)
       div.empty-state
-        p No task executions recorded yet.
-        a.btn.btn-outline(href="/projects/") Run Tasks
+        p No projects registered yet. Create your first project and define tasks to get started.
+        a.btn.btn-primary(href="/projects/add", style="margin-top: 12px;") Create Project
     - else
-      table.data-table
-        thead
-          tr
-            th Task ID
-            th Parent Build
-            th Project
-            th Status
-            th Fingerprint
-            th Duration
-            th Started
-            th Actions
-        tbody
-          - foreach(t; recentTasks)
-            tr
-              td
-                a.task-link(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}", style="font-weight: 600;") #{t.taskId}
-              td
-                a.build-link(href="/builds/details?id=#{t.buildId}") #{t.buildId}
-              td #{t.projectName.length > 0 ? t.projectName : (t.projectId.length > 0 ? t.projectId : "default")}
-              td
-                - if (t.status == "succeeded")
-                  span.badge.badge-success SUCCESS
-                - else if (t.status == "cached")
-                  span.badge.badge-cached CACHED
-                - else if (t.status == "failed")
-                  span.badge.badge-danger FAILED
-                - else if (t.status == "running")
-                  span.badge.badge-warning RUNNING
-                - else
-                  span.badge.badge-secondary #{t.status}
-              td
-                - if (t.fingerprint.length >= 8)
-                  code #{t.fingerprint[0 .. 8]}...
-                - else if (t.fingerprint.length > 0)
-                  code #{t.fingerprint}
-                - else
-                  span.text-muted -
-              td #{t.durationMs} ms
-              td #{t.startedAt}
-              td
-                a.btn.btn-sm(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}") Steps & Logs
+      div.projects-accordion-list
+        - foreach(p; dashboardProjects)
+          div.project-card.accordion-card(id="project-card-#{p.project.id}")
+            div.accordion-header(data-toggle="accordion", data-target="project-content-#{p.project.id}")
+              div.accordion-title-area
+                button.accordion-toggle(type="button", aria-expanded="true", aria-controls="project-content-#{p.project.id}", title="Toggle project tasks")
+                  span.chevron-icon
+                div
+                  h3.accordion-title
+                    a(href="/projects/details?id=#{p.project.id}", onclick="event.stopPropagation();", title="View Project Details") #{p.project.name.length > 0 ? p.project.name : p.project.id}
+                  - if (p.project.description.length > 0)
+                    div.accordion-meta #{p.project.description}
+              div.accordion-actions(onclick="event.stopPropagation();")
+                span.badge.badge-outline #{p.totalTasks} #{p.totalTasks == 1 ? "task" : "tasks"}
+                - if (p.successfulTasks > 0)
+                  span.badge.badge-success #{p.successfulTasks} passed
+                - if (p.failedTasks > 0)
+                  span.badge.badge-danger #{p.failedTasks} failed
+                a.btn.btn-sm.btn-outline(href="/projects/tasks/edit?project_id=#{p.project.id}", title="Add new task to this project") + Add Task
+                a.btn.btn-sm.btn-outline(href="/projects/details?id=#{p.project.id}", title="View DAG graph and details") View DAG
+                form(method="POST", action="/projects/run", style="display: inline-block; margin: 0;")
+                  input(type="hidden", name="id", value="#{p.project.id}")
+                  button.btn.btn-sm.btn-primary(type="submit", title="Execute all tasks in this project") ⚡ Run All
 
-    div.section-title-bar(style="margin-top: 30px;")
+            div.accordion-content(id="project-content-#{p.project.id}")
+              - if (p.tasks.length == 0)
+                div.empty-state(style="padding: 24px 16px;")
+                  p No tasks registered for this project yet.
+                  a.btn.btn-sm.btn-primary(href="/projects/tasks/edit?project_id=#{p.project.id}") + Create First Task
+              - else
+                table.data-table(style="margin: 0;")
+                  thead
+                    tr
+                      th(style="width: 25%;") Task
+                      th(style="width: 20%;") Dependencies
+                      th(style="width: 15%;") Change Status
+                      th(style="width: 15%;") Last Run Status
+                      th(style="width: 15%;") Last Execution
+                      th(style="width: 10%; text-align: right;") Actions
+                  tbody
+                    - foreach(t; p.tasks)
+                      tr
+                        td
+                          div(style="font-weight: 600;")
+                            a.task-link(href="/tasks/details?project_id=#{p.project.id}&task_id=#{t.id}") #{t.name}
+                          - if (t.name != t.id)
+                            code.text-muted(style="font-size: 11px;") #{t.id}
+                        td
+                          - if (t.dependsOn.length == 0)
+                            span.text-muted(style="font-size: 12px;") (root task)
+                          - else
+                            - foreach(dep; t.dependsOn)
+                              span.badge.badge-secondary(style="margin-right: 4px; font-size: 11px;") #{dep}
+                        td
+                          - if (t.changeStatus == "up_to_date")
+                            span.badge.badge-uptodate UP TO DATE
+                          - else if (t.changeStatus == "pending_changes")
+                            span.badge.badge-pending PENDING CHANGES
+                          - else
+                            span.badge.badge-neverrun NEVER RUN
+                        td
+                          - if (t.lastStatus == "succeeded")
+                            span.badge.badge-success SUCCESS
+                          - else if (t.lastStatus == "cached")
+                            span.badge.badge-cached CACHED
+                          - else if (t.lastStatus == "failed")
+                            span.badge.badge-danger FAILED
+                          - else if (t.lastStatus == "running")
+                            span.badge.badge-running RUNNING
+                          - else
+                            span.badge.badge-secondary NEVER RUN
+                        td
+                          - if (t.lastBuildId.length > 0)
+                            div(style="font-size: 12px;")
+                              a.build-link(href="/tasks/execution?build_id=#{t.lastBuildId}&task_id=#{t.id}") #{t.lastBuildId}
+                              - if (t.lastDurationMs > 0)
+                                span.text-muted(style="margin-left: 6px;") (#{t.lastDurationMs} ms)
+                            - if (t.lastStartedAt.length > 0)
+                              div.text-muted(style="font-size: 11px;") #{t.lastStartedAt}
+                          - else
+                            span.text-muted -
+                        td(style="text-align: right;")
+                          div.btn-group(style="display: inline-flex; gap: 6px; align-items: center; justify-content: flex-end;")
+                            form(method="POST", action="/projects/run", style="display: inline-block; margin: 0;")
+                              input(type="hidden", name="id", value="#{p.project.id}")
+                              input(type="hidden", name="target_task_id", value="#{t.id}")
+                              button.btn.btn-sm.btn-primary(type="submit", title="Execute task subgraph") ⚡ Run
+                            a.btn.btn-sm.btn-outline(href="/tasks/details?project_id=#{p.project.id}&task_id=#{t.id}", title="View task configuration and history") Details
+
+    div.section-title-bar(style="margin-top: 36px;")
       h2 Recent Builds
-      a.btn.btn-outline(href="/builds/") All Builds
+      a.btn.btn-outline(href="/builds/") View All Builds
 
     - if (builds.length == 0)
       div.empty-state
         p No builds executed yet.
-        a.btn.btn-outline(href="/projects/") Run Tasks
     - else
       table.data-table
         thead
           tr
             th Build ID
+            th Project
             th Status
-            th Trigger
+            th Trigger Source
             th Started
             th Duration
             th Actions
@@ -93,7 +155,8 @@ block maincontent
           - foreach(b; builds)
             tr
               td
-                a.build-link(href="/builds/details?id=#{b.buildId}") #{b.buildId}
+                a.build-link(href="/builds/details?id=#{b.buildId}", style="font-weight: 600;") #{b.buildId}
+              td #{b.projectName.length > 0 ? b.projectName : (b.projectId.length > 0 ? b.projectId : "-")}
               td
                 - if (b.status == "succeeded")
                   span.badge.badge-success SUCCESS
@@ -102,17 +165,18 @@ block maincontent
                 - else if (b.status == "failed")
                   span.badge.badge-danger FAILED
                 - else if (b.status == "running")
-                  span.badge.badge-warning RUNNING
+                  span.badge.badge-running RUNNING
                 - else
                   span.badge.badge-secondary #{b.status}
-              td #{b.triggerSource}
+              td #{b.triggerSource.length > 0 ? b.triggerSource : "manual"}
               td #{b.startedAt}
               td #{b.durationMs} ms
               td
                 a.btn.btn-sm(href="/builds/details?id=#{b.buildId}") View Graph & Logs
 
-    div.section-title-bar(style="margin-top: 30px;")
+    div.section-title-bar(style="margin-top: 36px;")
       h2 Active Trigger Rules
+      a.btn.btn-sm.btn-outline(href="/projects/") Trigger Configuration
 
     - if (triggers.length == 0)
       div.empty-state
@@ -127,11 +191,11 @@ block maincontent
             th Criteria
             th Force Execution
         tbody
-          - foreach(t; triggers)
+          - foreach(trg; triggers)
             tr
-              td #{t.name}
-              td #{t.targetTaskId}
+              td #{trg.name}
+              td #{trg.targetTaskId}
               td
-                span.badge.badge-info #{t.triggerType}
-              td #{t.criteria}
-              td #{t.forceExecution ? "Yes" : "No"}
+                span.badge.badge-info #{trg.triggerType}
+              td #{trg.criteria}
+              td #{trg.forceExecution ? "Yes" : "No"}

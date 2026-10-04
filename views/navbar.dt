@@ -1,16 +1,13 @@
-div.menu-item
-  h1.site-title Confector
-div.menu-item
-  a.item-link(href="/") Dashboard
-div.menu-item
-  a.item-link(href="/tasks/") Tasks
-div.menu-item
-  a.item-link(href="/builds/") Builds
-div.menu-item
-  a.item-link(href="/projects/") Projects
-div.menu-item
-  a.item-link(href="/executors/") Executors
-div.menu-item
-  a.item-link(href="/repositories/") Repositories
-div.menu-item
-  a.item-link(href="/admin/plugins") Admin
+div.navbar-container
+  div.navbar-brand
+    a.brand-link(href="/")
+      span.brand-logo ⚡
+      span.brand-title Confector
+      span.brand-badge CI/CD
+  nav.navbar-nav
+    a.nav-item(href="/", data-route="dashboard") Dashboard
+    a.nav-item(href="/projects/", data-route="projects") Projects
+    a.nav-item(href="/builds/", data-route="builds") Builds
+    a.nav-item(href="/executors/", data-route="executors") Executors
+    a.nav-item(href="/repositories/", data-route="repositories") Repositories
+    a.nav-item(href="/admin/plugins", data-route="admin") Admin
