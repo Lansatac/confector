@@ -1,11 +1,30 @@
 extends layout
 
 block maincontent
-  h1 Confector - Home
-  p Add the thing!
-  form(method="POST", action='/repositories/add_repo', name='add-repo')
-    label Repository Name
-    input( name='repository-name', required )
-    label Repository Address
-    input( name='repository-address', required )
-    input(type='submit', value='Add')
+  div.repositories-container
+    div.header-section
+      div(style="margin-bottom: 8px; font-size: 0.9em;")
+        a(href="/repositories/", style="color: var(--text-muted, #64748b); text-decoration: none;") Repositories
+        span.text-muted(style="margin: 0 6px;") /
+        span.text-muted Add Repository
+      h1 Register Repository
+      p Add a remote repository address to make it available for discrete task inputs and step runners.
+
+    - if (errorMessage.length > 0)
+      div.alert.alert-danger(style="max-width: 680px; margin-top: 15px; padding: 12px 16px; background-color: #fee2e2; color: #991b1b; border-radius: 6px; border: 1px solid #f87171;")
+        strong Error: 
+        span #{errorMessage}
+
+    div.card(style="max-width: 680px; margin-top: 20px;")
+      form(action="/repositories/add", method="POST")
+        div.form-group
+          label(for="name") Repository Identifier / Name:
+          input.form-control#name(type="text", name="name", placeholder="e.g. confector-core", required)
+
+        div.form-group
+          label(for="address") Remote Address / URL:
+          input.form-control#address(type="text", name="address", placeholder="e.g. https://github.com/org/repo.git", required)
+
+        div(style="margin-top: 20px; display: flex; gap: 10px;")
+          button.btn.btn-primary(type="submit") Register Repository
+          a.btn.btn-outline(href="/repositories/") Cancel

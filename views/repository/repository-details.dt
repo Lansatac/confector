@@ -1,18 +1,81 @@
 extends layout
 
 block maincontent
-  - import vibe.data.json;
-  script(src="/static/scripts/repository/clone.js")
-  script connect(#{Json(name)})
-  h1 #{name}
-  div.repo-details-content
-    label Address: #{address}
-    form(method="POST", action='/repositories/clone_repo', name='clone-repo')
-      input( name='name', id='name', value='#{name}')
-      input( type="submit", value='Clone Repository' )
-    form(method="POST", action='/repositories/delete_repo', name='delete-repo')
-      input( name='name', id='name', value='#{name}')
-      input( type="submit", value='Delete Repository' )
-    textarea.clone-history#history(rows=20, readonly=true)
-      - foreach (ln; logLines)
-        |= ln
+  div.repo-details-container
+    div.header-section
+      div(style="margin-bottom: 8px; font-size: 0.9em;")
+        a(href="/repositories/", style="color: var(--text-muted, #64748b); text-decoration: none;") Repositories
+        span.text-muted(style="margin: 0 6px;") /
+        span.text-muted #{repoName}
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 Repository: #{repoName}
+          p.text-muted(style="margin: 4px 0 0 0;") Remote VCS repository reference.
+        div(style="display: flex; gap: 10px;")
+          a.btn.btn-outline(href="/repositories/") &larr; Back to Repositories
+
+    div.grid-2col(style="margin-top: 20px;")
+      div.card
+        h3 Repository Information
+        table.data-table
+          tr
+            th(style="width: 140px;") Name
+            td
+              strong #{repoName}
+          tr
+            th Address
+            td
+              - if (repoAddress.length > 0)
+                code #{repoAddress}
+              - else
+                span.text-muted Not specified
+          - if (repoCreatedAt.length > 0)
+            tr
+              th Registered At
+              td #{repoCreatedAt}
+
+      div.card
+        h3 Usage Summary
+        p This repository configuration is available to discrete task runners for checkout and build execution.
+        div(style="margin-top: 15px;")
+          span.badge.badge-primary #{connectedProjects.length} #{connectedProjects.length == 1 ? "project" : "projects"} using this repository
+
+    div.section-title-bar(style="margin-top: 30px;")
+      div(style="display: flex; align-items: center; gap: 10px;")
+        h2 Connected Projects
+        span.badge.badge-secondary #{connectedProjects.length} #{connectedProjects.length == 1 ? "project" : "projects"}
+
+    - if (connectedProjects.length == 0)
+      div.empty-state
+        p No projects currently reference this repository.
+        a.btn.btn-primary(href="/projects/", style="margin-top: 10px;") View Projects
+    - else
+      table.data-table
+        thead
+          tr
+            th Project Name & ID
+            th Repository Usage
+            th Associated Tasks
+            th Actions
+        tbody
+          - foreach(cp; connectedProjects)
+            tr
+              td
+                div(style="font-weight: 600;")
+                  a(href="/projects/details?id=#{cp.id}", style="text-decoration: none;") #{cp.name}
+                div.text-muted(style="font-size: 0.85em;")
+                  code #{cp.id}
+              td
+                - if (cp.isProjectDefault)
+                  span.badge.badge-success Default Project Repo
+                - else
+                  span.badge.badge-info Task Dependency
+              td
+                - if (cp.matchingTasks.length > 0)
+                  div(style="display: flex; flex-wrap: wrap; gap: 4px;")
+                    - foreach(tName; cp.matchingTasks)
+                      span.badge.badge-secondary #{tName}
+                - else
+                  span.text-muted (Project default repository)
+              td
+                a.btn.btn-sm.btn-outline(href="/projects/details?id=#{cp.id}") View Project

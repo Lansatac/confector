@@ -233,7 +233,7 @@ URLRouter createRouter(
 
     router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
 
-    router.any("/repositories/*", repositoryRouter(client));
+    router.any("/repositories/*", repositoryRouter(stateRepo));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
     return router;

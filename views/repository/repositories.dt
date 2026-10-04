@@ -1,12 +1,52 @@
 extends layout
 
 block maincontent
-  h1 Repositories
-  h2 All Repositories
-  div.repository-list
-    - foreach(r; repositories)
-      div.repository-item
-        a( href="repo_details?name=#{r.name}" ) #{r.name}
-        label Address:
-        label #{r.address}
-  a( href="add_repo" ) Add Repository
+  div.repositories-container
+    div.header-section
+      div(style="display: flex; justify-content: space-between; align-items: center;")
+        div
+          h1 Repositories
+          p Manage remote repository sources and version control inputs for task workflows.
+        div
+          a.btn.btn-primary(href="/repositories/add") + Add Repository
+
+    div.stats-grid(style="margin-top: 20px;")
+      div.stat-card
+        div.stat-value #{repoViews.length}
+        div.stat-label Total Repositories
+      div.stat-card
+        div.stat-value #{totalConnectedProjects}
+        div.stat-label Linked Projects
+
+    div.section-title-bar(style="margin-top: 25px;")
+      h2 Registered Repositories
+
+    - if (repoViews.length == 0)
+      div.empty-state
+        p No repositories registered yet. Add a repository to reference it in discrete tasks.
+        a.btn.btn-primary(href="/repositories/add", style="margin-top: 10px;") Register First Repository
+    - else
+      table.data-table
+        thead
+          tr
+            th Repository Name
+            th Remote Address / URL
+            th Linked Projects
+            th Registered At
+            th Actions
+        tbody
+          - foreach(r; repoViews)
+            tr
+              td
+                div(style="font-weight: 600;")
+                  a(href="/repositories/details?name=#{r.name}", style="text-decoration: none;") #{r.name}
+              td
+                code(style="font-size: 0.9em;") #{r.address}
+              td
+                - if (r.projectCount > 0)
+                  span.badge.badge-primary #{r.projectCount} #{r.projectCount == 1 ? "project" : "projects"}
+                - else
+                  span.text-muted 0 projects
+              td #{r.createdAt.length > 0 ? r.createdAt : "—"}
+              td
+                a.btn.btn-sm.btn-outline(href="/repositories/details?name=#{r.name}") Details

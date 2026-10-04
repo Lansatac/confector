@@ -1,4 +1,17 @@
 extends layout
 
 block maincontent
-  p Error adding repository!
+  div.repositories-container
+    div.header-section
+      div(style="margin-bottom: 8px; font-size: 0.9em;")
+        a(href="/repositories/", style="color: var(--text-muted, #64748b); text-decoration: none;") Repositories
+        span.text-muted(style="margin: 0 6px;") /
+        span.text-muted Error
+      h1 Error Registering Repository
+      p An error occurred while attempting to register the repository.
+
+    div.card(style="max-width: 680px; margin-top: 20px;")
+      p(style="color: var(--color-danger, #ef4444);") Failed to register repository. A repository with this name may already exist or invalid parameters were provided.
+      div(style="margin-top: 20px; display: flex; gap: 10px;")
+        a.btn.btn-primary(href="/repositories/add") Try Again
+        a.btn.btn-outline(href="/repositories/") Back to Repositories
