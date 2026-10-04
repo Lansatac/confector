@@ -90,7 +90,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         auto projects = stateRepo !is null ? stateRepo.listProjects() : [];
         auto builds = stateRepo !is null ? stateRepo.listBuilds(10) : [];
         auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(10) : [];
-        auto triggers = stateRepo !is null ? stateRepo.listTriggerRules() : [];
         ulong pendingTasks = queue !is null ? queue.getPendingCount() : 0;
         ulong deadLetterCount = queue !is null ? queue.getDeadLetterMessages().length : 0;
 
@@ -160,7 +159,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             dashboardProjects ~= pvm;
         }
 
-        res.render!("dashboard/home.dt", dashboardProjects, builds, recentTasks, triggers, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds, totalProjects, totalTasksAll, successfulTasksAll, failedTasksAll);
+        res.render!("dashboard/home.dt", dashboardProjects, builds, recentTasks, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds, totalProjects, totalTasksAll, successfulTasksAll, failedTasksAll);
     });
 
     // Projects Management

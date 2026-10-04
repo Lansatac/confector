@@ -173,29 +173,3 @@ block maincontent
               td #{b.durationMs} ms
               td
                 a.btn.btn-sm(href="/builds/details?id=#{b.buildId}") View Graph & Logs
-
-    div.section-title-bar(style="margin-top: 36px;")
-      h2 Active Trigger Rules
-      a.btn.btn-sm.btn-outline(href="/projects/") Trigger Configuration
-
-    - if (triggers.length == 0)
-      div.empty-state
-        p No trigger rules configured.
-    - else
-      table.data-table
-        thead
-          tr
-            th Name
-            th Target Task
-            th Type
-            th Criteria
-            th Force Execution
-        tbody
-          - foreach(trg; triggers)
-            tr
-              td #{trg.name}
-              td #{trg.targetTaskId}
-              td
-                span.badge.badge-info #{trg.triggerType}
-              td #{trg.criteria}
-              td #{trg.forceExecution ? "Yes" : "No"}
