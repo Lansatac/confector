@@ -81,4 +81,4 @@ This document outlines the architectural principles, key design decisions, subsy
 
 For specific JSON/YAML schemas, payload formats, and data contracts, refer to the documentation in [`docs/`](docs/):
 - **[Data Contracts & Schemas](docs/schemas.md)**: Task DAG YAML definitions, fingerprint hash formula, queue task messages, and artifact metadata.
-- **[Plugin Architecture Reference](docs/plugins.md)**: Plugin lifecycle, registry mechanics, and extension interfaces (`TaskRunner`, `RepositoryProvider`).
+- **[Plugin Architecture Reference](docs/plugins.md)**: Plugin lifecycle, registry mechanics, and extension interfaces (`BuildStepSystem`, `RepositoryProvider`).

@@ -82,6 +82,15 @@
         "confector:powershell_runner": "*",
         "confector:local_process": "*"
       }
+    },
+    {
+      "name": "all",
+      "targetType": "none",
+      "dependencies": {
+        "confector": "*",
+        "confector:runner": "*",
+        "confector:plugins": "*"
+      }
     }
 	]
 }

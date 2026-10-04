@@ -1,0 +1,131 @@
+extends layout
+
+block maincontent
+  div.task-details-container
+    div.header-section
+      div.title-row
+        h1 Task Details: #{taskRecord.taskId}
+        div.status-container
+          - if (taskRecord.status == "succeeded")
+            span.badge.badge-lg.badge-success SUCCESS
+          - else if (taskRecord.status == "cached")
+            span.badge.badge-lg.badge-cached CACHED
+          - else if (taskRecord.status == "failed")
+            span.badge.badge-lg.badge-danger FAILED
+          - else if (taskRecord.status == "running")
+            span.badge.badge-lg.badge-warning RUNNING
+          - else
+            span.badge.badge-lg.badge-secondary #{taskRecord.status}
+
+    div.details-grid
+      div.detail-item
+        strong Parent Build:
+        span 
+          a.build-link(href="/builds/details?id=#{taskRecord.buildId}") #{taskRecord.buildId}
+      div.detail-item
+        strong Project:
+        span  #{taskRecord.projectName.length > 0 ? taskRecord.projectName : (build.projectName.length > 0 ? build.projectName : "default")}
+      div.detail-item
+        strong Deterministic Fingerprint:
+        span 
+          - if (taskRecord.fingerprint.length > 0)
+            code #{taskRecord.fingerprint}
+          - else
+            span.text-muted unknown
+      div.detail-item
+        strong Exit Code:
+        span  #{taskRecord.exitCode}
+      div.detail-item
+        strong Started:
+        span  #{taskRecord.startedAt.length > 0 ? taskRecord.startedAt : "-"}
+      div.detail-item
+        strong Finished:
+        span  #{taskRecord.finishedAt.length > 0 ? taskRecord.finishedAt : "-"}
+      div.detail-item
+        strong Execution Duration:
+        span  #{taskRecord.durationMs} ms
+
+    - if (taskRecord.errorMessage.length > 0)
+      div.alert.alert-danger(style="margin-top: 20px;")
+        strong Error: 
+        span #{taskRecord.errorMessage}
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Build Step Breakdown
+      div
+        span.badge.badge-primary #{taskNode.steps.length} steps configured
+
+    - if (taskNode.steps.length == 0)
+      div.empty-state(style="padding: 15px; margin-bottom: 20px;")
+        p No discrete build steps configured (task evaluated as no-op).
+    - else
+      table.data-table(style="margin-bottom: 30px;")
+        thead
+          tr
+            th #
+            th Step Type
+            th Step Name
+            th Target Command / Script
+            th Working Directory
+        tbody
+          - foreach(size_t idx, step; taskNode.steps)
+            tr
+              td #{idx + 1}
+              td
+                span.badge.badge-info #{step.type}
+              td
+                strong #{step.name.length > 0 ? step.name : step.type}
+              td
+                - string cmdSummary = step.script.length > 0 ? step.script : step.command;
+                - if (cmdSummary.length == 0 && "script" in step.parameters) cmdSummary = step.parameters["script"];
+                - if (cmdSummary.length == 0 && "command" in step.parameters) cmdSummary = step.parameters["command"];
+                - if (cmdSummary.length > 60)
+                  code #{cmdSummary[0 .. 60]}...
+                - else if (cmdSummary.length > 0)
+                  code #{cmdSummary}
+                - else
+                  span.text-muted -
+              td #{step.workingDirectory.length > 0 ? step.workingDirectory : "."}
+
+    - if (taskRecord.producedArtifacts.length > 0 || taskNode.outputs.artifacts.length > 0)
+      div.section-title-bar(style="margin-top: 20px;")
+        h2 Artifacts
+      table.data-table(style="margin-bottom: 30px;")
+        thead
+          tr
+            th Artifact ID
+            th Declared Path
+            th Size
+            th SHA-256 Hash
+        tbody
+          - foreach(art; taskRecord.producedArtifacts)
+            tr
+              td
+                strong #{art.artifactId}
+              td #{art.filePath}
+              td #{art.sizeBytes} B
+              td
+                code #{art.sha256}
+          - if (taskRecord.producedArtifacts.length == 0)
+            - foreach(artDecl; taskNode.outputs.artifacts)
+              tr
+                td
+                  strong #{artDecl.effectiveId}
+                td #{artDecl.effectivePath}
+                td.text-muted -
+                td.text-muted pending
+
+    div.section-title-bar(style="margin-top: 30px;")
+      h2 Task Output Logs
+      div.log-controls
+        button.btn.btn-sm.btn-outline#btn-autoscroll Auto-scroll: ON
+        button.btn.btn-sm.btn-primary#btn-refresh-logs Refresh Logs
+
+    div.terminal-box#live-terminal(data-build-id="#{taskRecord.buildId}", data-task-id="#{taskRecord.taskId}")
+      - if (logs.length == 0)
+        div.log-empty No log output recorded for this task execution.
+      - else
+        - foreach(line; logs)
+          div.log-line #{line}
+
+  script(src="/static/scripts/live_logs.js")

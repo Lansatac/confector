@@ -141,6 +141,81 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         });
     }
 
+    // Task Execution Query and Log Endpoints
+    router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            auto repo = engine.stateRepository;
+            string statusFilter = req.query.get("status", "");
+            string projectFilter = req.query.get("project_id", "");
+            string limitStr = req.query.get("limit", "50");
+            size_t limit = 50;
+            try { import std.conv : to; limit = limitStr.to!size_t; } catch (Exception) {}
+
+            auto tasks = repo !is null ? repo.listRecentTaskExecutions(limit, statusFilter, projectFilter) : [];
+            res.writeJsonBody(tasks);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/builds/:build_id/tasks/:task_id", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string buildId = req.params["build_id"];
+            string taskId = req.params["task_id"];
+            auto repo = engine.stateRepository;
+
+            TaskExecutionRecord record;
+            if (repo !is null && repo.getTaskExecution(buildId, taskId, record))
+            {
+                res.writeJsonBody(record);
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json(format("Task execution not found for build '%s', task '%s'", buildId, taskId));
+                res.writeJsonBody(err);
+            }
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    router.get("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string buildId = req.params["build_id"];
+            string taskId = req.params["task_id"];
+            auto repo = engine.stateRepository;
+
+            string[] logs = repo !is null ? repo.getTaskLogs(buildId, taskId) : [];
+            Json resp = Json.emptyObject;
+            resp["build_id"] = Json(buildId);
+            resp["task_id"] = Json(taskId);
+            resp["logs"] = serializeToJson(logs);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
     // Remote Worker Task Completion Callback endpoints
     router.post("/tasks/:fingerprint/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
@@ -236,7 +311,8 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             {
                 foreach (line; lines)
                 {
-                    repo.appendBuildLog(buildId, line);
+                    repo.appendBuildLog(buildId, format("[%s] %s", taskId, line));
+                    repo.appendTaskLog(buildId, taskId, line);
                 }
             }
 

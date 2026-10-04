@@ -2,7 +2,6 @@ module confector.runner.serverless_runner;
 
 import confector.core.model;
 import confector.core.storage;
-import confector.core.executor : TaskRunner;
 import confector.runner.engine;
 import confector.core.plugin;
 
@@ -146,6 +145,29 @@ unittest
     import std.file : exists, isFile, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
 
+    class MockServerlessStepRunner : Plugin, BuildStepSystem
+    {
+        @property string name() const pure nothrow @safe { return "mock_serverless_runner"; }
+        @property string versionString() const pure nothrow @safe { return "1.0.0"; }
+        @property string description() const pure nothrow @safe { return "Mock Serverless Step Runner"; }
+        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        @property string systemName() const pure nothrow @safe { return "mock-serverless-step-system"; }
+        void initialize(PluginContext context = null) {}
+        void shutdown() {}
+
+        bool canExecuteStep(in BuildStep step) const { return true; }
+        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+        {
+            StepExecutionResult res;
+            res.success = true;
+            res.exitCode = 0;
+            return res;
+        }
+    }
+
+    PluginRegistry.instance.shutdownAll();
+    PluginRegistry.instance.registerPlugin(new MockServerlessStepRunner());
+
     string testDir = "test_serverless_run";
     if (exists(testDir)) rmdirRecurse(testDir);
     mkdirRecurse(testDir);
@@ -159,14 +181,7 @@ unittest
     TaskNode node;
     node.id = "echo_step";
     node.name = "Echo Step";
-    version(Windows)
-    {
-        node.script = "cmd /c \"echo serverless test\"";
-    }
-    else
-    {
-        node.script = "echo serverless test";
-    }
+    node.steps = [BuildStep("Echo Step", "process", null, "echo serverless test")];
     req.task = node;
 
     // Test struct-based execution

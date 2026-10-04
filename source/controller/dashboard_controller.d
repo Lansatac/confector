@@ -36,6 +36,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
     // Home / Dashboard
     router.get("/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto builds = stateRepo !is null ? stateRepo.listBuilds(10) : [];
+        auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(10) : [];
         auto triggers = stateRepo !is null ? stateRepo.listTriggerRules() : [];
         ulong pendingTasks = queue !is null ? queue.getPendingCount() : 0;
         ulong deadLetterCount = queue !is null ? queue.getDeadLetterMessages().length : 0;
@@ -44,7 +45,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         ulong successfulBuilds = builds.filter!(b => b.status == "succeeded" || b.status == "cached").count;
         ulong failedBuilds = builds.filter!(b => b.status == "failed").count;
 
-        res.render!("dashboard/home.dt", builds, triggers, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds);
+        res.render!("dashboard/home.dt", builds, recentTasks, triggers, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds);
     });
 
     // Projects Management
@@ -541,11 +542,79 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         res.redirect("/projects/");
     });
 
+    // Tasks List & Active Work Queue (Task-Centric View)
+    router.get("/tasks/", (HTTPServerRequest req, HTTPServerResponse res) {
+        string statusFilter = req.query.get("status", "");
+        string projectFilter = req.query.get("project_id", "");
+        auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(50, statusFilter, projectFilter) : [];
+        auto queuedTasks = queue !is null ? queue.getPendingMessages(50) : [];
+        res.render!("task/tasks.dt", recentTasks, queuedTasks, statusFilter, projectFilter);
+    });
+
+    router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.redirect("/tasks/");
+    });
+
+    // Task Details View
+    router.get("/tasks/details", (HTTPServerRequest req, HTTPServerResponse res) {
+        string buildId = req.query.get("build_id", "");
+        if (buildId.length == 0) buildId = req.query.get("build", "");
+        string taskId = req.query.get("task_id", "");
+        if (taskId.length == 0) taskId = req.query.get("id", "");
+
+        TaskExecutionRecord taskRecord;
+        bool foundRecord = stateRepo !is null && stateRepo.getTaskExecution(buildId, taskId, taskRecord);
+        if (!foundRecord)
+        {
+            taskRecord.buildId = buildId;
+            taskRecord.taskId = taskId;
+            taskRecord.status = "unknown";
+        }
+
+        string[] logs = stateRepo !is null ? stateRepo.getTaskLogs(buildId, taskId) : [];
+        if (logs.length == 0 && stateRepo !is null && buildId.length > 0)
+        {
+            auto bLogs = stateRepo.getBuildLogs(buildId);
+            string prefix = format("[%s]", taskId);
+            foreach (line; bLogs)
+            {
+                if (line.length >= prefix.length && line[0 .. prefix.length] == prefix)
+                {
+                    logs ~= line[prefix.length .. $].strip();
+                }
+            }
+            if (logs.length == 0) logs = bLogs;
+        }
+
+        BuildRecord build;
+        if (stateRepo !is null && buildId.length > 0)
+        {
+            stateRepo.getBuild(buildId, build);
+        }
+
+        TaskNode taskNode;
+        ProjectRecord project;
+        if (stateRepo !is null && build.projectId.length > 0 && stateRepo.getProject(build.projectId, project))
+        {
+            foreach (t; project.tasks)
+            {
+                if (t.id == taskId)
+                {
+                    taskNode = t;
+                    break;
+                }
+            }
+        }
+
+        res.render!("task/task-details.dt", taskRecord, logs, build, taskNode);
+    });
+
     // Builds List & Active Work Queue
     router.get("/builds/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto builds = stateRepo !is null ? stateRepo.listBuilds(50) : [];
         auto queuedTasks = queue !is null ? queue.getPendingMessages(50) : [];
-        res.render!("build/builds.dt", builds, queuedTasks);
+        auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(25) : [];
+        res.render!("build/builds.dt", builds, queuedTasks, recentTasks);
     });
 
     // Build Details & Task Graph Visualization
@@ -697,6 +766,20 @@ unittest
     TaskStatus st1, st2;
     assert(stateRepo.getTaskStatus("b_dash_2", "test_node_1", st1) && st1 == TaskStatus.cached);
     assert(stateRepo.getTaskStatus("b_dash_2", "test_node_2", st2) && st2 == TaskStatus.succeeded);
+
+    // Test task execution record and task-scoped log queries
+    TaskExecutionRecord taskRec;
+    taskRec.buildId = "b_dash_2";
+    taskRec.taskId = "test_node_2";
+    taskRec.status = "succeeded";
+    taskRec.durationMs = 45;
+    taskRec.fingerprint = "0123456789abcdef";
+    stateRepo.recordTaskExecution(taskRec);
+    stateRepo.appendTaskLog("b_dash_2", "test_node_2", "Task step log line 1");
+
+    auto recentTasks = stateRepo.listRecentTaskExecutions();
+    assert(recentTasks.length >= 1);
+    assert(stateRepo.getTaskLogs("b_dash_2", "test_node_2") == ["Task step log line 1"]);
 
     import std.file : exists, rmdirRecurse;
     if (exists("test_dashboard_storage")) rmdirRecurse("test_dashboard_storage");

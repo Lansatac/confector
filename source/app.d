@@ -223,6 +223,9 @@ URLRouter createRouter(
     router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
     router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/builds/"); });
 
+    router.any("/tasks/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
+    router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/tasks/"); });
+
     router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance));
     router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
 
@@ -271,10 +274,26 @@ void main()
 
     // Configure router and server settings
     auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, storage.client);
+    debug setLogLevel(LogLevel.info);
     auto settings = createServerSettings(8080);
 
     listenHTTP(settings, router);
 
     writeln("Starting server");
     runApplication();
+}
+
+unittest
+{
+    auto stateRepo = new InMemoryBuildStateRepository();
+    auto queue = new InMemoryWorkQueue();
+    auto storage = new LocalArtifactStorage("test_app_storage");
+    auto engine = new TaskEngine(storage, stateRepo);
+    auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
+
+    auto router = createRouter(engine, queue, coordinator, stateRepo, null);
+    assert(router !is null);
+
+    import std.file : exists, rmdirRecurse;
+    if (exists("test_app_storage")) rmdirRecurse("test_app_storage");
 }

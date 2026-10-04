@@ -1,20 +1,19 @@
 extends layout
 
 block maincontent
-  div.builds-container
+  div.tasks-container
     div.header-section
-      h1 Builds & Task Queue
-      p Track active task queues, discrete task execution stream, and parent build DAG runs.
+      h1 Task Queue & Execution Stream
+      p Real-time inspection of distributed DAG task execution units, cache status, and worker dispatch.
 
     div.section-title-bar(style="margin-top: 10px; margin-bottom: 15px;")
       h2 Active Work Queue
       div
-        span.badge.badge-primary #{queuedTasks.length} queued task units
-        a.btn.btn-sm.btn-outline(href="/tasks/", style="margin-left: 10px;") View Full Task Stream
+        span.badge.badge-primary #{queuedTasks.length} queued
 
     - if (queuedTasks.length == 0)
       div.empty-state(style="margin-bottom: 30px; padding: 20px;")
-        p Build queue is empty. No tasks currently waiting for workers.
+        p Task queue is empty. No tasks currently awaiting worker dispatch.
     - else
       table.data-table(style="margin-bottom: 30px;")
         thead
@@ -37,16 +36,23 @@ block maincontent
               td #{msg.attempt} / #{msg.maxAttempts}
               td #{msg.timeoutSeconds}s
 
-    - if (recentTasks.length > 0)
-      div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")
-        h2 Recent Task Executions
-        a.btn.btn-sm.btn-outline(href="/tasks/") View All Tasks
+    div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")
+      h2 Task Execution Stream
+      div.filter-bar
+        - if (statusFilter.length > 0 || projectFilter.length > 0)
+          a.btn.btn-sm.btn-outline(href="/tasks/") Clear Filters
 
-      table.data-table(style="margin-bottom: 30px;")
+    - if (recentTasks.length == 0)
+      div.empty-state
+        p No task executions recorded.
+        a.btn.btn-primary(href="/projects/") Run Project Tasks
+    - else
+      table.data-table
         thead
           tr
             th Task ID
             th Parent Build
+            th Project
             th Status
             th Fingerprint
             th Duration
@@ -59,6 +65,7 @@ block maincontent
                 a.task-link(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}", style="font-weight: 600;") #{t.taskId}
               td
                 a.build-link(href="/builds/details?id=#{t.buildId}") #{t.buildId}
+              td #{t.projectName.length > 0 ? t.projectName : (t.projectId.length > 0 ? t.projectId : "default")}
               td
                 - if (t.status == "succeeded")
                   span.badge.badge-success SUCCESS
@@ -81,49 +88,3 @@ block maincontent
               td #{t.startedAt}
               td
                 a.btn.btn-sm(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}") Steps & Logs
-
-    div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")
-      h2 Build Execution History
-      a.btn.btn-primary(href="/projects/") Run Project Tasks
-
-    - if (builds.length == 0)
-      div.empty-state
-        p No builds executed yet.
-        a.btn.btn-primary(href="/projects/") Run Project Tasks
-    - else
-      table.data-table
-        thead
-          tr
-            th Build ID
-            th Project
-            th Status
-            th Trigger Source
-            th Started
-            th Finished
-            th Duration
-            th Task Count
-            th Actions
-        tbody
-          - foreach(b; builds)
-            tr
-              td
-                a.build-link(href="/builds/details?id=#{b.buildId}") #{b.buildId}
-              td #{b.projectName}
-              td
-                - if (b.status == "succeeded")
-                  span.badge.badge-success SUCCESS
-                - else if (b.status == "cached")
-                  span.badge.badge-cached CACHED
-                - else if (b.status == "failed")
-                  span.badge.badge-danger FAILED
-                - else if (b.status == "running")
-                  span.badge.badge-warning RUNNING
-                - else
-                  span.badge.badge-secondary #{b.status}
-              td #{b.triggerSource}
-              td #{b.startedAt}
-              td #{b.finishedAt}
-              td #{b.durationMs} ms
-              td #{b.executedTasks.length}
-              td
-                a.btn.btn-sm(href="/builds/details?id=#{b.buildId}") DAG & Build Logs

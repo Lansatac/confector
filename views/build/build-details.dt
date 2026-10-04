@@ -65,7 +65,7 @@ block maincontent
       canvas#dag-canvas(width="800", height="240")
       div.dag-node-list
         - foreach(taskId; build.executedTasks)
-          div.dag-node-card(data-task="#{taskId}")
+          a.dag-node-card(href="/tasks/details?build_id=#{build.buildId}&task_id=#{taskId}", data-task="#{taskId}", style="text-decoration: none; color: inherit; display: block;")
             div.node-header
               span.node-id #{taskId}
               - auto pStatus = taskId in taskStatuses;
@@ -82,11 +82,12 @@ block maincontent
                 span.badge.badge-sm.badge-secondary #{statusStr}
             div.node-meta
               - if (statusStr == "cached")
-                span Cached
+                span Cached (0 ms)
               - else if (statusStr == "failed")
                 span Failed
               - else
                 span Executed
+              span(style="margin-left: 8px; color: var(--primary-color, #3b82f6);") View Details &rarr;
 
     div.section-title-bar(style="margin-top: 30px;")
       h2 Live Execution Logs

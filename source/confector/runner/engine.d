@@ -260,6 +260,7 @@ class TaskEngine
             if (m_stateRepo !is null)
             {
                 try { m_stateRepo.appendBuildLog(buildId, format("[%s] %s", task.id, line)); } catch (Exception) {}
+                try { m_stateRepo.appendTaskLog(buildId, task.id, line); } catch (Exception) {}
             }
             if (logCallback !is null)
             {
@@ -267,48 +268,37 @@ class TaskEngine
             }
         };
 
-        // 7. Execute task build steps or fallback script
+        // 7. Execute task build steps
         int taskExitCode = 0;
         bool taskSuccess = true;
         string taskErrorMessage;
 
-        if (task.steps.length > 0)
-        {
-            StepExecutionContext stepCtx;
-            stepCtx.buildId = buildId;
-            stepCtx.taskId = task.id;
-            stepCtx.workspaceDir = workspaceDir;
-            stepCtx.workingDirectory = effectiveWorkingDir;
-            stepCtx.artifactStorage = m_artifactStorage;
-            stepCtx.logCallback = combinedLogger;
-            foreach (k, v; task.environment) stepCtx.environment[k] = v;
-            foreach (k, v; task.inputs.parameters) stepCtx.taskParameters[k] = v;
+        StepExecutionContext stepCtx;
+        stepCtx.buildId = buildId;
+        stepCtx.taskId = task.id;
+        stepCtx.workspaceDir = workspaceDir;
+        stepCtx.workingDirectory = effectiveWorkingDir;
+        stepCtx.artifactStorage = m_artifactStorage;
+        stepCtx.logCallback = combinedLogger;
+        foreach (k, v; task.environment) stepCtx.environment[k] = v;
+        foreach (k, v; task.inputs.parameters) stepCtx.taskParameters[k] = v;
 
-            import std.algorithm.searching : canFind;
-            import std.json : JSONType;
-            string[] effectiveAllowedRepos;
-            string[string] effectiveRepoMap;
-            if (repositoryMap !is null)
+        import std.algorithm.searching : canFind;
+        import std.json : JSONType;
+        string[] effectiveAllowedRepos;
+        string[string] effectiveRepoMap;
+        if (repositoryMap !is null)
+        {
+            foreach (k, v; repositoryMap)
             {
-                foreach (k, v; repositoryMap)
-                {
-                    effectiveRepoMap[k] = v;
-                    if (!effectiveAllowedRepos.canFind(k)) effectiveAllowedRepos ~= k;
-                    if (!effectiveAllowedRepos.canFind(v)) effectiveAllowedRepos ~= v;
-                }
+                effectiveRepoMap[k] = v;
+                if (!effectiveAllowedRepos.canFind(k)) effectiveAllowedRepos ~= k;
+                if (!effectiveAllowedRepos.canFind(v)) effectiveAllowedRepos ~= v;
             }
-            if (allowedRepositories !is null)
-            {
-                foreach (r; allowedRepositories)
-                {
-                    if (!effectiveAllowedRepos.canFind(r)) effectiveAllowedRepos ~= r;
-                    if (r in effectiveRepoMap && !effectiveAllowedRepos.canFind(effectiveRepoMap[r]))
-                    {
-                        effectiveAllowedRepos ~= effectiveRepoMap[r];
-                    }
-                }
-            }
-            foreach (r; task.inputs.repositories)
+        }
+        if (allowedRepositories !is null)
+        {
+            foreach (r; allowedRepositories)
             {
                 if (!effectiveAllowedRepos.canFind(r)) effectiveAllowedRepos ~= r;
                 if (r in effectiveRepoMap && !effectiveAllowedRepos.canFind(effectiveRepoMap[r]))
@@ -316,91 +306,53 @@ class TaskEngine
                     effectiveAllowedRepos ~= effectiveRepoMap[r];
                 }
             }
-            if (task.hasCustomComponent("git_source"))
+        }
+        foreach (r; task.inputs.repositories)
+        {
+            if (!effectiveAllowedRepos.canFind(r)) effectiveAllowedRepos ~= r;
+            if (r in effectiveRepoMap && !effectiveAllowedRepos.canFind(effectiveRepoMap[r]))
             {
-                auto comp = task.getCustomComponent("git_source");
-                if (comp.type == JSONType.object && "url" in comp)
-                {
-                    string u = comp["url"].str;
-                    if (!effectiveAllowedRepos.canFind(u)) effectiveAllowedRepos ~= u;
-                }
-            }
-            stepCtx.allowedRepositories = effectiveAllowedRepos;
-            stepCtx.repositoryMap = effectiveRepoMap;
-
-            foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
-            {
-                string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
-                combinedLogger(format("[confector] Running build step [%d/%d]: %s", stepIdx + 1, task.steps.length, stepLabel));
-
-                auto stepSystem = PluginRegistry.instance.findStepSystem(step);
-                if (stepSystem is null)
-                {
-                    taskSuccess = false;
-                    taskExitCode = 1;
-                    taskErrorMessage = format("No plugin registered to handle build step type '%s' (step: '%s')", step.type, stepLabel);
-                    combinedLogger(format("[confector] Error: %s", taskErrorMessage));
-                    break;
-                }
-
-                auto stepResult = stepSystem.executeStep(step, stepCtx);
-                if (!stepResult.success)
-                {
-                    taskSuccess = false;
-                    taskExitCode = stepResult.exitCode != 0 ? stepResult.exitCode : 1;
-                    taskErrorMessage = stepResult.errorMessage.length > 0
-                        ? stepResult.errorMessage
-                        : format("Build step '%s' failed with exit code %d", stepLabel, taskExitCode);
-                    combinedLogger(format("[confector] Build step '%s' failed: %s", stepLabel, taskErrorMessage));
-                    break;
-                }
+                effectiveAllowedRepos ~= effectiveRepoMap[r];
             }
         }
-        else
+        if (task.hasCustomComponent("git_source"))
         {
-            // Fallback script execution via TaskExecutionSystem or TaskRunner
-            auto execSystem = PluginRegistry.instance.findExecutionSystem(task);
-            TaskRunner fallbackRunner = null;
-            if (execSystem is null)
+            auto comp = task.getCustomComponent("git_source");
+            if (comp.type == JSONType.object && "url" in comp)
             {
-                auto runners = PluginRegistry.instance.getPluginsOfType!TaskRunner();
-                if (runners.length == 0)
-                {
-                    result.status = TaskStatus.failed;
-                    result.errorMessage = "No TaskExecutionSystem or TaskRunner plugin registered in PluginRegistry";
-                    if (m_stateRepo !is null)
-                    {
-                        m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.failed, result.errorMessage);
-                    }
-                    sw.stop();
-                    result.durationMs = sw.peek.total!"msecs";
-                    return result;
-                }
-                fallbackRunner = runners[0];
+                string u = comp["url"].str;
+                if (!effectiveAllowedRepos.canFind(u)) effectiveAllowedRepos ~= u;
+            }
+        }
+        stepCtx.allowedRepositories = effectiveAllowedRepos;
+        stepCtx.repositoryMap = effectiveRepoMap;
+
+        foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
+        {
+            string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
+            combinedLogger(format("[confector] Running build step [%d/%d]: %s", stepIdx + 1, task.steps.length, stepLabel));
+
+            auto stepSystem = PluginRegistry.instance.findStepSystem(step);
+            if (stepSystem is null)
+            {
+                taskSuccess = false;
+                taskExitCode = 1;
+                taskErrorMessage = format("No plugin registered to handle build step type '%s' (step: '%s')", step.type, stepLabel);
+                combinedLogger(format("[confector] Error: %s", taskErrorMessage));
+                break;
             }
 
-            ExecutionRequest req;
-            req.command = task.script;
-            req.workingDirectory = effectiveWorkingDir;
-            foreach (k, v; task.environment)
+            auto stepResult = stepSystem.executeStep(step, stepCtx);
+            if (!stepResult.success)
             {
-                req.environmentVariables[k] = v;
+                taskSuccess = false;
+                taskExitCode = stepResult.exitCode != 0 ? stepResult.exitCode : 1;
+                taskErrorMessage = stepResult.errorMessage.length > 0
+                    ? stepResult.errorMessage
+                    : format("Build step '%s' failed with exit code %d", stepLabel, taskExitCode);
+                combinedLogger(format("[confector] Build step '%s' failed: %s", stepLabel, taskErrorMessage));
+                break;
             }
-            req.timeoutSeconds = task.timeoutSeconds;
-
-            ExecutionResult execResult;
-            if (execSystem !is null)
-            {
-                execResult = execSystem.executeTask(task, req, combinedLogger);
-            }
-            else
-            {
-                execResult = fallbackRunner.execute(req, combinedLogger);
-            }
-
-            taskExitCode = execResult.exitCode;
-            taskSuccess = execResult.success;
-            taskErrorMessage = execResult.errorMessage;
         }
 
         result.exitCode = taskExitCode;
@@ -717,67 +669,17 @@ unittest
     import std.file : rmdirRecurse, mkdirRecurse, write;
     import std.process : pipeShell, Redirect, Config, wait;
 
-    class MockEnginePlugin : Plugin, TaskRunner, TaskExecutionSystem, BuildStepSystem
+    class MockEnginePlugin : Plugin, BuildStepSystem
     {
         @property string name() const { return "mock-engine-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock engine runner plugin"; }
         @property PluginCategory category() const { return PluginCategory.runner; }
-        @property string runnerType() const { return "process"; }
         @property string systemName() const { return "mock-engine-system"; }
         @property string stepType() const { return "process"; }
 
         void initialize(PluginContext context = null) {}
         void shutdown() {}
-
-        bool canExecute(in ExecutionRequest request) const { return true; }
-        bool canExecute(in TaskNode task) const { return true; }
-
-        ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
-        {
-            ExecutionResult res;
-            try
-            {
-                auto pipe = pipeShell(request.command, Redirect.stdout | Redirect.stderrToStdout, request.environmentVariables.length > 0 ? request.environmentVariables : null, Config.retainStderr, request.workingDirectory);
-                foreach (line; pipe.stdout.byLineCopy)
-                {
-                    res.outputLines ~= line;
-                    if (logCallback !is null) logCallback(line);
-                }
-                res.exitCode = wait(pipe.pid);
-                res.success = (res.exitCode == 0);
-            }
-            catch (Exception e)
-            {
-                res.exitCode = -1;
-                res.success = false;
-                res.errorMessage = e.msg;
-            }
-            return res;
-        }
-
-        ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null)
-        {
-            ExecutionResult res;
-            try
-            {
-                auto pipe = pipeShell(task.script, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr, request.workingDirectory);
-                foreach (line; pipe.stdout.byLineCopy)
-                {
-                    res.outputLines ~= line;
-                    if (logCallback !is null) logCallback(line);
-                }
-                res.exitCode = wait(pipe.pid);
-                res.success = (res.exitCode == 0);
-            }
-            catch (Exception e)
-            {
-                res.exitCode = -1;
-                res.success = false;
-                res.errorMessage = e.msg;
-            }
-            return res;
-        }
 
         bool canExecuteStep(in BuildStep step) const
         {
@@ -823,7 +725,6 @@ unittest
                 }
                 res.exitCode = wait(pipe.pid);
                 res.success = (res.exitCode == 0);
-                if (!res.success) res.errorMessage = format("Step exited with code %d", res.exitCode);
             }
             catch (Exception e)
             {
@@ -854,11 +755,11 @@ unittest
     node1.name = "Step 1";
     version(Windows)
     {
-        node1.script = "cmd /c \"echo hello > output.txt\"";
+        node1.steps = [BuildStep("Write Output", "process", null, "cmd /c \"echo hello > output.txt\"")];
     }
     else
     {
-        node1.script = "echo hello > output.txt";
+        node1.steps = [BuildStep("Write Output", "process", null, "echo hello > output.txt")];
     }
     node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 
@@ -890,11 +791,11 @@ unittest
     node2.inputs.upstreamArtifacts = [UpstreamArtifactRef("step1", "output.txt")];
     version(Windows)
     {
-        node2.script = "cmd /c \"type output.txt > result.txt\"";
+        node2.steps = [BuildStep("Process Output", "process", null, "cmd /c \"type output.txt > result.txt\"")];
     }
     else
     {
-        node2.script = "cat output.txt > result.txt";
+        node2.steps = [BuildStep("Process Output", "process", null, "cat output.txt > result.txt")];
     }
     node2.outputs.artifacts = [OutputArtifactDecl("result.txt", "result.txt")];
 
@@ -927,7 +828,7 @@ unittest
     TaskNode nodeBad;
     nodeBad.id = "bad_step";
     nodeBad.inputs.upstreamArtifacts = [UpstreamArtifactRef("non_existent_task", "missing.txt")];
-    nodeBad.script = "cmd /c \"echo should not run\"";
+    nodeBad.steps = [BuildStep("Bad Step", "process", null, "echo should not run")];
     auto badRes = engine.executeTask("build_bad", nodeBad, testDir);
     assert(badRes.status == TaskStatus.failed);
     assert(badRes.errorMessage.length > 0);

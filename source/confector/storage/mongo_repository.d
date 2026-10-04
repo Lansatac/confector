@@ -23,6 +23,7 @@ class MongoBuildStateRepository : BuildStateRepository
     private MongoCollection m_cacheCollection;
     private MongoCollection m_buildsCollection;
     private MongoCollection m_logsCollection;
+    private MongoCollection m_taskLogsCollection;
     private MongoCollection m_triggersCollection;
     private MongoCollection m_projectsCollection;
     private MongoCollection m_repositoriesCollection;
@@ -34,6 +35,7 @@ class MongoBuildStateRepository : BuildStateRepository
         m_cacheCollection = client.getCollection(format("%s.fingerprint_cache", dbName));
         m_buildsCollection = client.getCollection(format("%s.builds", dbName));
         m_logsCollection = client.getCollection(format("%s.build_logs", dbName));
+        m_taskLogsCollection = client.getCollection(format("%s.task_logs", dbName));
         m_triggersCollection = client.getCollection(format("%s.triggers", dbName));
         m_projectsCollection = client.getCollection(format("%s.projects", dbName));
         m_repositoriesCollection = client.getCollection(format("%s.repositories", dbName));
@@ -113,6 +115,108 @@ class MongoBuildStateRepository : BuildStateRepository
             logError("Failed to list task executions for build %s: %s", buildId, e.msg);
         }
         return list;
+    }
+
+    override TaskExecutionRecord[] listRecentTaskExecutions(size_t limit = 50, string statusFilter = null, string projectIdFilter = null)
+    {
+        TaskExecutionRecord[] list;
+        try
+        {
+            Bson query = Bson.emptyObject;
+            if (statusFilter.length > 0)
+            {
+                query["status"] = Bson(statusFilter);
+            }
+            if (projectIdFilter.length > 0)
+            {
+                query["project_id"] = Bson(projectIdFilter);
+            }
+
+            FindOptions opts;
+            opts.sort = Bson(["started_at": Bson(-1), "updated_at": Bson(-1)]);
+            opts.limit = cast(int)limit;
+            auto cursor = m_statusCollection.find(query, opts);
+            foreach (doc; cursor)
+            {
+                try
+                {
+                    list ~= deserializeBson!TaskExecutionRecord(sanitizeBson(doc));
+                }
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize task execution record: %s", e.msg);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logError("Failed to list recent task executions: %s", e.msg);
+        }
+        return list;
+    }
+
+    override void appendTaskLog(string buildId, string taskId, string line)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+            query["task_id"] = Bson(taskId);
+
+            Bson update = Bson.emptyObject;
+            Bson pushField = Bson.emptyObject;
+            pushField["lines"] = Bson(line);
+            update["$push"] = pushField;
+
+            Bson setField = Bson.emptyObject;
+            setField["build_id"] = Bson(buildId);
+            setField["task_id"] = Bson(taskId);
+            setField["updated_at"] = Bson(Clock.currTime.toISOString());
+            update["$set"] = setField;
+
+            UpdateOptions opts;
+            opts.upsert = true;
+            m_taskLogsCollection.updateOne(query, update, opts);
+        }
+        catch (Exception e)
+        {
+            logError("Failed to append task log (buildId=%s, taskId=%s): %s", buildId, taskId, e.msg);
+        }
+    }
+
+    override string[] getTaskLogs(string buildId, string taskId)
+    {
+        try
+        {
+            Bson query = Bson.emptyObject;
+            query["build_id"] = Bson(buildId);
+            query["task_id"] = Bson(taskId);
+
+            auto doc = m_taskLogsCollection.findOne(query, FindOptions.init);
+            if (doc.isNull || doc.type == Bson.Type.null_)
+            {
+                return [];
+            }
+
+            auto pLines = doc.tryIndex("lines");
+            if (!pLines.isNull && pLines.get.type == Bson.Type.array)
+            {
+                string[] lines;
+                foreach (Bson item; pLines.get)
+                {
+                    if (item.type == Bson.Type.string)
+                    {
+                        lines ~= item.get!string;
+                    }
+                }
+                return lines;
+            }
+        }
+        catch (Exception e)
+        {
+            logWarn("Failed to get task logs (buildId=%s, taskId=%s): %s", buildId, taskId, e.msg);
+        }
+        return [];
     }
 
     override TaskStatus[string] getTaskStatusesForBuild(string buildId)

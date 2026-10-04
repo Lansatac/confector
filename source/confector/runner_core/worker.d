@@ -551,7 +551,7 @@ unittest
     import std.file : exists, rmdirRecurse, mkdirRecurse, write;
     import confector.core.plugin : PluginRegistry, Plugin;
     import confector.core.plugin_loader : PluginLoader;
-    import confector.plugin_api : TaskRunner, ExecutionRequest, ExecutionResult, PluginCategory, LogDelegate;
+    import confector.plugin_api : BuildStepSystem, StepExecutionContext, StepExecutionResult, PluginCategory, LogDelegate;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import vibe.core.core : runTask, sleep;
@@ -559,32 +559,33 @@ unittest
 
     scope(exit) PluginLoader.instance.unloadAll();
 
-    class MockTaskRunner : Plugin, TaskRunner
+    class MockStepRunner : Plugin, BuildStepSystem
     {
         @property string name() const pure nothrow @safe { return "mock_runner"; }
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
-        @property string description() const pure nothrow @safe { return "Mock Task Runner"; }
+        @property string description() const pure nothrow @safe { return "Mock Step Runner"; }
         @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
-        @property string runnerType() const pure nothrow @safe { return "mock"; }
+        @property string systemName() const pure nothrow @safe { return "mock-step-system"; }
         void initialize(PluginContext context = null) {}
         void shutdown() {}
 
-        ExecutionResult execute(in ExecutionRequest req, LogDelegate logCallback = null)
+        bool canExecuteStep(in BuildStep step) const { return true; }
+        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
         {
-            ExecutionResult res;
+            StepExecutionResult res;
             res.exitCode = 0;
             res.success = true;
             res.outputLines = ["Mock step execution finished successfully"];
-            if (logCallback !is null)
+            if (context.logCallback !is null)
             {
-                logCallback("Mock step execution finished successfully");
+                context.logCallback("Mock step execution finished successfully");
             }
             return res;
         }
     }
 
     PluginRegistry.instance.shutdownAll();
-    PluginRegistry.instance.registerPlugin(new MockTaskRunner());
+    PluginRegistry.instance.registerPlugin(new MockStepRunner());
 
     string testDir = "test_http_worker_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -614,7 +615,7 @@ unittest
     mockMsg.taskId = "task_test_1";
     mockMsg.nodeFingerprint = "fp_mock_123";
     mockMsg.taskNode.id = "task_test_1";
-    mockMsg.taskNode.script = "echo done";
+    mockMsg.taskNode.steps = [BuildStep("step", "mock", null, "echo done")];
 
     router.post("/api/v1/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCalled = true;
@@ -680,13 +681,41 @@ unittest
     import std.file : exists, rmdirRecurse, mkdirRecurse, write;
     import confector.core.plugin : PluginRegistry, Plugin;
     import confector.core.plugin_loader : PluginLoader;
-    import confector.plugin_api : TaskRunner, ExecutionRequest, ExecutionResult, PluginCategory, LogDelegate;
+    import confector.plugin_api : BuildStepSystem, StepExecutionContext, StepExecutionResult, PluginCategory, LogDelegate;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import vibe.core.core : runTask, sleep;
     import core.time : msecs;
 
     scope(exit) PluginLoader.instance.unloadAll();
+
+    class MockMultiStepRunner : Plugin, BuildStepSystem
+    {
+        @property string name() const pure nothrow @safe { return "mock_multistep_runner"; }
+        @property string versionString() const pure nothrow @safe { return "1.0.0"; }
+        @property string description() const pure nothrow @safe { return "Mock Multistep Runner"; }
+        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        @property string systemName() const pure nothrow @safe { return "mock-multistep-system"; }
+        void initialize(PluginContext context = null) {}
+        void shutdown() {}
+
+        bool canExecuteStep(in BuildStep step) const { return true; }
+        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+        {
+            StepExecutionResult res;
+            res.exitCode = 0;
+            res.success = true;
+            res.outputLines = ["Step finished"];
+            if (context.logCallback !is null)
+            {
+                context.logCallback(step.script.length > 0 ? step.script : step.command);
+            }
+            return res;
+        }
+    }
+
+    PluginRegistry.instance.shutdownAll();
+    PluginRegistry.instance.registerPlugin(new MockMultiStepRunner());
 
     string testDir = "test_http_multistep_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -707,7 +736,7 @@ unittest
     msgStep1.taskId = "task_step_1";
     msgStep1.nodeFingerprint = "fp_step_1";
     msgStep1.taskNode.id = "task_step_1";
-    msgStep1.taskNode.script = "echo step 1 finished";
+    msgStep1.taskNode.steps = [BuildStep("step1", "mock", null, "echo step 1 finished")];
 
     TaskQueueMessage msgStep2;
     msgStep2.messageId = "msg_step_2";
@@ -716,7 +745,7 @@ unittest
     msgStep2.taskId = "task_step_2";
     msgStep2.nodeFingerprint = "fp_step_2";
     msgStep2.taskNode.id = "task_step_2";
-    msgStep2.taskNode.script = "echo step 2 finished";
+    msgStep2.taskNode.steps = [BuildStep("step2", "mock", null, "echo step 2 finished")];
 
     router.post("/api/v1/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCount++;

@@ -49,14 +49,6 @@ struct ExecutionResult
     @optional @asName("duration_ms") ulong durationMs = 0;
 }
 
-/**
- * Task runner interface for execution environments (e.g. bash, powershell).
- */
-interface TaskRunner
-{
-    @property string runnerType() const;
-    ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null);
-}
 
 /**
  * Status or state of a provisioned worker or compute resource.

@@ -1,7 +1,7 @@
 module confector.plugin_api.system;
 
 import confector.plugin_api.model;
-import confector.plugin_api.executor : ExecutionRequest, ExecutionResult, LogDelegate;
+import confector.plugin_api.executor : LogDelegate;
 import std.json : JSONValue, JSONType;
 import vibe.data.serialization : optional;
 
@@ -51,15 +51,6 @@ interface FingerprintContributionSystem
     string contributeFingerprint(in TaskNode task, in FingerprintContributionContext context) const;
 }
 
-/**
- * Stateless system interface for executing task payloads matching specific runner components.
- */
-interface TaskExecutionSystem
-{
-    @property string systemName() const;
-    bool canExecute(in TaskNode task) const;
-    ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null);
-}
 
 /**
  * Context payload provided to a build step system during step execution.

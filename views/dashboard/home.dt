@@ -21,8 +21,59 @@ block maincontent
         div.stat-value.text-info #{pendingTasks}
 
     div.section-title-bar
+      h2 Recent Task Executions
+      a.btn.btn-primary(href="/tasks/") All Tasks & Queue
+
+    - if (recentTasks.length == 0)
+      div.empty-state
+        p No task executions recorded yet.
+        a.btn.btn-outline(href="/projects/") Run Tasks
+    - else
+      table.data-table
+        thead
+          tr
+            th Task ID
+            th Parent Build
+            th Project
+            th Status
+            th Fingerprint
+            th Duration
+            th Started
+            th Actions
+        tbody
+          - foreach(t; recentTasks)
+            tr
+              td
+                a.task-link(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}", style="font-weight: 600;") #{t.taskId}
+              td
+                a.build-link(href="/builds/details?id=#{t.buildId}") #{t.buildId}
+              td #{t.projectName.length > 0 ? t.projectName : (t.projectId.length > 0 ? t.projectId : "default")}
+              td
+                - if (t.status == "succeeded")
+                  span.badge.badge-success SUCCESS
+                - else if (t.status == "cached")
+                  span.badge.badge-cached CACHED
+                - else if (t.status == "failed")
+                  span.badge.badge-danger FAILED
+                - else if (t.status == "running")
+                  span.badge.badge-warning RUNNING
+                - else
+                  span.badge.badge-secondary #{t.status}
+              td
+                - if (t.fingerprint.length >= 8)
+                  code #{t.fingerprint[0 .. 8]}...
+                - else if (t.fingerprint.length > 0)
+                  code #{t.fingerprint}
+                - else
+                  span.text-muted -
+              td #{t.durationMs} ms
+              td #{t.startedAt}
+              td
+                a.btn.btn-sm(href="/tasks/details?build_id=#{t.buildId}&task_id=#{t.taskId}") Steps & Logs
+
+    div.section-title-bar(style="margin-top: 30px;")
       h2 Recent Builds
-      a.btn.btn-primary(href="/projects/") Projects & Tasks
+      a.btn.btn-outline(href="/builds/") All Builds
 
     - if (builds.length == 0)
       div.empty-state

@@ -1,6 +1,7 @@
 module confector.core.model;
 
 public import confector.plugin_api.model;
+public import confector.plugin_api.system : StepExecutionResult, StepExecutionContext;
 
 import std.typecons : Nullable;
 import vibe.data.json;
@@ -13,6 +14,8 @@ struct TaskExecutionRecord
 {
     @optional @asName("task_id") string taskId;
     @optional @asName("build_id") string buildId;
+    @optional @asName("project_id") string projectId;
+    @optional @asName("project_name") string projectName;
     @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached, skipped, cancelled
     @optional @asName("fingerprint") string fingerprint;
     @optional @asName("exit_code") int exitCode = 0;
@@ -22,6 +25,7 @@ struct TaskExecutionRecord
     @optional @asName("duration_ms") ulong durationMs = 0;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
+    @optional @asName("step_results") StepExecutionResult[] stepResults;
 }
 
 /**
@@ -38,6 +42,7 @@ struct TaskExecutionResult
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("duration_ms") ulong durationMs = 0;
+    @optional @asName("step_results") StepExecutionResult[] stepResults;
 }
 
 /**

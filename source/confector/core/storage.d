@@ -308,6 +308,21 @@ interface BuildStateRepository
     bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record);
 
     /**
+     * Lists recent task executions across all builds with optional filtering.
+     */
+    TaskExecutionRecord[] listRecentTaskExecutions(size_t limit = 50, string statusFilter = null, string projectIdFilter = null);
+
+    /**
+     * Appends a log line to a task's isolated output stream.
+     */
+    void appendTaskLog(string buildId, string taskId, string line);
+
+    /**
+     * Retrieves all log lines for a specific task execution.
+     */
+    string[] getTaskLogs(string buildId, string taskId);
+
+    /**
      * Retrieves all task execution records for a build.
      */
     TaskExecutionRecord[] getTaskExecutionsForBuild(string buildId);
@@ -454,6 +469,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private CacheRecord[string] m_fingerprintCache;
     private BuildRecord[string] m_builds;
     private string[][string] m_buildLogs;
+    private string[][string] m_taskLogs;
     private TriggerRuleRecord[string] m_triggerRules;
     private ProjectRecord[string] m_projects;
     private RepositoryRecord[string] m_repositories;
@@ -472,12 +488,52 @@ class InMemoryBuildStateRepository : BuildStateRepository
     override void recordTaskExecution(TaskExecutionRecord record)
     {
         string key = statusKey(record.buildId, record.taskId);
+        if (record.projectId.length == 0 || record.projectName.length == 0)
+        {
+            if (auto pb = record.buildId in m_builds)
+            {
+                if (record.projectId.length == 0) record.projectId = pb.projectId;
+                if (record.projectName.length == 0) record.projectName = pb.projectName;
+            }
+        }
         m_taskRecords[key] = record;
         m_taskStatuses[key] = cast(TaskStatus)record.status;
         if (auto pb = record.buildId in m_builds)
         {
             pb.taskRecords[record.taskId] = record;
         }
+    }
+
+    override TaskExecutionRecord[] listRecentTaskExecutions(size_t limit = 50, string statusFilter = null, string projectIdFilter = null)
+    {
+        TaskExecutionRecord[] list;
+        foreach (k, rec; m_taskRecords)
+        {
+            if (statusFilter.length > 0 && rec.status != statusFilter) continue;
+            if (projectIdFilter.length > 0 && rec.projectId != projectIdFilter) continue;
+            list ~= rec;
+        }
+        if (list.length > limit)
+        {
+            list = list[$ - limit .. $];
+        }
+        return list;
+    }
+
+    override void appendTaskLog(string buildId, string taskId, string line)
+    {
+        string key = statusKey(buildId, taskId);
+        m_taskLogs[key] ~= line;
+    }
+
+    override string[] getTaskLogs(string buildId, string taskId)
+    {
+        string key = statusKey(buildId, taskId);
+        if (auto p = key in m_taskLogs)
+        {
+            return *p;
+        }
+        return null;
     }
 
     override bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record)

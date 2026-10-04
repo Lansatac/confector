@@ -8,14 +8,14 @@ import std.json : JSONValue, JSONType;
 
 import confector.plugin_api.model;
 import confector.plugin_api.plugin;
-import confector.plugin_api.system : TaskExecutionSystem, BuildStepSystem, StepExecutionContext, StepExecutionResult;
-import confector.plugin_api.executor : TaskRunner, ExecutionRequest, ExecutionResult, LogDelegate;
+import confector.plugin_api.system : BuildStepSystem, StepExecutionContext, StepExecutionResult;
+import confector.plugin_api.executor : LogDelegate;
 
 /**
  * PowerShell script execution plugin.
- * Implements StepExecutionPlugin, TaskRunner, TaskExecutionSystem, and BuildStepSystem interfaces for PowerShell scripts.
+ * Implements StepExecutionPlugin and BuildStepSystem interfaces for PowerShell scripts.
  */
-class PowerShellRunnerPlugin : StepExecutionPlugin, TaskRunner, TaskExecutionSystem, BuildStepSystem
+class PowerShellRunnerPlugin : StepExecutionPlugin, BuildStepSystem
 {
     private PluginContext m_context;
 
@@ -23,7 +23,6 @@ class PowerShellRunnerPlugin : StepExecutionPlugin, TaskRunner, TaskExecutionSys
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "PowerShell script execution and runner plugin"; }
     @property PluginCategory category() const { return PluginCategory.runner; }
-    @property string runnerType() const { return "powershell"; }
     @property string systemName() const { return "powershell-step-system"; }
 
     void initialize(PluginContext context = null)
@@ -43,92 +42,9 @@ class PowerShellRunnerPlugin : StepExecutionPlugin, TaskRunner, TaskExecutionSys
         }
     }
 
-    bool canExecute(in ExecutionRequest request) const
-    {
-        return request.command.length > 0;
-    }
-
-    bool canExecute(in TaskNode task) const
-    {
-        if (task.hasCustomComponent("powershell") || task.hasCustomComponent("pwsh")) return true;
-        if (task.script.length > 0)
-        {
-            if (task.hasCustomComponent("shell"))
-            {
-                auto shellComp = task.getCustomComponent("shell");
-                if (shellComp.type == JSONType.string && (shellComp.str == "powershell" || shellComp.str == "pwsh"))
-                {
-                    return true;
-                }
-            }
-            if (task.hasCustomComponent("runner"))
-            {
-                auto runnerComp = task.getCustomComponent("runner");
-                if (runnerComp.type == JSONType.string && (runnerComp.str == "powershell" || runnerComp.str == "pwsh"))
-                {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     private string[] getPowerShellCommandArgs(string executable, string command) const
     {
         return [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command];
-    }
-
-    ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
-    {
-        ExecutionResult result;
-        string exe = "powershell";
-        version(Posix)
-        {
-            exe = "pwsh";
-        }
-
-        try
-        {
-            string[] args = getPowerShellCommandArgs(exe, request.command);
-            auto pipe = pipeProcess(args,
-                Redirect.stdout | Redirect.stderrToStdout,
-                request.environmentVariables.length > 0 ? request.environmentVariables : null,
-                Config.retainStderr,
-                request.workingDirectory.length > 0 ? request.workingDirectory : null);
-
-            foreach (line; pipe.stdout.byLineCopy)
-            {
-                result.outputLines ~= line;
-                if (logCallback !is null)
-                {
-                    logCallback(line);
-                }
-            }
-
-            result.exitCode = wait(pipe.pid);
-            result.success = (result.exitCode == 0);
-            if (!result.success)
-            {
-                result.errorMessage = format("PowerShell execution exited with code %d", result.exitCode);
-            }
-        }
-        catch (Exception e)
-        {
-            result.exitCode = -1;
-            result.success = false;
-            result.errorMessage = e.msg;
-            if (logCallback !is null)
-            {
-                logCallback(format("Execution error: %s", e.msg));
-            }
-        }
-
-        return result;
-    }
-
-    ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null)
-    {
-        return execute(request, logCallback);
     }
 
     bool canExecuteStep(in BuildStep step) const
@@ -234,7 +150,6 @@ unittest
     plugin.initialize(new NullPluginContext("powershell-runner"));
     assert(plugin.name == "powershell-runner");
     assert(plugin.category == PluginCategory.runner);
-    assert(plugin.runnerType == "powershell");
     assert(plugin.systemName == "powershell-step-system");
 
     BuildStep psStep;
@@ -250,12 +165,4 @@ unittest
     BuildStep bashStep;
     bashStep.type = "bash";
     assert(!plugin.canExecuteStep(bashStep));
-
-    TaskNode taskNode;
-    taskNode.id = "ps-node";
-    taskNode.script = "Write-Output hello";
-    assert(!plugin.canExecute(taskNode));
-
-    taskNode.setCustomComponent("shell", JSONValue("powershell"));
-    assert(plugin.canExecute(taskNode));
 }

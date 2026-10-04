@@ -73,7 +73,6 @@ final class PluginRegistry
     private Plugin[string] _plugins;
     private InputResolverSystem[] _inputResolvers;
     private FingerprintContributionSystem[] _fingerprintContributors;
-    private TaskExecutionSystem[] _executionSystems;
     private ArtifactPublishingSystem[] _artifactPublishers;
     private BuildStepSystem[] _stepSystems;
     private BuildStepProvider[] _stepProviders;
@@ -109,10 +108,6 @@ final class PluginRegistry
         {
             registerFingerprintContributor(contributor);
         }
-        if (auto execSystem = cast(TaskExecutionSystem) plugin)
-        {
-            registerExecutionSystem(execSystem);
-        }
         if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
         {
             registerArtifactPublisher(pubSystem);
@@ -146,15 +141,6 @@ final class PluginRegistry
         if (!_fingerprintContributors.canFind(system))
         {
             _fingerprintContributors ~= system;
-        }
-    }
-
-    public void registerExecutionSystem(TaskExecutionSystem system)
-    {
-        import std.algorithm : canFind;
-        if (!_executionSystems.canFind(system))
-        {
-            _executionSystems ~= system;
         }
     }
 
@@ -219,14 +205,6 @@ final class PluginRegistry
                     else i++;
                 }
             }
-            if (auto execSystem = cast(TaskExecutionSystem) plugin)
-            {
-                for (size_t i = 0; i < _executionSystems.length; )
-                {
-                    if (_executionSystems[i] is execSystem) _executionSystems = _executionSystems.remove(i);
-                    else i++;
-                }
-            }
             if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
             {
                 for (size_t i = 0; i < _artifactPublishers.length; )
@@ -270,11 +248,6 @@ final class PluginRegistry
     public FingerprintContributionSystem[] getFingerprintContributors()
     {
         return _fingerprintContributors;
-    }
-
-    public TaskExecutionSystem[] getExecutionSystems()
-    {
-        return _executionSystems;
     }
 
     public ArtifactPublishingSystem[] getArtifactPublishers()
@@ -333,18 +306,6 @@ final class PluginRegistry
         return null;
     }
 
-    public TaskExecutionSystem findExecutionSystem(in TaskNode task)
-    {
-        foreach (sys; _executionSystems)
-        {
-            if (sys.canExecute(task))
-            {
-                return sys;
-            }
-        }
-        return null;
-    }
-
     public Plugin getPlugin(string name)
     {
         if (auto p = name in _plugins)
@@ -379,7 +340,6 @@ final class PluginRegistry
         _plugins.clear();
         _inputResolvers.length = 0;
         _fingerprintContributors.length = 0;
-        _executionSystems.length = 0;
         _artifactPublishers.length = 0;
         _stepSystems.length = 0;
         _stepProviders.length = 0;
@@ -418,7 +378,7 @@ unittest
     assert(mock.shutdownCalled);
     assert(registry.getPlugin("mock-plugin") is null);
 
-    class IntegratedPlugin : Plugin, InputResolverSystem, TaskExecutionSystem, BuildStepSystem, BuildStepProvider
+    class IntegratedPlugin : Plugin, InputResolverSystem, BuildStepSystem, BuildStepProvider
     {
         @property string name() const { return "integrated-plugin"; }
         @property string versionString() const { return "1.0.0"; }
@@ -433,14 +393,6 @@ unittest
 
         bool canResolve(in TaskNode task) const { return task.id == "task-resolved"; }
         void resolveInputs(in TaskNode task, ref InputResolutionContext context) {}
-
-        bool canExecute(in TaskNode task) const { return task.script == "echo hello"; }
-        ExecutionResult executeTask(in TaskNode task, in ExecutionRequest request, LogDelegate logCallback = null)
-        {
-            ExecutionResult res;
-            res.success = true;
-            return res;
-        }
 
         bool canExecuteStep(in BuildStep step) const { return step.type == "test-step"; }
         StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
@@ -459,16 +411,10 @@ unittest
     registry.registerPlugin(integrated);
 
     assert(registry.getInputResolvers().length == 1);
-    assert(registry.getExecutionSystems().length == 1);
     assert(registry.getStepSystems().length == 1);
     assert(registry.getStepProviders().length == 1);
     assert(registry.getStepProvider("test-step") is integrated);
     assert(registry.getStepProvider("non-existent") is null);
-
-    TaskNode testNode;
-    testNode.id = "task-resolved";
-    testNode.script = "echo hello";
-    assert(registry.findExecutionSystem(testNode) is integrated);
 
     BuildStep step;
     step.type = "test-step";
@@ -477,7 +423,6 @@ unittest
     // Test unregistering
     registry.unregisterPlugin("integrated-plugin");
     assert(registry.getInputResolvers().length == 0);
-    assert(registry.getExecutionSystems().length == 0);
     assert(registry.getStepSystems().length == 0);
     assert(registry.getStepProviders().length == 0);
     assert(registry.getStepProvider("test-step") is null);
