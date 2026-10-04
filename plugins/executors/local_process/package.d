@@ -65,7 +65,7 @@ class LocalProcessInstance : ComputeInstance
                 }
             }
         }
-        return ["process", "bash", "powershell", "git"];
+        return ["bash", "powershell", "git"];
     }
 
     ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
@@ -411,7 +411,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             "isolateEnvironment": JSONValue(false),
             "secretToken": JSONValue(""),
             "allowedStepTypes": JSONValue([
-                JSONValue("process"),
                 JSONValue("bash"),
                 JSONValue("powershell"),
                 JSONValue("git")
