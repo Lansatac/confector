@@ -3,17 +3,52 @@ module confector.plugin_api.plugin;
 public import confector.plugin_api.logging;
 
 /**
+ * Formal plugin category indicating the role and execution boundary of a plugin.
+ */
+enum PluginCategory : string
+{
+    definition = "definition",  // Step Definition Plugins (BuildStepProvider, UI templates, validation schemas)
+    runner = "runner",          // Step Execution Plugins (BuildStepSystem, InputResolverSystem)
+    worker = "worker"           // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
+}
+
+/**
  * Base interface for all Confector plugins.
- * Encapsulates lifecycle hooks and metadata for modular extensions.
+ * Encapsulates lifecycle hooks, metadata, and category classification for modular extensions.
  */
 interface Plugin
 {
     @property string name() const;
     @property string versionString() const;
     @property string description() const;
+    @property PluginCategory category() const;
 
     void initialize(PluginContext context = null);
     void shutdown();
+}
+
+/**
+ * Interface for Step Definition Plugins.
+ * Loaded by the server/control plane to provide step UI forms, default parameters, and validation.
+ */
+interface StepDefinitionPlugin : Plugin
+{
+}
+
+/**
+ * Interface for Step Execution Plugins.
+ * Loaded exclusively by confector-runner to execute build steps and resolve task inputs.
+ */
+interface StepExecutionPlugin : Plugin
+{
+}
+
+/**
+ * Interface for Worker / Compute Provider Plugins.
+ * Loaded by the server/control plane to manage compute fleets, worker lifecycles, and credential injection.
+ */
+interface WorkerPlugin : Plugin
+{
 }
 
 /**

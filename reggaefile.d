@@ -44,8 +44,8 @@ Target[] copyDirectoryFiles(string srcDir, string destDir) {
     return targets;
 }
 
-Target pluginTarget(string name) {
-    string pluginDir = buildPath("plugins", name);
+Target pluginTarget(string name, string relPath = "") {
+    string pluginDir = buildPath("plugins", relPath.length > 0 ? relPath : name);
     Target[] srcTargets;
     if (exists(pluginDir)) {
         foreach (DirEntry entry; dirEntries(pluginDir, SpanMode.depth)) {
@@ -57,21 +57,38 @@ Target pluginTarget(string name) {
     return Target.phony("plugin-" ~ name, dubCmd(name), srcTargets);
 }
 
+Target runnerTarget() {
+    string runnerDir = buildPath("source", "confector", "runner_app");
+    Target[] srcTargets;
+    if (exists(runnerDir)) {
+        foreach (DirEntry entry; dirEntries(runnerDir, SpanMode.depth)) {
+            if (entry.isFile) {
+                srcTargets ~= Target(entry.name);
+            }
+        }
+    }
+    return Target.phony("runner", dubCmd("runner"), srcTargets);
+}
+
 Build reggaeBuild() {
     Target appTarget = app();
+    Target runnerBinary = runnerTarget();
     
     // Plugin Targets (output to bin/plugins/)
-    auto bash = pluginTarget("bash");
-    auto git = pluginTarget("git");
-    auto localExec = pluginTarget("local_executor");
-    auto powershell = pluginTarget("powershell");
+    auto bashDef = pluginTarget("bash_def", "bash/def");
+    auto bashRunner = pluginTarget("bash_runner", "bash/runner");
+    auto gitDef = pluginTarget("git_def", "git/def");
+    auto gitRunner = pluginTarget("git_runner", "git/runner");
+    auto powershellDef = pluginTarget("powershell_def", "powershell/def");
+    auto powershellRunner = pluginTarget("powershell_runner", "powershell/runner");
+    auto localProcess = pluginTarget("local_process", "executors/local_process");
     
-    auto plugins = Target.phony("plugins", "", [bash, git, localExec, powershell]);
+    auto plugins = Target.phony("plugins", "", [bashDef, bashRunner, gitDef, gitRunner, powershellDef, powershellRunner, localProcess]);
 
-    // Default 'all' target grouping application, plugins, and static/view assets
-    auto all = Target.phony("all", "", [appTarget, plugins]);
+    // Default 'all' target grouping application, runner, plugins, and static/view assets
+    auto all = Target.phony("all", "", [appTarget, runnerBinary, plugins]);
 
-    Target[] allTargets = [all, appTarget, plugins, bash, git, localExec, powershell];
+    Target[] allTargets = [all, appTarget, runnerBinary, plugins, bashDef, bashRunner, gitDef, gitRunner, powershellDef, powershellRunner, localProcess];
 
     return Build(allTargets);
 }

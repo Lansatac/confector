@@ -62,7 +62,7 @@ URLRouter adminRouter(PluginRegistry registry, PluginLoader loader = null)
         }
 
         ulong stepSystemsCount = reg.getStepSystems().length;
-        ulong executorProvidersCount = reg.getExecutorProviders().length;
+        ulong executorProvidersCount = reg.getComputeProviders().length;
 
         string errorMessage = req.query.get("error", "");
         string successMessage = req.query.get("success", "");

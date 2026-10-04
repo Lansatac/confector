@@ -1,0 +1,60 @@
+- import std.format : format;
+div.executor-config-subform
+  div.form-group
+    label(for="config_maxConcurrency") Max Concurrency (Worker Threads / Slots)
+    input#config_maxConcurrency.form-control(type="number", name="config_maxConcurrency", min="1", max="128", value=format("%d", concurrency), required)
+    small.form-help-text
+      | Maximum parallel build worker processes permitted on this host (Host CPU cores detected: 
+      = format("%d", hostCores)
+      | ).
+
+  div.form-group
+    label(for="config_workspaceDir") Workspace Directory / Sandboxed Root
+    input#config_workspaceDir.form-control(type="text", name="config_workspaceDir", value=workspaceDir, required)
+    small.form-help-text Local filesystem path where task workspaces and temporary staging areas are provisioned.
+
+  div.form-group
+    label(for="config_runnerBinary") Confector Runner Binary Path
+    input#config_runnerBinary.form-control(type="text", name="config_runnerBinary", value=runnerBinary, placeholder="bin/confector-runner")
+    small.form-help-text Path to the standalone confector-runner binary used for subprocess execution.
+
+  div.form-group
+    label(for="config_defaultShell") Default Shell
+    select#config_defaultShell.form-control(name="config_defaultShell")
+      - if (defaultShell == "powershell")
+        option(value="powershell", selected) PowerShell
+      - else
+        option(value="powershell") PowerShell
+      - if (defaultShell == "bash")
+        option(value="bash", selected) Bash
+      - else
+        option(value="bash") Bash
+      - if (defaultShell == "sh")
+        option(value="sh", selected) POSIX Shell (sh)
+      - else
+        option(value="sh") POSIX Shell (sh)
+      - if (defaultShell == "cmd")
+        option(value="cmd", selected) Windows Command Prompt (cmd.exe)
+      - else
+        option(value="cmd") Windows Command Prompt (cmd.exe)
+    small.form-help-text Primary shell invoked for generic command build steps.
+
+  div.form-group(style="margin: 15px 0; background-color: #f8fafc; padding: 10px; border-radius: 4px; border: 1px solid #e2e8f0;")
+    label(style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;")
+      - if (isolateEnvironment)
+        input#config_isolateEnvironment(type="checkbox", name="config_isolateEnvironment", value="true", checked)
+      - else
+        input#config_isolateEnvironment(type="checkbox", name="config_isolateEnvironment", value="true")
+      strong Enable Process Environment Sandboxing
+    small(style="color: #64748b; display: block; margin-top: 4px; margin-left: 24px;")
+      | When enabled, isolates runner process execution from host environment variables.
+
+  div.form-group
+    label(for="config_secretToken") Brokered Worker Secret / Token
+    input#config_secretToken.form-control(type="password", name="config_secretToken", value=secretToken, placeholder="Optional shared secret or authorization token")
+    small.form-help-text Brokered credential or registration token injected into worker subprocesses.
+
+  div.form-group
+    label(for="config_allowedStepTypes") Allowed Step Types (comma-separated)
+    input#config_allowedStepTypes.form-control(type="text", name="config_allowedStepTypes", value=allowedStepsStr)
+    small.form-help-text Supported build step types (e.g. process, bash, powershell, git).

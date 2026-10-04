@@ -1,7 +1,7 @@
 module confector.core.storage;
 
 import confector.core.model;
-import confector.core.executor : ExecutorRecord;
+import confector.core.executor : WorkerRecord;
 import std.file : exists, isFile, isDir, mkdirRecurse, read, write, copy, remove, rename, rmdir, dirEntries, SpanMode;
 import std.path : buildPath, dirName, baseName;
 import std.format : format;
@@ -420,17 +420,17 @@ interface BuildStateRepository
     /**
      * Saves or updates an executor record.
      */
-    void saveExecutor(in ExecutorRecord executor);
+    void saveExecutor(in WorkerRecord executor);
 
     /**
      * Retrieves an executor record by ID.
      */
-    bool getExecutor(string id, out ExecutorRecord executor);
+    bool getExecutor(string id, out WorkerRecord executor);
 
     /**
      * Lists all configured executors.
      */
-    ExecutorRecord[] listExecutors();
+    WorkerRecord[] listExecutors();
 
     /**
      * Deletes an executor record by ID.
@@ -457,7 +457,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private TriggerRuleRecord[string] m_triggerRules;
     private ProjectRecord[string] m_projects;
     private RepositoryRecord[string] m_repositories;
-    private ExecutorRecord[string] m_executors;
+    private WorkerRecord[string] m_executors;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -722,12 +722,12 @@ class InMemoryBuildStateRepository : BuildStateRepository
         return false;
     }
 
-    override void saveExecutor(in ExecutorRecord executor)
+    override void saveExecutor(in WorkerRecord executor)
     {
         m_executors[executor.id] = cast()executor;
     }
 
-    override bool getExecutor(string id, out ExecutorRecord executor)
+    override bool getExecutor(string id, out WorkerRecord executor)
     {
         auto p = id in m_executors;
         if (p !is null)
@@ -738,9 +738,9 @@ class InMemoryBuildStateRepository : BuildStateRepository
         return false;
     }
 
-    override ExecutorRecord[] listExecutors()
+    override WorkerRecord[] listExecutors()
     {
-        ExecutorRecord[] list;
+        WorkerRecord[] list;
         foreach (e; m_executors)
         {
             list ~= e;
@@ -856,7 +856,7 @@ unittest
 
     // Executor persistence in InMemoryBuildStateRepository
     import std.json : JSONValue;
-    ExecutorRecord exec;
+    WorkerRecord exec;
     exec.id = "exec-local-1";
     exec.name = "Local Executor 1";
     exec.providerType = "local";
@@ -868,7 +868,7 @@ unittest
 
     stateRepo.saveExecutor(exec);
     assert(stateRepo.listExecutors().length == 1);
-    ExecutorRecord fetchedExec;
+    WorkerRecord fetchedExec;
     assert(stateRepo.getExecutor("exec-local-1", fetchedExec));
     assert(fetchedExec.name == "Local Executor 1");
     assert(!fetchedExec.enabled);
@@ -877,7 +877,7 @@ unittest
     // Toggle enabled
     fetchedExec.enabled = true;
     stateRepo.saveExecutor(fetchedExec);
-    ExecutorRecord updatedExec;
+    WorkerRecord updatedExec;
     assert(stateRepo.getExecutor("exec-local-1", updatedExec));
     assert(updatedExec.enabled);
 

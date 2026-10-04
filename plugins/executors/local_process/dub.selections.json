@@ -1,0 +1,9 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"diet-ng": "1.8.4",
+		"stdx-allocator": "2.77.5",
+		"vibe-container": "1.7.1",
+		"vibe-serialization": "1.2.0"
+	}
+}

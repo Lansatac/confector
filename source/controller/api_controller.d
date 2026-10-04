@@ -6,7 +6,6 @@ import confector.core.dag;
 import confector.core.storage;
 import confector.core.trigger;
 import confector.runner.engine;
-import confector.runner.serverless_runner;
 import confector.runner.coordinator;
 import confector.queue.queue;
 
@@ -17,32 +16,6 @@ import std.datetime.systime : Clock;
 URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null)
 {
     auto router = new URLRouter();
-
-    // Serverless JSON-RPC endpoint
-    router.post("/rpc", (HTTPServerRequest req, HTTPServerResponse res) {
-        string bodyText = req.bodyReader.readAllUTF8();
-        string rpcResponse = handleServerlessJsonRpc(bodyText, engine);
-        res.contentType = "application/json";
-        res.writeBody(rpcResponse);
-    });
-
-    // Direct Task Execution endpoint
-    router.post("/tasks/execute", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            Json bodyJson = req.json;
-            ServerlessTaskRequest taskReq = deserializeJson!ServerlessTaskRequest(bodyJson);
-            ServerlessTaskResponse taskRes = executeServerlessTask(taskReq, engine);
-            res.writeJsonBody(taskRes);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
 
     // Work Queue endpoints
     if (queue !is null)
@@ -238,7 +211,52 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    // Run Project via Coordinator / Engine
+    router.post("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string buildId = req.params["build_id"];
+            string taskId = req.params["task_id"];
+            Json bodyJson = req.json;
+            string[] lines;
+            if ("lines" in bodyJson && bodyJson["lines"].type == Json.Type.array)
+            {
+                lines = deserializeJson!(string[])(bodyJson["lines"]);
+            }
+            else if ("logs" in bodyJson && bodyJson["logs"].type == Json.Type.array)
+            {
+                lines = deserializeJson!(string[])(bodyJson["logs"]);
+            }
+            else if ("line" in bodyJson && bodyJson["line"].type == Json.Type.string)
+            {
+                lines = [bodyJson["line"].get!string];
+            }
+
+            auto repo = engine.stateRepository;
+            if (repo !is null)
+            {
+                foreach (line; lines)
+                {
+                    repo.appendBuildLog(buildId, line);
+                }
+            }
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("ok");
+            resp["build_id"] = Json(buildId);
+            resp["task_id"] = Json(taskId);
+            resp["appended"] = Json(lines.length);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Run Project via the queue-backed coordinator
     router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
@@ -261,26 +279,21 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
                 return;
             }
 
-            if (coordinator !is null)
+            if (coordinator is null)
             {
-                string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, force, "api", workspaceDir);
-                Json resp = Json.emptyObject;
-                resp["build_id"] = Json(buildId);
-                resp["status"] = Json("running");
-                resp["project_id"] = Json(projectId);
-                res.writeJsonBody(resp);
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build coordinator is required for task execution");
+                res.writeJsonBody(err);
+                return;
             }
-            else
-            {
-                auto graph = new TaskGraph(proj.tasks);
-                string[] sorted = targetTaskId.length > 0 ? graph.resolveSubgraph(targetTaskId) : graph.topologicalSort();
-                ExecutionPlan plan;
-                plan.orderedTaskIds = sorted;
-                plan.toExecuteTaskIds = sorted;
-                string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
-                auto result = engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, force);
-                res.writeJsonBody(result);
-            }
+
+            string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, force, "api", workspaceDir);
+            Json resp = Json.emptyObject;
+            resp["build_id"] = Json(buildId);
+            resp["status"] = Json("queued");
+            resp["project_id"] = Json(projectId);
+            res.writeJsonBody(resp);
         }
         catch (Exception e)
         {
@@ -343,13 +356,30 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
                 }
             }
 
-            auto subGraph = new TaskGraph(subTasks);
-            string[] sortedOrder = subGraph.topologicalSort();
-            ExecutionPlan plan;
-            plan.orderedTaskIds = sortedOrder;
-            plan.toExecuteTaskIds = sortedOrder;
+            if (coordinator is null)
+            {
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build coordinator is required for task execution");
+                res.writeJsonBody(err);
+                return;
+            }
 
-            auto result = engine.executeTasks(buildId, subTasks, plan, workspaceDir, projectId, projectName, event.targetTaskId, event.force);
+            ProjectRecord triggerProject;
+            triggerProject.id = projectId;
+            triggerProject.name = projectName;
+            triggerProject.tasks = subTasks;
+            string queuedBuildId = coordinator.startBuild(
+                triggerProject,
+                null,
+                event.force,
+                "trigger",
+                workspaceDir);
+
+            Json result = Json.emptyObject;
+            result["build_id"] = Json(queuedBuildId);
+            result["status"] = Json("queued");
+            result["task_ids"] = serializeToJson(targetSubgraphs);
             res.writeJsonBody(result);
         }
         catch (Exception e)
@@ -822,29 +852,26 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
                 workspaceDir = bodyJson["workspace_dir"].get!string;
             }
 
-            auto graph = new TaskGraph(proj.tasks);
-            string[] orderedTasks;
-            if (targetTaskId.length > 0)
+            if (coordinator is null)
             {
-                orderedTasks = graph.resolveSubgraph(targetTaskId);
-            }
-            else
-            {
-                orderedTasks = graph.topologicalSort();
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build coordinator is required for task execution");
+                res.writeJsonBody(err);
+                return;
             }
 
-            ExecutionPlan plan;
-            plan.orderedTaskIds = orderedTasks;
-            plan.toExecuteTaskIds = orderedTasks;
-
-            string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
-            if ("build_id" in bodyJson && bodyJson["build_id"].type == Json.Type.string)
-            {
-                buildId = bodyJson["build_id"].get!string;
-            }
-
-            auto execResult = engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, force);
-            res.writeJsonBody(execResult);
+            string buildId = coordinator.startBuild(
+                proj,
+                targetTaskId.length > 0 ? targetTaskId : null,
+                force,
+                "api",
+                workspaceDir);
+            Json response = Json.emptyObject;
+            response["build_id"] = Json(buildId);
+            response["status"] = Json("queued");
+            response["project_id"] = Json(proj.id);
+            res.writeJsonBody(response);
         }
         catch (Exception e)
         {
@@ -884,21 +911,22 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
                 workspaceDir = bodyJson["workspace_dir"].get!string;
             }
 
-            auto graph = new TaskGraph(proj.tasks);
-            string[] orderedTasks = graph.resolveSubgraph(targetTaskId);
-
-            ExecutionPlan plan;
-            plan.orderedTaskIds = orderedTasks;
-            plan.toExecuteTaskIds = orderedTasks;
-
-            string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
-            if ("build_id" in bodyJson && bodyJson["build_id"].type == Json.Type.string)
+            if (coordinator is null)
             {
-                buildId = bodyJson["build_id"].get!string;
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build coordinator is required for task execution");
+                res.writeJsonBody(err);
+                return;
             }
 
-            auto execResult = engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, force);
-            res.writeJsonBody(execResult);
+            string buildId = coordinator.startBuild(proj, targetTaskId, force, "api", workspaceDir);
+            Json response = Json.emptyObject;
+            response["build_id"] = Json(buildId);
+            response["status"] = Json("queued");
+            response["project_id"] = Json(proj.id);
+            response["task_id"] = Json(targetTaskId);
+            res.writeJsonBody(response);
         }
         catch (Exception e)
         {
@@ -955,6 +983,7 @@ unittest
         @property string name() const { return "mock-api-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock api plugin"; }
+        @property PluginCategory category() const { return PluginCategory.definition; }
         void initialize(PluginContext context = null) {}
         void shutdown() {}
     }

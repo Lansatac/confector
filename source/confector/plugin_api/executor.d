@@ -59,9 +59,21 @@ interface TaskRunner
 }
 
 /**
- * Abstract task executor interface capable of running execution requests.
+ * Status or state of a provisioned worker or compute resource.
  */
-interface TaskExecutor
+enum WorkerStatus : string
+{
+    idle = "idle",
+    provisioning = "provisioning",
+    running = "running",
+    terminated = "terminated",
+    error = "error"
+}
+
+/**
+ * Abstract compute instance / task executor interface capable of running execution requests.
+ */
+interface ComputeInstance
 {
     @property string id() const;
     @property string providerType() const;
@@ -71,9 +83,9 @@ interface TaskExecutor
 }
 
 /**
- * Persisted record of a configured task executor.
+ * Persisted record of a configured worker pool or compute provider instance.
  */
-struct ExecutorRecord
+struct WorkerRecord
 {
     @optional string id;
     @optional string name;
@@ -97,9 +109,10 @@ struct ExecutorRecord
 }
 
 /**
- * Provider interface for dynamically creating and configuring task executors.
+ * Worker / Compute Provider interface responsible for provisioning compute infrastructure,
+ * worker fleet lifecycle management, credential injection, and configuration rendering.
  */
-interface ExecutorProvider
+interface ComputeProvider
 {
     @property string providerType() const;
     @property string displayName() const;
@@ -109,12 +122,12 @@ interface ExecutorProvider
     JSONValue defaultConfig() const;
     string[] validateConfig(in JSONValue config) const;
     string renderConfigFormHtml(in JSONValue currentConfig) const;
-    TaskExecutor createExecutor(in ExecutorRecord record);
+    ComputeInstance createExecutor(in WorkerRecord record);
 }
 
 unittest
 {
-    ExecutorRecord rec;
+    WorkerRecord rec;
     rec.id = "e-1";
     rec.name = "Runner";
     rec.providerType = "local";

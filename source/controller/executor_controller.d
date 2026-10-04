@@ -4,7 +4,7 @@ import vibe.vibe;
 import confector.core.model;
 import confector.core.storage : BuildStateRepository;
 import confector.core.plugin : PluginRegistry;
-import confector.core.executor : ExecutorProvider, ExecutorRecord, TaskExecutor;
+import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance;
 import confector.core.json_compat : toStdJson, toVibeJson;
 
 import std.algorithm : filter, count;
@@ -27,7 +27,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     // 1. Executors List View
     router.get("/executors/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto executors = stateRepo !is null ? stateRepo.listExecutors() : [];
-        auto providers = registry !is null ? registry.getExecutorProviders() : [];
+        auto providers = registry !is null ? registry.getComputeProviders() : [];
 
         size_t enabledCount = executors.filter!(e => e.enabled).count;
         size_t disabledCount = executors.length - enabledCount;
@@ -37,13 +37,13 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 
     // 2. Add Executor View
     router.get("/executors/add", (HTTPServerRequest req, HTTPServerResponse res) {
-        auto providers = registry !is null ? registry.getExecutorProviders() : [];
+        auto providers = registry !is null ? registry.getComputeProviders() : [];
         string selectedType = req.query.get("provider", "");
 
-        ExecutorProvider selectedProvider = null;
+        ComputeProvider selectedProvider = null;
         if (selectedType.length > 0 && registry !is null)
         {
-            selectedProvider = registry.getExecutorProvider(selectedType);
+            selectedProvider = registry.getComputeProvider(selectedType);
         }
         if (selectedProvider is null && providers.length > 0)
         {
@@ -61,7 +61,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     });
 
     // Helper function to build Json configuration from form
-    Json buildConfigFromForm(HTTPServerRequest req, ExecutorProvider provider)
+    Json buildConfigFromForm(HTTPServerRequest req, ComputeProvider provider)
     {
         Json config = provider !is null ? provider.defaultConfig().toVibeJson : Json.emptyObject;
         if (config.type != Json.Type.object)
@@ -94,6 +94,24 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
             config["defaultShell"] = defaultShellStr;
         }
 
+        string runnerBinaryStr = req.form.get("config_runnerBinary", "");
+        if (runnerBinaryStr.length > 0)
+        {
+            config["runnerBinary"] = runnerBinaryStr;
+        }
+
+        string secretTokenStr = req.form.get("config_secretToken", "");
+        if (secretTokenStr.length > 0)
+        {
+            config["secretToken"] = secretTokenStr;
+        }
+
+        string isolateEnvStr = req.form.get("config_isolateEnvironment", "");
+        if (isolateEnvStr.length > 0)
+        {
+            config["isolateEnvironment"] = (isolateEnvStr == "true" || isolateEnvStr == "1" || isolateEnvStr == "on");
+        }
+
         string allowedStepTypesStr = req.form.get("config_allowedStepTypes", "");
         if (allowedStepTypesStr.length > 0)
         {
@@ -121,7 +139,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
         }
 
         string providerType = req.form.get("provider_type", "").strip;
-        ExecutorProvider provider = registry !is null ? registry.getExecutorProvider(providerType) : null;
+        ComputeProvider provider = registry !is null ? registry.getComputeProvider(providerType) : null;
 
         Json config = buildConfigFromForm(req, provider);
 
@@ -136,7 +154,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
             }
         }
 
-        ExecutorRecord record;
+        WorkerRecord record;
         record.id = execId;
         record.name = req.form.get("name", "Local Executor").strip;
         record.providerType = providerType;
@@ -159,7 +177,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     // 4. Details View
     router.get("/executors/details", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.query.get("id", "");
-        ExecutorRecord executor;
+        WorkerRecord executor;
         bool found = stateRepo !is null && stateRepo.getExecutor(id, executor);
         if (!found)
         {
@@ -169,7 +187,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
             executor.configuration = JSONValue(string[string].init);
         }
 
-        ExecutorProvider provider = registry !is null ? registry.getExecutorProvider(executor.providerType) : null;
+        ComputeProvider provider = registry !is null ? registry.getComputeProvider(executor.providerType) : null;
         string configPrettyJson = executor.configuration.toPrettyString();
 
         res.render!("executor/executor-details.dt", executor, provider, configPrettyJson);
@@ -178,10 +196,10 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     // 5. Edit View
     router.get("/executors/edit", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.query.get("id", "");
-        ExecutorRecord executor;
+        WorkerRecord executor;
         bool found = stateRepo !is null && stateRepo.getExecutor(id, executor);
 
-        ExecutorProvider provider = registry !is null ? registry.getExecutorProvider(executor.providerType) : null;
+        ComputeProvider provider = registry !is null ? registry.getComputeProvider(executor.providerType) : null;
         string configFormHtml = provider !is null ? provider.renderConfigFormHtml(executor.configuration) : "";
 
         string errorMessage = req.query.get("error", "");
@@ -192,7 +210,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     router.post("/executors/save", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.form.get("id", "");
         string providerType = req.form.get("provider_type", "");
-        ExecutorProvider provider = registry !is null ? registry.getExecutorProvider(providerType) : null;
+        ComputeProvider provider = registry !is null ? registry.getComputeProvider(providerType) : null;
 
         Json config = buildConfigFromForm(req, provider);
 
@@ -207,10 +225,10 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
             }
         }
 
-        ExecutorRecord existing;
+        WorkerRecord existing;
         bool found = stateRepo !is null && stateRepo.getExecutor(id, existing);
 
-        ExecutorRecord record;
+        WorkerRecord record;
         record.id = id;
         record.name = req.form.get("name", existing.name).strip;
         record.providerType = providerType.length > 0 ? providerType : existing.providerType;
@@ -231,7 +249,7 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     // 7. Toggle Enable/Disable
     router.post("/executors/toggle", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.form.get("id", "");
-        ExecutorRecord executor;
+        WorkerRecord executor;
         if (stateRepo !is null && stateRepo.getExecutor(id, executor))
         {
             executor.enabled = !executor.enabled;
@@ -259,14 +277,15 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
 unittest
 {
     import confector.core.storage : InMemoryBuildStateRepository;
-    import confector.core.plugin : Plugin, PluginContext;
-    import confector.core.executor : ExecutorProvider, TaskExecutor;
+    import confector.core.plugin : Plugin, PluginContext, PluginCategory;
+    import confector.core.executor : ComputeProvider, ComputeInstance, WorkerRecord;
 
-    class MockExecutorProvider : Plugin, ExecutorProvider
+    class MockComputeProvider : Plugin, ComputeProvider
     {
         @property string name() const { return "mock-executor-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock Executor Provider"; }
+        @property PluginCategory category() const { return PluginCategory.worker; }
         @property string providerType() const { return "mock-local"; }
         @property string displayName() const { return "Mock Local Executor"; }
         @property string[] supportedStepTypes() const { return ["process", "mock"]; }
@@ -282,24 +301,24 @@ unittest
 
         string[] validateConfig(in JSONValue config) const { return null; }
         string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Mock Config</div>"; }
-        TaskExecutor createExecutor(in ExecutorRecord record) const { return null; }
+        ComputeInstance createExecutor(in WorkerRecord record) { return null; }
     }
 
     auto repo = new InMemoryBuildStateRepository();
     auto reg = PluginRegistry.instance;
     reg.shutdownAll();
 
-    auto mockPlugin = new MockExecutorProvider();
+    auto mockPlugin = new MockComputeProvider();
     reg.registerPlugin(mockPlugin);
 
-    assert(reg.getExecutorProviders().length == 1);
-    assert(reg.getExecutorProvider("mock-local") is mockPlugin);
+    assert(reg.getComputeProviders().length == 1);
+    assert(reg.getComputeProvider("mock-local") is mockPlugin);
 
     auto router = executorRouter(repo, reg);
     assert(router !is null);
 
     // Test record persistence and disabled by default status
-    ExecutorRecord exec;
+    WorkerRecord exec;
     exec.id = "exec-test-init";
     exec.name = "Initial Executor";
     exec.providerType = "mock-local";
@@ -308,7 +327,7 @@ unittest
     repo.saveExecutor(exec);
 
     assert(repo.listExecutors().length == 1);
-    ExecutorRecord fetched;
+    WorkerRecord fetched;
     assert(repo.getExecutor("exec-test-init", fetched));
     assert(!fetched.enabled);
 

@@ -6,7 +6,7 @@ unittest
 {
     import std.json : JSONValue;
 
-    ExecutorRecord record;
+    WorkerRecord record;
     record.id = "exec_1";
     record.name = "Local Runner 1";
     record.providerType = "local";

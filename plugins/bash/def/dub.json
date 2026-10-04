@@ -1,10 +1,11 @@
 {
-	"name": "bash",
-	"description": "Bash Plugin for Confector",
+	"name": "bash_def",
+	"description": "Bash Step Definition Plugin for Confector",
 	"targetType": "dynamicLibrary",
-	"targetPath": "../../bin/plugins",
+	"targetName": "confector_bash_def",
+	"targetPath": "../../../bin/plugins",
 	"sourcePaths": ["."],
-	"importPaths": [".."],
+	"importPaths": ["."],
 	"stringImportPaths": ["."],
 	"dependencies": {
 		"confector:plugin_api": "*",

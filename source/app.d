@@ -14,7 +14,6 @@ import confector.queue.queue;
 import confector.queue.mongo_queue;
 import confector.runner.engine;
 import confector.runner.coordinator;
-import confector.runner.worker;
 
 debug static import std.stdio;
 
@@ -30,24 +29,80 @@ void errorPage(HTTPServerRequest req,
 	res.render!("error.dt", req, error);
 }
 
+string readSecretFile(string path)
+{
+  import std.encoding : getBOM, BOM;
+  import std.file : exists, read;
+  import std.string : strip;
+  import std.conv : to;
+  import std.encoding : transcode;
+    
+  if (!exists(path))
+      return "";
+  try
+  {
+      auto raw = cast(const(ubyte)[]) read(path);
+      if (raw.length == 0)
+          return "";
+      auto bom = getBOM(raw);
+      auto payload = raw[bom.sequence.length .. $];
+      switch (bom.schema)
+      {
+          case BOM.utf16le:
+              return (cast(const(wchar)[]) payload).to!string.strip;
+          case BOM.utf16be:
+              // Byte-swap big-endian UTF-16 to host endian
+              wchar[] wbuf = new wchar[](payload.length / 2);
+              for (size_t i = 0; i + 1 < payload.length; i += 2)
+                  wbuf[i / 2] = cast(wchar)((payload[i] << 8) | payload[i + 1]);
+              return wbuf.to!string.strip;
+          case BOM.utf32le:
+              return (cast(const(dchar)[]) payload).to!string.strip;
+          case BOM.utf8:
+          case BOM.none:
+          default:
+              return (cast(const(char)[]) payload).to!string.strip;
+      }
+  }
+  catch (Exception e)
+  {
+      writeln("Could not read mongo secret: ", e.msg);
+      return "";
+  }
+}
+
 void main()
 {
   import std.file;
   import std.format;
   import std.conv;
-  
+  import std.string : strip;
 
-  auto password = readText!wstring("/run/secrets/mongo-readwrite-password").to!string;
+  // Ensure info and error logs are printed to console
+  setLogLevel(vibe.core.log.LogLevel.warn);
+  debug setLogLevel(vibe.core.log.LogLevel.info);
 
-  auto mongoAddress = "mongo:27017/confector";
+  string password = readSecretFile("/run/secrets/mongo-readwrite-password");
 
-  writefln("Connecting to mongo at %s...", mongoAddress);
+  auto mongoHost = "mongo:27017/confector";
+  string mongoUri;
+  if (password.length > 0)
+  {
+      mongoUri = "mongodb://dev-read-write:" ~ password ~ "@" ~ mongoHost;
+      writefln("Connecting to mongo at %s (authenticated)...", mongoHost);
+  }
+  else
+  {
+      mongoUri = "mongodb://" ~ mongoHost;
+      writefln("Connecting to mongo at %s...", mongoHost);
+  }
+
   MongoClient client;
   BuildStateRepository stateRepo;
   WorkQueue workQueue;
   try
   {
-	  client = connectMongoDB("mongodb://%s".format(mongoAddress));
+	  client = connectMongoDB(mongoUri);
     stateRepo = new MongoBuildStateRepository(client);
     workQueue = new MongoWorkQueue(client);
   }
@@ -59,13 +114,20 @@ void main()
   }
   writeln("Connected to mongo.");
 	
-  // Automatically load bundled plugins from ./plugins directory
-  auto bundledPlugins = PluginLoader.instance.loadBundledPlugins("./plugins");
+  // Automatically load bundled plugins from bin/plugins and plugins directories (definition and worker plugins only)
+  Plugin[] bundledPlugins;
+  foreach (pluginDir; ["bin/plugins", "plugins", "./bin/plugins", "./plugins"])
+  {
+      if (exists(pluginDir) && isDir(pluginDir))
+      {
+          bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker]);
+      }
+  }
   if (bundledPlugins.length > 0)
   {
       foreach (p; bundledPlugins)
       {
-          writefln("[plugins] Loaded bundled plugin '%s' v%s", p.name, p.versionString);
+          writefln("[plugins] Loaded bundled plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
       }
   }
   else
@@ -105,8 +167,11 @@ void main()
           {
               try
               {
-                  auto p = PluginLoader.instance.loadPlugin(trimmed, false);
-                  writefln("[plugins] Dynamically loaded plugin '%s' v%s from %s", p.name, p.versionString, trimmed);
+                  auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker]);
+                  if (p !is null)
+                  {
+                      writefln("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
+                  }
               }
               catch (Exception e)
               {
@@ -121,34 +186,12 @@ void main()
   }
   writefln("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
 
-  // Ensure info and error logs are printed to console
-  setLogLevel(vibe.core.log.LogLevel.info);
 
   // Initialize execution engine, coordinator & storage
   auto artifactStorage = new LocalArtifactStorage(".confector/artifacts");
   auto taskEngine = new TaskEngine(artifactStorage, stateRepo);
   auto buildCoordinator = new BuildCoordinator(artifactStorage, stateRepo, workQueue);
-  writeln("Initialized Confector execution engine and build coordinator.");
-
-  // Start background worker runner to process queue tasks
-  WorkerConfig workerConfig;
-  workerConfig.workerId = "worker_default";
-  auto worker = new WorkerRunner(workerConfig, workQueue, taskEngine, artifactStorage, stateRepo, (bId, tId, res) {
-      buildCoordinator.onTaskCompleted(bId, tId, res);
-  });
-  runTask({
-      try
-      {
-          logInfo("Background worker task fiber started.");
-          worker.runWorkerLoop();
-          logInfo("Background worker task fiber finished.");
-      }
-      catch (Exception e)
-      {
-          logError("Worker loop failed with exception: %s\n%s", e.msg, e.toString());
-      }
-  });
-  writeln("Started background worker runner.");
+  writeln("Initialized Confector execution engine and build coordinator (stateless control plane mode).");
 
 	auto router = new URLRouter;
 
@@ -175,14 +218,13 @@ void main()
   router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 	
 	auto settings = new HTTPServerSettings;
-	//settings.port = 8080;
+	settings.port = 8080;
   settings.errorPageHandler = toDelegate(&errorPage);
 
   settings.options = HTTPServerOption.defaults;
 
   debug settings.options = HTTPServerOption.defaults | HTTPServerOption.errorStackTraces;
   //debug settings.accessLogToConsole = true;
-  debug setLogLevel(vibe.core.log.LogLevel.info);
 	
 	listenHTTP(settings, router);
 	

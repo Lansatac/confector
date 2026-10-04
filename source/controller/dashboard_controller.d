@@ -530,27 +530,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
                 }
                 else
                 {
-                    string workspaceDir = ".";
-
-                    auto graph = new TaskGraph(proj.tasks);
-                    string[] orderedTasks;
-                    if (targetTaskId.length > 0)
-                    {
-                        orderedTasks = graph.resolveSubgraph(targetTaskId);
-                    }
-                    else
-                    {
-                        orderedTasks = graph.topologicalSort();
-                    }
-
-                    ExecutionPlan plan;
-                    plan.orderedTaskIds = orderedTasks;
-                    plan.toExecuteTaskIds = orderedTasks;
-
-                    string buildId = "build_" ~ randomUUID().toString()[0 .. 8];
-                    engine.executeTasks(buildId, proj.tasks, plan, workspaceDir, proj.id, proj.name, targetTaskId, false);
-                    res.redirect("/builds/details?id=" ~ buildId);
-                    return;
+                    logError("Cannot run project '%s': build coordinator is not configured", proj.id);
                 }
             }
         }

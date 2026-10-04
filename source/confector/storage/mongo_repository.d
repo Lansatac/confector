@@ -2,7 +2,7 @@ module confector.storage.mongo_repository;
 
 import confector.core.model;
 import confector.core.storage;
-import confector.core.executor : ExecutorRecord;
+import confector.core.executor : WorkerRecord;
 import confector.core.json_compat : sanitizeBson;
 
 import vibe.db.mongo.client : MongoClient;
@@ -634,7 +634,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
     }
 
-    override void saveExecutor(in ExecutorRecord executor)
+    override void saveExecutor(in WorkerRecord executor)
     {
         try
         {
@@ -655,7 +655,7 @@ class MongoBuildStateRepository : BuildStateRepository
         }
     }
 
-    override bool getExecutor(string id, out ExecutorRecord executor)
+    override bool getExecutor(string id, out WorkerRecord executor)
     {
         try
         {
@@ -668,7 +668,7 @@ class MongoBuildStateRepository : BuildStateRepository
                 return false;
             }
 
-            executor = deserializeBson!ExecutorRecord(sanitizeBson(doc));
+            executor = deserializeBson!WorkerRecord(sanitizeBson(doc));
             return true;
         }
         catch (Exception e)
@@ -678,9 +678,9 @@ class MongoBuildStateRepository : BuildStateRepository
         }
     }
 
-    override ExecutorRecord[] listExecutors()
+    override WorkerRecord[] listExecutors()
     {
-        ExecutorRecord[] list;
+        WorkerRecord[] list;
         try
         {
             auto cursor = m_executorsCollection.find();
@@ -688,7 +688,7 @@ class MongoBuildStateRepository : BuildStateRepository
             {
                 try
                 {
-                    list ~= deserializeBson!ExecutorRecord(sanitizeBson(doc));
+                    list ~= deserializeBson!WorkerRecord(sanitizeBson(doc));
                 }
                 catch (Exception e)
                 {

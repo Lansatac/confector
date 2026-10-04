@@ -77,14 +77,16 @@ struct UpstreamArtifactRef
     @optional @asName("destination") string destination;
     @optional string name;
     @optional string path;
+    @optional string sha256;
 
-    this(string taskId, string artifactId, string destination = "") pure nothrow @safe
+    this(string taskId, string artifactId, string destination = "", string sha256 = null) pure nothrow @safe
     {
         this.taskId = taskId;
         this.artifactId = artifactId;
         this.destination = destination;
         this.name = artifactId;
         this.path = artifactId;
+        this.sha256 = sha256;
     }
 
     @property string effectiveArtifactId() const pure nothrow @safe

@@ -1,10 +1,11 @@
 {
-	"name": "powershell",
-	"description": "PowerShell Plugin for Confector",
+	"name": "powershell_def",
+	"description": "PowerShell Step Definition Plugin for Confector",
 	"targetType": "dynamicLibrary",
-	"targetPath": "../../bin/plugins",
+	"targetName": "confector_powershell_def",
+	"targetPath": "../../../bin/plugins",
 	"sourcePaths": ["."],
-	"importPaths": [".."],
+	"importPaths": ["."],
 	"stringImportPaths": ["."],
 	"dependencies": {
 		"confector:plugin_api": "*",

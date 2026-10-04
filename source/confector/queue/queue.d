@@ -20,6 +20,7 @@ struct InputArtifactRef
     @optional @asName("storage_uri") string storageUri;
     @optional @asName("target_path") string targetPath; // deprecated legacy alias
     @optional @asName("destination") string destination;
+    @optional @asName("sha256") string sha256;
 }
 
 /**

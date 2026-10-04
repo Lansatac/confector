@@ -65,7 +65,7 @@ Execution runtimes, version control providers, and storage backends are decouple
 
    **Granular build targets:**
    - `ninja app` — Compile the main server and synchronize assets
-   - `ninja plugins` — Compile all dynamic plugins (`bash`, `git`, `local_executor`, `powershell`)
+   - `ninja plugins` — Compile all dynamic plugins (`bash`, `git`, `powershell`, `local_process`)
    - `ninja plugin-<name>` — Compile a specific plugin (e.g., `ninja plugin-git`)
 
 3. **Run the server:**

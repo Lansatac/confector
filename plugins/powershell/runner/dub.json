@@ -1,0 +1,13 @@
+{
+	"name": "powershell_runner",
+	"description": "PowerShell Step Runner Plugin for Confector",
+	"targetType": "dynamicLibrary",
+	"targetName": "confector_powershell_runner",
+	"targetPath": "../../../bin/plugins",
+	"sourcePaths": ["."],
+	"importPaths": ["."],
+	"dependencies": {
+		"confector:plugin_api": "*"
+	},
+	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
+}

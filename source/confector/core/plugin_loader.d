@@ -59,6 +59,9 @@ final class PluginLoader
     private static PluginLoader _instance;
     private LoadedPluginRecord[string] _loadedPlugins; // Keyed by plugin.name
     private string[string] _pathToPluginName; // Keyed by absolute library path
+    private LoadedPluginRecord[string] _allPathRecords; // Keyed by absolute library path (including filtered)
+    private string[] _loadOrder; // Chronological order of loading for LIFO unloading
+    private void*[] _allLoadedHandles; // Chronological list of all opened dynamic library handles for POSIX LIFO closing
 
     public static PluginLoader instance()
     {
@@ -123,7 +126,7 @@ final class PluginLoader
      * Loads a shared dynamic library plugin from the given path, resolves its factory entrypoint,
      * instantiates the plugin, and registers it with PluginRegistry.
      */
-    public Plugin loadPlugin(string libraryPath, bool isBundled = false)
+    public Plugin loadPlugin(string libraryPath, bool isBundled = false, const(PluginCategory)[] allowedCategories = null)
     {
         string trimmedPath = libraryPath.strip;
         if (trimmedPath.length == 0)
@@ -144,37 +147,58 @@ final class PluginLoader
         string absPath = absolutePath(trimmedPath);
 
         // Check if already loaded by this path
-        if (auto pName = absPath in _pathToPluginName)
+        if (auto rec = absPath in _allPathRecords)
         {
-            if (auto rec = *pName in _loadedPlugins)
+            if (allowedCategories !is null && allowedCategories.length > 0)
             {
-                return rec.plugin;
+                if (!allowedCategories.canFind(rec.plugin.category))
+                {
+                    return null;
+                }
             }
+            if (rec.plugin.name !in _loadedPlugins)
+            {
+                PluginRegistry.instance.registerPlugin(rec.plugin);
+                _loadedPlugins[rec.plugin.name] = *rec;
+                _pathToPluginName[absPath] = rec.plugin.name;
+                _loadOrder ~= rec.plugin.name;
+            }
+            return rec.plugin;
         }
 
         void* handle = null;
 
         version (Windows)
         {
-            handle = Runtime.loadLibrary(trimmedPath);
+            handle = Runtime.loadLibrary(absPath);
             if (handle is null)
             {
-                handle = cast(void*) LoadLibraryW(trimmedPath.toUTF16z());
+                enum DWORD LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
+                handle = cast(void*) LoadLibraryExW(absPath.toUTF16z(), null, LOAD_WITH_ALTERED_SEARCH_PATH);
+            }
+            if (handle is null)
+            {
+                handle = cast(void*) LoadLibraryW(absPath.toUTF16z());
             }
             if (handle is null)
             {
                 DWORD err = GetLastError();
-                throw new PluginLoadException(format("Failed to load dynamic library '%s' (Win32 error %d)", trimmedPath, err));
+                throw new PluginLoadException(format("Failed to load dynamic library '%s' (Win32 error %d)", absPath, err));
             }
         }
         else version (Posix)
         {
-            handle = dlopen(trimmedPath.toStringz(), RTLD_NOW | RTLD_LOCAL);
+            handle = dlopen(absPath.toStringz(), RTLD_NOW | RTLD_GLOBAL);
+            if (handle is null)
+            {
+                handle = dlopen(absPath.toStringz(), RTLD_NOW | RTLD_LOCAL);
+            }
             if (handle is null)
             {
                 const(char)* err = dlerror();
-                throw new PluginLoadException(format("Failed to load dynamic library '%s': %s", trimmedPath, err ? to!string(err) : "unknown error"));
+                throw new PluginLoadException(format("Failed to load dynamic library '%s': %s", absPath, err ? to!string(err) : "unknown error"));
             }
+            _allLoadedHandles ~= handle;
         }
         else
         {
@@ -215,17 +239,28 @@ final class PluginLoader
             throw new PluginLoadException(format("Plugin factory '%s' in '%s' returned null", CONFECTOR_PLUGIN_FACTORY_SYMBOL, trimmedPath));
         }
 
-        // Register with PluginRegistry
-        PluginRegistry.instance.registerPlugin(plugin);
-
         LoadedPluginRecord record;
         record.path = absPath;
         record.handle = handle;
         record.plugin = plugin;
         record.isBundled = isBundled;
 
+        _allPathRecords[absPath] = record;
+
+        if (allowedCategories !is null && allowedCategories.length > 0)
+        {
+            if (!allowedCategories.canFind(plugin.category))
+            {
+                return null;
+            }
+        }
+
+        // Register with PluginRegistry
+        PluginRegistry.instance.registerPlugin(plugin);
+
         _loadedPlugins[plugin.name] = record;
         _pathToPluginName[absPath] = plugin.name;
+        _loadOrder ~= plugin.name;
 
         return plugin;
     }
@@ -233,7 +268,7 @@ final class PluginLoader
     /**
      * Loads multiple plugin dynamic libraries from an array of file paths.
      */
-    public Plugin[] loadPlugins(in string[] libraryPaths, bool isBundled = false)
+    public Plugin[] loadPlugins(in string[] libraryPaths, bool isBundled = false, const(PluginCategory)[] allowedCategories = null)
     {
         Plugin[] loaded;
         foreach (path; libraryPaths)
@@ -241,7 +276,11 @@ final class PluginLoader
             string trimmed = path.strip;
             if (trimmed.length > 0)
             {
-                loaded ~= loadPlugin(trimmed, isBundled);
+                auto p = loadPlugin(trimmed, isBundled, allowedCategories);
+                if (p !is null)
+                {
+                    loaded ~= p;
+                }
             }
         }
         return loaded;
@@ -251,7 +290,7 @@ final class PluginLoader
      * Scans a directory (defaulting to "./plugins") for plugin dynamic libraries,
      * automatically loading and registering them as bundled plugins.
      */
-    public Plugin[] loadBundledPlugins(string directory = "./plugins")
+    public Plugin[] loadBundledPlugins(string directory = "./plugins", const(PluginCategory)[] allowedCategories = null)
     {
         Plugin[] loaded;
         if (!exists(directory) || !isDir(directory))
@@ -283,13 +322,13 @@ final class PluginLoader
                 {
                     try
                     {
-                        auto p = loadPlugin(entry.name, true);
+                        auto p = loadPlugin(entry.name, true, allowedCategories);
                         if (p !is null)
                         {
                             loaded ~= p;
                         }
                     }
-                    catch (Exception e)
+                    catch (Throwable e)
                     {
                         // Non-plugin libraries or incompatible binaries in directory are skipped
                     }
@@ -312,23 +351,57 @@ final class PluginLoader
             _loadedPlugins.remove(name);
             _pathToPluginName.remove(record.path);
 
+            import std.algorithm.mutation : remove;
+            import std.algorithm.searching : countUntil;
+            auto idx = _loadOrder.countUntil(name);
+            if (idx >= 0)
+            {
+                _loadOrder = _loadOrder.remove(idx);
+            }
+
             PluginRegistry.instance.unregisterPlugin(name);
-            unloadHandle(record.handle);
+            version (Windows)
+            {
+                _allPathRecords.remove(record.path);
+                unloadHandle(record.handle);
+            }
         }
     }
 
     /**
-     * Unloads all dynamically loaded plugins and releases their library handles.
+     * Unloads all dynamically loaded plugins in reverse chronological order (LIFO)
+     * and releases their library handles.
      */
     public void unloadAll()
     {
-        auto names = _loadedPlugins.keys;
-        foreach (name; names)
+        for (ptrdiff_t i = cast(ptrdiff_t)_loadOrder.length - 1; i >= 0; --i)
+        {
+            if (i < _loadOrder.length)
+            {
+                unloadPlugin(_loadOrder[i]);
+            }
+        }
+        auto remainingNames = _loadedPlugins.keys;
+        foreach (name; remainingNames)
         {
             unloadPlugin(name);
         }
         _loadedPlugins.clear();
         _pathToPluginName.clear();
+        _loadOrder.length = 0;
+        _allPathRecords.clear();
+
+        version (Posix)
+        {
+            for (ptrdiff_t i = cast(ptrdiff_t)_allLoadedHandles.length - 1; i >= 0; --i)
+            {
+                if (_allLoadedHandles[i] !is null)
+                {
+                    dlclose(_allLoadedHandles[i]);
+                }
+            }
+            _allLoadedHandles.length = 0;
+        }
     }
 
     private static void unloadHandle(void* handle)

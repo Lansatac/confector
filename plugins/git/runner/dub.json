@@ -1,14 +1,13 @@
 {
-	"name": "local_executor",
-	"description": "Local Executor Plugin for Confector",
+	"name": "git_runner",
+	"description": "Git Step Runner Plugin for Confector",
 	"targetType": "dynamicLibrary",
-	"targetPath": "../../bin/plugins",
+	"targetName": "confector_git_runner",
+	"targetPath": "../../../bin/plugins",
 	"sourcePaths": ["."],
-	"importPaths": [".."],
-	"stringImportPaths": ["."],
+	"importPaths": ["."],
 	"dependencies": {
-		"confector:plugin_api": "*",
-		"diet-ng": "~>1.8"
+		"confector:plugin_api": "*"
 	},
 	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
 }

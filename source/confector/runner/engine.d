@@ -722,6 +722,7 @@ unittest
         @property string name() const { return "mock-engine-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock engine runner plugin"; }
+        @property PluginCategory category() const { return PluginCategory.runner; }
         @property string runnerType() const { return "process"; }
         @property string systemName() const { return "mock-engine-system"; }
         @property string stepType() const { return "process"; }
@@ -1013,16 +1014,17 @@ unittest
         assert(exists(buildPath(testDir, "ps.txt")));
     }
 
-    // Executor Provider & Persistence Integration Test
-    import confector.core.executor : ExecutorRecord, ExecutorProvider, TaskExecutor;
+    // Compute Provider & Persistence Integration Test
+    import confector.core.executor : WorkerRecord, ComputeProvider, ComputeInstance;
     import controller.executor_controller : executorRouter;
     import std.json : JSONValue;
 
-    class MockEngineExecutorProvider : Plugin, ExecutorProvider
+    class MockEngineComputeProvider : Plugin, ComputeProvider
     {
         @property string name() const { return "mock-local-executor-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock local executor plugin"; }
+        @property PluginCategory category() const { return PluginCategory.worker; }
         @property string providerType() const { return "local"; }
         @property string displayName() const { return "Local Process Executor"; }
         @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
@@ -1039,12 +1041,12 @@ unittest
         string[] validateConfig(in JSONValue config) const { return null; }
         string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Local Config</div>"; }
 
-        TaskExecutor createExecutor(in ExecutorRecord record) const
+        ComputeInstance createExecutor(in WorkerRecord record)
         {
-            class MockTaskExecutor : TaskExecutor
+            class MockComputeInstance : ComputeInstance
             {
-                ExecutorRecord m_rec;
-                this(in ExecutorRecord rec) { m_rec = cast()rec; }
+                WorkerRecord m_rec;
+                this(in WorkerRecord rec) { m_rec = cast()rec; }
                 @property string id() const { return m_rec.id; }
                 @property string providerType() const { return m_rec.providerType; }
                 @property bool isEnabled() const { return m_rec.enabled; }
@@ -1067,16 +1069,16 @@ unittest
                     return res;
                 }
             }
-            return new MockTaskExecutor(record);
+            return new MockComputeInstance(record);
         }
     }
 
-    auto localExecPlugin = new MockEngineExecutorProvider();
+    auto localExecPlugin = new MockEngineComputeProvider();
     PluginRegistry.instance.registerPlugin(localExecPlugin);
 
-    auto providers = PluginRegistry.instance.getExecutorProviders();
+    auto providers = PluginRegistry.instance.getComputeProviders();
     assert(providers.length >= 1);
-    auto foundLocal = PluginRegistry.instance.getExecutorProvider("local");
+    auto foundLocal = PluginRegistry.instance.getComputeProvider("local");
     assert(foundLocal !is null);
     assert(foundLocal.supportedStepTypes.length >= 4);
 
@@ -1086,7 +1088,7 @@ unittest
     assert(formHtml.length > 0);
 
     // Verify newly instantiated executor is disabled by default
-    ExecutorRecord execRecord;
+    WorkerRecord execRecord;
     execRecord.id = "exec_integ_1";
     execRecord.name = "Integration Test Runner";
     execRecord.providerType = "local";
@@ -1095,7 +1097,7 @@ unittest
     execRecord.configuration = localDefConfig;
 
     stateRepo.saveExecutor(execRecord);
-    ExecutorRecord fetchedExec;
+    WorkerRecord fetchedExec;
     assert(stateRepo.getExecutor("exec_integ_1", fetchedExec));
     assert(!fetchedExec.enabled);
 

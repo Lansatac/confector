@@ -77,7 +77,7 @@ final class PluginRegistry
     private ArtifactPublishingSystem[] _artifactPublishers;
     private BuildStepSystem[] _stepSystems;
     private BuildStepProvider[] _stepProviders;
-    private ExecutorProvider[] _executorProviders;
+    private ComputeProvider[] _computeProviders;
     private PluginLogCallback _logCallback;
 
     public static PluginRegistry instance()
@@ -125,9 +125,9 @@ final class PluginRegistry
         {
             registerStepProvider(stepProvider);
         }
-        if (auto provider = cast(ExecutorProvider) plugin)
+        if (auto provider = cast(ComputeProvider) plugin)
         {
-            registerExecutorProvider(provider);
+            registerComputeProvider(provider);
         }
     }
 
@@ -185,12 +185,12 @@ final class PluginRegistry
         }
     }
 
-    public void registerExecutorProvider(ExecutorProvider provider)
+    public void registerComputeProvider(ComputeProvider provider)
     {
         import std.algorithm : canFind;
-        if (!_executorProviders.canFind(provider))
+        if (!_computeProviders.canFind(provider))
         {
-            _executorProviders ~= provider;
+            _computeProviders ~= provider;
         }
     }
 
@@ -251,11 +251,11 @@ final class PluginRegistry
                     else i++;
                 }
             }
-            if (auto provider = cast(ExecutorProvider) plugin)
+            if (auto provider = cast(ComputeProvider) plugin)
             {
-                for (size_t i = 0; i < _executorProviders.length; )
+                for (size_t i = 0; i < _computeProviders.length; )
                 {
-                    if (_executorProviders[i] is provider) _executorProviders = _executorProviders.remove(i);
+                    if (_computeProviders[i] is provider) _computeProviders = _computeProviders.remove(i);
                     else i++;
                 }
             }
@@ -304,14 +304,14 @@ final class PluginRegistry
         return null;
     }
 
-    public ExecutorProvider[] getExecutorProviders()
+    public ComputeProvider[] getComputeProviders()
     {
-        return _executorProviders;
+        return _computeProviders;
     }
 
-    public ExecutorProvider getExecutorProvider(string providerType)
+    public ComputeProvider getComputeProvider(string providerType)
     {
-        foreach (p; _executorProviders)
+        foreach (p; _computeProviders)
         {
             if (p.providerType == providerType)
             {
@@ -383,7 +383,7 @@ final class PluginRegistry
         _artifactPublishers.length = 0;
         _stepSystems.length = 0;
         _stepProviders.length = 0;
-        _executorProviders.length = 0;
+        _computeProviders.length = 0;
     }
 }
 
@@ -399,6 +399,7 @@ unittest
         @property string name() const { return "mock-plugin"; }
         @property string versionString() const { return "0.1.0"; }
         @property string description() const { return "Mock plugin for testing"; }
+        @property PluginCategory category() const { return PluginCategory.runner; }
 
         void initialize(PluginContext context = null) { initialized = true; }
         void shutdown() { shutdownCalled = true; }
@@ -422,6 +423,7 @@ unittest
         @property string name() const { return "integrated-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Integrated test plugin"; }
+        @property PluginCategory category() const { return PluginCategory.runner; }
         @property string systemName() const { return "integrated-system"; }
         @property string stepType() const { return "test-step"; }
         @property string displayName() const { return "Test Step"; }
@@ -479,4 +481,34 @@ unittest
     assert(registry.getStepSystems().length == 0);
     assert(registry.getStepProviders().length == 0);
     assert(registry.getStepProvider("test-step") is null);
+
+    // Test ComputeProvider registration
+    class MockComputeProvider : Plugin, ComputeProvider
+    {
+        @property string name() const { return "mock-compute"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Mock compute provider"; }
+        @property PluginCategory category() const { return PluginCategory.worker; }
+        @property string providerType() const { return "mock_pool"; }
+        @property string displayName() const { return "Mock Pool"; }
+        @property string[] supportedStepTypes() const { return ["bash", "powershell"]; }
+
+        void initialize(PluginContext context = null) {}
+        void shutdown() {}
+
+        JSONValue defaultConfig() const { return JSONValue(["poolSize": JSONValue(2)]); }
+        string[] validateConfig(in JSONValue config) const { return null; }
+        string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Config</div>"; }
+        ComputeInstance createExecutor(in WorkerRecord record) { return null; }
+    }
+
+    auto computePl = new MockComputeProvider();
+    registry.registerPlugin(computePl);
+    assert(registry.getComputeProviders().length == 1);
+    assert(registry.getComputeProvider("mock_pool") is computePl);
+    assert(registry.getComputeProvider("unknown") is null);
+
+    registry.unregisterPlugin("mock-compute");
+    assert(registry.getComputeProviders().length == 0);
+    assert(registry.getComputeProvider("mock_pool") is null);
 }

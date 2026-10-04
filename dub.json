@@ -6,21 +6,23 @@
 	"dependencies": {
 		"diet-ng": "~>1.8",
 		"vibe-d": "~>0.10.3",
-		"confector:core": "*"
+		"confector:core": "*",
+		"confector:runner_core": "*"
 	},
 	"description": "A build system.",
 	"license": "The Unlicense",
 	"name": "confector",
 	"targetPath": "bin",
-  "workingDirectory": "bin",
-  "copyFiles": ["public"],
+	"workingDirectory": "bin",
+	"excludedSourceFiles": ["source/confector/runner_app/*"],
+	"copyFiles": ["public"],
 	"subPackages": [
 		{
 			"name": "plugin_api",
 			"targetType": "library",
 			"sourcePaths": ["source/confector/plugin_api"],
 			"importPaths": ["source"],
-	    "targetPath": "lib",
+			"targetPath": "lib",
 			"dependencies": {
 				"vibe-serialization": "~>1.2.0"
 			}
@@ -28,26 +30,57 @@
 		{
 			"name": "core",
 			"targetType": "library",
-			"sourcePaths": ["source/confector/core"],
+			"sourcePaths": ["source/confector/core", "source/confector/queue"],
 			"importPaths": ["source"],
-	    "targetPath": "lib",
+			"targetPath": "lib",
 			"dependencies": {
 				"confector:plugin_api": "*",
 				"vibe-d": "~>0.10.3"
 			}
 		},
-		"./plugins/bash",
-		"./plugins/git",
-		"./plugins/local_executor",
-		"./plugins/powershell",
+		{
+			"name": "runner_core",
+			"targetType": "library",
+			"sourcePaths": ["source/confector/runner_core"],
+			"importPaths": ["source"],
+			"targetPath": "lib",
+			"dependencies": {
+				"confector:core": "*",
+				"vibe-d": "~>0.10.3"
+			}
+		},
+		{
+			"name": "runner",
+			"targetType": "executable",
+			"targetName": "confector-runner",
+			"sourcePaths": ["source/confector/runner_app"],
+			"importPaths": ["source"],
+			"targetPath": "bin",
+			"workingDirectory": "bin",
+			"dependencies": {
+				"confector:runner_core": "*",
+				"confector:core": "*",
+				"vibe-d": "~>0.10.3"
+			}
+		},
+		"./plugins/bash/def",
+		"./plugins/bash/runner",
+		"./plugins/git/def",
+		"./plugins/git/runner",
+		"./plugins/powershell/def",
+		"./plugins/powershell/runner",
+		"./plugins/executors/local_process",
     {
       "name": "plugins",
       "targetType": "none",
       "dependencies": {
-        "confector:bash": "*",
-        "confector:git": "*",
-        "confector:local_executor": "*",
-        "confector:powershell": "*"
+        "confector:bash_def": "*",
+        "confector:bash_runner": "*",
+        "confector:git_def": "*",
+        "confector:git_runner": "*",
+        "confector:powershell_def": "*",
+        "confector:powershell_runner": "*",
+        "confector:local_process": "*"
       }
     }
 	]
