@@ -6,6 +6,7 @@ import std.encoding : BOM, getBOM;
 import std.file : exists, isDir, read;
 import std.format : format;
 import std.functional : toDelegate;
+import std.path : buildPath;
 import std.process : environment;
 import std.stdio : writefln, writeln;
 import std.string : split, strip;
@@ -202,10 +203,15 @@ URLRouter createRouter(
     auto router = new URLRouter();
 
     // Static assets
-    router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
+    string publicDir = exists("public") ? "public" : (exists("../public") ? "../public" : "public");
+    if (exists(buildPath(publicDir, "images", "favicon.ico")))
+        router.get("/favicon.ico", serveStaticFile(buildPath(publicDir, "images", "favicon.ico")));
+    else
+        router.get("/favicon.ico", serveStaticFile("public/images/favicon.ico"));
+
     auto fsettings = new HTTPFileServerSettings();
     fsettings.serverPathPrefix = "/static";
-    router.get("/static/*", serveStaticFiles("public/", fsettings));
+    router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
     router.any("/api/v1/*", apiRouter(taskEngine, workQueue, buildCoordinator));

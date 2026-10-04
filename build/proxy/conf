@@ -1,6 +1,6 @@
 server {
   listen 80;
-  server_name development;
+  server_name localhost development "";
 
   location / {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -18,5 +18,5 @@ upstream development {
   # enable sticky session based on IP
   ip_hash;
 
-  server development:80;
+  server development:8080;
 }

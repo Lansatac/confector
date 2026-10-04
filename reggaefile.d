@@ -85,10 +85,15 @@ Build reggaeBuild() {
     
     auto plugins = Target.phony("plugins", "", [bashDef, bashRunner, gitDef, gitRunner, powershellDef, powershellRunner, localProcess]);
 
-    // Default 'all' target grouping application, runner, plugins, and static/view assets
-    auto all = Target.phony("all", "", [appTarget, runnerBinary, plugins]);
+    // Static assets & view templates copied to bin/
+    auto staticFiles = copyDirectoryFiles("public", "bin/public");
+    auto viewFiles = copyDirectoryFiles("views", "bin/views");
+    auto staticAssets = Target.phony("static_assets", "", staticFiles ~ viewFiles);
 
-    Target[] allTargets = [all, appTarget, runnerBinary, plugins, bashDef, bashRunner, gitDef, gitRunner, powershellDef, powershellRunner, localProcess];
+    // Default 'all' target grouping application, runner, plugins, and static/view assets
+    auto all = Target.phony("all", "", [appTarget, runnerBinary, plugins, staticAssets]);
+
+    Target[] allTargets = [all, appTarget, runnerBinary, plugins, bashDef, bashRunner, gitDef, gitRunner, powershellDef, powershellRunner, localProcess, staticAssets] ~ staticFiles ~ viewFiles;
 
     return Build(allTargets);
 }
