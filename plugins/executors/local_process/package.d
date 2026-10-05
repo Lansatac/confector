@@ -15,6 +15,8 @@ import core.thread : Thread;
 import confector.plugin_api.model;
 import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, WorkerPlugin;
 import confector.plugin_api.executor : ComputeProvider, ComputeInstance, WorkerRecord, ExecutionRequest, ExecutionResult, LogDelegate, ComputeProvisioner;
+import confector.config;
+import vibe.data.json : Json;
 
 /**
  * Concrete ComputeInstance managing task execution by provisioning and launching
@@ -372,6 +374,7 @@ class LocalProcessInstance : ComputeInstance
 class LocalProcessProvider : WorkerPlugin, ComputeProvider
 {
     private PluginContext m_context;
+    private LocalProcessProvisionerConfig m_scopedConfig;
 
     @property string name() const { return "local-process"; }
     @property string versionString() const { return "1.0.0"; }
@@ -380,6 +383,85 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
     @property string providerType() const { return "local_process"; }
     @property string displayName() const { return "Local Subprocess Runner"; }
     @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+    @property LocalProcessProvisionerConfig scopedConfig() const { return cast()m_scopedConfig; }
+
+    override ConfigDefinition[] configDefinitions() const
+    {
+        return [
+            ConfigDefinition(
+                "plugins.local-process.maxConcurrency",
+                "CONFECTOR_LOCAL_CONCURRENCY",
+                Json(cast(long)totalCPUs),
+                "Maximum concurrent runner subprocesses allowed"
+            ),
+            ConfigDefinition(
+                "plugins.local_process.maxConcurrency",
+                "CONFECTOR_LOCAL_CONCURRENCY",
+                Json(cast(long)totalCPUs),
+                "Maximum concurrent runner subprocesses allowed"
+            ),
+            ConfigDefinition(
+                "plugins.local-process.runnerBinary",
+                "CONFECTOR_RUNNER_BIN",
+                Json("bin/confector-runner"),
+                "Path to confector-runner binary"
+            ),
+            ConfigDefinition(
+                "plugins.local_process.runnerBinary",
+                "CONFECTOR_RUNNER_BIN",
+                Json("bin/confector-runner"),
+                "Path to confector-runner binary"
+            ),
+            ConfigDefinition(
+                "plugins.local-process.workspaceDir",
+                "CONFECTOR_WORKSPACE_DIR",
+                Json(".confector/workspaces"),
+                "Base directory for runner workspaces"
+            ),
+            ConfigDefinition(
+                "plugins.local_process.workspaceDir",
+                "CONFECTOR_WORKSPACE_DIR",
+                Json(".confector/workspaces"),
+                "Base directory for runner workspaces"
+            ),
+            ConfigDefinition(
+                "plugins.local-process.storageDir",
+                "CONFECTOR_LOCAL_PROCESS_STORAGE_DIR",
+                Json(".confector/artifacts"),
+                "Base directory for runner artifacts"
+            ),
+            ConfigDefinition(
+                "plugins.local_process.storageDir",
+                "CONFECTOR_LOCAL_PROCESS_STORAGE_DIR",
+                Json(".confector/artifacts"),
+                "Base directory for runner artifacts"
+            ),
+            ConfigDefinition(
+                "plugins.local-process.serverUrl",
+                "CONFECTOR_SERVER_URL",
+                Json("http://localhost:8080"),
+                "Base URL of Confector server"
+            ),
+            ConfigDefinition(
+                "plugins.local_process.serverUrl",
+                "CONFECTOR_SERVER_URL",
+                Json("http://localhost:8080"),
+                "Base URL of Confector server"
+            ),
+            ConfigDefinition(
+                "plugins.local-process.secretToken",
+                "CONFECTOR_RUNNER_TOKEN",
+                Json(""),
+                "Secret authentication token for runner"
+            ),
+            ConfigDefinition(
+                "plugins.local_process.secretToken",
+                "CONFECTOR_RUNNER_TOKEN",
+                Json(""),
+                "Secret authentication token for runner"
+            )
+        ];
+    }
 
     void initialize(PluginContext context = null)
     {
@@ -387,6 +469,17 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         if (m_context !is null)
         {
             m_context.info("LocalProcessProvider initialized");
+            if (m_context.config !is null)
+            {
+                try
+                {
+                    m_scopedConfig = m_context.config.bind!LocalProcessProvisionerConfig();
+                }
+                catch (Exception e)
+                {
+                    m_scopedConfig = LocalProcessProvisionerConfig.init;
+                }
+            }
         }
     }
 
@@ -400,16 +493,20 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
 
     JSONValue defaultConfig() const
     {
-        long defaultConcurrency = cast(long)totalCPUs;
+        long defaultConcurrency = cast(long)(m_scopedConfig.maxConcurrency > 0 ? m_scopedConfig.maxConcurrency : totalCPUs);
         if (defaultConcurrency <= 0) defaultConcurrency = 1;
+
+        string runnerBin = m_scopedConfig.runnerBinary.length > 0 ? m_scopedConfig.runnerBinary : "bin/confector-runner";
+        string workDir = m_scopedConfig.workspaceDir.length > 0 ? m_scopedConfig.workspaceDir : ".confector/workspaces";
+        string secretTok = m_scopedConfig.secretToken;
 
         JSONValue cfg = JSONValue([
             "maxConcurrency": JSONValue(defaultConcurrency),
-            "workspaceDir": JSONValue(".confector/workspaces"),
-            "runnerBinary": JSONValue("bin/confector-runner"),
+            "workspaceDir": JSONValue(workDir),
+            "runnerBinary": JSONValue(runnerBin),
             "defaultShell": JSONValue("powershell"),
             "isolateEnvironment": JSONValue(false),
-            "secretToken": JSONValue(""),
+            "secretToken": JSONValue(secretTok),
             "allowedStepTypes": JSONValue([
                 JSONValue("process"),
                 JSONValue("bash"),
@@ -470,7 +567,7 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         string defaultShell = "powershell";
         bool isolateEnvironment = false;
         string secretToken = "";
-        string allowedStepsStr = "process, bash, powershell, git";
+        string allowedStepsStr = "";
 
         if (currentConfig.type == JSONType.object)
         {
@@ -551,6 +648,51 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         }
         return new LocalProcessProvisioner(cfg);
     }
+}
+
+/**
+ * Registers local process plugin configuration definitions in the ConfigRegistry.
+ */
+void registerLocalProcessConfigDefinitions(ConfigRegistry registry)
+{
+    if (registry is null) return;
+
+    registry.registerDefinition(ConfigDefinition(
+        "plugins.local_process.maxConcurrency",
+        "CONFECTOR_LOCAL_CONCURRENCY",
+        Json(cast(long)totalCPUs),
+        "Maximum concurrent runner subprocesses allowed"
+    ));
+    registry.registerDefinition(ConfigDefinition(
+        "plugins.local_process.runnerBinary",
+        "CONFECTOR_RUNNER_BIN",
+        Json("bin/confector-runner"),
+        "Path to confector-runner binary"
+    ));
+    registry.registerDefinition(ConfigDefinition(
+        "plugins.local_process.workspaceDir",
+        "CONFECTOR_WORKSPACE_DIR",
+        Json(".confector/workspaces"),
+        "Base directory for runner workspaces"
+    ));
+    registry.registerDefinition(ConfigDefinition(
+        "plugins.local_process.storageDir",
+        "CONFECTOR_LOCAL_PROCESS_STORAGE_DIR",
+        Json(".confector/artifacts"),
+        "Base directory for runner artifacts"
+    ));
+    registry.registerDefinition(ConfigDefinition(
+        "plugins.local_process.serverUrl",
+        "CONFECTOR_SERVER_URL",
+        Json("http://localhost:8080"),
+        "Base URL of Confector server"
+    ));
+    registry.registerDefinition(ConfigDefinition(
+        "plugins.local_process.secretToken",
+        "CONFECTOR_RUNNER_TOKEN",
+        Json(""),
+        "Secret authentication token for runner"
+    ));
 }
 
 /**
@@ -881,4 +1023,16 @@ unittest
     auto provFromRecord = provider.createProvisioner(rec);
     assert(provFromRecord !is null);
     assert(provFromRecord.providerType == "local");
+
+    // Test ConfigRegistry integration with LocalProcessProvider
+    auto configReg = new ConfigRegistry();
+    auto localPlugin = new LocalProcessProvider();
+    // Simulate runtime registration through PluginRegistry or direct defs registration
+    foreach (ref def; localPlugin.configDefinitions())
+    {
+        configReg.registerDefinition(def);
+    }
+    auto pluginCtx = new NullPluginContext("local_process", configReg.getScope("plugins.local_process"));
+    localPlugin.initialize(pluginCtx);
+    assert(localPlugin.scopedConfig.runnerBinary == "bin/confector-runner");
 }

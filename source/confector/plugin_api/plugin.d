@@ -23,8 +23,20 @@ interface Plugin
     @property string description() const;
     @property PluginCategory category() const;
 
+    ConfigDefinition[] configDefinitions() const;
+
     void initialize(PluginContext context = null);
     void shutdown();
+}
+
+/**
+ * Convenience abstract base class for plugins providing default empty implementations.
+ */
+abstract class BasePlugin : Plugin
+{
+    ConfigDefinition[] configDefinitions() const { return null; }
+    void initialize(PluginContext context = null) {}
+    void shutdown() {}
 }
 
 /**

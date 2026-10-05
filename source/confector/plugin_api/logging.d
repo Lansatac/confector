@@ -1,5 +1,8 @@
 module confector.plugin_api.logging;
 
+public import confector.config : ConfigAccessor, ScopedConfigAccessor, ResolutionEngine, ConfigDefinition, ConfigType;
+import vibe.data.json : Json;
+
 /**
  * Standard log severity levels for plugins.
  */
@@ -35,6 +38,7 @@ alias PluginLogCallback = void delegate(in LogEntry entry);
 interface PluginContext
 {
     @property string pluginName() const;
+    @property ConfigAccessor config();
     void log(LogLevel level, string message, string context = null);
 
     final void trace(string message, string context = null) { log(LogLevel.trace, message, context); }
@@ -51,15 +55,29 @@ interface PluginContext
 class NullPluginContext : PluginContext
 {
     private string m_name;
+    private ConfigAccessor m_config;
 
-    this(string name = "plugin")
+    this(string name = "plugin", ConfigAccessor configAccessor = null)
     {
         m_name = name;
+        if (configAccessor !is null)
+        {
+            m_config = configAccessor;
+        }
+        else
+        {
+            m_config = new ScopedConfigAccessor(new ResolutionEngine(Json.emptyObject), "plugins." ~ name);
+        }
     }
 
     @property string pluginName() const
     {
         return m_name;
+    }
+
+    @property ConfigAccessor config()
+    {
+        return m_config;
     }
 
     void log(LogLevel level, string message, string context = null)

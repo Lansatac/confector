@@ -22,6 +22,8 @@ class BashDefinitionPlugin : StepDefinitionPlugin, BuildStepProvider
     @property string stepType() const { return "bash"; }
     @property string displayName() const { return "Bash Script"; }
 
+    ConfigDefinition[] configDefinitions() const { return null; }
+
     void initialize(PluginContext context = null)
     {
         m_context = context;

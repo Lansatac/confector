@@ -585,6 +585,7 @@ unittest
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Step Runner"; }
         @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-step-system"; }
         void initialize(PluginContext context = null) {}
         void shutdown() {}
@@ -723,6 +724,7 @@ unittest
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Multistep Runner"; }
         @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-multistep-system"; }
         void initialize(PluginContext context = null) {}
         void shutdown() {}

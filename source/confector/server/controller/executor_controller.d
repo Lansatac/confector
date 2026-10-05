@@ -311,6 +311,7 @@ unittest
     import confector.core.storage : InMemoryBuildStateRepository;
     import confector.core.plugin : Plugin, PluginContext, PluginCategory;
     import confector.core.executor : ComputeProvider, ComputeInstance, WorkerRecord;
+    import confector.config : ConfigDefinition;
 
     class MockComputeProvider : Plugin, ComputeProvider
     {
@@ -321,6 +322,7 @@ unittest
         @property string providerType() const { return "mock-local"; }
         @property string displayName() const { return "Mock Local Executor"; }
         @property string[] supportedStepTypes() const { return ["process", "mock"]; }
+        ConfigDefinition[] configDefinitions() const { return null; }
 
         void initialize(PluginContext context = null) {}
         void shutdown() {}
@@ -376,11 +378,19 @@ unittest
     // Test with CapacityBroker and WorkQueue
     import confector.queue.queue : InMemoryWorkQueue;
     import confector.runner.capacity_broker : DefaultCapacityBroker;
-    import plugins.executors.local_process : LocalProcessProvisioner;
+
+    class TestComputeProvisioner : ComputeProvisioner
+    {
+        @property string providerType() const { return "local"; }
+        @property size_t activeInstanceCount() const { return 0; }
+        @property size_t maxCapacity() const { return 4; }
+        bool canProvision(in QueueDemand demand) const { return true; }
+        void requestCapacity(in QueueDemand demand) {}
+    }
 
     auto testQueue = new InMemoryWorkQueue();
     auto testBroker = new DefaultCapacityBroker(testQueue);
-    auto testProv = new LocalProcessProvisioner();
+    auto testProv = new TestComputeProvisioner();
     testBroker.registerProvisioner(testProv);
 
     auto routerWithBroker = executorRouter(repo, reg, testBroker, testQueue);

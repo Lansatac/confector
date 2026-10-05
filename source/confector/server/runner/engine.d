@@ -675,6 +675,7 @@ unittest
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock engine runner plugin"; }
         @property PluginCategory category() const { return PluginCategory.runner; }
+        ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const { return "mock-engine-system"; }
         @property string stepType() const { return "process"; }
 
@@ -929,6 +930,7 @@ unittest
         @property string providerType() const { return "local"; }
         @property string displayName() const { return "Local Process Executor"; }
         @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+        ConfigDefinition[] configDefinitions() const { return null; }
 
         void initialize(PluginContext context = null) {}
         void shutdown() {}

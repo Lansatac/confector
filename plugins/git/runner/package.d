@@ -9,7 +9,7 @@ import std.algorithm.searching : canFind, startsWith, endsWith;
 import std.json : JSONValue, JSONType;
 
 import confector.plugin_api.model;
-import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, StepExecutionPlugin;
+import confector.plugin_api.plugin;
 import confector.plugin_api.vcs;
 import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult;
 import confector.plugin_api.executor : LogDelegate;
@@ -110,6 +110,8 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "Git version control execution, input resolution, and build step runner plugin"; }
     @property PluginCategory category() const { return PluginCategory.runner; }
+
+    ConfigDefinition[] configDefinitions() const { return null; }
     @property string providerType() const { return "git"; }
     @property string systemName() const { return "git-input-resolver"; }
 

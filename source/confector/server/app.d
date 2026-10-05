@@ -12,6 +12,8 @@ import std.string : split, strip;
 
 import vibe.vibe;
 
+import confector.config;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig;
 import confector.core.executor : CapacityBroker, ComputeProvisioner;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
@@ -22,7 +24,6 @@ import confector.runner.capacity_broker : DefaultCapacityBroker;
 import confector.runner.coordinator : BuildCoordinator;
 import confector.runner.engine : TaskEngine;
 import confector.storage.mongo_repository : MongoBuildStateRepository;
-import plugins.executors.local_process : LocalProcessProvisioner, LocalProcessProvisionerConfig;
 
 import controller.admin_controller : adminRouter;
 import controller.api_controller : apiRouter;
@@ -118,8 +119,8 @@ StorageContext initStorage(string mongoHost = "mongo:27017/confector", string se
     return ctx;
 }
 
-/// Discovers and loads bundled plugins as well as dynamically configured plugins via CONFECTOR_PLUGINS.
-void initPlugins()
+/// Discovers and loads bundled plugins as well as dynamically configured plugins via server config / CONFECTOR_PLUGINS.
+void initPlugins(string extraPlugins = "")
 {
     // Automatically load bundled plugins from bin/plugins and plugins directories (definition and worker plugins only)
     Plugin[] bundledPlugins;
@@ -143,8 +144,8 @@ void initPlugins()
         logInfo("[plugins] No bundled plugins found in ./plugins.");
     }
 
-    // Dynamically load additional configured plugins via CONFECTOR_PLUGINS
-    string confectorPluginsEnv = environment.get("CONFECTOR_PLUGINS", "");
+    // Dynamically load additional configured plugins via extraPlugins or CONFECTOR_PLUGINS
+    string confectorPluginsEnv = extraPlugins.length > 0 ? extraPlugins : environment.get("CONFECTOR_PLUGINS", "");
     string[] pluginPaths;
     if (confectorPluginsEnv.length > 0)
     {
@@ -260,54 +261,61 @@ HTTPServerSettings createServerSettings(ushort port = 8080)
 
 void main()
 {
-    // Configure default log level (info in debug, warn in release, or overridden by CONFECTOR_LOG_LEVEL)
-    LogLevel configuredLogLevel = LogLevel.info;
+    // Initialize central ConfigRegistry
+    auto configRegistry = new ConfigRegistry();
+    registerServerConfigDefinitions(configRegistry);
 
-    string envLogLevel = environment.get("CONFECTOR_LOG_LEVEL", environment.get("LOG_LEVEL", ""));
-    if (envLogLevel.length > 0)
+    // Optionally load configuration file if available
+    foreach (cfgPath; ["confector.json", "confector.yaml", "config/confector.json"])
     {
-        import std.string : toLower;
-        switch (envLogLevel.toLower())
+        if (exists(cfgPath))
         {
-            case "trace": configuredLogLevel = LogLevel.trace; break;
-            case "debug": configuredLogLevel = LogLevel.debug_; break;
-            case "info": configuredLogLevel = LogLevel.info; break;
-            case "warn": configuredLogLevel = LogLevel.warn; break;
-            case "error": configuredLogLevel = LogLevel.error; break;
-            default: break;
+            try
+            {
+                configRegistry.loadConfigFile(cfgPath);
+                logInfo("[config] Loaded configuration file from %s", cfgPath);
+                break;
+            }
+            catch (Exception e)
+            {
+                logWarn("[config] Failed to load config file '%s': %s", cfgPath, e.msg);
+            }
         }
+    }
+
+    // Connect ConfigRegistry to PluginRegistry for scoped plugin configs
+    PluginRegistry.instance.setConfigRegistry(configRegistry);
+
+    // Load typed server configuration
+    ServerConfig serverConfig = loadServerConfig(configRegistry);
+
+    // Configure log level
+    LogLevel configuredLogLevel = LogLevel.info;
+    switch (serverConfig.logLevel.toLower())
+    {
+        case "trace": configuredLogLevel = LogLevel.trace; break;
+        case "debug": configuredLogLevel = LogLevel.debug_; break;
+        case "info": configuredLogLevel = LogLevel.info; break;
+        case "warn": configuredLogLevel = LogLevel.warn; break;
+        case "error": configuredLogLevel = LogLevel.error; break;
+        default: break;
     }
     setLogLevel(configuredLogLevel);
 
     // Initialize database & work queues
-    auto storage = initStorage();
+    auto storage = initStorage(serverConfig.storage.mongoHost, serverConfig.storage.secretPath);
 
     // Automatically load plugins
-    initPlugins();
+    initPlugins(serverConfig.plugins.confectorPlugins);
 
     // Initialize execution engine, coordinator & storage
-    auto artifactStorage = new LocalArtifactStorage(".confector/artifacts");
+    auto artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
     auto taskEngine = new TaskEngine(artifactStorage, storage.stateRepo);
     auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
     logInfo("Initialized Confector execution engine and build coordinator.");
 
-    // Initialize capacity broker & register default local process provisioner
+    // Initialize capacity broker
     auto capacityBroker = new DefaultCapacityBroker(storage.workQueue, buildCoordinator);
-
-    LocalProcessProvisionerConfig localCfg;
-    localCfg.runnerBinary = environment.get("CONFECTOR_RUNNER_BIN", "bin/confector-runner");
-    localCfg.serverUrl = environment.get("CONFECTOR_SERVER_URL", "http://localhost:8080");
-    localCfg.workspaceDir = environment.get("CONFECTOR_WORKSPACE_DIR", ".confector/workspaces");
-    localCfg.storageDir = environment.get("CONFECTOR_STORAGE_DIR", ".confector/artifacts");
-    localCfg.pluginsDir = environment.get("CONFECTOR_PLUGINS_DIR", "plugins");
-    string concurrencyEnv = environment.get("CONFECTOR_LOCAL_CONCURRENCY", "");
-    if (concurrencyEnv.length > 0)
-    {
-        try { localCfg.maxConcurrency = concurrencyEnv.to!size_t; } catch (Exception) {}
-    }
-    auto localProvisioner = new LocalProcessProvisioner(localCfg);
-    capacityBroker.registerProvisioner(localProvisioner);
-    logInfo("[capacity_broker] Registered default LocalProcessProvisioner (maxCapacity=%d)", localProvisioner.maxCapacity);
 
     // Register any provisioners from loaded plugins
     foreach (plugin; PluginRegistry.instance.allPlugins())
@@ -325,23 +333,41 @@ void main()
 
     // Configure router and server settings
     auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, storage.client, capacityBroker);
-    auto settings = createServerSettings(8080);
+    auto settings = createServerSettings(serverConfig.http.port);
+    if (serverConfig.http.bindAddress.length > 0)
+    {
+        settings.bindAddresses = [serverConfig.http.bindAddress];
+    }
 
     listenHTTP(settings, router);
 
-    logInfo("Starting server");
+    logInfo("Starting server on port %d", serverConfig.http.port);
     runApplication();
 }
 
 unittest
 {
+    auto configRegistry = new ConfigRegistry();
+    registerServerConfigDefinitions(configRegistry);
+    PluginRegistry.instance.setConfigRegistry(configRegistry);
+
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
     auto storage = new LocalArtifactStorage("test_app_storage");
     auto engine = new TaskEngine(storage, stateRepo);
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
     auto broker = new DefaultCapacityBroker(queue, coordinator);
-    broker.registerProvisioner(new LocalProcessProvisioner());
+
+    class TestProvisioner : ComputeProvisioner
+    {
+        @property string providerType() const { return "local"; }
+        @property size_t activeInstanceCount() const { return 0; }
+        @property size_t maxCapacity() const { return 4; }
+        bool canProvision(in QueueDemand demand) const { return true; }
+        void requestCapacity(in QueueDemand demand) {}
+    }
+
+    broker.registerProvisioner(new TestProvisioner());
 
     auto router = createRouter(engine, queue, coordinator, stateRepo, null, broker);
     assert(router !is null);

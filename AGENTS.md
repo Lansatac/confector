@@ -38,10 +38,6 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Decision**: Task execution consists of an arbitrary ordered list of plugin-defined build steps (such as the Git plugin's `clone_repository` step or the process runner's `process` step).
 - **Rationale**: Replaces rigid, monolithic script execution with composable, sequentially executed step systems. Each plugin exposes step handlers dynamically via `BuildStepSystem`, maximizing reusability and fine-grained error isolation.
 
-### 1.9 Unified Build Orchestration & Contained Artifact Directory
-- **Decision**: The multi-package build (server executable, dynamic plugin libraries, Diet-NG views, and static assets) is orchestrated via Reggae generating a Ninja build graph targeting a single contained `bin/` directory.
-- **Rationale**: Provides fast, deterministic, parallel builds and ensures all runtime components (`bin/confector`, `bin/plugins/`, `bin/views/`, `bin/public/`) reside in a single self-contained artifact directory for deployment and local execution.
-
 ---
 
 ## 2. Subsystem Boundaries & Responsibilities
@@ -68,10 +64,9 @@ This document outlines the architectural principles, key design decisions, subsy
    - Use standard D type qualifiers (`immutable`, `const`, `pure`, `@safe` / `@trusted` where appropriate).
    - Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.
 5. **Build & Execution Workflow**:
-   - Generate Ninja build configuration: `reggae -b ninja .`
-   - Build all targets (app, plugins, assets): `ninja`
-   - Build specific components: `ninja app`, `ninja plugins`, `ninja plugin-<name>`
-   - Run the server: `./bin/confector` (Linux) or `.\bin\confector.exe` (Windows)
+   - Build all targets (app, plugins, assets): `dub build`
+   - Build specific components: `dub build :server`, `dub build :plugins`, etc
+   - Run the server: `dub run :server`
 6. **Unit Testing**:
    - Every core algorithm (DAG resolution, cycle detection, fingerprinting, trigger matching, plugin registration) must be accompanied by comprehensive unit tests (`dub test confector:core`).
 

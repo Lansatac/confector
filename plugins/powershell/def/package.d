@@ -22,6 +22,8 @@ class PowerShellDefinitionPlugin : StepDefinitionPlugin, BuildStepProvider
     @property string stepType() const { return "powershell"; }
     @property string displayName() const { return "PowerShell Script"; }
 
+    ConfigDefinition[] configDefinitions() const { return null; }
+
     void initialize(PluginContext context = null)
     {
         m_context = context;

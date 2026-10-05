@@ -23,6 +23,8 @@ class PowerShellRunnerPlugin : StepExecutionPlugin, BuildStepSystem
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "PowerShell script execution and runner plugin"; }
     @property PluginCategory category() const { return PluginCategory.runner; }
+
+    ConfigDefinition[] configDefinitions() const { return null; }
     @property string systemName() const { return "powershell-step-system"; }
 
     void initialize(PluginContext context = null)

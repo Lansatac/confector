@@ -151,6 +151,7 @@ unittest
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Serverless Step Runner"; }
         @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-serverless-step-system"; }
         void initialize(PluginContext context = null) {}
         void shutdown() {}

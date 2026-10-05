@@ -6,27 +6,57 @@ public import confector.plugin_api.model;
 public import confector.plugin_api.executor;
 public import confector.plugin_api.system;
 public import confector.plugin_api.vcs;
+public import confector.config;
 
 import vibe.core.log : logDebug, logInfo, logWarn, logError;
+import vibe.data.json : Json;
 
 /**
  * Concrete PluginContext provided by the Confector host.
- * Routes plugin logging to custom sinks or host logs.
+ * Routes plugin logging to custom sinks or host logs and provides scoped configuration access.
  */
 class HostPluginContext : PluginContext
 {
     private string m_pluginName;
     private PluginLogCallback m_logSink;
+    private ConfigAccessor m_config;
 
-    this(string pluginName, PluginLogCallback logSink = null)
+    this(string pluginName, PluginLogCallback logSink = null, ConfigAccessor configAccessor = null)
     {
         m_pluginName = pluginName;
         m_logSink = logSink;
+        if (configAccessor !is null)
+        {
+            m_config = configAccessor;
+        }
+        else
+        {
+            m_config = new ScopedConfigAccessor(new ResolutionEngine(Json.emptyObject), "plugins." ~ pluginName);
+        }
+    }
+
+    this(string pluginName, ConfigRegistry registry, PluginLogCallback logSink = null)
+    {
+        m_pluginName = pluginName;
+        m_logSink = logSink;
+        if (registry !is null)
+        {
+            m_config = registry.getScope("plugins." ~ pluginName);
+        }
+        else
+        {
+            m_config = new ScopedConfigAccessor(new ResolutionEngine(Json.emptyObject), "plugins." ~ pluginName);
+        }
     }
 
     @property string pluginName() const
     {
         return m_pluginName;
+    }
+
+    @property ConfigAccessor config()
+    {
+        return m_config;
     }
 
     void log(LogLevel level, string message, string context = null)
@@ -78,6 +108,7 @@ final class PluginRegistry
     private BuildStepProvider[] _stepProviders;
     private ComputeProvider[] _computeProviders;
     private PluginLogCallback _logCallback;
+    private ConfigRegistry _configRegistry;
 
     public static PluginRegistry instance()
     {
@@ -93,10 +124,46 @@ final class PluginRegistry
         _logCallback = callback;
     }
 
-    public void registerPlugin(Plugin plugin)
+    public void setConfigRegistry(ConfigRegistry registry)
+    {
+        _configRegistry = registry;
+    }
+
+    public ConfigRegistry getConfigRegistry()
+    {
+        return _configRegistry;
+    }
+
+    public void registerPlugin(Plugin plugin, ConfigAccessor configAccessor = null)
     {
         _plugins[plugin.name] = plugin;
-        auto ctx = new HostPluginContext(plugin.name, _logCallback);
+
+        // Register any configuration definitions declared by the plugin
+        if (_configRegistry !is null)
+        {
+            auto defs = plugin.configDefinitions();
+            if (defs !is null)
+            {
+                foreach (ref def; defs)
+                {
+                    _configRegistry.registerDefinition(def);
+                }
+            }
+        }
+
+        ConfigAccessor scopeConfig = configAccessor;
+        if (scopeConfig is null)
+        {
+            if (_configRegistry !is null)
+            {
+                scopeConfig = _configRegistry.getScope("plugins." ~ plugin.name);
+            }
+            else
+            {
+                scopeConfig = new ScopedConfigAccessor(new ResolutionEngine(Json.emptyObject), "plugins." ~ plugin.name);
+            }
+        }
+        auto ctx = new HostPluginContext(plugin.name, _logCallback, scopeConfig);
         plugin.initialize(ctx);
 
         // Automatically register implemented system interfaces
@@ -361,6 +428,8 @@ unittest
         @property string description() const { return "Mock plugin for testing"; }
         @property PluginCategory category() const { return PluginCategory.runner; }
 
+        ConfigDefinition[] configDefinitions() const { return null; }
+
         void initialize(PluginContext context = null) { initialized = true; }
         void shutdown() { shutdownCalled = true; }
     }
@@ -387,6 +456,8 @@ unittest
         @property string systemName() const { return "integrated-system"; }
         @property string stepType() const { return "test-step"; }
         @property string displayName() const { return "Test Step"; }
+
+        ConfigDefinition[] configDefinitions() const { return null; }
 
         void initialize(PluginContext context = null) {}
         void shutdown() {}
@@ -438,6 +509,8 @@ unittest
         @property string displayName() const { return "Mock Pool"; }
         @property string[] supportedStepTypes() const { return ["bash", "powershell"]; }
 
+        ConfigDefinition[] configDefinitions() const { return null; }
+
         void initialize(PluginContext context = null) {}
         void shutdown() {}
 
@@ -456,4 +529,65 @@ unittest
     registry.unregisterPlugin("mock-compute");
     assert(registry.getComputeProviders().length == 0);
     assert(registry.getComputeProvider("mock_pool") is null);
+}
+
+unittest
+{
+    // Test Plugin Config integration
+    import vibe.data.json : parseJsonString;
+    import std.process : environment;
+
+    class ConfigurablePlugin : Plugin
+    {
+        string configuredRunner;
+        size_t concurrency;
+
+        @property string name() const { return "configurable_plugin"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Plugin with config"; }
+        @property PluginCategory category() const { return PluginCategory.runner; }
+
+        ConfigDefinition[] configDefinitions() const
+        {
+            return [
+                ConfigDefinition("plugins.configurable_plugin.customOption", "CUSTOM_OPTION_ENV", Json("default_opt"), "Custom option description")
+            ];
+        }
+
+        void initialize(PluginContext context = null)
+        {
+            if (context !is null && context.config !is null)
+            {
+                configuredRunner = context.config.getString("runnerBinary", "default-bin");
+                concurrency = context.config.get!size_t("maxConcurrency", 2);
+            }
+        }
+
+        void shutdown() {}
+    }
+
+    string configJson = `{
+        "plugins": {
+            "configurable_plugin": {
+                "runnerBinary": "custom/runner/bin",
+                "maxConcurrency": 10
+            }
+        }
+    }`;
+    auto configRegistry = new ConfigRegistry(parseJsonString(configJson));
+
+    auto reg = PluginRegistry.instance;
+    reg.setConfigRegistry(configRegistry);
+
+    auto plug = new ConfigurablePlugin();
+    reg.registerPlugin(plug);
+
+    assert(plug.configuredRunner == "custom/runner/bin");
+    assert(plug.concurrency == 10);
+    // Verify definition was registered in configRegistry
+    auto scopeCfg = configRegistry.getScope("plugins.configurable_plugin");
+    assert(scopeCfg.getString("customOption") == "default_opt");
+
+    reg.unregisterPlugin("configurable_plugin");
+    reg.setConfigRegistry(null);
 }

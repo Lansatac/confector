@@ -23,6 +23,8 @@ class GitDefinitionPlugin : StepDefinitionPlugin, BuildStepProvider
     @property string stepType() const { return "clone_repository"; }
     @property string displayName() const { return "Clone Git Repository"; }
 
+    ConfigDefinition[] configDefinitions() const { return null; }
+
     void initialize(PluginContext context = null)
     {
         m_context = context;

@@ -1105,6 +1105,7 @@ unittest
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Mock api plugin"; }
         @property PluginCategory category() const { return PluginCategory.definition; }
+        ConfigDefinition[] configDefinitions() const { return null; }
         void initialize(PluginContext context = null) {}
         void shutdown() {}
     }
