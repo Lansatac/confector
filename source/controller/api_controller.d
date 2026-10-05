@@ -15,12 +15,49 @@ import std.datetime.systime : Clock;
 
 URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null)
 {
+    import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
+
+    void postRoute(H)(string path, H handler)
+    {
+        router.post(path, handler);
+        if (!path.startsWith("/api/v1"))
+        {
+            router.post("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
+        }
+    }
+
+    void getRoute(H)(string path, H handler)
+    {
+        router.get(path, handler);
+        if (!path.startsWith("/api/v1"))
+        {
+            router.get("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
+        }
+    }
+
+    void anyRoute(H)(string path, H handler)
+    {
+        router.any(path, handler);
+        if (!path.startsWith("/api/v1"))
+        {
+            router.any("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
+        }
+    }
+
+    void deleteRoute(H)(string path, H handler)
+    {
+        router.delete_(path, handler);
+        if (!path.startsWith("/api/v1"))
+        {
+            router.delete_("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
+        }
+    }
 
     // Work Queue endpoints
     if (queue !is null)
     {
-        router.post("/queue/enqueue", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/enqueue", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 TaskQueueMessage msg = deserializeJson!TaskQueueMessage(req.json);
@@ -39,7 +76,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
         });
 
-        router.post("/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 auto pMax = "max_messages" in req.json;
@@ -58,7 +95,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
         });
 
-        router.post("/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 string receiptHandle = req.json["receipt_handle"].get!string;
@@ -76,7 +113,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
         });
 
-        router.post("/queue/nack", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/nack", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 string receiptHandle = req.json["receipt_handle"].get!string;
@@ -98,7 +135,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
         });
 
-        router.post("/queue/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 string receiptHandle = req.json["receipt_handle"].get!string;
@@ -118,14 +155,14 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
         });
 
-        router.get("/queue/stats", (HTTPServerRequest req, HTTPServerResponse res) {
+        getRoute("/queue/stats", (HTTPServerRequest req, HTTPServerResponse res) {
             Json stats = Json.emptyObject;
             stats["pending_count"] = Json(queue.getPendingCount());
             stats["dead_letter_count"] = Json(queue.getDeadLetterMessages().length);
             res.writeJsonBody(stats);
         });
 
-        router.get("/queue/pending", (HTTPServerRequest req, HTTPServerResponse res) {
+        getRoute("/queue/pending", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 auto msgs = queue.getPendingMessages(50);
@@ -142,7 +179,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     }
 
     // Task Execution Query and Log Endpoints
-    router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             auto repo = engine.stateRepository;
@@ -164,7 +201,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.get("/builds/:build_id/tasks/:task_id", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/builds/:build_id/tasks/:task_id", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string buildId = req.params["build_id"];
@@ -193,7 +230,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.get("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string buildId = req.params["build_id"];
@@ -217,7 +254,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Remote Worker Task Completion Callback endpoints
-    router.post("/tasks/:fingerprint/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/tasks/:fingerprint/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string fingerprint = req.params["fingerprint"];
@@ -257,7 +294,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string buildId = req.params["build_id"];
@@ -294,7 +331,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string buildId = req.params["build_id"];
@@ -341,7 +378,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Run Project via the queue-backed coordinator
-    router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projectId = req.json["project_id"].get!string;
@@ -389,7 +426,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Task Graph Trigger & Execution endpoint
-    router.post("/tasks/execute", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/tasks/execute", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             Json bodyJson = req.json;
@@ -476,7 +513,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Builds API
-    router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/builds", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             auto repo = engine.stateRepository;
@@ -497,7 +534,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.get("/builds/details", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/builds/details", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string buildId = req.query.get("id", "");
@@ -536,7 +573,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.get("/builds/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/builds/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string buildId = req.query.get("id", "");
@@ -557,7 +594,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Trigger Rules API
-    router.get("/triggers", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/triggers", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             auto repo = engine.stateRepository;
@@ -573,7 +610,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/triggers/create", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/triggers/create", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             TriggerRuleRecord rule = deserializeJson!TriggerRuleRecord(req.json);
@@ -602,7 +639,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/triggers/delete", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/triggers/delete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string ruleId = req.json["id"].get!string;
@@ -622,7 +659,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Projects REST API
-    router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             auto repo = engine.stateRepository;
@@ -638,7 +675,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             ProjectRecord proj = deserializeJson!ProjectRecord(req.json);
@@ -669,7 +706,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.get("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -696,7 +733,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.delete_("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+    deleteRoute("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -726,7 +763,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Project Tasks API
-    router.get("/projects/:id/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects/:id/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -753,7 +790,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/projects/:id/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects/:id/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -807,7 +844,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.get("/projects/:id/tasks/:taskId", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects/:id/tasks/:taskId", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -846,7 +883,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.delete_("/projects/:id/tasks/:taskId", (HTTPServerRequest req, HTTPServerResponse res) {
+    deleteRoute("/projects/:id/tasks/:taskId", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -903,7 +940,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Project Task Graph Execution endpoint
-    router.post("/projects/:id/execute", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects/:id/execute", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -966,7 +1003,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    router.post("/projects/:id/tasks/:taskId/execute", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects/:id/tasks/:taskId/execute", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -1022,7 +1059,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     });
 
     // Webhook receiver endpoint
-    router.post("/triggers/webhook", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/triggers/webhook", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             Json bodyJson = req.json;

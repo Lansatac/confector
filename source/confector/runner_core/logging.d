@@ -2,8 +2,44 @@ module confector.runner_core.logging;
 
 import confector.plugin_api.executor : LogDelegate;
 import std.format : format;
+import std.stdio : stderr, writeln;
 import core.sync.mutex : Mutex;
-import vibe.core.log : logInfo, logError, logWarn, logDebug;
+
+/**
+ * Log helper functions for runner_core without vibe-d dependencies.
+ */
+void logInfo(Args...)(string fmt, Args args)
+{
+    // runner info logs can be suppressed or formatted
+}
+
+void logDebug(Args...)(string fmt, Args args)
+{
+    // runner debug logs
+}
+
+void logTrace(Args...)(string fmt, Args args)
+{
+    // runner trace logs
+}
+
+void logWarn(Args...)(string fmt, Args args)
+{
+    try
+    {
+        stderr.writefln("[WARN] " ~ fmt, args);
+    }
+    catch (Exception) {}
+}
+
+void logError(Args...)(string fmt, Args args)
+{
+    try
+    {
+        stderr.writefln("[ERROR] " ~ fmt, args);
+    }
+    catch (Exception) {}
+}
 
 /**
  * Thread-safe execution logger collecting step and script output lines

@@ -2,7 +2,7 @@ module confector.queue.mongo_queue;
 
 import confector.queue.queue;
 import confector.core.model;
-import confector.core.json_compat : sanitizeBson;
+import confector.core.json_compat : sanitizeBson, getBsonLong, getBsonInt;
 
 import vibe.db.mongo.client : MongoClient;
 import vibe.db.mongo.collection : MongoCollection, FindOptions, UpdateOptions;
@@ -162,9 +162,9 @@ class MongoWorkQueue : WorkQueue
             string bId = candidate.tryIndex("build_id").isNull ? "" : candidate["build_id"].get!string;
             string tId = candidate.tryIndex("task_id").isNull ? "" : candidate["task_id"].get!string;
             string stat = candidate.tryIndex("status").isNull ? "" : candidate["status"].get!string;
-            long visAfter = candidate.tryIndex("visible_after").isNull ? 0 : candidate["visible_after"].to!long;
-            int attempt = candidate.tryIndex("attempt").isNull ? 1 : candidate["attempt"].to!int;
-            int maxAttempts = candidate.tryIndex("max_attempts").isNull ? 3 : candidate["max_attempts"].to!int;
+            long visAfter = candidate.tryIndex("visible_after").isNull ? 0 : getBsonLong(candidate["visible_after"]);
+            int attempt = candidate.tryIndex("attempt").isNull ? 1 : getBsonInt(candidate["attempt"], 1);
+            int maxAttempts = candidate.tryIndex("max_attempts").isNull ? 3 : getBsonInt(candidate["max_attempts"], 3);
 
             logInfo("[mongo_queue] Dequeue candidate found: msgId='%s', task='%s', build='%s', status='%s', visible_after=%d, attempt=%d/%d", msgId, tId, bId, stat, visAfter, attempt, maxAttempts);
 
@@ -263,7 +263,7 @@ class MongoWorkQueue : WorkQueue
                     msg.createdAt = candidate.tryIndex("created_at").isNull ? "" : candidate["created_at"].get!string;
                     msg.attempt = attempt;
                     msg.maxAttempts = maxAttempts;
-                    msg.timeoutSeconds = candidate.tryIndex("timeout_seconds").isNull ? 900 : cast(size_t)candidate["timeout_seconds"].to!long;
+                    msg.timeoutSeconds = candidate.tryIndex("timeout_seconds").isNull ? 900 : cast(size_t)getBsonLong(candidate["timeout_seconds"], 900);
                     msg.visibleAfterUnix = newVisibleAfter;
 
                     result ~= msg;
@@ -310,8 +310,8 @@ class MongoWorkQueue : WorkQueue
             return;
         }
 
-        int attempt = doc["attempt"].to!int;
-        int maxAttempts = doc["max_attempts"].to!int;
+        int attempt = getBsonInt(doc["attempt"], 1);
+        int maxAttempts = getBsonInt(doc["max_attempts"], 3);
 
         if (!requeue || attempt >= maxAttempts)
         {
@@ -401,8 +401,8 @@ class MongoWorkQueue : WorkQueue
             }
 
             msg.createdAt = doc.tryIndex("created_at").isNull ? "" : doc["created_at"].get!string;
-            msg.attempt = doc.tryIndex("attempt").isNull ? 1 : doc["attempt"].to!int;
-            msg.maxAttempts = doc.tryIndex("max_attempts").isNull ? 3 : doc["max_attempts"].to!int;
+            msg.attempt = doc.tryIndex("attempt").isNull ? 1 : getBsonInt(doc["attempt"], 1);
+            msg.maxAttempts = doc.tryIndex("max_attempts").isNull ? 3 : getBsonInt(doc["max_attempts"], 3);
             msg.errorReason = doc.tryIndex("error_reason").isNull ? "" : doc["error_reason"].get!string;
             result ~= msg;
         }
@@ -477,10 +477,10 @@ class MongoWorkQueue : WorkQueue
 
                 if (!candidate.tryIndex("created_at").isNull && candidate["created_at"].type == Bson.Type.string)
                     msg.createdAt = candidate["created_at"].get!string;
-                msg.attempt = candidate.tryIndex("attempt").isNull ? 1 : candidate["attempt"].to!int;
-                msg.maxAttempts = candidate.tryIndex("max_attempts").isNull ? 3 : candidate["max_attempts"].to!int;
-                msg.timeoutSeconds = candidate.tryIndex("timeout_seconds").isNull ? 900 : cast(size_t)candidate["timeout_seconds"].to!long;
-                msg.visibleAfterUnix = candidate.tryIndex("visible_after").isNull ? currentUnixTime() : candidate["visible_after"].to!long;
+                msg.attempt = candidate.tryIndex("attempt").isNull ? 1 : getBsonInt(candidate["attempt"], 1);
+                msg.maxAttempts = candidate.tryIndex("max_attempts").isNull ? 3 : getBsonInt(candidate["max_attempts"], 3);
+                msg.timeoutSeconds = candidate.tryIndex("timeout_seconds").isNull ? 900 : cast(size_t)getBsonLong(candidate["timeout_seconds"], 900);
+                msg.visibleAfterUnix = candidate.tryIndex("visible_after").isNull ? currentUnixTime() : getBsonLong(candidate["visible_after"], currentUnixTime());
                 result ~= msg;
             }
         }

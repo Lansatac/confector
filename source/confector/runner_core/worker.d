@@ -9,11 +9,9 @@ import confector.runner_core.engine;
 import confector.runner_core.artifacts;
 import confector.runner_core.logging;
 
-import vibe.http.client : requestHTTP, HTTPMethod, HTTPClientResponse;
-import vibe.inet.url : URL;
-import vibe.data.json;
-import vibe.core.log : logInfo, logError, logWarn, logDebug;
+import vibe.data.json : Json, serializeToJson, deserializeJson, serializeToJsonString, parseJsonString;
 
+import std.net.curl : HTTP;
 import std.file : exists, mkdirRecurse, isDir;
 import std.path : buildPath;
 import std.uuid : randomUUID;
@@ -22,6 +20,8 @@ import std.stdio : writeln, stderr;
 import std.datetime.systime : Clock;
 import std.process : environment;
 import std.algorithm.searching : canFind;
+import core.thread : Thread;
+import core.time : Duration, seconds, msecs;
 
 /**
  * Configuration options for the HTTP-based remote worker daemon.
@@ -97,65 +97,81 @@ class HttpWorkerClient
         }
     }
 
-    Json sendJson(string endpointPath, HTTPMethod method = HTTPMethod.POST, in Json bodyJson = Json.undefined)
+    Json sendJson(string endpointPath, string method = "POST", in Json bodyJson = Json.undefined)
     {
         string fullUrl = resolveEndpointUrl(endpointPath);
-        URL url = URL(fullUrl);
+        auto http = HTTP(fullUrl);
 
-        Json responseJson = Json.emptyObject;
+        http.addRequestHeader("Content-Type", "application/json");
+        http.addRequestHeader("Accept", "application/json");
 
-        requestHTTP(url, (scope req) {
-            req.method = method;
-            req.headers["Content-Type"] = "application/json";
-            req.headers["Accept"] = "application/json";
-            if (m_workerToken.length > 0)
-            {
-                req.headers["X-Worker-Token"] = m_workerToken;
-                req.headers["Authorization"] = "Bearer " ~ m_workerToken;
-            }
-            if (m_workerId.length > 0)
-            {
-                req.headers["X-Worker-ID"] = m_workerId;
-            }
+        if (m_workerToken.length > 0)
+        {
+            http.addRequestHeader("X-Worker-Token", m_workerToken);
+            http.addRequestHeader("Authorization", "Bearer " ~ m_workerToken);
+        }
+        if (m_workerId.length > 0)
+        {
+            http.addRequestHeader("X-Worker-ID", m_workerId);
+        }
 
-            if (bodyJson.type != Json.Type.undefined && bodyJson.type != Json.Type.null_)
-            {
-                req.writeJsonBody(bodyJson);
-            }
-        }, (scope res) {
-            if (res.statusCode >= 200 && res.statusCode < 300)
+        char[] responseData;
+        http.onReceive = (ubyte[] data) {
+            responseData ~= cast(char[])data;
+            return data.length;
+        };
+
+        if (bodyJson.type != Json.Type.undefined && bodyJson.type != Json.Type.null_)
+        {
+            string bodyStr = serializeToJsonString(bodyJson);
+            http.setPostData(bodyStr, "application/json");
+        }
+        else if (method == "POST")
+        {
+            http.setPostData("{}", "application/json");
+        }
+
+        http.method = HTTP.Method.post;
+        if (method == "GET") http.method = HTTP.Method.get;
+        else if (method == "PUT") http.method = HTTP.Method.put;
+        else if (method == "DELETE") http.method = HTTP.Method.del;
+
+        http.perform();
+
+        if (http.statusLine.code >= 200 && http.statusLine.code < 300)
+        {
+            if (responseData.length > 0)
             {
                 try
                 {
-                    if (!res.bodyReader.empty)
-                    {
-                        responseJson = res.readJson();
-                    }
+                    return parseJsonString(responseData.idup);
                 }
                 catch (Exception)
                 {
-                    responseJson = Json.emptyObject;
+                    return Json.emptyObject;
                 }
             }
-            else
+            return Json.emptyObject;
+        }
+        else
+        {
+            string errMsg;
+            if (responseData.length > 0)
             {
-                string errMsg;
                 try
                 {
-                    if (!res.bodyReader.empty)
-                    {
-                        auto errJson = res.readJson();
-                        if ("error" in errJson) errMsg = errJson["error"].get!string;
-                        else errMsg = errJson.toString();
-                    }
+                    auto errJson = parseJsonString(responseData.idup);
+                    if ("error" in errJson) errMsg = errJson["error"].get!string;
+                    else errMsg = responseData.idup;
                 }
-                catch (Exception) {}
-                if (errMsg.length == 0) errMsg = format("HTTP %d %s", res.statusCode, res.statusPhrase);
-                throw new Exception(format("Server request to '%s' failed: %s", fullUrl, errMsg));
+                catch (Exception)
+                {
+                    errMsg = responseData.idup;
+                }
             }
-        });
-
-        return responseJson;
+            if (errMsg.length == 0) errMsg = format("HTTP %d %s", http.statusLine.code, http.statusLine.reason);
+            throw new Exception(format("Server request to '%s' failed: %s", fullUrl, errMsg));
+        }
     }
 
     TaskQueueMessage[] dequeueTasks(size_t maxMessages = 1, size_t visibilityTimeout = 30)
@@ -165,7 +181,7 @@ class HttpWorkerClient
         req["visibility_timeout"] = Json(visibilityTimeout);
         req["worker_id"] = Json(m_workerId);
 
-        Json res = sendJson("/queue/dequeue", HTTPMethod.POST, req);
+        Json res = sendJson("/queue/dequeue", "POST", req);
         if (res.type == Json.Type.array)
         {
             return deserializeJson!(TaskQueueMessage[])(res);
@@ -182,7 +198,7 @@ class HttpWorkerClient
             req["receipt_handle"] = Json(receiptHandle);
             req["extension_seconds"] = Json(extensionSeconds);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/heartbeat", HTTPMethod.POST, req);
+            sendJson("/queue/heartbeat", "POST", req);
             return true;
         }
         catch (Exception e)
@@ -200,7 +216,7 @@ class HttpWorkerClient
             Json req = Json.emptyObject;
             req["receipt_handle"] = Json(receiptHandle);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/ack", HTTPMethod.POST, req);
+            sendJson("/queue/ack", "POST", req);
             return true;
         }
         catch (Exception e)
@@ -220,7 +236,7 @@ class HttpWorkerClient
             req["requeue"] = Json(requeue);
             req["error_reason"] = Json(errorReason);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/nack", HTTPMethod.POST, req);
+            sendJson("/queue/nack", "POST", req);
             return true;
         }
         catch (Exception e)
@@ -239,7 +255,7 @@ class HttpWorkerClient
             req["lines"] = serializeToJson(lines);
             req["worker_id"] = Json(m_workerId);
             string endpoint = format("/builds/%s/tasks/%s/logs", buildId, taskId);
-            sendJson(endpoint, HTTPMethod.POST, req);
+            sendJson(endpoint, "POST", req);
             return true;
         }
         catch (Exception e)
@@ -256,7 +272,7 @@ class HttpWorkerClient
         {
             Json bodyJson = serializeToJson(result);
             string endpoint = format("/builds/%s/tasks/%s/complete", buildId, taskId);
-            sendJson(endpoint, HTTPMethod.POST, bodyJson);
+            sendJson(endpoint, "POST", bodyJson);
             success = true;
         }
         catch (Exception e)
@@ -268,13 +284,11 @@ class HttpWorkerClient
         {
             try
             {
-                URL url = URL(callbackUrl);
-                Json bodyJson = serializeToJson(result);
-                requestHTTP(url, (scope req) {
-                    req.method = HTTPMethod.POST;
-                    req.headers["Content-Type"] = "application/json";
-                    req.writeJsonBody(bodyJson);
-                }, (scope res) {});
+                auto http = HTTP(callbackUrl);
+                http.addRequestHeader("Content-Type", "application/json");
+                string bodyStr = serializeToJsonString(result);
+                http.setPostData(bodyStr, "application/json");
+                http.perform();
             }
             catch (Exception e)
             {
@@ -354,25 +368,37 @@ class HttpWorkerRunner
         logInfo("[worker] Processing task '%s' for build '%s' (receipt: %s)", taskId, buildId, msg.receiptHandle);
 
         // Heartbeat periodic timer
-        import vibe.core.core : setTimer, Timer;
-        import core.time : seconds;
-        Timer heartbeatTimer;
-        bool hasHeartbeatTimer = false;
+        Thread heartbeatThread;
+        bool heartbeatRunning = false;
         if (msg.receiptHandle.length > 0 && m_config.heartbeatIntervalSeconds > 0)
         {
-            heartbeatTimer = setTimer(m_config.heartbeatIntervalSeconds.seconds, {
-                if (m_client !is null && msg.receiptHandle.length > 0)
+            heartbeatRunning = true;
+            string handle = msg.receiptHandle;
+            size_t intervalSec = m_config.heartbeatIntervalSeconds;
+            size_t visTimeout = m_config.visibilityTimeoutSeconds;
+            heartbeatThread = new Thread({
+                while (heartbeatRunning)
                 {
-                    m_client.extendHeartbeat(msg.receiptHandle, m_config.visibilityTimeoutSeconds);
+                    Thread.sleep(intervalSec.seconds);
+                    if (!heartbeatRunning) break;
+                    if (m_client !is null && handle.length > 0)
+                    {
+                        m_client.extendHeartbeat(handle, visTimeout);
+                    }
                 }
-            }, true);
-            hasHeartbeatTimer = true;
+            });
+            heartbeatThread.isDaemon = true;
+            heartbeatThread.start();
         }
         scope(exit)
         {
-            if (hasHeartbeatTimer)
+            if (heartbeatRunning)
             {
-                heartbeatTimer.stop();
+                heartbeatRunning = false;
+                if (heartbeatThread !is null)
+                {
+                    heartbeatThread.join();
+                }
             }
         }
 
@@ -503,9 +529,6 @@ class HttpWorkerRunner
 
         logInfo("[worker] Remote worker '%s' started, polling server '%s'...", m_client.workerId, m_client.serverUrl);
 
-        import vibe.core.core : sleep;
-        import core.time : seconds;
-
         while (!m_stopRequested)
         {
             try
@@ -517,7 +540,7 @@ class HttpWorkerRunner
                     {
                         break;
                     }
-                    sleep(m_config.pollIntervalSeconds.seconds);
+                    Thread.sleep(m_config.pollIntervalSeconds.seconds);
                     continue;
                 }
 
@@ -538,7 +561,7 @@ class HttpWorkerRunner
             catch (Exception e)
             {
                 logError("[worker] Error during worker polling loop: %s", e.msg);
-                sleep(m_config.pollIntervalSeconds.seconds);
+                Thread.sleep(m_config.pollIntervalSeconds.seconds);
             }
         }
 
@@ -666,7 +689,17 @@ unittest
     config.heartbeatIntervalSeconds = 1;
 
     auto workerRunner = new HttpWorkerRunner(config);
-    workerRunner.run();
+    auto workerThread = new Thread({
+        workerRunner.run();
+    });
+    workerThread.start();
+
+    // Drive vibe event loop until worker thread completes
+    while (workerThread.isRunning)
+    {
+        sleep(50.msecs);
+    }
+    workerThread.join();
 
     assert(workerRunner.tasksProcessed == 1);
     assert(dequeueCalled);
@@ -803,7 +836,17 @@ unittest
     config.heartbeatIntervalSeconds = 1;
 
     auto workerRunner = new HttpWorkerRunner(config);
-    workerRunner.run();
+    auto workerThread = new Thread({
+        workerRunner.run();
+    });
+    workerThread.start();
+
+    // Drive vibe event loop until worker thread completes
+    while (workerThread.isRunning)
+    {
+        sleep(50.msecs);
+    }
+    workerThread.join();
 
     assert(workerRunner.tasksProcessed == 2);
     assert(completedTasks.length == 2);

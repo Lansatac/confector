@@ -48,8 +48,7 @@
 			"importPaths": ["source"],
 			"targetPath": "lib",
 			"dependencies": {
-				"confector:core": "*",
-				"vibe-d": "~>0.10.3"
+				"confector:core": "*"
 			}
 		},
 		{
@@ -62,8 +61,7 @@
 			"workingDirectory": "bin",
 			"dependencies": {
 				"confector:runner_core": "*",
-				"confector:core": "*",
-				"vibe-d": "~>0.10.3"
+				"confector:core": "*"
 			}
 		},
 		"./plugins/bash/def",

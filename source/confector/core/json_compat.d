@@ -5,6 +5,38 @@ import vibe.data.bson : Bson;
 import std.json : JSONValue, JSONType, parseJSON;
 
 /**
+ * Safely extracts a long integer from a BSON value, accommodating int, long, double, or string types.
+ */
+long getBsonLong(in Bson b, long defaultVal = 0)
+{
+    switch (b.type)
+    {
+        case Bson.Type.int_: return cast(long)b.get!int;
+        case Bson.Type.long_: return b.get!long;
+        case Bson.Type.double_: return cast(long)b.get!double;
+        case Bson.Type.string:
+            try { import std.conv : to; return b.get!string.to!long; } catch (Exception) { return defaultVal; }
+        default: return defaultVal;
+    }
+}
+
+/**
+ * Safely extracts an integer from a BSON value, accommodating int, long, double, or string types.
+ */
+int getBsonInt(in Bson b, int defaultVal = 0)
+{
+    switch (b.type)
+    {
+        case Bson.Type.int_: return b.get!int;
+        case Bson.Type.long_: return cast(int)b.get!long;
+        case Bson.Type.double_: return cast(int)b.get!double;
+        case Bson.Type.string:
+            try { import std.conv : to; return b.get!string.to!int; } catch (Exception) { return defaultVal; }
+        default: return defaultVal;
+    }
+}
+
+/**
  * Sanitizes a BSON value by removing fields with Type.undefined and converting
  * legacy object/undefined values to clean representations, enabling backwards
  * compatibility with MongoDB records stored by previous versions.

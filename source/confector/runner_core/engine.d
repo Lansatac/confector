@@ -15,7 +15,7 @@ import std.format : format;
 import std.json : JSONType;
 import std.algorithm.searching : canFind;
 import std.datetime.stopwatch : StopWatch, AutoStart;
-import vibe.core.log : logInfo, logError, logWarn, logDebug;
+import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
 
 /**
  * Result of a task execution.

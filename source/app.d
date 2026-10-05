@@ -8,7 +8,6 @@ import std.format : format;
 import std.functional : toDelegate;
 import std.path : buildPath;
 import std.process : environment;
-import std.stdio : writefln, writeln;
 import std.string : split, strip;
 
 import vibe.vibe;
@@ -72,7 +71,7 @@ string readSecretFile(string path)
     }
     catch (Exception e)
     {
-        writeln("Could not read mongo secret: ", e.msg);
+        logError("Could not read mongo secret: ", e.msg);
         return "";
     }
 }
@@ -95,12 +94,12 @@ StorageContext initStorage(string mongoHost = "mongo:27017/confector", string se
     if (password.length > 0)
     {
         mongoUri = "mongodb://dev-read-write:" ~ password ~ "@" ~ mongoHost;
-        writefln("Connecting to mongo at %s (authenticated)...", mongoHost);
+        logInfo("Connecting to mongo at %s (authenticated)...", mongoHost);
     }
     else
     {
         mongoUri = "mongodb://" ~ mongoHost;
-        writefln("Connecting to mongo at %s...", mongoHost);
+        logInfo("Connecting to mongo at %s...", mongoHost);
     }
 
     try
@@ -108,11 +107,11 @@ StorageContext initStorage(string mongoHost = "mongo:27017/confector", string se
         ctx.client = connectMongoDB(mongoUri);
         ctx.stateRepo = new MongoBuildStateRepository(ctx.client);
         ctx.workQueue = new MongoWorkQueue(ctx.client);
-        writeln("Connected to mongo.");
+        logInfo("Connected to mongo.");
     }
     catch (Exception e)
     {
-        writefln("Fatal: Failed to connect to MongoDB at %s: %s", mongoUri, e.msg);
+        logError("Fatal: Failed to connect to MongoDB at %s: %s", mongoUri, e.msg);
         throw new Exception(format("Failed to connect to MongoDB at %s: %s", mongoUri, e.msg), e);
     }
 
@@ -136,12 +135,12 @@ void initPlugins()
     {
         foreach (p; bundledPlugins)
         {
-            writefln("[plugins] Loaded bundled plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
+            logInfo("[plugins] Loaded bundled plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
         }
     }
     else
     {
-        writeln("[plugins] No bundled plugins found in ./plugins.");
+        logInfo("[plugins] No bundled plugins found in ./plugins.");
     }
 
     // Dynamically load additional configured plugins via CONFECTOR_PLUGINS
@@ -176,22 +175,22 @@ void initPlugins()
                     auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker]);
                     if (p !is null)
                     {
-                        writefln("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
+                        logInfo("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
                     }
                 }
                 catch (Exception e)
                 {
-                    writefln("[plugins] Warning: Failed to load configured plugin '%s': %s", trimmed, e.msg);
+                    logWarn("[plugins] Failed to load configured plugin '%s': %s", trimmed, e.msg);
                 }
             }
         }
     }
     else
     {
-        writeln("[plugins] No additional external plugins configured via CONFECTOR_PLUGINS.");
+        logInfo("[plugins] No additional external plugins configured via CONFECTOR_PLUGINS.");
     }
 
-    writefln("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
+    logInfo("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
 }
 
 /// Configures application URL routing.
@@ -217,7 +216,9 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    router.any("/api/v1/*", apiRouter(taskEngine, workQueue, buildCoordinator));
+    auto api = apiRouter(taskEngine, workQueue, buildCoordinator);
+    router.any("/api/v1/*", api);
+    router.any("/api/*", api);
 
     // Dashboard, builds, projects, executors, and admin UI
     router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
@@ -259,9 +260,24 @@ HTTPServerSettings createServerSettings(ushort port = 8080)
 
 void main()
 {
-    // Ensure info and error logs are printed to console
-    setLogLevel(LogLevel.warn);
-    debug setLogLevel(LogLevel.info);
+    // Configure default log level (info in debug, warn in release, or overridden by CONFECTOR_LOG_LEVEL)
+    LogLevel configuredLogLevel = LogLevel.info;
+
+    string envLogLevel = environment.get("CONFECTOR_LOG_LEVEL", environment.get("LOG_LEVEL", ""));
+    if (envLogLevel.length > 0)
+    {
+        import std.string : toLower;
+        switch (envLogLevel.toLower())
+        {
+            case "trace": configuredLogLevel = LogLevel.trace; break;
+            case "debug": configuredLogLevel = LogLevel.debug_; break;
+            case "info": configuredLogLevel = LogLevel.info; break;
+            case "warn": configuredLogLevel = LogLevel.warn; break;
+            case "error": configuredLogLevel = LogLevel.error; break;
+            default: break;
+        }
+    }
+    setLogLevel(configuredLogLevel);
 
     // Initialize database & work queues
     auto storage = initStorage();
@@ -273,7 +289,7 @@ void main()
     auto artifactStorage = new LocalArtifactStorage(".confector/artifacts");
     auto taskEngine = new TaskEngine(artifactStorage, storage.stateRepo);
     auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
-    writeln("Initialized Confector execution engine and build coordinator (stateless control plane mode).");
+    logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Initialize capacity broker & register default local process provisioner
     auto capacityBroker = new DefaultCapacityBroker(storage.workQueue, buildCoordinator);
@@ -291,7 +307,7 @@ void main()
     }
     auto localProvisioner = new LocalProcessProvisioner(localCfg);
     capacityBroker.registerProvisioner(localProvisioner);
-    writefln("[capacity_broker] Registered default LocalProcessProvisioner (maxCapacity=%d)", localProvisioner.maxCapacity);
+    logInfo("[capacity_broker] Registered default LocalProcessProvisioner (maxCapacity=%d)", localProvisioner.maxCapacity);
 
     // Register any provisioners from loaded plugins
     foreach (plugin; PluginRegistry.instance.allPlugins())
@@ -299,22 +315,21 @@ void main()
         if (auto prov = cast(ComputeProvisioner) plugin)
         {
             capacityBroker.registerProvisioner(prov);
-            writefln("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)", prov.providerType, prov.maxCapacity);
+            logInfo("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)", prov.providerType, prov.maxCapacity);
         }
     }
 
     // Start capacity broker evaluation loop
     capacityBroker.start();
-    writeln("[capacity_broker] Started capacity evaluation loop.");
+    logInfo("[capacity_broker] Started capacity evaluation loop.");
 
     // Configure router and server settings
     auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, storage.client, capacityBroker);
-    debug setLogLevel(LogLevel.info);
     auto settings = createServerSettings(8080);
 
     listenHTTP(settings, router);
 
-    writeln("Starting server");
+    logInfo("Starting server");
     runApplication();
 }
 

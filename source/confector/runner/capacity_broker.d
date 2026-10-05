@@ -6,12 +6,12 @@ import confector.queue.queue;
 import confector.runner.coordinator;
 
 import core.sync.mutex : Mutex;
-import core.thread : Thread;
 import core.time : Duration, seconds, msecs;
 import std.algorithm.searching : canFind;
 import std.datetime.systime : Clock;
 import std.format : format;
-import vibe.core.log : logInfo, logError, logWarn, logDebug;
+import vibe.core.core : runTask, sleep, Task;
+import vibe.core.log : logInfo, logError, logWarn, logDebug, logTrace;
 
 /**
  * Server-side capacity broker that inspects queue backlog / demand and delegates
@@ -25,7 +25,7 @@ class DefaultCapacityBroker : CapacityBroker
     private ComputeProvisioner[] m_provisioners;
     private Mutex m_mutex;
     private bool m_running = false;
-    private Thread m_brokerThread;
+    private Task m_brokerTask;
     private Duration m_pollInterval;
 
     // Allow one-shot local workers time to start and claim work before spawning
@@ -40,10 +40,16 @@ class DefaultCapacityBroker : CapacityBroker
 
     void registerProvisioner(ComputeProvisioner provisioner)
     {
-        if (provisioner is null) return;
+        if (provisioner is null)
+        {
+            logError("[capacity_broker] registerProvisioner called with null provisioner");
+            return;
+        }
         synchronized (m_mutex)
         {
             m_provisioners ~= provisioner;
+            logDebug("[capacity_broker] Registered compute provisioner '%s' (activeInstances=%d, maxCapacity=%d)",
+                provisioner.providerType, provisioner.activeInstanceCount, provisioner.maxCapacity);
         }
     }
 
@@ -91,11 +97,23 @@ class DefaultCapacityBroker : CapacityBroker
 
     void evaluateDemand()
     {
-        if (m_workQueue is null) return;
+        if (m_workQueue is null)
+        {
+            logError("[capacity_broker] evaluateDemand: work queue is null, skipping evaluation");
+            return;
+        }
+
+        logDebug("[capacity_broker] evaluateDemand: inspecting work queue backlog (registered provisioners: %d)", m_provisioners.length);
 
         // Inspect pending queue backlog
         TaskQueueMessage[] pending = m_workQueue.getPendingMessages(100);
-        if (pending.length == 0) return;
+        if (pending.length == 0)
+        {
+            logDebug("[capacity_broker] evaluateDemand: no pending work queue messages found");
+            return;
+        }
+
+        logDebug("[capacity_broker] evaluateDemand: found %d pending queue message(s)", pending.length);
 
         // Group pending messages by (executorType, requirements) into QueueDemand items
         QueueDemand[string] demandMap;
@@ -111,6 +129,9 @@ class DefaultCapacityBroker : CapacityBroker
                 }
             }
 
+            logDebug("[capacity_broker] evaluateDemand: pending msg '%s' (task '%s', build '%s', executorType='%s', reqKey='%s')",
+                msg.id, msg.workOrder.taskId, msg.workOrder.buildId, execType, reqKey);
+
             if (auto p = reqKey in demandMap)
             {
                 p.pendingWorkOrderCount++;
@@ -125,18 +146,37 @@ class DefaultCapacityBroker : CapacityBroker
             }
         }
 
+        logDebug("[capacity_broker] evaluateDemand: grouped into %d distinct demand specification(s)", demandMap.length);
+
         // For each demand, find matching provisioners and request capacity
         synchronized (m_mutex)
         {
             foreach (key, demand; demandMap)
             {
+                logDebug("[capacity_broker] evaluateDemand: matching provisioners for demand key '%s' (executorType='%s', pendingCount=%d)",
+                    key, demand.executorType, demand.pendingWorkOrderCount);
+
+                bool matched = false;
                 foreach (prov; m_provisioners)
                 {
-                    if (prov.canProvision(demand))
+                    bool canProv = prov.canProvision(demand);
+                    logDebug("[capacity_broker] evaluateDemand: provisioner '%s' (active=%d, max=%d) canProvision=%s for '%s'",
+                        prov.providerType, prov.activeInstanceCount, prov.maxCapacity, canProv, key);
+
+                    if (canProv)
                     {
+                        logDebug("[capacity_broker] evaluateDemand: requesting capacity from provisioner '%s' for %d work order(s)",
+                            prov.providerType, demand.pendingWorkOrderCount);
                         prov.requestCapacity(demand);
+                        matched = true;
                         break;
                     }
+                }
+
+                if (!matched)
+                {
+                    logWarn("[capacity_broker] evaluateDemand: no registered provisioner could satisfy demand key '%s' (executorType='%s')",
+                        key, demand.executorType);
                 }
             }
         }
@@ -146,46 +186,72 @@ class DefaultCapacityBroker : CapacityBroker
     {
         synchronized (m_mutex)
         {
-            if (m_running) return;
+            if (m_running)
+            {
+                logWarn("[capacity_broker] start() called but broker loop is already running");
+                return;
+            }
             m_running = true;
         }
 
-        m_brokerThread = new Thread({
-            while (isRunning)
+        logDebug("[capacity_broker] Starting capacity broker evaluation loop (pollInterval=%s)", m_pollInterval);
+
+        m_brokerTask = runTask(() nothrow {
+            try
             {
-                try
+                logDebug("[capacity_broker] Broker evaluation task started");
+                while (isRunning)
                 {
-                    evaluateDemand();
+                    try
+                    {
+                        evaluateDemand();
+                    }
+                    catch (Exception e)
+                    {
+                        try { logError("[capacity_broker] Error evaluating demand: %s", e.msg); } catch (Exception) {}
+                    }
+                    try
+                    {
+                        sleep(m_pollInterval);
+                    }
+                    catch (Exception)
+                    {
+                        break;
+                    }
                 }
-                catch (Exception e)
-                {
-                    try { logError("[capacity_broker] Error evaluating demand: %s", e.msg); } catch (Exception) {}
-                }
-                Thread.sleep(m_pollInterval);
+                logDebug("[capacity_broker] Broker evaluation task stopped");
             }
+            catch (Throwable) {}
         });
-        m_brokerThread.isDaemon = true;
-        m_brokerThread.start();
     }
 
     void stop()
     {
         synchronized (m_mutex)
         {
-            if (!m_running) return;
+            if (!m_running)
+            {
+                logDebug("[capacity_broker] stop() called but broker loop is not running");
+                return;
+            }
             m_running = false;
         }
 
-        if (m_brokerThread !is null)
+        logDebug("[capacity_broker] Stopping capacity broker evaluation loop");
+
+        if (m_brokerTask != Task.init && m_brokerTask.running)
         {
             try
             {
-                m_brokerThread.join();
+                m_brokerTask.interrupt();
+                m_brokerTask.join();
+                logDebug("[capacity_broker] Broker evaluation task joined successfully");
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                logDebug("[capacity_broker] Exception while joining broker task: %s", e.msg);
             }
-            m_brokerThread = null;
+            m_brokerTask = Task.init;
         }
     }
 }

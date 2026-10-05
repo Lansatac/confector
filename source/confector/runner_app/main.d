@@ -186,7 +186,6 @@ int handleRun(string[] args)
 int handleWorker(string[] args)
 {
     import std.process : environment;
-    import vibe.core.core : runTask, runApplication, exitEventLoop;
 
     string serverUrl = environment.get("CONFECTOR_SERVER_URL", "http://localhost:8080");
     string workerId = environment.get("CONFECTOR_WORKER_ID", "");
@@ -238,24 +237,17 @@ int handleWorker(string[] args)
     config.verbose = verbose;
 
     int exitCode = 0;
-    runTask(() nothrow {
-        try
-        {
-            auto runner = new HttpWorkerRunner(config);
-            runner.run();
-        }
-        catch (Throwable e)
-        {
-            try { stderr.writefln("[worker] Fatal worker error: %s", e.msg); } catch (Exception) {}
-            exitCode = 1;
-        }
-        finally
-        {
-            exitEventLoop();
-        }
-    });
+    try
+    {
+        auto runner = new HttpWorkerRunner(config);
+        runner.run();
+    }
+    catch (Throwable e)
+    {
+        stderr.writefln("[worker] Fatal worker error: %s", e.msg);
+        exitCode = 1;
+    }
 
-    runApplication();
     return exitCode;
 }
 
