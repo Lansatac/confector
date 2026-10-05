@@ -30,6 +30,7 @@
       "targetPath": "bin/server",
       "workingDirectory": "bin/server",
       "sourcePaths": ["source/confector/server"],
+      "copyFiles": ["../../public"],
       "dependencies": {
         "diet-ng": "~>1.8",
         "vibe-d": "~>0.10.3",
@@ -84,13 +85,6 @@
 				"confector:core": "*"
 			}
 		},
-		"./plugins/bash/def",
-		"./plugins/bash/runner",
-		"./plugins/git/def",
-		"./plugins/git/runner",
-		"./plugins/powershell/def",
-		"./plugins/powershell/runner",
-		"./plugins/executors/local_process",
     {
       "name": "plugins",
       "targetType": "none",
@@ -104,14 +98,12 @@
         "confector:local_process": "*"
       }
     },
-    {
-      "name": "all",
-      "targetType": "none",
-      "dependencies": {
-        "confector": "*",
-        "confector:runner": "*",
-        "confector:plugins": "*"
-      }
-    }
+		"./plugins/bash/def",
+		"./plugins/bash/runner",
+		"./plugins/git/def",
+		"./plugins/git/runner",
+		"./plugins/powershell/def",
+		"./plugins/powershell/runner",
+		"./plugins/executors/local_process"
 	]
 }

@@ -261,12 +261,21 @@ HTTPServerSettings createServerSettings(ushort port = 8080)
 
 void main()
 {
+  import std.process : environment;
+  import std.path : buildPath;
+
+    string configDir = environment.get("CONFECTOR_CONFIG_DIR", "");
+    if(configDir.length == 0)
+    {
+        logWarn("[config] CONFECTOR_CONFIG_DIR not set, using default './confector_config'");
+        configDir = "./confector_config";
+    }
     // Initialize central ConfigRegistry
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
 
     // Optionally load configuration file if available
-    foreach (cfgPath; ["confector.json", "confector.yaml", "config/confector.json"])
+    foreach (cfgPath; [configDir.buildPath("confector.json"), configDir.buildPath("confector.yaml")])
     {
         if (exists(cfgPath))
         {

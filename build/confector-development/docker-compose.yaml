@@ -1,18 +1,18 @@
 services:
   development:
     build:
-      context: .
-      dockerfile: build/development/Dockerfile
+      context: ../../
+      dockerfile: build/confector-development/dev-container/Dockerfile
     secrets:
       - mongo-readwrite-password
     depends_on:
       - mongo
     volumes:
       # Bind mount host source code
-      - .:/code:cached
+      - ../../.:/code
+      - ./build/confector-development/config:/etc/confector
       # Mask .dub directory with an isolated named volume to prevent host/container conflicts
-      - dub-build-cache:/code/.dub
-      - reggae-build-cache:/code/.reggae
+      - dub-build-cache:/home/dev/.dub
       - code-bin:/code/bin
       # Docker socket for container-in-container workflows (if required by tasks)
       - /var/run/docker.sock:/var/run/docker.sock
@@ -44,7 +44,7 @@ services:
       MONGO_INITDB_DATABASE: confector
 
   proxy:
-    build: build/proxy
+    build: proxy
     ports:
       - 8080:80
     depends_on:
@@ -58,7 +58,6 @@ secrets:
 
 volumes:
   dub-build-cache:
-  reggae-build-cache:
   code-bin:
   mongo-data:
 
