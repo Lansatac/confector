@@ -343,6 +343,16 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
             mkdirRecurse(cloneTargetDir);
         }
 
+        string effectiveRepoUrl = repoParam;
+        if (context.repositoryMap !is null)
+        {
+            int maxHops = 10;
+            while (maxHops-- > 0 && (effectiveRepoUrl in context.repositoryMap))
+            {
+                effectiveRepoUrl = context.repositoryMap[effectiveRepoUrl];
+            }
+        }
+
         string gitExecutable = "git";
         if ("executable" in step.parameters && step.parameters["executable"].length > 0)
         {
@@ -362,7 +372,7 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
         {
             cloneArgs ~= "--recurse-submodules";
         }
-        cloneArgs ~= repoParam;
+        cloneArgs ~= effectiveRepoUrl;
         cloneArgs ~= ".";
 
         if (context.logCallback !is null)
@@ -500,17 +510,21 @@ unittest
     assert(!unauthRes.success);
     assert(unauthRes.exitCode == 403);
 
-    // Security escape boundary test
-    StepExecutionContext escCtx;
-    escCtx.workspaceDir = "sub/workspace";
-    escCtx.workingDirectory = "sub/workspace";
+    // Repository map alias resolution check
+    StepExecutionContext mapCtx;
+    mapCtx.workspaceDir = ".";
+    mapCtx.workingDirectory = ".";
+    mapCtx.allowedRepositories = ["https://github.com/allowed/repo.git"];
+    mapCtx.repositoryMap = ["confector": "https://github.com/allowed/repo.git"];
 
-    BuildStep escStep;
-    escStep.type = "clone_repository";
-    escStep.parameters["repository"] = "https://github.com/allowed/repo.git";
-    escStep.parameters["target_dir"] = "../../escape_attempt";
+    BuildStep aliasStep;
+    aliasStep.type = "clone_repository";
+    aliasStep.parameters["repository"] = "confector";
+    // Target invalid directory to avoid running actual git clone during unit test while testing pre-clone resolution
+    aliasStep.parameters["target_dir"] = "../escape";
 
-    auto escRes = plugin.executeStep(escStep, escCtx);
-    assert(!escRes.success);
-    assert(escRes.exitCode != 0);
+    auto aliasRes = plugin.executeStep(aliasStep, mapCtx);
+    // Should pass whitelist auth check (not 403) and fail on boundary escape (code 1)
+    assert(aliasRes.exitCode != 403);
+    assert(!aliasRes.success);
 }
