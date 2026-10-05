@@ -61,7 +61,7 @@ class CloudWorkQueue : WorkQueue
         }
     }
 
-    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30)
+    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30, const(string[]) supportedExecutorTypes = null)
     {
         if (m_transport !is null && m_config.endpointUrl.length > 0)
         {
@@ -71,11 +71,27 @@ class CloudWorkQueue : WorkQueue
                 return [];
             }
             Json parsed = parseJsonString(resp);
-            return deserializeJson!(TaskQueueMessage[])(parsed);
+            auto messages = deserializeJson!(TaskQueueMessage[])(parsed);
+            if (supportedExecutorTypes.length == 0) return messages;
+            TaskQueueMessage[] filtered;
+            foreach (m; messages)
+            {
+                bool match = false;
+                foreach (t; supportedExecutorTypes)
+                {
+                    if (t == m.executorType || (t.length == 0 && m.executorType.length == 0))
+                    {
+                        match = true;
+                        break;
+                    }
+                }
+                if (match) filtered ~= m;
+            }
+            return filtered;
         }
         else
         {
-            return m_localFallbackQueue.dequeue(maxMessages, visibilityTimeoutSeconds);
+            return m_localFallbackQueue.dequeue(maxMessages, visibilityTimeoutSeconds, supportedExecutorTypes);
         }
     }
 

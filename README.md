@@ -27,7 +27,7 @@ Traditional CI/CD systems are built around linear stages and persistent worker i
 Workflows are defined as directed graphs of distinct tasks with explicit inputs and outputs, enabling optimal parallelism and dependency resolution.
 
 ### 2. Content-Addressed Build Caching
-Tasks are memoized based on input hashes (dependencies, upstream artifacts, configuration, and custom components). Valid cached outputs are reused instantly, reducing build times.
+Tasks are memoized based on deterministic input fingerprints computed upfront from task definitions and upstream task fingerprints (transitive input hashing) rather than dynamic runtime artifact file hashes. If inputs and upstream dependencies are unchanged, execution is skipped with a `cached` status, reusing valid outputs instantly and reducing build times.
 
 ### 3. Arbitrary Node-Level Triggers
 Events (commits, webhooks, cron, or manual actions) can trigger any specific node in a graph. Confector validates upstream dependencies and runs only the required subgraph.

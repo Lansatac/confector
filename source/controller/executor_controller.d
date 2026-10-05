@@ -4,7 +4,8 @@ import vibe.vibe;
 import confector.core.model;
 import confector.core.storage : BuildStateRepository;
 import confector.core.plugin : PluginRegistry;
-import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance;
+import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance, CapacityBroker, ComputeProvisioner;
+import confector.queue.queue : WorkQueue;
 import confector.core.json_compat : toStdJson, toVibeJson;
 
 import std.algorithm : filter, count;
@@ -20,7 +21,11 @@ import std.uuid : randomUUID;
 /**
  * Creates the URL router for the /executors endpoints.
  */
-URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry)
+URLRouter executorRouter(
+    BuildStateRepository stateRepo,
+    PluginRegistry registry,
+    CapacityBroker broker = null,
+    WorkQueue workQueue = null)
 {
     auto router = new URLRouter();
 
@@ -28,11 +33,38 @@ URLRouter executorRouter(BuildStateRepository stateRepo, PluginRegistry registry
     router.get("/executors/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto executors = stateRepo !is null ? stateRepo.listExecutors() : [];
         auto providers = registry !is null ? registry.getComputeProviders() : [];
+        ComputeProvisioner[] provisioners = broker !is null ? broker.provisioners : [];
 
         size_t enabledCount = executors.filter!(e => e.enabled).count;
         size_t disabledCount = executors.length - enabledCount;
+        size_t activeCapacity = broker !is null ? broker.activeInstanceCount : 0;
+        size_t maxCapacity = broker !is null ? broker.maxCapacity : 0;
+        size_t queueDemandDepth = workQueue !is null ? workQueue.getPendingMessages(1000).length : 0;
 
-        res.render!("executor/executors.dt", executors, providers, enabledCount, disabledCount);
+        res.render!("executor/executors.dt", executors, providers, provisioners, enabledCount, disabledCount, activeCapacity, maxCapacity, queueDemandDepth);
+    });
+
+    // 1b. Capacity & Demand API Status
+    router.get("/executors/capacity", (HTTPServerRequest req, HTTPServerResponse res) {
+        Json resp = Json.emptyObject;
+        resp["active_capacity"] = Json(broker !is null ? broker.activeInstanceCount : 0);
+        resp["max_capacity"] = Json(broker !is null ? broker.maxCapacity : 0);
+        resp["queue_demand_depth"] = Json(workQueue !is null ? workQueue.getPendingMessages(1000).length : 0);
+
+        Json provArr = Json.emptyArray;
+        if (broker !is null)
+        {
+            foreach (prov; broker.provisioners)
+            {
+                Json p = Json.emptyObject;
+                p["provider_type"] = Json(prov.providerType);
+                p["active_instances"] = Json(prov.activeInstanceCount);
+                p["max_capacity"] = Json(prov.maxCapacity);
+                provArr ~= p;
+            }
+        }
+        resp["provisioners"] = provArr;
+        res.writeJsonBody(resp);
     });
 
     // 2. Add Executor View
@@ -340,4 +372,19 @@ unittest
     // Delete
     assert(repo.deleteExecutor("exec-test-init"));
     assert(repo.listExecutors().length == 0);
+
+    // Test with CapacityBroker and WorkQueue
+    import confector.queue.queue : InMemoryWorkQueue;
+    import confector.runner.capacity_broker : DefaultCapacityBroker;
+    import plugins.executors.local_process : LocalProcessProvisioner;
+
+    auto testQueue = new InMemoryWorkQueue();
+    auto testBroker = new DefaultCapacityBroker(testQueue);
+    auto testProv = new LocalProcessProvisioner();
+    testBroker.registerProvisioner(testProv);
+
+    auto routerWithBroker = executorRouter(repo, reg, testBroker, testQueue);
+    assert(routerWithBroker !is null);
+    assert(testBroker.provisioners.length == 1);
+    assert(testBroker.maxCapacity >= 1);
 }

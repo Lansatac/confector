@@ -13,14 +13,17 @@ import std.string : split, strip;
 
 import vibe.vibe;
 
+import confector.core.executor : CapacityBroker, ComputeProvisioner;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.storage : BuildStateRepository, LocalArtifactStorage;
+import confector.core.storage : BuildStateRepository, LocalArtifactStorage, InMemoryBuildStateRepository;
 import confector.queue.mongo_queue : MongoWorkQueue;
-import confector.queue.queue : WorkQueue;
+import confector.queue.queue : WorkQueue, InMemoryWorkQueue;
+import confector.runner.capacity_broker : DefaultCapacityBroker;
 import confector.runner.coordinator : BuildCoordinator;
 import confector.runner.engine : TaskEngine;
 import confector.storage.mongo_repository : MongoBuildStateRepository;
+import plugins.executors.local_process : LocalProcessProvisioner, LocalProcessProvisionerConfig;
 
 import controller.admin_controller : adminRouter;
 import controller.api_controller : apiRouter;
@@ -197,7 +200,8 @@ URLRouter createRouter(
     WorkQueue workQueue,
     BuildCoordinator buildCoordinator,
     BuildStateRepository stateRepo,
-    MongoClient client)
+    MongoClient client,
+    CapacityBroker capacityBroker = null)
 {
     auto router = new URLRouter();
 
@@ -225,7 +229,7 @@ URLRouter createRouter(
     router.any("/tasks/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
     router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/tasks/"); });
 
-    router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance));
+    router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance, capacityBroker, workQueue));
     router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
 
     router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
@@ -271,8 +275,40 @@ void main()
     auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
     writeln("Initialized Confector execution engine and build coordinator (stateless control plane mode).");
 
+    // Initialize capacity broker & register default local process provisioner
+    auto capacityBroker = new DefaultCapacityBroker(storage.workQueue, buildCoordinator);
+
+    LocalProcessProvisionerConfig localCfg;
+    localCfg.runnerBinary = environment.get("CONFECTOR_RUNNER_BIN", "bin/confector-runner");
+    localCfg.serverUrl = environment.get("CONFECTOR_SERVER_URL", "http://localhost:8080");
+    localCfg.workspaceDir = environment.get("CONFECTOR_WORKSPACE_DIR", ".confector/workspaces");
+    localCfg.storageDir = environment.get("CONFECTOR_STORAGE_DIR", ".confector/artifacts");
+    localCfg.pluginsDir = environment.get("CONFECTOR_PLUGINS_DIR", "plugins");
+    string concurrencyEnv = environment.get("CONFECTOR_LOCAL_CONCURRENCY", "");
+    if (concurrencyEnv.length > 0)
+    {
+        try { localCfg.maxConcurrency = concurrencyEnv.to!size_t; } catch (Exception) {}
+    }
+    auto localProvisioner = new LocalProcessProvisioner(localCfg);
+    capacityBroker.registerProvisioner(localProvisioner);
+    writefln("[capacity_broker] Registered default LocalProcessProvisioner (maxCapacity=%d)", localProvisioner.maxCapacity);
+
+    // Register any provisioners from loaded plugins
+    foreach (plugin; PluginRegistry.instance.allPlugins())
+    {
+        if (auto prov = cast(ComputeProvisioner) plugin)
+        {
+            capacityBroker.registerProvisioner(prov);
+            writefln("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)", prov.providerType, prov.maxCapacity);
+        }
+    }
+
+    // Start capacity broker evaluation loop
+    capacityBroker.start();
+    writeln("[capacity_broker] Started capacity evaluation loop.");
+
     // Configure router and server settings
-    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, storage.client);
+    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, storage.client, capacityBroker);
     debug setLogLevel(LogLevel.info);
     auto settings = createServerSettings(8080);
 
@@ -289,9 +325,14 @@ unittest
     auto storage = new LocalArtifactStorage("test_app_storage");
     auto engine = new TaskEngine(storage, stateRepo);
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
+    auto broker = new DefaultCapacityBroker(queue, coordinator);
+    broker.registerProvisioner(new LocalProcessProvisioner());
 
-    auto router = createRouter(engine, queue, coordinator, stateRepo, null);
+    auto router = createRouter(engine, queue, coordinator, stateRepo, null, broker);
     assert(router !is null);
+
+    assert(broker.provisioners.length == 1);
+    assert(broker.maxCapacity >= 1);
 
     import std.file : exists, rmdirRecurse;
     if (exists("test_app_storage")) rmdirRecurse("test_app_storage");

@@ -1,88 +1,12 @@
 module confector.queue.queue;
 
-import confector.core.model;
+public import confector.core.model;
 import vibe.data.json;
 import vibe.data.serialization : asName = name;
 
 import std.datetime.systime : Clock;
 import std.format : format;
 import std.uuid : randomUUID;
-
-/**
- * Authoritative upstream artifact reference for worker staging.
- * Addressed by (taskFingerprint, artifactId) with optional unpack destination.
- */
-struct InputArtifactRef
-{
-    @asName("task_id") string taskId;
-    @optional @asName("task_fingerprint") string taskFingerprint;
-    @optional @asName("artifact_id") string artifactId;
-    @optional @asName("storage_uri") string storageUri;
-    @optional @asName("target_path") string targetPath; // deprecated legacy alias
-    @optional @asName("destination") string destination;
-    @optional @asName("sha256") string sha256;
-}
-
-/**
- * Deprecated dual representation retained only for serialization compatibility.
- * New code must use InputArtifactRef via TaskExecutionPayload.inputArtifacts.
- */
-struct UpstreamArtifactLocation
-{
-    @asName("task_id") string taskId;
-    @optional @asName("task_fingerprint") string taskFingerprint;
-    @optional @asName("artifact_id") string artifactId;
-    @optional @asName("artifact_path") string artifactPath;
-    @optional @asName("destination") string destination;
-    @optional @asName("storage_backend") string storageBackend = "local";
-    @optional @asName("storage_uri") string storageUri;
-    @optional @asName("sha256") string sha256;
-    @optional @asName("target_path") string targetPath;
-}
-
-/**
- * Self-contained execution payload for worker tasks.
- */
-struct TaskExecutionPayload
-{
-    @optional @asName("repository_url") string repositoryUrl;
-    @optional @asName("commit_sha") string commitSha;
-    @optional @asName("allowed_repositories") string[] allowedRepositories;
-    @optional @asName("repository_map") string[string] repositoryMap;
-    @optional string script;
-    @optional string[string] environment;
-    /// Single authoritative list of upstream artifacts to unpack before execution.
-    @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
-    /// Deprecated: no longer populated by coordinator; kept for wire compatibility.
-    @optional @asName("upstream_artifact_locations") UpstreamArtifactLocation[] upstreamArtifactLocations;
-    /// Map of upstream taskId -> task fingerprint (content-addressed).
-    @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
-    @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
-    @optional @asName("workspace_dir") string workspaceDir;
-    @optional @asName("callback_url") string callbackUrl;
-    @optional @asName("node_fingerprint") string nodeFingerprint;
-    @optional @asName("force") bool force = false;
-}
-
-/**
- * Message queued for worker consumption.
- */
-struct TaskQueueMessage
-{
-    @asName("message_id") string messageId;
-    @asName("receipt_handle") string receiptHandle;
-    @asName("build_id") string buildId;
-    @asName("task_id") string taskId;
-    @asName("node_fingerprint") string nodeFingerprint;
-    @asName("execution_payload") TaskExecutionPayload executionPayload;
-    @asName("task_node") TaskNode taskNode;
-    @asName("created_at") string createdAt;
-    int attempt = 1;
-    @asName("max_attempts") int maxAttempts = 3;
-    @asName("timeout_seconds") size_t timeoutSeconds = 900;
-    @asName("visible_after") long visibleAfterUnix = 0;
-    @asName("error_reason") string errorReason;
-}
 
 /**
  * Generic Work Queue interface for decoupled task distribution.
@@ -97,8 +21,9 @@ interface WorkQueue
     /**
      * Dequeues up to maxMessages ready for processing.
      * Sets visibility timeout on returned messages.
+     * Optionally filters by supported executor types (e.g., ["local", "local_process", ""]).
      */
-    TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30);
+    TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30, const(string[]) supportedExecutorTypes = null);
 
     /**
      * Acknowledges successful processing of a message, removing it from the queue.
@@ -175,7 +100,24 @@ class InMemoryWorkQueue : WorkQueue
         m_entries ~= entry;
     }
 
-    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30)
+    private static bool matchesExecutor(const(TaskQueueMessage) msg, const(string[]) supportedExecutorTypes)
+    {
+        if (supportedExecutorTypes.length == 0)
+        {
+            return true;
+        }
+        string msgExec = msg.executorType;
+        foreach (t; supportedExecutorTypes)
+        {
+            if (t == msgExec || (t.length == 0 && msgExec.length == 0))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30, const(string[]) supportedExecutorTypes = null)
     {
         long now = currentUnixTime();
         TaskQueueMessage[] result;
@@ -185,6 +127,11 @@ class InMemoryWorkQueue : WorkQueue
             if (result.length >= maxMessages)
             {
                 break;
+            }
+
+            if (!matchesExecutor(entry.message, supportedExecutorTypes))
+            {
+                continue;
             }
 
             if (!entry.inFlight && entry.visibleAfterUnix <= now)
@@ -388,4 +335,32 @@ unittest
     assert(queue.getDeadLetterMessages().length == 1);
     assert(queue.getDeadLetterMessages()[0].taskId == "task_fail");
     assert(queue.getDeadLetterMessages()[0].errorReason == "Execution failed");
+
+    // Test Executor Capability Filtering on Dequeue
+    auto tagQueue = new InMemoryWorkQueue();
+    TaskQueueMessage localTask;
+    localTask.taskId = "local_task";
+    localTask.workOrder.executorType = "local";
+    tagQueue.enqueue(localTask);
+
+    TaskQueueMessage gpuTask;
+    gpuTask.taskId = "gpu_task";
+    gpuTask.workOrder.executorType = "gpu";
+    tagQueue.enqueue(gpuTask);
+
+    assert(tagQueue.getPendingCount() == 2);
+
+    // Filter for local executor only
+    auto localClaimed = tagQueue.dequeue(10, 30, ["local"]);
+    assert(localClaimed.length == 1);
+    assert(localClaimed[0].taskId == "local_task");
+
+    // GPU task remains untouched in queue (not claimed, not nacked)
+    assert(tagQueue.getPendingCount() == 1);
+
+    // Remote GPU worker can claim its task
+    auto gpuClaimed = tagQueue.dequeue(10, 30, ["gpu"]);
+    assert(gpuClaimed.length == 1);
+    assert(gpuClaimed[0].taskId == "gpu_task");
+    assert(gpuClaimed[0].attempt == 1);
 }

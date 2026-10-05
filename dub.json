@@ -14,6 +14,9 @@
 	"name": "confector",
 	"targetPath": "bin",
 	"workingDirectory": "bin",
+	"sourcePaths": ["source", "plugins/executors/local_process"],
+	"importPaths": ["source", "plugins", "plugins/executors/local_process"],
+	"stringImportPaths": ["views", "plugins/executors/local_process"],
 	"excludedSourceFiles": ["source/confector/runner_app/*"],
 	"copyFiles": ["public"],
 	"subPackages": [

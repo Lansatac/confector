@@ -333,6 +333,23 @@ struct TaskNode
 }
 
 /**
+ * Represents outstanding demand for compute capacity from the work queue.
+ */
+struct QueueDemand
+{
+    @optional @asName("executor_type") string executorType;
+    @optional @asName("requirements") string[string] requirements;
+    @optional @asName("pending_work_order_count") size_t pendingWorkOrderCount;
+
+    this(string executorType, size_t pendingWorkOrderCount = 0, string[string] requirements = null) pure nothrow @safe
+    {
+        this.executorType = executorType;
+        this.pendingWorkOrderCount = pendingWorkOrderCount;
+        this.requirements = requirements;
+    }
+}
+
+/**
  * Metadata recorded for stored artifacts.
  */
 struct ArtifactMetadata

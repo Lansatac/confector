@@ -56,6 +56,16 @@ class MongoWorkQueue : WorkQueue
         doc["build_id"] = Bson(message.buildId);
         doc["task_id"] = Bson(message.taskId);
         doc["node_fingerprint"] = Bson(message.nodeFingerprint);
+        doc["executor_type"] = Bson(message.executorType);
+
+        try
+        {
+            doc["work_order"] = serializeToBson(message.workOrder);
+        }
+        catch (Exception e)
+        {
+            logError("Failed to serialize work order for task '%s' (build '%s'): %s", message.taskId, message.buildId, e.msg);
+        }
 
         try
         {
@@ -97,7 +107,7 @@ class MongoWorkQueue : WorkQueue
         }
     }
 
-    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30)
+    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30, const(string[]) supportedExecutorTypes = null)
     {
         long now = currentUnixTime();
         TaskQueueMessage[] result;
@@ -112,6 +122,25 @@ class MongoWorkQueue : WorkQueue
             Bson visFilter = Bson.emptyObject;
             visFilter["$lte"] = Bson(now);
             query["visible_after"] = visFilter;
+
+            if (supportedExecutorTypes.length > 0)
+            {
+                Bson[] execOr;
+                foreach (t; supportedExecutorTypes)
+                {
+                    if (t.length == 0)
+                    {
+                        execOr ~= Bson(["executor_type": Bson("")]);
+                        execOr ~= Bson(["executor_type": Bson(cast(string)null)]);
+                        execOr ~= Bson(["executor_type": Bson(["$exists": Bson(false)])]);
+                    }
+                    else
+                    {
+                        execOr ~= Bson(["executor_type": Bson(t)]);
+                    }
+                }
+                query["$or"] = Bson(execOr);
+            }
 
             Bson candidate;
             try
@@ -194,6 +223,18 @@ class MongoWorkQueue : WorkQueue
                     msg.buildId = bId;
                     msg.taskId = tId;
                     msg.nodeFingerprint = candidate.tryIndex("node_fingerprint").isNull ? "" : candidate["node_fingerprint"].get!string;
+
+                    try
+                    {
+                        if (!candidate.tryIndex("work_order").isNull && candidate["work_order"].type != Bson.Type.null_)
+                        {
+                            msg.workOrder = deserializeBson!WorkOrder(sanitizeBson(candidate["work_order"]));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        logError("[mongo_queue] Failed to deserialize work order for task '%s' (msg '%s', build '%s'): %s\n%s", msg.taskId, msgId, msg.buildId, e.msg, e.toString());
+                    }
 
                     try
                     {

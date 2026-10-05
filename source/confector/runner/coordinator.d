@@ -10,6 +10,7 @@ import std.algorithm : canFind, filter;
 import std.array : array;
 import std.datetime.systime : Clock;
 import std.format : format;
+import std.json : JSONValue, JSONType;
 import std.uuid : randomUUID;
 import core.sync.mutex : Mutex;
 import vibe.core.log : logInfo, logError, logWarn, logDebug;
@@ -303,29 +304,63 @@ class BuildCoordinator
     }
 
     /**
+     * Steps DAG progression for a given build: evaluates dependencies,
+     * resolves cached nodes, and enqueues newly unblocked WorkOrders.
+     */
+    void stepBuild(string buildId)
+    {
+        synchronized (m_mutex)
+        {
+            evaluateReadyTasksLocked(buildId);
+        }
+    }
+
+    /**
      * Handles task completion results from local or remote workers.
      * Updates task and build status, saves cached fingerprints, and advances downstream dependents
      * for all builds subscribed to the completed task execution.
      */
-    void onTaskCompleted(string fingerprint, TaskExecutionResult result)
+    void onTaskCompleted(string fingerprint, TaskExecutionResult result, string receiptHandle = null)
     {
         if (result.fingerprint.length == 0 || result.fingerprint == "unknown")
         {
             result.fingerprint = fingerprint;
         }
-        onTaskCompleted(result.buildId, result.taskId, result);
+        if (receiptHandle.length > 0 && result.receiptHandle.length == 0)
+        {
+            result.receiptHandle = receiptHandle;
+        }
+        onTaskCompleted(result.buildId, result.taskId, result, receiptHandle);
     }
 
-    void onTaskCompleted(TaskExecutionResult result)
+    void onTaskCompleted(TaskExecutionResult result, string receiptHandle = null)
     {
-        onTaskCompleted(result.buildId, result.taskId, result);
+        if (receiptHandle.length > 0 && result.receiptHandle.length == 0)
+        {
+            result.receiptHandle = receiptHandle;
+        }
+        onTaskCompleted(result.buildId, result.taskId, result, receiptHandle);
     }
 
-    void onTaskCompleted(string buildId, string taskId, TaskExecutionResult result)
+    void onTaskCompleted(string buildId, string taskId, TaskExecutionResult result, string receiptHandle = null)
     {
         synchronized (m_mutex)
         {
             logInfo("[coordinator] Build '%s': Task '%s' completion received with status '%s' (exit code: %d, duration: %d ms, error: '%s')", buildId, taskId, result.status, result.exitCode, result.durationMs, result.errorMessage);
+
+            // Acknowledge queue message if receipt handle provided
+            string effectiveReceiptHandle = receiptHandle.length > 0 ? receiptHandle : result.receiptHandle;
+            if (effectiveReceiptHandle.length > 0 && m_workQueue !is null)
+            {
+                try
+                {
+                    m_workQueue.ack(effectiveReceiptHandle);
+                }
+                catch (Exception e)
+                {
+                    logDebug("[coordinator] Queue acknowledgment note for receipt handle '%s': %s", effectiveReceiptHandle, e.msg);
+                }
+            }
 
             try
             {
@@ -838,17 +873,64 @@ class BuildCoordinator
                     payload.inputArtifacts ~= inArt;
                 }
 
-                TaskQueueMessage msg;
-                msg.messageId = "msg_" ~ randomUUID().toString();
-                msg.buildId = buildId;
-                msg.taskId = tId;
-                msg.nodeFingerprint = fingerprint;
-                msg.taskNode = node;
-                msg.executionPayload = payload;
-                msg.timeoutSeconds = node.timeoutSeconds;
-                msg.createdAt = Clock.currTime.toISOString();
+                // Resolve executorType and requirements tags from TaskNode components or definitions
+                string executorType = "local";
+                string[string] requirements;
 
-                logInfo("[coordinator] Build '%s': Enqueuing ready task '%s' to work queue (fingerprint: %s, timeout: %ds)", buildId, tId, fingerprint, node.timeoutSeconds);
+                if (node.hasCustomComponent("executor"))
+                {
+                    auto comp = node.getCustomComponent("executor");
+                    if (comp.type == JSONType.string) executorType = comp.str;
+                    else if (comp.type == JSONType.object && "type" in comp) executorType = comp["type"].str;
+                }
+                else if (node.hasCustomComponent("executor_type"))
+                {
+                    auto comp = node.getCustomComponent("executor_type");
+                    if (comp.type == JSONType.string) executorType = comp.str;
+                }
+                else if (node.components !is null && "executor_type" in node.components)
+                {
+                    executorType = node.components["executor_type"];
+                }
+                else if (node.components !is null && "executor" in node.components)
+                {
+                    executorType = node.components["executor"];
+                }
+
+                if (node.hasCustomComponent("requirements"))
+                {
+                    auto comp = node.getCustomComponent("requirements");
+                    if (comp.type == JSONType.object)
+                    {
+                        foreach (k, v; comp.object)
+                        {
+                            if (v.type == JSONType.string) requirements[k] = v.str;
+                            else requirements[k] = v.toString();
+                        }
+                    }
+                }
+
+                WorkOrder workOrder;
+                workOrder.buildId = buildId;
+                workOrder.taskId = tId;
+                workOrder.fingerprint = fingerprint;
+                workOrder.executorType = executorType;
+                workOrder.requirements = requirements;
+                workOrder.payload = payload;
+                workOrder.timeoutSeconds = node.timeoutSeconds;
+                workOrder.createdAt = Clock.currTime.toISOString();
+
+                TaskQueueMessage msg;
+                msg.id = "msg_" ~ randomUUID().toString();
+                msg.workOrder = workOrder;
+                msg.status = "enqueued";
+                msg.taskNode = node;
+                msg.timeoutSeconds = node.timeoutSeconds;
+                msg.maxAttempts = 3;
+                msg.visibleAfterUnix = Clock.currTime.toUnixTime();
+                msg.createdAt = workOrder.createdAt;
+
+                logInfo("[coordinator] Build '%s': Enqueuing ready task '%s' to work queue (fingerprint: %s, executor: %s, timeout: %ds)", buildId, tId, fingerprint, executorType, node.timeoutSeconds);
 
                 if (m_workQueue !is null)
                 {
@@ -1300,5 +1382,114 @@ unittest
         TaskStatus taskStatusAfter;
         assert(stateRepo.getTaskStatus(bSolo, "solo_task", taskStatusAfter));
         assert(taskStatusAfter == TaskStatus.cancelled, "Task status should remain cancelled for cancelled build");
+    }
+
+    // 9. Structured WorkOrder Construction & Tag Resolution
+    {
+        auto coord9 = new BuildCoordinator(storage, stateRepo, queue);
+
+        TaskNode gpuTask;
+        gpuTask.id = "train_model";
+        gpuTask.script = "python train.py";
+        gpuTask.timeoutSeconds = 1200;
+        gpuTask.setCustomComponent("executor", JSONValue("aws-ecs"));
+
+        JSONValue reqsObj = JSONValue(["gpu": JSONValue("true"), "arch": JSONValue("x86_64"), "cuda": JSONValue("12.0")]);
+        gpuTask.setCustomComponent("requirements", reqsObj);
+
+        ProjectRecord projWorkOrder;
+        projWorkOrder.id = "proj_work_order_test";
+        projWorkOrder.name = "WorkOrder Tagging Project";
+        projWorkOrder.tasks = [gpuTask];
+
+        string bWorkOrder = coord9.startBuild(projWorkOrder, null, true);
+        assert(queue.getPendingCount() == 1);
+
+        auto deqGpu = queue.dequeue(1);
+        assert(deqGpu.length == 1);
+        assert(deqGpu[0].taskId == "train_model");
+        assert(deqGpu[0].buildId == bWorkOrder);
+
+        // Verify WorkOrder structure and metadata
+        WorkOrder wo = deqGpu[0].workOrder;
+        assert(wo.buildId == bWorkOrder);
+        assert(wo.taskId == "train_model");
+        assert(wo.fingerprint == deqGpu[0].nodeFingerprint);
+        assert(wo.executorType == "aws-ecs");
+        assert(wo.requirements["gpu"] == "true");
+        assert(wo.requirements["arch"] == "x86_64");
+        assert(wo.requirements["cuda"] == "12.0");
+        assert(wo.timeoutSeconds == 1200);
+        assert(wo.payload.script == "python train.py");
+
+        // Complete the task and verify build completion
+        TaskExecutionResult resGpu;
+        resGpu.taskId = "train_model";
+        resGpu.buildId = bWorkOrder;
+        resGpu.status = TaskStatus.succeeded;
+        resGpu.fingerprint = wo.fingerprint;
+        coord9.onTaskCompleted(bWorkOrder, "train_model", resGpu);
+
+        BuildRecord bWorkOrderRec;
+        assert(stateRepo.getBuild(bWorkOrder, bWorkOrderRec));
+        assert(bWorkOrderRec.status == "succeeded");
+    }
+
+    // 10. Queue Message Acknowledgment & stepBuild Progression
+    {
+        auto coord10 = new BuildCoordinator(storage, stateRepo, queue);
+
+        TaskNode step1;
+        step1.id = "step1";
+        step1.script = "echo step 1";
+
+        TaskNode step2;
+        step2.id = "step2";
+        step2.dependsOn = ["step1"];
+        step2.script = "echo step 2";
+
+        ProjectRecord projAck;
+        projAck.id = "proj_ack_test";
+        projAck.tasks = [step1, step2];
+
+        string bAck = coord10.startBuild(projAck, null, true);
+        assert(queue.getPendingCount() == 1);
+
+        // Dequeue step1 message - will receive a receiptHandle
+        auto deqStep1 = queue.dequeue(1);
+        assert(deqStep1.length == 1);
+        string rHandle = deqStep1[0].receiptHandle;
+        assert(rHandle.length > 0);
+
+        // Complete step1 providing receiptHandle directly in TaskExecutionResult
+        TaskExecutionResult resStep1;
+        resStep1.taskId = "step1";
+        resStep1.buildId = bAck;
+        resStep1.status = TaskStatus.succeeded;
+        resStep1.fingerprint = deqStep1[0].nodeFingerprint;
+        resStep1.receiptHandle = rHandle;
+        coord10.onTaskCompleted(bAck, "step1", resStep1);
+
+        // Downstream step2 is now ready in queue
+        assert(queue.getPendingCount() == 1);
+
+        // Explicit stepBuild invocation succeeds without errors
+        coord10.stepBuild(bAck);
+        assert(queue.getPendingCount() == 1);
+
+        auto deqStep2 = queue.dequeue(1);
+        assert(deqStep2[0].taskId == "step2");
+
+        // Complete step2 passing receiptHandle via parameter overload
+        TaskExecutionResult resStep2;
+        resStep2.taskId = "step2";
+        resStep2.buildId = bAck;
+        resStep2.status = TaskStatus.succeeded;
+        resStep2.fingerprint = deqStep2[0].nodeFingerprint;
+        coord10.onTaskCompleted(bAck, "step2", resStep2, deqStep2[0].receiptHandle);
+
+        BuildRecord bAckRec;
+        assert(stateRepo.getBuild(bAck, bAckRec));
+        assert(bAckRec.status == "succeeded");
     }
 }

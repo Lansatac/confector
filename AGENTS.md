@@ -11,8 +11,8 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Rationale**: Linear pipelines artificially constrain execution order and prevent fine-grained dependency modeling. An explicit DAG allows maximal parallelism, fan-out/fan-in patterns, and exact dependency isolation.
 
 ### 1.2 Deterministic Content-Addressed Caching
-- **Decision**: Task execution is memoized using cryptographic input fingerprints (upstream artifact digests, task configurations, custom components, and script definitions).
-- **Rationale**: Eliminates redundant computation. If inputs and upstream artifacts have not changed, execution is skipped with a `cached` status, enabling near-instant validation cycles.
+- **Decision**: Task execution is memoized using cryptographic input fingerprints computed deterministically upfront from task definitions and upstream task fingerprints (transitive input hashing) rather than dynamic runtime artifact file hashes.
+- **Rationale**: Eliminates redundant computation and decouples work definition from execution. Upfront transitive hashing ensures fingerprints are deterministic, statically resolvable during DAG scheduling before compute allocation, and invariant across all compute backends.
 
 ### 1.3 Arbitrary Node-Level Triggers & Subgraph Slicing
 - **Decision**: Triggers (git events, webhooks, cron, manual dispatches) can target any arbitrary node in the DAG, not just root nodes.

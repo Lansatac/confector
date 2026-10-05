@@ -238,31 +238,61 @@ class TaskEngine
         stepCtx.allowedRepositories = effectiveAllowedRepos;
         stepCtx.repositoryMap = effectiveRepoMap;
 
-        foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
+        if (task.steps.length == 0 && task.script.length > 0)
         {
-            string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
-            combinedLogger(format("[confector] Running build step [%d/%d]: %s", stepIdx + 1, task.steps.length, stepLabel));
-
-            auto stepSystem = PluginRegistry.instance.findStepSystem(step);
-            if (stepSystem is null)
+            import std.process : pipeShell, Redirect, Config, wait;
+            combinedLogger(format("[confector] Running task script: %s", task.script));
+            try
             {
-                taskSuccess = false;
-                taskExitCode = 1;
-                taskErrorMessage = format("No plugin registered to handle build step type '%s' (step: '%s')", step.type, stepLabel);
-                combinedLogger(format("[confector] Error: %s", taskErrorMessage));
-                break;
+                auto pipe = pipeShell(task.script, Redirect.stdout | Redirect.stderrToStdout, task.environment.length > 0 ? task.environment : null, Config.retainStderr, effectiveWorkingDir);
+                foreach (line; pipe.stdout.byLineCopy)
+                {
+                    combinedLogger(line);
+                }
+                taskExitCode = wait(pipe.pid);
+                taskSuccess = (taskExitCode == 0);
+                if (!taskSuccess)
+                {
+                    taskErrorMessage = format("Script execution failed with exit code %d", taskExitCode);
+                    combinedLogger(format("[confector] %s", taskErrorMessage));
+                }
             }
-
-            auto stepResult = stepSystem.executeStep(step, stepCtx);
-            if (!stepResult.success)
+            catch (Exception e)
             {
                 taskSuccess = false;
-                taskExitCode = stepResult.exitCode != 0 ? stepResult.exitCode : 1;
-                taskErrorMessage = stepResult.errorMessage.length > 0
-                    ? stepResult.errorMessage
-                    : format("Build step '%s' failed with exit code %d", stepLabel, taskExitCode);
-                combinedLogger(format("[confector] Build step '%s' failed: %s", stepLabel, taskErrorMessage));
-                break;
+                taskExitCode = -1;
+                taskErrorMessage = e.msg;
+                combinedLogger(format("[confector] Error executing script: %s", e.msg));
+            }
+        }
+        else
+        {
+            foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
+            {
+                string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
+                combinedLogger(format("[confector] Running build step [%d/%d]: %s", stepIdx + 1, task.steps.length, stepLabel));
+
+                auto stepSystem = PluginRegistry.instance.findStepSystem(step);
+                if (stepSystem is null)
+                {
+                    taskSuccess = false;
+                    taskExitCode = 1;
+                    taskErrorMessage = format("No plugin registered to handle build step type '%s' (step: '%s')", step.type, stepLabel);
+                    combinedLogger(format("[confector] Error: %s", taskErrorMessage));
+                    break;
+                }
+
+                auto stepResult = stepSystem.executeStep(step, stepCtx);
+                if (!stepResult.success)
+                {
+                    taskSuccess = false;
+                    taskExitCode = stepResult.exitCode != 0 ? stepResult.exitCode : 1;
+                    taskErrorMessage = stepResult.errorMessage.length > 0
+                        ? stepResult.errorMessage
+                        : format("Build step '%s' failed with exit code %d", stepLabel, taskExitCode);
+                    combinedLogger(format("[confector] Build step '%s' failed: %s", stepLabel, taskErrorMessage));
+                    break;
+                }
             }
         }
 

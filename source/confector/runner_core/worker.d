@@ -550,14 +550,11 @@ unittest
 {
     import std.file : exists, rmdirRecurse, mkdirRecurse, write;
     import confector.core.plugin : PluginRegistry, Plugin;
-    import confector.core.plugin_loader : PluginLoader;
     import confector.plugin_api : BuildStepSystem, StepExecutionContext, StepExecutionResult, PluginCategory, LogDelegate;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import vibe.core.core : runTask, sleep;
     import core.time : msecs;
-
-    scope(exit) PluginLoader.instance.unloadAll();
 
     class MockStepRunner : Plugin, BuildStepSystem
     {
@@ -586,6 +583,7 @@ unittest
 
     PluginRegistry.instance.shutdownAll();
     PluginRegistry.instance.registerPlugin(new MockStepRunner());
+    scope(exit) PluginRegistry.instance.unregisterPlugin("mock_step_runner");
 
     string testDir = "test_http_worker_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -680,14 +678,11 @@ unittest
 {
     import std.file : exists, rmdirRecurse, mkdirRecurse, write;
     import confector.core.plugin : PluginRegistry, Plugin;
-    import confector.core.plugin_loader : PluginLoader;
     import confector.plugin_api : BuildStepSystem, StepExecutionContext, StepExecutionResult, PluginCategory, LogDelegate;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import vibe.core.core : runTask, sleep;
     import core.time : msecs;
-
-    scope(exit) PluginLoader.instance.unloadAll();
 
     class MockMultiStepRunner : Plugin, BuildStepSystem
     {
@@ -716,6 +711,7 @@ unittest
 
     PluginRegistry.instance.shutdownAll();
     PluginRegistry.instance.registerPlugin(new MockMultiStepRunner());
+    scope(exit) PluginRegistry.instance.unregisterPlugin("mock_multistep_runner");
 
     string testDir = "test_http_multistep_suite";
     if (exists(testDir)) rmdirRecurse(testDir);

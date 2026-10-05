@@ -226,6 +226,10 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             {
                 result.fingerprint = fingerprint;
             }
+            if (result.receiptHandle.length == 0 && "receipt_handle" in req.query)
+            {
+                result.receiptHandle = req.query["receipt_handle"];
+            }
 
             if (coordinator !is null)
             {
@@ -261,6 +265,10 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
             result.buildId = buildId;
             result.taskId = taskId;
+            if (result.receiptHandle.length == 0 && "receipt_handle" in req.query)
+            {
+                result.receiptHandle = req.query["receipt_handle"];
+            }
 
             if (coordinator !is null)
             {

@@ -3,6 +3,8 @@ module confector.plugin_api.executor;
 import std.json : JSONValue, JSONType, parseJSON;
 import vibe.data.serialization : asName = name, optional, ignore;
 
+import confector.plugin_api.model : QueueDemand;
+
 /**
  * Delegate callback type for streaming logs from tasks and executors.
  */
@@ -115,6 +117,44 @@ interface ComputeProvider
     string[] validateConfig(in JSONValue config) const;
     string renderConfigFormHtml(in JSONValue currentConfig) const;
     ComputeInstance createExecutor(in WorkerRecord record);
+}
+
+/**
+ * Plugin interface for provisioning compute capacity on demand (e.g., local subprocesses,
+ * ECS tasks, Kubernetes Jobs, AWS Lambda).
+ */
+interface ComputeProvisioner
+{
+    @property string providerType() const;
+    bool canProvision(in QueueDemand demand) const;
+    void requestCapacity(in QueueDemand demand);
+    @property size_t activeInstanceCount() const;
+    @property size_t maxCapacity() const;
+}
+
+/**
+ * Server-side broker coordinating capacity across registered provisioners.
+ */
+interface CapacityBroker
+{
+    void registerProvisioner(ComputeProvisioner provisioner);
+    void evaluateDemand();
+    void start();
+    void stop();
+    @property size_t activeInstanceCount() const;
+    @property size_t maxCapacity() const;
+    @property ComputeProvisioner[] provisioners();
+}
+
+/**
+ * Interface for queue consumers / worker pools managing task execution lifecycle.
+ */
+interface WorkerPool
+{
+    void start();
+    void stop();
+    @property size_t activeTaskCount() const;
+    @property size_t maxConcurrentTasks() const;
 }
 
 unittest

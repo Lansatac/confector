@@ -14,7 +14,7 @@ import core.thread : Thread;
 
 import confector.plugin_api.model;
 import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, WorkerPlugin;
-import confector.plugin_api.executor : ComputeProvider, ComputeInstance, WorkerRecord, ExecutionRequest, ExecutionResult, LogDelegate;
+import confector.plugin_api.executor : ComputeProvider, ComputeInstance, WorkerRecord, ExecutionRequest, ExecutionResult, LogDelegate, ComputeProvisioner;
 
 /**
  * Concrete ComputeInstance managing task execution by provisioning and launching
@@ -411,6 +411,7 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             "isolateEnvironment": JSONValue(false),
             "secretToken": JSONValue(""),
             "allowedStepTypes": JSONValue([
+                JSONValue("process"),
                 JSONValue("bash"),
                 JSONValue("powershell"),
                 JSONValue("git")
@@ -525,6 +526,249 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
     {
         return new LocalProcessInstance(record);
     }
+
+    ComputeProvisioner createProvisioner(in WorkerRecord record)
+    {
+        LocalProcessProvisionerConfig cfg;
+        if (record.configuration.type == JSONType.object)
+        {
+            if (auto p = "maxConcurrency" in record.configuration)
+            {
+                if (p.type == JSONType.integer) cfg.maxConcurrency = cast(size_t)p.integer;
+            }
+            if (auto p = "workspaceDir" in record.configuration)
+            {
+                if (p.type == JSONType.string) cfg.workspaceDir = p.str;
+            }
+            if (auto p = "runnerBinary" in record.configuration)
+            {
+                if (p.type == JSONType.string) cfg.runnerBinary = p.str;
+            }
+            if (auto p = "secretToken" in record.configuration)
+            {
+                if (p.type == JSONType.string) cfg.secretToken = p.str;
+            }
+        }
+        return new LocalProcessProvisioner(cfg);
+    }
+}
+
+/**
+ * Configuration for LocalProcessProvisioner.
+ */
+struct LocalProcessProvisionerConfig
+{
+    string runnerBinary = "bin/confector-runner";
+    string serverUrl = "http://localhost:8080";
+    string workspaceDir = ".confector/workspaces";
+    string storageDir = ".confector/artifacts";
+    string pluginsDir = "plugins";
+    string secretToken = "";
+    size_t maxConcurrency = 0; // 0 = totalCPUs
+    string[] supportedExecutorTypes = ["local", "local_process", ""];
+    void delegate(string[] cmdArgs) customLauncher = null;
+}
+
+/**
+ * ComputeProvisioner implementation that manages local subprocess capacity
+ * by launching standalone confector-runner worker instances up to a concurrency ceiling.
+ */
+class LocalProcessProvisioner : ComputeProvisioner
+{
+    private LocalProcessProvisionerConfig m_config;
+    private size_t m_activeInstances = 0;
+    private Mutex m_mutex;
+
+    this(LocalProcessProvisionerConfig config = LocalProcessProvisionerConfig.init)
+    {
+        m_config = config;
+        if (m_config.maxConcurrency == 0)
+        {
+            m_config.maxConcurrency = totalCPUs > 0 ? totalCPUs : 4;
+        }
+        if (m_config.supportedExecutorTypes.length == 0)
+        {
+            m_config.supportedExecutorTypes = ["local", "local_process", ""];
+        }
+        m_mutex = new Mutex();
+    }
+
+    @property string providerType() const
+    {
+        return "local";
+    }
+
+    @property size_t activeInstanceCount() const
+    {
+        synchronized (m_mutex)
+        {
+            return m_activeInstances;
+        }
+    }
+
+    @property size_t maxCapacity() const
+    {
+        return m_config.maxConcurrency;
+    }
+
+    bool canProvision(in QueueDemand demand) const
+    {
+        string exec = demand.executorType;
+        bool matchesType = false;
+        foreach (t; m_config.supportedExecutorTypes)
+        {
+            if (exec == t)
+            {
+                matchesType = true;
+                break;
+            }
+        }
+        if (!matchesType && exec.length > 0)
+        {
+            return false;
+        }
+
+        if (demand.requirements !is null)
+        {
+            if (auto p = "gpu" in demand.requirements)
+            {
+                if (*p == "true") return false;
+            }
+            if (auto p = "cloud" in demand.requirements)
+            {
+                if (*p == "aws" || *p == "k8s") return false;
+            }
+        }
+
+        return true;
+    }
+
+    void requestCapacity(in QueueDemand demand)
+    {
+        if (!canProvision(demand))
+        {
+            return;
+        }
+
+        size_t toSpawn = 0;
+        synchronized (m_mutex)
+        {
+            if (m_activeInstances >= m_config.maxConcurrency)
+            {
+                return;
+            }
+            size_t available = m_config.maxConcurrency - m_activeInstances;
+            toSpawn = demand.pendingWorkOrderCount > 0 ? demand.pendingWorkOrderCount : 1;
+            if (toSpawn > available)
+            {
+                toSpawn = available;
+            }
+            m_activeInstances += toSpawn;
+        }
+
+        for (size_t i = 0; i < toSpawn; i++)
+        {
+            spawnRunnerInstance();
+        }
+    }
+
+    private void spawnRunnerInstance()
+    {
+        if (m_config.customLauncher !is null)
+        {
+            try
+            {
+                m_config.customLauncher(["custom"]);
+            }
+            finally
+            {
+                synchronized (m_mutex)
+                {
+                    if (m_activeInstances > 0) m_activeInstances--;
+                }
+            }
+            return;
+        }
+
+        auto workerThread = new Thread({
+            try
+            {
+                string binPath = m_config.runnerBinary;
+                version (Windows)
+                {
+                    import std.string : endsWith;
+                    if (!binPath.endsWith(".exe") && exists(binPath ~ ".exe"))
+                    {
+                        binPath ~= ".exe";
+                    }
+                }
+
+                if (!exists(binPath))
+                {
+                    string[] fallbacks = ["bin/confector-runner", "../bin/confector-runner", "./confector-runner", "confector-runner"];
+                    try
+                    {
+                        import std.file : thisExePath;
+                        import std.path : dirName, buildPath;
+                        string exeDir = dirName(thisExePath());
+                        fallbacks ~= buildPath(exeDir, "confector-runner");
+                    }
+                    catch (Exception) {}
+
+                    foreach (fb; fallbacks)
+                    {
+                        string candidate = fb;
+                        version (Windows)
+                        {
+                            import std.string : endsWith;
+                            if (!candidate.endsWith(".exe")) candidate ~= ".exe";
+                        }
+                        if (exists(candidate))
+                        {
+                            binPath = candidate;
+                            break;
+                        }
+                    }
+                }
+
+                if (exists(binPath))
+                {
+                    string[] runnerArgs = [
+                        binPath,
+                        "worker",
+                        format("--server-url=%s", m_config.serverUrl),
+                        format("--workspace=%s", m_config.workspaceDir),
+                        format("--storage-dir=%s", m_config.storageDir),
+                        format("--plugins-dir=%s", m_config.pluginsDir),
+                        "--max-tasks=1",
+                        "--poll-interval=1"
+                    ];
+                    if (m_config.secretToken.length > 0)
+                    {
+                        runnerArgs ~= format("--token=%s", m_config.secretToken);
+                    }
+
+                    auto pid = spawnProcess(runnerArgs);
+                    wait(pid);
+                }
+            }
+            catch (Exception)
+            {
+            }
+            finally
+            {
+                synchronized (m_mutex)
+                {
+                    if (m_activeInstances > 0)
+                    {
+                        m_activeInstances--;
+                    }
+                }
+            }
+        });
+        workerThread.isDaemon = true;
+        workerThread.start();
+    }
 }
 
 /**
@@ -604,4 +848,37 @@ unittest
         auto subprocRes = enabledInstance.execute(testReq);
         assert(subprocRes.exitCode == 0 || subprocRes.durationMs > 0);
     }
+
+    // Test LocalProcessProvisioner capability checking and demand handling
+    LocalProcessProvisionerConfig provConfig;
+    provConfig.maxConcurrency = 3;
+    bool customLaunched = false;
+    provConfig.customLauncher = (args) {
+        customLaunched = true;
+    };
+
+    auto provisioner = new LocalProcessProvisioner(provConfig);
+    assert(provisioner.providerType == "local");
+    assert(provisioner.maxCapacity == 3);
+    assert(provisioner.activeInstanceCount == 0);
+
+    // Matches local and default executor types
+    assert(provisioner.canProvision(QueueDemand("local", 1)));
+    assert(provisioner.canProvision(QueueDemand("local_process", 1)));
+    assert(provisioner.canProvision(QueueDemand("", 1)));
+
+    // Rejects incompatible tags and requirements
+    assert(!provisioner.canProvision(QueueDemand("kubernetes", 1)));
+    assert(!provisioner.canProvision(QueueDemand("ecs", 1)));
+    assert(!provisioner.canProvision(QueueDemand("local", 1, ["gpu": "true"])));
+    assert(!provisioner.canProvision(QueueDemand("local", 1, ["cloud": "aws"])));
+
+    // Request capacity
+    provisioner.requestCapacity(QueueDemand("local", 2));
+    assert(customLaunched);
+
+    // Test createProvisioner via provider
+    auto provFromRecord = provider.createProvisioner(rec);
+    assert(provFromRecord !is null);
+    assert(provFromRecord.providerType == "local");
 }

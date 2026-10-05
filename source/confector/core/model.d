@@ -43,6 +43,7 @@ struct TaskExecutionResult
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("duration_ms") ulong durationMs = 0;
     @optional @asName("step_results") StepExecutionResult[] stepResults;
+    @optional @asName("receipt_handle") string receiptHandle;
 }
 
 /**
@@ -113,6 +114,194 @@ struct ExecutionPlan
     string[] orderedTaskIds;
     string[] cachedTaskIds;
     string[] toExecuteTaskIds;
+}
+
+/**
+ * Authoritative upstream artifact reference for worker staging.
+ * Addressed by (taskFingerprint, artifactId) with optional unpack destination.
+ */
+struct InputArtifactRef
+{
+    @asName("task_id") string taskId;
+    @optional @asName("task_fingerprint") string taskFingerprint;
+    @optional @asName("artifact_id") string artifactId;
+    @optional @asName("storage_uri") string storageUri;
+    @optional @asName("target_path") string targetPath; // deprecated legacy alias
+    @optional @asName("destination") string destination;
+    @optional @asName("sha256") string sha256;
+}
+
+/**
+ * Deprecated dual representation retained only for serialization compatibility.
+ * New code must use InputArtifactRef via TaskExecutionPayload.inputArtifacts.
+ */
+struct UpstreamArtifactLocation
+{
+    @asName("task_id") string taskId;
+    @optional @asName("task_fingerprint") string taskFingerprint;
+    @optional @asName("artifact_id") string artifactId;
+    @optional @asName("artifact_path") string artifactPath;
+    @optional @asName("destination") string destination;
+    @optional @asName("storage_backend") string storageBackend = "local";
+    @optional @asName("storage_uri") string storageUri;
+    @optional @asName("sha256") string sha256;
+    @optional @asName("target_path") string targetPath;
+}
+
+/**
+ * Self-contained execution payload for worker tasks.
+ */
+struct TaskExecutionPayload
+{
+    @optional @asName("repository_url") string repositoryUrl;
+    @optional @asName("commit_sha") string commitSha;
+    @optional @asName("allowed_repositories") string[] allowedRepositories;
+    @optional @asName("repository_map") string[string] repositoryMap;
+    @optional string script;
+    @optional string[string] environment;
+    /// Single authoritative list of upstream artifacts to unpack before execution.
+    @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
+    /// Deprecated: no longer populated by coordinator; kept for wire compatibility.
+    @optional @asName("upstream_artifact_locations") UpstreamArtifactLocation[] upstreamArtifactLocations;
+    /// Map of upstream taskId -> task fingerprint (content-addressed).
+    @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
+    @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
+    @optional @asName("workspace_dir") string workspaceDir;
+    @optional @asName("callback_url") string callbackUrl;
+    @optional @asName("node_fingerprint") string nodeFingerprint;
+    @optional @asName("force") bool force = false;
+}
+
+/**
+ * Represents a fully resolved, ready-to-execute work order dispatched to a worker or queue.
+ */
+struct WorkOrder
+{
+    @optional @asName("build_id") string buildId;
+    @optional @asName("task_id") string taskId;
+    @optional @asName("fingerprint") string fingerprint;
+    @optional @asName("executor_type") string executorType;               // e.g., "local", "queue", "aws-ecs"
+    @optional @asName("requirements") string[string] requirements;       // e.g., ["arch": "x86_64", "gpu": "true"]
+    @optional @asName("payload") TaskExecutionPayload payload;
+    @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
+    @optional @asName("created_at") string createdAt;
+}
+
+/**
+ * Message queued for worker consumption wrapping a WorkOrder and tracking queue lease state.
+ */
+struct TaskQueueMessage
+{
+    @optional @asName("id") string id;
+    @optional @asName("receipt_handle") string receiptHandle;
+    @optional @asName("work_order") WorkOrder workOrder;
+    @optional @asName("status") string status = "enqueued";              // "enqueued", "claimed", "completed", "failed"
+    @optional @asName("locked_by") string lockedBy;
+    @optional @asName("lock_expires_at") long lockExpiresAt = 0;
+    @optional @asName("retry_count") size_t retryCount = 0;
+    @optional @asName("attempt") int attempt = 1;
+    @optional @asName("task_node") TaskNode taskNode;
+    @optional @asName("max_attempts") size_t maxAttempts = 3;
+    @optional @asName("visible_after") long visibleAfterUnix = 0;
+    @optional @asName("error_reason") string errorReason;
+
+    // Helper constructor
+    this(string id, WorkOrder workOrder, string status = "enqueued", string lockedBy = null, long lockExpiresAt = 0, size_t retryCount = 0) pure nothrow @safe
+    {
+        this.id = id;
+        this.workOrder = workOrder;
+        this.status = status;
+        this.lockedBy = lockedBy;
+        this.lockExpiresAt = lockExpiresAt;
+        this.retryCount = retryCount;
+        this.attempt = cast(int)retryCount + 1;
+    }
+
+    // Convenience properties for backwards compatibility and ease of access
+    @ignore @property string messageId() const pure nothrow @safe
+    {
+        return id;
+    }
+
+    @ignore @property void messageId(string val) pure nothrow @safe
+    {
+        id = val;
+    }
+
+    @ignore @property string taskId() const pure nothrow @safe
+    {
+        return workOrder.taskId;
+    }
+
+    @ignore @property void taskId(string val) pure nothrow @safe
+    {
+        workOrder.taskId = val;
+    }
+
+    @ignore @property string buildId() const pure nothrow @safe
+    {
+        return workOrder.buildId;
+    }
+
+    @ignore @property void buildId(string val) pure nothrow @safe
+    {
+        workOrder.buildId = val;
+    }
+
+    @ignore @property string nodeFingerprint() const pure nothrow @safe
+    {
+        return workOrder.fingerprint;
+    }
+
+    @ignore @property void nodeFingerprint(string val) pure nothrow @safe
+    {
+        workOrder.fingerprint = val;
+    }
+
+    @ignore @property string executorType() const pure nothrow @safe
+    {
+        return workOrder.executorType;
+    }
+
+    @ignore @property void executorType(string val) pure nothrow @safe
+    {
+        workOrder.executorType = val;
+    }
+
+    @ignore @property size_t timeoutSeconds() const pure nothrow @safe
+    {
+        return workOrder.timeoutSeconds;
+    }
+
+    @ignore @property void timeoutSeconds(size_t val) pure nothrow @safe
+    {
+        workOrder.timeoutSeconds = val;
+    }
+
+    @ignore @property string createdAt() const pure nothrow @safe
+    {
+        return workOrder.createdAt;
+    }
+
+    @ignore @property void createdAt(string val) pure nothrow @safe
+    {
+        workOrder.createdAt = val;
+    }
+
+    @ignore @property ref TaskExecutionPayload executionPayload() return pure nothrow @safe
+    {
+        return workOrder.payload;
+    }
+
+    @ignore @property const(TaskExecutionPayload) executionPayload() const pure nothrow @safe
+    {
+        return workOrder.payload;
+    }
+
+    @ignore @property void executionPayload(TaskExecutionPayload val) pure nothrow @safe
+    {
+        workOrder.payload = val;
+    }
 }
 
 /**
@@ -227,4 +416,86 @@ unittest
     assert(oldProject.tasks.length == 1);
     assert(oldProject.tasks[0].id == "confector-test");
     assert(oldProject.tasks[0].steps.length == 2);
+
+    // Test WorkOrder serialization, tag deserialization, and payload wrapping
+    WorkOrder wo;
+    wo.buildId = "bld_100";
+    wo.taskId = "compile";
+    wo.fingerprint = "fp_abc123";
+    wo.executorType = "local";
+    wo.requirements = ["arch": "x86_64", "gpu": "true"];
+    wo.timeoutSeconds = 600;
+    wo.createdAt = "2026-10-04T12:00:00Z";
+    wo.payload.script = "dub build";
+    wo.payload.workspaceDir = "/tmp/workspace";
+    wo.payload.inputArtifacts = [InputArtifactRef("upstream_task", "fp_upstream", "art_1", "s3://bucket/art_1.tar.gz")];
+
+    Json woJson = serializeToJson(wo);
+    assert(woJson["build_id"].get!string == "bld_100");
+    assert(woJson["task_id"].get!string == "compile");
+    assert(woJson["fingerprint"].get!string == "fp_abc123");
+    assert(woJson["executor_type"].get!string == "local");
+    assert(woJson["requirements"]["arch"].get!string == "x86_64");
+    assert(woJson["requirements"]["gpu"].get!string == "true");
+    assert(woJson["payload"]["script"].get!string == "dub build");
+    assert(woJson["payload"]["input_artifacts"].length == 1);
+
+    WorkOrder woDeserialized = deserializeJson!WorkOrder(woJson);
+    assert(woDeserialized.buildId == "bld_100");
+    assert(woDeserialized.taskId == "compile");
+    assert(woDeserialized.fingerprint == "fp_abc123");
+    assert(woDeserialized.executorType == "local");
+    assert(woDeserialized.requirements["arch"] == "x86_64");
+    assert(woDeserialized.requirements["gpu"] == "true");
+    assert(woDeserialized.timeoutSeconds == 600);
+    assert(woDeserialized.payload.script == "dub build");
+    assert(woDeserialized.payload.inputArtifacts.length == 1);
+    assert(woDeserialized.payload.inputArtifacts[0].taskId == "upstream_task");
+    assert(woDeserialized.payload.inputArtifacts[0].taskFingerprint == "fp_upstream");
+
+    // Test TaskQueueMessage wrapping WorkOrder and lease properties
+    TaskQueueMessage msg;
+    msg.id = "msg_001";
+    msg.receiptHandle = "rcpt_999";
+    msg.workOrder = wo;
+    msg.status = "claimed";
+    msg.lockedBy = "worker_node_42";
+    msg.lockExpiresAt = 1790000000L;
+    msg.retryCount = 2;
+    msg.attempt = 3;
+    msg.maxAttempts = 5;
+    msg.visibleAfterUnix = 1790000030L;
+    msg.errorReason = "Temporary worker timeout";
+
+    // Test compatibility accessors
+    assert(msg.messageId == "msg_001");
+    assert(msg.taskId == "compile");
+    assert(msg.buildId == "bld_100");
+    assert(msg.nodeFingerprint == "fp_abc123");
+    assert(msg.executorType == "local");
+    assert(msg.timeoutSeconds == 600);
+    assert(msg.executionPayload.script == "dub build");
+    assert(msg.retryCount == 2);
+    assert(msg.attempt == 3);
+
+    Json msgJson = serializeToJson(msg);
+    assert(msgJson["id"].get!string == "msg_001");
+    assert(msgJson["status"].get!string == "claimed");
+    assert(msgJson["locked_by"].get!string == "worker_node_42");
+    assert(msgJson["lock_expires_at"].get!long == 1790000000L);
+    assert(msgJson["retry_count"].get!ulong == 2);
+    assert(msgJson["work_order"]["build_id"].get!string == "bld_100");
+
+    TaskQueueMessage msgDeserialized = deserializeJson!TaskQueueMessage(msgJson);
+    assert(msgDeserialized.id == "msg_001");
+    assert(msgDeserialized.receiptHandle == "rcpt_999");
+    assert(msgDeserialized.status == "claimed");
+    assert(msgDeserialized.lockedBy == "worker_node_42");
+    assert(msgDeserialized.lockExpiresAt == 1790000000L);
+    assert(msgDeserialized.retryCount == 2);
+    assert(msgDeserialized.workOrder.taskId == "compile");
+    assert(msgDeserialized.workOrder.requirements["gpu"] == "true");
+    assert(msgDeserialized.taskId == "compile");
+    assert(msgDeserialized.buildId == "bld_100");
+    assert(msgDeserialized.nodeFingerprint == "fp_abc123");
 }

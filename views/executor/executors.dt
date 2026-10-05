@@ -24,6 +24,38 @@ block maincontent
       div.stat-card
         div.stat-value #{providers.length}
         div.stat-label Available Provider Types
+      div.stat-card
+        div.stat-value #{activeCapacity} / #{maxCapacity}
+        div.stat-label Capacity (Active / Max)
+      div.stat-card
+        div.stat-value #{queueDemandDepth}
+        div.stat-label Queue Demand Depth
+
+    div.section-title-bar(style="margin-top: 25px;")
+      h2 Active Compute Provisioners & Broker Capacity
+
+    - if (provisioners.length == 0)
+      div.empty-state
+        p No compute provisioners currently registered with the capacity broker.
+    - else
+      table.data-table
+        thead
+          tr
+            th Provider Type
+            th Active Instances
+            th Max Capacity
+            th Provisioner Class
+        tbody
+          - foreach(prov; provisioners)
+            tr
+              td
+                span.badge.badge-primary #{prov.providerType}
+              td
+                span(style="font-weight: bold;") #{prov.activeInstanceCount}
+              td
+                span #{prov.maxCapacity}
+              td
+                code #{typeid(cast(Object)prov).name}
 
     div.section-title-bar(style="margin-top: 25px;")
       h2 Configured Executor Instances
