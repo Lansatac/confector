@@ -12,7 +12,7 @@ services:
       - ../../.:/code
       - ./config:/etc/confector
       # Mask .dub directory with an isolated named volume to prevent host/container conflicts
-      - dub-build-cache:/home/dev/.dub
+      - dev-home:/home/dev/
       - code-bin:/code/bin
       # Docker socket for container-in-container workflows (if required by tasks)
       - /var/run/docker.sock:/var/run/docker.sock
@@ -57,7 +57,7 @@ secrets:
     file: mongo/dev-readwrite-password.txt
 
 volumes:
-  dub-build-cache:
+  dev-home:
   code-bin:
   mongo-data:
 

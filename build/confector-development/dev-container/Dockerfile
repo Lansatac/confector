@@ -28,7 +28,7 @@ RUN curl -fsS https://dlang.org/install.sh | bash -s install dmd -p /opt/dlang \
     && echo "${DMD_DIR}/linux/lib64" > /etc/ld.so.conf.d/dlang.conf && ldconfig \
     && chmod -R a+rX /opt/dlang
 
-    # Pre-build and install Reggae globally to make it universally available in PATH
+# Pre-build and install Reggae globally
 RUN dub fetch reggae \
    && dub build reggae \
    && REGGAE_BIN=$(find /root/.dub/packages/reggae/ -name reggae -type f -perm /111 | head -n 1) \
