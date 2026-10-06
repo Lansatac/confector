@@ -13,10 +13,8 @@ import core.time : Duration, seconds, msecs, MonoTime;
 import core.thread : Thread;
 
 import confector.plugin_api.model;
-import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, WorkerPlugin;
+import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, WorkerPlugin, ConfigDefinition, ConfigRegistry, Description, Key, Env, EnvVar, Required;
 import confector.plugin_api.executor : ComputeProvider, ComputeInstance, WorkerRecord, ExecutionRequest, ExecutionResult, LogDelegate, ComputeProvisioner;
-import confector.config;
-import vibe.data.json : Json;
 
 /**
  * Concrete ComputeInstance managing task execution by provisioning and launching

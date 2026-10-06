@@ -136,6 +136,7 @@ final class PluginRegistry
 
     public void registerPlugin(Plugin plugin, ConfigAccessor configAccessor = null)
     {
+        logDebug("[plugin_registry] registerPlugin: starting for '%s'", plugin.name);
         _plugins[plugin.name] = plugin;
 
         // Register any configuration definitions declared by the plugin
@@ -164,7 +165,9 @@ final class PluginRegistry
             }
         }
         auto ctx = new HostPluginContext(plugin.name, _logCallback, scopeConfig);
+        logDebug("[plugin_registry] Calling initialize() for '%s'", plugin.name);
         plugin.initialize(ctx);
+        logDebug("[plugin_registry] initialize() returned for '%s'", plugin.name);
 
         // Automatically register implemented system interfaces
         if (auto resolver = cast(InputResolverSystem) plugin)
@@ -191,6 +194,7 @@ final class PluginRegistry
         {
             registerComputeProvider(provider);
         }
+        logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
     }
 
     public void registerInputResolver(InputResolverSystem system)

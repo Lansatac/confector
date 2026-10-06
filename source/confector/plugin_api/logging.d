@@ -1,6 +1,6 @@
 module confector.plugin_api.logging;
 
-public import confector.config : ConfigAccessor, ScopedConfigAccessor, ResolutionEngine, ConfigDefinition, ConfigType;
+public import confector.config : ConfigAccessor, ScopedConfigAccessor, ResolutionEngine, ConfigDefinition, ConfigType, ConfigRegistry, Description, Key, Env, EnvVar, Required;
 import vibe.data.json : Json;
 
 /**

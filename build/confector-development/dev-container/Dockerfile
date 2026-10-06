@@ -29,11 +29,11 @@ RUN curl -fsS https://dlang.org/install.sh | bash -s install dmd -p /opt/dlang \
     && chmod -R a+rX /opt/dlang
 
     # Pre-build and install Reggae globally to make it universally available in PATH
-#RUN dub fetch reggae \
-#    && dub build reggae \
-#    && REGGAE_BIN=$(find /root/.dub/packages/reggae/ -name reggae -type f -perm /111 | head -n 1) \
-#    && cp "${REGGAE_BIN}" /usr/local/bin/reggae \
-#    && rm -rf /root/.dub
+RUN dub fetch reggae \
+   && dub build reggae \
+   && REGGAE_BIN=$(find /root/.dub/packages/reggae/ -name reggae -type f -perm /111 | head -n 1) \
+   && cp "${REGGAE_BIN}" /usr/local/bin/reggae \
+   && rm -rf /root/.dub
 
 # Create a non-root dev user matching standard dev container setups
 ARG USERNAME=dev

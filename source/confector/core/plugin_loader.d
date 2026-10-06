@@ -168,6 +168,9 @@ final class PluginLoader
 
         void* handle = null;
 
+        import vibe.core.log : logDebug;
+        logDebug("[plugin_loader] About to dlopen: %s", absPath);
+
         version (Windows)
         {
             handle = Runtime.loadLibrary(absPath);
@@ -199,12 +202,14 @@ final class PluginLoader
                 throw new PluginLoadException(format("Failed to load dynamic library '%s': %s", absPath, err ? to!string(err) : "unknown error"));
             }
             _allLoadedHandles ~= handle;
+            logDebug("[plugin_loader] dlopen succeeded for: %s", absPath);
         }
         else
         {
             static assert(0, "Unsupported platform for dynamic plugin loading");
         }
 
+        logDebug("[plugin_loader] Looking up symbol %s in: %s", CONFECTOR_PLUGIN_FACTORY_SYMBOL, absPath);
         void* sym = null;
         version (Windows)
         {
@@ -222,10 +227,12 @@ final class PluginLoader
         }
 
         auto factory = cast(PluginFactoryFn) sym;
+        logDebug("[plugin_loader] Invoking factory function for: %s", absPath);
         Plugin plugin = null;
         try
         {
             plugin = factory();
+            logDebug("[plugin_loader] Factory returned plugin '%s' for: %s", plugin.name, absPath);
         }
         catch (Throwable t)
         {
@@ -256,7 +263,9 @@ final class PluginLoader
         }
 
         // Register with PluginRegistry
+        logDebug("[plugin_loader] Registering plugin '%s' with PluginRegistry", plugin.name);
         PluginRegistry.instance.registerPlugin(plugin);
+        logDebug("[plugin_loader] Plugin '%s' registered successfully", plugin.name);
 
         _loadedPlugins[plugin.name] = record;
         _pathToPluginName[absPath] = plugin.name;
@@ -298,7 +307,7 @@ final class PluginLoader
             return loaded;
         }
 
-        foreach (DirEntry entry; dirEntries(directory, SpanMode.depth))
+        foreach (DirEntry entry; dirEntries(directory, SpanMode.shallow))
         {
             if (entry.isFile)
             {

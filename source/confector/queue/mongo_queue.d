@@ -448,8 +448,21 @@ class MongoWorkQueue : WorkQueue
                     msg.receiptHandle = candidate["receipt_handle"].get!string;
                 msg.buildId = candidate.tryIndex("build_id").isNull ? "" : candidate["build_id"].get!string;
                 msg.taskId = candidate.tryIndex("task_id").isNull ? "" : candidate["task_id"].get!string;
+                msg.executorType = candidate.tryIndex("executor_type").isNull ? "" : candidate["executor_type"].get!string;
                 if (!candidate.tryIndex("node_fingerprint").isNull && candidate["node_fingerprint"].type == Bson.Type.string)
                     msg.nodeFingerprint = candidate["node_fingerprint"].get!string;
+
+                try
+                {
+                    if (!candidate.tryIndex("work_order").isNull && candidate["work_order"].type != Bson.Type.null_)
+                    {
+                        msg.workOrder = deserializeBson!WorkOrder(sanitizeBson(candidate["work_order"]));
+                    }
+                }
+                catch (Exception e)
+                {
+                    logError("Failed to deserialize pending work order (msg '%s'): %s", msg.messageId, e.msg);
+                }
 
                 try
                 {
