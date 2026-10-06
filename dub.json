@@ -30,7 +30,7 @@
       "targetPath": "bin/server",
       "workingDirectory": "bin/server",
       "sourcePaths": ["source/confector/server"],
-      "copyFiles": ["../../public"],
+      "copyFiles": ["public"],
       "dependencies": {
         "diet-ng": "~>1.8",
         "vibe-d": "~>0.10.3",

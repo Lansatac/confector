@@ -10,7 +10,7 @@ services:
     volumes:
       # Bind mount host source code
       - ../../.:/code
-      - ./build/confector-development/config:/etc/confector
+      - ./config:/etc/confector
       # Mask .dub directory with an isolated named volume to prevent host/container conflicts
       - dub-build-cache:/home/dev/.dub
       - code-bin:/code/bin

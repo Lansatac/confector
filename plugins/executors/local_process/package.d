@@ -387,80 +387,9 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
 
     override ConfigDefinition[] configDefinitions() const
     {
-        return [
-            ConfigDefinition(
-                "plugins.local-process.maxConcurrency",
-                "CONFECTOR_LOCAL_CONCURRENCY",
-                Json(cast(long)totalCPUs),
-                "Maximum concurrent runner subprocesses allowed"
-            ),
-            ConfigDefinition(
-                "plugins.local_process.maxConcurrency",
-                "CONFECTOR_LOCAL_CONCURRENCY",
-                Json(cast(long)totalCPUs),
-                "Maximum concurrent runner subprocesses allowed"
-            ),
-            ConfigDefinition(
-                "plugins.local-process.runnerBinary",
-                "CONFECTOR_RUNNER_BIN",
-                Json("bin/confector-runner"),
-                "Path to confector-runner binary"
-            ),
-            ConfigDefinition(
-                "plugins.local_process.runnerBinary",
-                "CONFECTOR_RUNNER_BIN",
-                Json("bin/confector-runner"),
-                "Path to confector-runner binary"
-            ),
-            ConfigDefinition(
-                "plugins.local-process.workspaceDir",
-                "CONFECTOR_WORKSPACE_DIR",
-                Json(".confector/workspaces"),
-                "Base directory for runner workspaces"
-            ),
-            ConfigDefinition(
-                "plugins.local_process.workspaceDir",
-                "CONFECTOR_WORKSPACE_DIR",
-                Json(".confector/workspaces"),
-                "Base directory for runner workspaces"
-            ),
-            ConfigDefinition(
-                "plugins.local-process.storageDir",
-                "CONFECTOR_LOCAL_PROCESS_STORAGE_DIR",
-                Json(".confector/artifacts"),
-                "Base directory for runner artifacts"
-            ),
-            ConfigDefinition(
-                "plugins.local_process.storageDir",
-                "CONFECTOR_LOCAL_PROCESS_STORAGE_DIR",
-                Json(".confector/artifacts"),
-                "Base directory for runner artifacts"
-            ),
-            ConfigDefinition(
-                "plugins.local-process.serverUrl",
-                "CONFECTOR_SERVER_URL",
-                Json("http://localhost:8080"),
-                "Base URL of Confector server"
-            ),
-            ConfigDefinition(
-                "plugins.local_process.serverUrl",
-                "CONFECTOR_SERVER_URL",
-                Json("http://localhost:8080"),
-                "Base URL of Confector server"
-            ),
-            ConfigDefinition(
-                "plugins.local-process.secretToken",
-                "CONFECTOR_RUNNER_TOKEN",
-                Json(""),
-                "Secret authentication token for runner"
-            ),
-            ConfigDefinition(
-                "plugins.local_process.secretToken",
-                "CONFECTOR_RUNNER_TOKEN",
-                Json(""),
-                "Secret authentication token for runner"
-            )
-        ];
+        // Definitions are now registered via bindDefinition!LocalProcessProvisionerConfig
+        // This method is kept for backward compatibility but returns an empty array.
+        return [];
     }
 
     void initialize(PluginContext context = null)
@@ -657,42 +586,7 @@ void registerLocalProcessConfigDefinitions(ConfigRegistry registry)
 {
     if (registry is null) return;
 
-    registry.registerDefinition(ConfigDefinition(
-        "plugins.local_process.maxConcurrency",
-        "CONFECTOR_LOCAL_CONCURRENCY",
-        Json(cast(long)totalCPUs),
-        "Maximum concurrent runner subprocesses allowed"
-    ));
-    registry.registerDefinition(ConfigDefinition(
-        "plugins.local_process.runnerBinary",
-        "CONFECTOR_RUNNER_BIN",
-        Json("bin/confector-runner"),
-        "Path to confector-runner binary"
-    ));
-    registry.registerDefinition(ConfigDefinition(
-        "plugins.local_process.workspaceDir",
-        "CONFECTOR_WORKSPACE_DIR",
-        Json(".confector/workspaces"),
-        "Base directory for runner workspaces"
-    ));
-    registry.registerDefinition(ConfigDefinition(
-        "plugins.local_process.storageDir",
-        "CONFECTOR_LOCAL_PROCESS_STORAGE_DIR",
-        Json(".confector/artifacts"),
-        "Base directory for runner artifacts"
-    ));
-    registry.registerDefinition(ConfigDefinition(
-        "plugins.local_process.serverUrl",
-        "CONFECTOR_SERVER_URL",
-        Json("http://localhost:8080"),
-        "Base URL of Confector server"
-    ));
-    registry.registerDefinition(ConfigDefinition(
-        "plugins.local_process.secretToken",
-        "CONFECTOR_RUNNER_TOKEN",
-        Json(""),
-        "Secret authentication token for runner"
-    ));
+    registry.bindDefinition!LocalProcessProvisionerConfig("plugins.local_process");
 }
 
 /**
@@ -700,13 +594,27 @@ void registerLocalProcessConfigDefinitions(ConfigRegistry registry)
  */
 struct LocalProcessProvisionerConfig
 {
+    @Description("Path to confector-runner binary")
     string runnerBinary = "bin/confector-runner";
+
+    @Description("Base URL of Confector server")
     string serverUrl = "http://localhost:8080";
+
+    @Description("Base directory for runner workspaces")
     string workspaceDir = ".confector/workspaces";
+
+    @Description("Base directory for runner artifacts")
     string storageDir = ".confector/artifacts";
+
+    @Description("Directory for bundled plugins")
     string pluginsDir = "plugins";
+
+    @Description("Secret authentication token for runner")
     string secretToken = "";
-    size_t maxConcurrency = 0; // 0 = totalCPUs
+
+    @Description("Maximum concurrent runner subprocesses allowed (0 = auto-detect CPU count)")
+    size_t maxConcurrency = 0;
+
     string[] supportedExecutorTypes = ["local", "local_process", ""];
     void delegate(string[] cmdArgs) customLauncher = null;
 }
@@ -1024,15 +932,11 @@ unittest
     assert(provFromRecord !is null);
     assert(provFromRecord.providerType == "local");
 
-    // Test ConfigRegistry integration with LocalProcessProvider
+    // Test ConfigRegistry integration with LocalProcessProvider using bindDefinition!T
     auto configReg = new ConfigRegistry();
-    auto localPlugin = new LocalProcessProvider();
-    // Simulate runtime registration through PluginRegistry or direct defs registration
-    foreach (ref def; localPlugin.configDefinitions())
-    {
-        configReg.registerDefinition(def);
-    }
+    registerLocalProcessConfigDefinitions(configReg);
     auto pluginCtx = new NullPluginContext("local_process", configReg.getScope("plugins.local_process"));
-    localPlugin.initialize(pluginCtx);
-    assert(localPlugin.scopedConfig.runnerBinary == "bin/confector-runner");
+    auto localPlugin2 = new LocalProcessProvider();
+    localPlugin2.initialize(pluginCtx);
+    assert(localPlugin2.scopedConfig.runnerBinary == "bin/confector-runner");
 }

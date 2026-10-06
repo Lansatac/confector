@@ -22,6 +22,44 @@ enum ConfigType
 }
 
 /**
+ * User-Defined Attribute to explicitly specify the environment variable name for a configuration field.
+ */
+struct EnvVar
+{
+    string name;
+}
+
+/// Convenience alias/struct for @Env("VAR_NAME")
+struct Env
+{
+    string name;
+}
+
+/**
+ * User-Defined Attribute to specify human-readable documentation for a configuration field.
+ */
+struct Description
+{
+    string text;
+}
+
+/**
+ * User-Defined Attribute to mark a configuration field as required.
+ */
+struct Required
+{
+    bool isRequired = true;
+}
+
+/**
+ * User-Defined Attribute to customize the JSON/configuration key name for a field.
+ */
+struct Key
+{
+    string name;
+}
+
+/**
  * Metadata definition for a configuration key.
  */
 struct ConfigDefinition
@@ -44,6 +82,21 @@ interface ConfigAccessor
     long getInt(string key, long defaultValue = 0) const;
     bool getBool(string key, bool defaultValue = false) const;
     double getDouble(string key, double defaultValue = 0.0) const;
+    ConfigAccessor getScope(string namespacePrefix) const;
+
+    void registerDefinition(in ConfigDefinition def);
+
+    final void bindDefinition(T)(string subPrefix = "")
+        if (is(T == struct))
+    {
+        registerDefinitionsFromStruct!T(this, subPrefix);
+    }
+
+    final void bindDefinitions(T)(string subPrefix = "")
+        if (is(T == struct))
+    {
+        registerDefinitionsFromStruct!T(this, subPrefix);
+    }
 
     // Type-safe struct / primitive binding via template final methods
     final T get(T)(string key) const
@@ -84,18 +137,51 @@ interface ConfigAccessor
                 static if (!is(typeof(__traits(getMember, T, member)) == function) &&
                            !is(typeof(__traits(getMember, T, member)) == delegate))
                 {
-                    alias MemberType = typeof(__traits(getMember, result, member));
-                    string memberKey = member;
-                    Json resolved = getJson(memberKey);
-                    if (resolved.type != Json.Type.undefined)
+                    static if (__traits(compiles, { auto testVal = __traits(getMember, result, member); }))
                     {
-                        try
+                        alias MemberType = typeof(__traits(getMember, result, member));
+                        string memberKey = member;
+                        static foreach (attr; __traits(getAttributes, __traits(getMember, result, member)))
                         {
-                            __traits(getMember, result, member) = coerceJson!MemberType(resolved);
+                            static if (is(typeof(attr) == Key))
+                            {
+                                memberKey = attr.name;
+                            }
                         }
-                        catch (Exception e)
+
+                        static if (is(MemberType == struct) && !is(MemberType == Json) && !is(MemberType == Duration))
                         {
-                            // Keep default value on coercion error
+                            Json resolved = getJson(memberKey);
+                            if (resolved.type == Json.Type.object)
+                            {
+                                try
+                                {
+                                    __traits(getMember, result, member) = coerceJson!MemberType(resolved);
+                                }
+                                catch (Exception e)
+                                {
+                                    __traits(getMember, result, member) = getScope(memberKey).bind!MemberType();
+                                }
+                            }
+                            else
+                            {
+                                __traits(getMember, result, member) = getScope(memberKey).bind!MemberType();
+                            }
+                        }
+                        else
+                        {
+                            Json resolved = getJson(memberKey);
+                            if (resolved.type != Json.Type.undefined)
+                            {
+                                try
+                                {
+                                    __traits(getMember, result, member) = coerceJson!MemberType(resolved);
+                                }
+                                catch (Exception e)
+                                {
+                                    // Keep default value on coercion error
+                                }
+                            }
                         }
                     }
                 }
@@ -116,6 +202,95 @@ interface ConfigRegistryInterface
 {
     void registerDefinition(in ConfigDefinition def);
     ConfigAccessor getScope(string namespacePrefix);
+
+    final void bindDefinition(T)(string prefix = "")
+        if (is(T == struct))
+    {
+        registerDefinitionsFromStruct!T(this, prefix);
+    }
+
+    final void bindDefinitions(T)(string prefix = "")
+        if (is(T == struct))
+    {
+        registerDefinitionsFromStruct!T(this, prefix);
+    }
+}
+
+/**
+ * Helper to recursively register configuration definitions from a struct type T.
+ */
+void registerDefinitionsFromStruct(T, Target)(Target target, string prefix = "")
+    if (is(T == struct))
+{
+    T defaultInstance = T.init;
+
+    foreach (member; __traits(allMembers, T))
+    {
+        static if (!is(typeof(__traits(getMember, T, member)) == function) &&
+                   !is(typeof(__traits(getMember, T, member)) == delegate))
+        {
+            static if (__traits(compiles, { auto testVal = __traits(getMember, defaultInstance, member); }))
+            {
+                alias MemberType = typeof(__traits(getMember, defaultInstance, member));
+
+                string envOverride = "";
+                string desc = "";
+                bool isReq = false;
+                string keyName = member;
+
+                static foreach (attr; __traits(getAttributes, __traits(getMember, defaultInstance, member)))
+                {
+                    static if (is(typeof(attr) == Env) || is(typeof(attr) == EnvVar))
+                    {
+                        envOverride = attr.name;
+                    }
+                    else static if (is(typeof(attr) == Description))
+                    {
+                        desc = attr.text;
+                    }
+                    else static if (is(typeof(attr) == Key))
+                    {
+                        keyName = attr.name;
+                    }
+                    else static if (is(attr == Required) || is(typeof(attr) == Required))
+                    {
+                        isReq = true;
+                    }
+                }
+
+                string fullKey = prefix.length > 0 ? (keyName.length > 0 ? prefix ~ "." ~ keyName : prefix) : keyName;
+
+                static if (is(MemberType == struct) && !is(MemberType == Json) && !is(MemberType == Duration))
+                {
+                    // Recurse into nested configuration structs
+                    registerDefinitionsFromStruct!MemberType(target, fullKey);
+                }
+                else
+                {
+                    auto memberVal = __traits(getMember, defaultInstance, member);
+                    Json defaultJson;
+                    static if (is(MemberType == Duration))
+                    {
+                        defaultJson = Json(memberVal.total!"msecs");
+                    }
+                    else
+                    {
+                        defaultJson = serializeToJson(memberVal);
+                    }
+
+                    string envVar = envOverride.length > 0 ? envOverride : keyToDefaultEnvVar(fullKey);
+
+                    target.registerDefinition(ConfigDefinition(
+                        fullKey,
+                        envVar,
+                        defaultJson,
+                        desc,
+                        isReq
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -339,10 +514,10 @@ class ResolutionEngine
  */
 class ScopedConfigAccessor : ConfigAccessor
 {
-    private const(ResolutionEngine) m_engine;
+    private ResolutionEngine m_engine;
     private string m_prefix;
 
-    this(const(ResolutionEngine) engine, string prefix = null)
+    this(ResolutionEngine engine, string prefix = null)
     {
         m_engine = engine;
         m_prefix = prefix;
@@ -353,6 +528,26 @@ class ScopedConfigAccessor : ConfigAccessor
         if (m_prefix.length == 0) return key;
         if (key.length == 0) return m_prefix;
         return m_prefix ~ "." ~ key;
+    }
+
+    override void registerDefinition(in ConfigDefinition def)
+    {
+        if (m_prefix.length > 0 && (def.key.length < m_prefix.length || def.key[0 .. m_prefix.length] != m_prefix))
+        {
+            string fullKey = qualifyKey(def.key);
+            string envVar = def.envVar.length > 0 ? def.envVar : keyToDefaultEnvVar(fullKey);
+            m_engine.registerDefinition(ConfigDefinition(fullKey, envVar, def.defaultValue, def.description, def.required));
+        }
+        else
+        {
+            m_engine.registerDefinition(def);
+        }
+    }
+
+    override ConfigAccessor getScope(string namespacePrefix) const
+    {
+        string newPrefix = qualifyKey(namespacePrefix);
+        return new ScopedConfigAccessor(cast(ResolutionEngine)m_engine, newPrefix);
     }
 
     override bool has(string key) const
@@ -657,4 +852,64 @@ unittest
     assert(scope_.getString("nonExistent", "defaultVal") == "defaultVal");
     assert(!scope_.has("nonExistent"));
     assert(scope_.has("str"));
+}
+
+unittest
+{
+    // Test 6: bindDefinition!T with automatic CONFECTOR_<NAMESPACES>_<FIELDNAME> and @Env overrides
+    struct HttpConfigTest
+    {
+        @Description("HTTP listen port")
+        ushort port = 8080;
+
+        @Env("CONFECTOR_CUSTOM_BIND_ADDR")
+        string bindAddress = "127.0.0.1";
+    }
+
+    struct NestedServerConfigTest
+    {
+        @Env("CONFECTOR_LOG_LEVEL")
+        string logLevel = "info";
+
+        HttpConfigTest http;
+    }
+
+    auto registry = new ConfigRegistry();
+    registry.bindDefinition!NestedServerConfigTest("server");
+
+    // Check default values
+    auto serverScope = registry.getScope("server");
+    auto cfg = serverScope.bind!NestedServerConfigTest();
+    assert(cfg.logLevel == "info");
+    assert(cfg.http.port == 8080);
+    assert(cfg.http.bindAddress == "127.0.0.1");
+
+    // Check env var override on default-derived env (CONFECTOR_SERVER_HTTP_PORT)
+    environment["CONFECTOR_SERVER_HTTP_PORT"] = "9090";
+    auto cfgWithEnv = serverScope.bind!NestedServerConfigTest();
+    assert(cfgWithEnv.http.port == 9090);
+    environment.remove("CONFECTOR_SERVER_HTTP_PORT");
+
+    // Check env var override on explicit @Env (CONFECTOR_LOG_LEVEL)
+    environment["CONFECTOR_LOG_LEVEL"] = "debug";
+    auto cfgWithLogLevel = serverScope.bind!NestedServerConfigTest();
+    assert(cfgWithLogLevel.logLevel == "debug");
+    environment.remove("CONFECTOR_LOG_LEVEL");
+
+    // Check env var override on explicit @Env for nested field (CONFECTOR_CUSTOM_BIND_ADDR)
+    environment["CONFECTOR_CUSTOM_BIND_ADDR"] = "0.0.0.0";
+    auto cfgWithBind = serverScope.bind!NestedServerConfigTest();
+    assert(cfgWithBind.http.bindAddress == "0.0.0.0");
+    environment.remove("CONFECTOR_CUSTOM_BIND_ADDR");
+
+    // Test binding definition directly on a scope
+    auto directRegistry = new ConfigRegistry();
+    auto httpScope = directRegistry.getScope("http");
+    httpScope.bindDefinition!HttpConfigTest();
+
+    // Default env var for http.port without server prefix is CONFECTOR_HTTP_PORT
+    environment["CONFECTOR_HTTP_PORT"] = "7070";
+    auto directHttpCfg = httpScope.bind!HttpConfigTest();
+    assert(directHttpCfg.port == 7070);
+    environment.remove("CONFECTOR_HTTP_PORT");
 }

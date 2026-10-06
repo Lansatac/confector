@@ -1,8 +1,31 @@
 {
   "server": {
+    "logLevel": "info",
     "http": {
       "port": 8080,
       "bindAddress": "0.0.0.0"
+    },
+    "storage": {
+      "mongoHost": "mongo:27017/confector",
+      "secretPath": "/run/secrets/mongo-readwrite-password",
+      "artifactsDir": ".confector/artifacts"
+    },
+    "plugins": {
+      "pluginsUploadDir": "",
+      "bundledPluginsDir": "../plugins",
+      "confectorPlugins": ""
+    }
+  },
+  "plugins": {
+    "local_process": {
+      "runnerBinary": "../runner/confector-runner",
+      "serverUrl": "http://localhost:8080",
+      "workspaceDir": ".confector/workspaces",
+      "storageDir": ".confector/artifacts",
+      "pluginsDir": "plugins",
+      "secretToken": "",
+      "maxConcurrency": 0,
+      "supportedExecutorTypes": ["local", "local_process", ""]
     }
   }
 }

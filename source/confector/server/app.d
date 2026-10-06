@@ -120,11 +120,14 @@ StorageContext initStorage(string mongoHost = "mongo:27017/confector", string se
 }
 
 /// Discovers and loads bundled plugins as well as dynamically configured plugins via server config / CONFECTOR_PLUGINS.
-void initPlugins(string extraPlugins = "")
+void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
 {
     // Automatically load bundled plugins from bin/plugins and plugins directories (definition and worker plugins only)
     Plugin[] bundledPlugins;
-    foreach (pluginDir; ["bin/plugins", "plugins", "./bin/plugins", "./plugins"])
+    string[] searchDirs = bundledPluginsDir.length > 0
+        ? [bundledPluginsDir]
+        : ["./plugins"];
+    foreach (pluginDir; searchDirs)
     {
         if (exists(pluginDir) && isDir(pluginDir))
         {
@@ -200,7 +203,6 @@ URLRouter createRouter(
     WorkQueue workQueue,
     BuildCoordinator buildCoordinator,
     BuildStateRepository stateRepo,
-    MongoClient client,
     CapacityBroker capacityBroker = null)
 {
     auto router = new URLRouter();
@@ -259,24 +261,21 @@ HTTPServerSettings createServerSettings(ushort port = 8080)
     return settings;
 }
 
-void main()
+ConfigRegistry loadConfigRegistry()
 {
-  import std.process : environment;
-  import std.path : buildPath;
-
     string configDir = environment.get("CONFECTOR_CONFIG_DIR", "");
-    if(configDir.length == 0)
+    if (configDir.length == 0)
     {
-        logWarn("[config] CONFECTOR_CONFIG_DIR not set, using default './confector_config'");
-        configDir = "./confector_config";
+        logWarn("[config] CONFECTOR_CONFIG_DIR not set, using default './config'");
+        configDir = "./config";
     }
-    // Initialize central ConfigRegistry
+
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
 
-    // Optionally load configuration file if available
     foreach (cfgPath; [configDir.buildPath("confector.json"), configDir.buildPath("confector.yaml")])
     {
+        logInfo("[config] Trying to load from configuration file %s", cfgPath);
         if (exists(cfgPath))
         {
             try
@@ -292,6 +291,14 @@ void main()
         }
     }
 
+    return configRegistry;
+}
+
+void main()
+{
+    // Initialize central ConfigRegistry
+    auto configRegistry = loadConfigRegistry();
+    registerServerConfigDefinitions(configRegistry);
     // Connect ConfigRegistry to PluginRegistry for scoped plugin configs
     PluginRegistry.instance.setConfigRegistry(configRegistry);
 
@@ -315,7 +322,7 @@ void main()
     auto storage = initStorage(serverConfig.storage.mongoHost, serverConfig.storage.secretPath);
 
     // Automatically load plugins
-    initPlugins(serverConfig.plugins.confectorPlugins);
+    initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
 
     // Initialize execution engine, coordinator & storage
     auto artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
@@ -341,7 +348,7 @@ void main()
     logInfo("[capacity_broker] Started capacity evaluation loop.");
 
     // Configure router and server settings
-    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, storage.client, capacityBroker);
+    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, capacityBroker);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
