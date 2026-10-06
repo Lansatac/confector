@@ -115,7 +115,7 @@ block maincontent
                         strong #{st.type}: 
                         span #{st.name.length > 0 ? st.name : (st.script.length > 0 ? st.script : st.type)}
                 - else
-                  code(style="font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; display: inline-block;") #{t.script}
+                  span(style="color: #6c757d; font-size: 0.85em;") No steps defined
               td
                 div(style="display: flex; gap: 5px;")
                   form(action="/projects/run", method="POST", style="display:inline;")

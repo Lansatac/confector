@@ -518,7 +518,6 @@ unittest
     TaskNode node;
     node.id = "build-task";
     node.name = "Build Task";
-    node.script = "echo building";
     node.steps = [
         BuildStep("Clone", "clone_repository", ["repository": "https://example.com/repo.git"], "", "", "", ""),
         BuildStep("Compile", "bash", ["executable": "bash"], "dub build", "", "", "{\"flags\": \"-v\"}")
@@ -526,14 +525,12 @@ unittest
     node.setCustomComponent("custom_prop", parseJSON("{\"enabled\": true}"));
     msg.taskNode = node;
 
-    msg.executionPayload.script = "echo payload";
     msg.executionPayload.expectedOutputs = [OutputArtifactDecl("app", "bin/app")];
 
     Bson payloadBson = serializeToBson(msg.executionPayload);
     Bson nodeBson = serializeToBson(msg.taskNode);
 
     TaskExecutionPayload deserializedPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(payloadBson));
-    assert(deserializedPayload.script == "echo payload");
     assert(deserializedPayload.expectedOutputs.length == 1);
     assert(deserializedPayload.expectedOutputs[0].path == "bin/app");
 

@@ -905,7 +905,7 @@ unittest
     proj.name = "Confector";
     TaskNode node;
     node.id = "build";
-    node.script = "dub build";
+    node.steps = [BuildStep("Build", "bash", null, "dub build")];
     proj.tasks = [node];
     proj.createdAt = "2026-09-30T12:00:00Z";
     proj.updatedAt = "2026-09-30T12:00:00Z";

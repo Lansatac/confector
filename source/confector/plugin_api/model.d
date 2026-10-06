@@ -223,17 +223,6 @@ struct ParameterInputComponent
     @optional string[string] parameters;
 }
 
-/**
- * Process execution component data.
- */
-struct ProcessExecutionComponent
-{
-    @optional string script;
-    @optional string command;
-    @optional string[] arguments;
-    @optional string[string] environment;
-    @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
-}
 
 /**
  * Artifact output component data.
@@ -270,7 +259,6 @@ struct TaskNode
     @optional @asName("depends_on") string[] dependsOn;
     @optional TaskInputs inputs;
     @optional TaskOutputs outputs;
-    @optional string script;
     @optional @asName("steps") BuildStep[] steps;
     @optional TriggerRule[] triggers;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
@@ -313,18 +301,6 @@ struct TaskNode
     UpstreamArtifactInputComponent getUpstreamArtifactInputComponent() const pure nothrow @safe
     {
         return UpstreamArtifactInputComponent(inputs.upstreamArtifacts.dup);
-    }
-
-    ProcessExecutionComponent getProcessExecutionComponent() const pure nothrow @safe
-    {
-        ProcessExecutionComponent comp;
-        comp.script = script;
-        comp.timeoutSeconds = timeoutSeconds;
-        foreach (k, v; environment)
-        {
-            comp.environment[k] = v;
-        }
-        return comp;
     }
 
     ArtifactOutputComponent getArtifactOutputComponent() const pure nothrow @safe

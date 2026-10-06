@@ -571,14 +571,16 @@ unittest
 unittest
 {
     // 9. Test deterministic upfront fingerprint calculation and propagation
-    TaskNode a; a.id = "compile"; a.script = "dub build";
+    TaskNode a; a.id = "compile";
+    a.steps = [BuildStep("Build", "bash", null, "dub build")];
     a.outputs.artifacts = [OutputArtifactDecl("binaries", "bin/*")];
 
     TaskNode b; b.id = "test"; b.dependsOn = ["compile"];
     b.inputs.upstreamArtifacts = [UpstreamArtifactRef("compile", "binaries", "dist")];
-    b.script = "dub test";
+    b.steps = [BuildStep("Test", "bash", null, "dub test")];
 
-    TaskNode c; c.id = "docs"; c.script = "dub build --build=docs";
+    TaskNode c; c.id = "docs";
+    c.steps = [BuildStep("Docs", "bash", null, "dub build --build=docs")];
 
     auto graph1 = new TaskGraph([a, b, c]);
     auto graph2 = new TaskGraph([a, b, c]);
@@ -592,7 +594,7 @@ unittest
 
     // 10. Modifying upstream task changes downstream fingerprint
     TaskNode aMod = a;
-    aMod.script = "dub build --build=release";
+    aMod.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
     auto graphMod = new TaskGraph([aMod, b, c]);
 
     // compile and test fingerprints must change

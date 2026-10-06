@@ -71,9 +71,6 @@ string computeUpstreamFingerprintsDigest(in string[string] upstreamFingerprints)
     return sha256Hex(app.data);
 }
 
-/// Alias for backward compatibility
-alias computeArtifactHashesDigest = computeUpstreamFingerprintsDigest;
-
 /**
  * Computes deterministic SHA256 digest of environment key-value pairs.
  */
@@ -260,8 +257,7 @@ string computeTaskConfigDigest(in TaskNode task) pure nothrow @safe
 /**
  * Computes the full Node Fingerprint deterministically upfront:
  * NodeFingerprint = SHA256(
- *     TaskScriptContent
- *   + BuildStepsHash
+ *     BuildStepsHash
  *   + UpstreamFingerprintsHash
  *   + TaskInputsHash
  *   + TaskOutputsHash
@@ -275,9 +271,7 @@ string computeNodeFingerprint(
 ) @trusted
 {
     auto app = appender!string();
-    app.put("SCRIPT:");
-    app.put(task.script);
-    app.put("\nSTEPS:");
+    app.put("STEPS:");
     app.put(computeBuildStepsDigest(task));
     app.put("\nUPSTREAM:");
     app.put(computeUpstreamFingerprintsDigest(upstreamFingerprints));
@@ -380,7 +374,7 @@ unittest
 {
     TaskNode task;
     task.id = "build";
-    task.script = "dub build --build=release";
+    task.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
     task.environment = ["DUB_ARGS": "-q", "RELEASE_TAG": "v1.0.0"];
 
     string[string] artifacts1 = [
@@ -401,11 +395,11 @@ unittest
     assert(fp1 == fp2, "Fingerprints must be identical across insertion order");
     assert(fp1.length == 64, "Fingerprint must be 64-char SHA256 hex string");
 
-    // 2. Invalidation when script changes
+    // 2. Invalidation when build step script changes
     TaskNode taskModScript = task;
-    taskModScript.script = "dub build --build=debug";
+    taskModScript.steps = [BuildStep("Build", "bash", null, "dub build --build=debug")];
     string fpModScript = computeNodeFingerprint(taskModScript, artifacts1);
-    assert(fpModScript != fp1, "Fingerprint must change when script changes");
+    assert(fpModScript != fp1, "Fingerprint must change when build step script changes");
 
     // 3. Invalidation when upstream artifact changes
     string[string] artifactsMod = artifacts1.dup;
@@ -430,7 +424,7 @@ unittest
     TaskNode taskSteps = task;
     taskSteps.steps = [
         BuildStep("Clone", "clone_repository", ["repository": "https://github.com/example/repo.git"]),
-        BuildStep("Build", "process", null, "dub build")
+        BuildStep("Build", "bash", null, "dub build")
     ];
     string fpSteps = computeNodeFingerprint(taskSteps, artifacts1);
     assert(fpSteps != fp1, "Fingerprint must change when build steps are added");
@@ -438,7 +432,7 @@ unittest
     TaskNode taskStepsMod = taskSteps;
     taskStepsMod.steps = [
         BuildStep("Clone", "clone_repository", ["repository": "https://github.com/example/repo.git"]),
-        BuildStep("Build", "process", null, "dub test")
+        BuildStep("Build", "bash", null, "dub test")
     ];
     string fpStepsMod = computeNodeFingerprint(taskStepsMod, artifacts1);
     assert(fpStepsMod != fpSteps, "Fingerprint must change when build step script changes");

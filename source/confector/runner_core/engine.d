@@ -238,32 +238,12 @@ class TaskEngine
         stepCtx.allowedRepositories = effectiveAllowedRepos;
         stepCtx.repositoryMap = effectiveRepoMap;
 
-        if (task.steps.length == 0 && task.script.length > 0)
+        if (task.steps.length == 0)
         {
-            import std.process : pipeShell, Redirect, Config, wait;
-            combinedLogger(format("[confector] Running task script: %s", task.script));
-            try
-            {
-                auto pipe = pipeShell(task.script, Redirect.stdout | Redirect.stderrToStdout, task.environment.length > 0 ? task.environment : null, Config.retainStderr, effectiveWorkingDir);
-                foreach (line; pipe.stdout.byLineCopy)
-                {
-                    combinedLogger(line);
-                }
-                taskExitCode = wait(pipe.pid);
-                taskSuccess = (taskExitCode == 0);
-                if (!taskSuccess)
-                {
-                    taskErrorMessage = format("Script execution failed with exit code %d", taskExitCode);
-                    combinedLogger(format("[confector] %s", taskErrorMessage));
-                }
-            }
-            catch (Exception e)
-            {
-                taskSuccess = false;
-                taskExitCode = -1;
-                taskErrorMessage = e.msg;
-                combinedLogger(format("[confector] Error executing script: %s", e.msg));
-            }
+            taskSuccess = false;
+            taskExitCode = 1;
+            taskErrorMessage = "Task has no build steps defined; only plugin-defined build steps are supported";
+            combinedLogger(format("[confector] Error: %s", taskErrorMessage));
         }
         else
         {
@@ -364,7 +344,7 @@ unittest
 
         bool canExecuteStep(in BuildStep step) const
         {
-            return step.type == "process" || step.type == "mock";
+            return step.type == "bash" || step.type == "mock";
         }
 
         StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
@@ -408,11 +388,11 @@ unittest
     node1.name = "Step 1";
     version(Windows)
     {
-        node1.steps = [BuildStep("Write Output", "process", null, "cmd /c \"echo hello > output.txt\"")];
+        node1.steps = [BuildStep("Write Output", "bash", null, "cmd /c \"echo hello > output.txt\"")];
     }
     else
     {
-        node1.steps = [BuildStep("Write Output", "process", null, "echo hello > output.txt")];
+        node1.steps = [BuildStep("Write Output", "bash", null, "echo hello > output.txt")];
     }
     node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 

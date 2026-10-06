@@ -373,7 +373,7 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
     @property PluginCategory category() const { return PluginCategory.worker; }
     @property string providerType() const { return "local_process"; }
     @property string displayName() const { return "Local Subprocess Runner"; }
-    @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+    @property string[] supportedStepTypes() const { return ["bash", "powershell", "git"]; }
     @property LocalProcessProvisionerConfig scopedConfig() const { return cast()m_scopedConfig; }
 
     override ConfigDefinition[] configDefinitions() const
@@ -424,7 +424,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             "defaultShell": JSONValue("powershell"),
             "isolateEnvironment": JSONValue(false),
             "allowedStepTypes": JSONValue([
-                JSONValue("process"),
                 JSONValue("bash"),
                 JSONValue("powershell"),
                 JSONValue("git")
@@ -794,7 +793,7 @@ unittest
     assert(provider.category == PluginCategory.worker);
     assert(provider.providerType == "local_process");
     assert(provider.displayName == "Local Subprocess Runner");
-    assert(provider.supportedStepTypes.length == 4);
+    assert(provider.supportedStepTypes.length == 3);
 
     auto defConfig = provider.defaultConfig();
     assert(defConfig.type == JSONType.object);
@@ -846,7 +845,7 @@ unittest
     rec.enabled = true;
     auto enabledInstance = provider.createExecutor(rec);
     assert(enabledInstance.isEnabled);
-    assert(enabledInstance.supportedStepTypes.length == 4);
+    assert(enabledInstance.supportedStepTypes.length == 3);
 
     // If confector-runner binary is built, test subprocess execution invocation
     string testRunnerBin = "bin/confector-runner";

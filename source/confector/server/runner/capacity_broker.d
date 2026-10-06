@@ -416,10 +416,14 @@ unittest
     e2eBroker.registerProvisioner(autoProv);
 
     // Build DAG: Step1 -> (Step2A, Step2B) -> Step3
-    TaskNode step1; step1.id = "step1"; step1.script = "echo step 1";
-    TaskNode step2A; step2A.id = "step2A"; step2A.dependsOn = ["step1"]; step2A.script = "echo step 2A";
-    TaskNode step2B; step2B.id = "step2B"; step2B.dependsOn = ["step1"]; step2B.script = "echo step 2B";
-    TaskNode step3; step3.id = "step3"; step3.dependsOn = ["step2A", "step2B"]; step3.script = "echo step 3";
+    TaskNode step1; step1.id = "step1";
+    step1.steps = [BuildStep("Step1", "bash", null, "echo step 1")];
+    TaskNode step2A; step2A.id = "step2A"; step2A.dependsOn = ["step1"];
+    step2A.steps = [BuildStep("Step2A", "bash", null, "echo step 2A")];
+    TaskNode step2B; step2B.id = "step2B"; step2B.dependsOn = ["step1"];
+    step2B.steps = [BuildStep("Step2B", "bash", null, "echo step 2B")];
+    TaskNode step3; step3.id = "step3"; step3.dependsOn = ["step2A", "step2B"];
+    step3.steps = [BuildStep("Step3", "bash", null, "echo step 3")] ;
 
     ProjectRecord dagProj;
     dagProj.id = "dag_proj";

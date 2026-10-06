@@ -1148,7 +1148,7 @@ unittest
     proj.name = "API Project";
     TaskNode node;
     node.id = "n1";
-    node.script = "echo hi";
+    node.steps = [BuildStep("Echo", "bash", null, "echo hi")];
     proj.tasks = [node];
     stateRepo.saveProject(proj);
     assert(stateRepo.listProjects().length == 1);

@@ -834,7 +834,6 @@ class BuildCoordinator
                 payload.repositoryUrl = active.project.repositoryUrl;
                 payload.allowedRepositories = allowedRepos;
                 payload.repositoryMap = repoMap;
-                payload.script = node.script;
                 payload.environment = node.environment;
                 payload.workspaceDir = active.workspaceDir;
                 payload.force = active.force;
@@ -1002,7 +1001,7 @@ unittest
     // 1. Single Task Graph
     TaskNode singleTask;
     singleTask.id = "lint";
-    singleTask.script = "echo linting";
+    singleTask.steps = [BuildStep("Lint", "bash", null, "echo linting")];
 
     ProjectRecord proj1;
     proj1.id = "proj_single";
@@ -1033,17 +1032,17 @@ unittest
     // 2. Linear Pipeline: A -> B -> C
     TaskNode taskA;
     taskA.id = "A";
-    taskA.script = "echo A";
+    taskA.steps = [BuildStep("A", "bash", null, "echo A")];
 
     TaskNode taskB;
     taskB.id = "B";
     taskB.dependsOn = ["A"];
-    taskB.script = "echo B";
+    taskB.steps = [BuildStep("B", "bash", null, "echo B")];
 
     TaskNode taskC;
     taskC.id = "C";
     taskC.dependsOn = ["B"];
-    taskC.script = "echo C";
+    taskC.steps = [BuildStep("C", "bash", null, "echo C")];
 
     ProjectRecord projLinear;
     projLinear.id = "proj_linear";
@@ -1186,12 +1185,12 @@ unittest
 
         TaskNode taskRoot;
         taskRoot.id = "fetch";
-        taskRoot.script = "echo fetching data";
+        taskRoot.steps = [BuildStep("Fetch", "bash", null, "echo fetching data")];
 
         TaskNode taskProc;
         taskProc.id = "process";
         taskProc.dependsOn = ["fetch"];
-        taskProc.script = "echo processing";
+        taskProc.steps = [BuildStep("Process", "bash", null, "echo processing")];
 
         ProjectRecord projCoalesce;
         projCoalesce.id = "proj_coalesce";
@@ -1249,12 +1248,12 @@ unittest
 
         TaskNode taskAlpha;
         taskAlpha.id = "alpha";
-        taskAlpha.script = "echo alpha source";
+        taskAlpha.steps = [BuildStep("Alpha", "bash", null, "echo alpha source")];
 
         TaskNode taskBeta;
         taskBeta.id = "beta";
         taskBeta.dependsOn = ["alpha"];
-        taskBeta.script = "echo beta build";
+        taskBeta.steps = [BuildStep("Beta", "bash", null, "echo beta build")];
 
         ProjectRecord projCache;
         projCache.id = "proj_cache_test";
@@ -1309,7 +1308,7 @@ unittest
 
         TaskNode taskShared;
         taskShared.id = "shared_task";
-        taskShared.script = "echo shared";
+        taskShared.steps = [BuildStep("Shared", "bash", null, "echo shared")];
 
         ProjectRecord projCancel;
         projCancel.id = "proj_cancel_test";
@@ -1353,7 +1352,7 @@ unittest
 
         TaskNode taskSolo;
         taskSolo.id = "solo_task";
-        taskSolo.script = "echo solo";
+        taskSolo.steps = [BuildStep("Solo", "bash", null, "echo solo")];
 
         ProjectRecord projSolo;
         projSolo.id = "proj_solo_cancel_test";
@@ -1396,7 +1395,7 @@ unittest
 
         TaskNode gpuTask;
         gpuTask.id = "train_model";
-        gpuTask.script = "python train.py";
+        gpuTask.steps = [BuildStep("Train", "bash", null, "python train.py")];
         gpuTask.timeoutSeconds = 1200;
         gpuTask.setCustomComponent("executor", JSONValue("aws-ecs"));
 
@@ -1426,7 +1425,6 @@ unittest
         assert(wo.requirements["arch"] == "x86_64");
         assert(wo.requirements["cuda"] == "12.0");
         assert(wo.timeoutSeconds == 1200);
-        assert(wo.payload.script == "python train.py");
 
         // Complete the task and verify build completion
         TaskExecutionResult resGpu;
@@ -1447,12 +1445,12 @@ unittest
 
         TaskNode step1;
         step1.id = "step1";
-        step1.script = "echo step 1";
+        step1.steps = [BuildStep("Step1", "bash", null, "echo step 1")];
 
         TaskNode step2;
         step2.id = "step2";
         step2.dependsOn = ["step1"];
-        step2.script = "echo step 2";
+        step2.steps = [BuildStep("Step2", "bash", null, "echo step 2")];
 
         ProjectRecord projAck;
         projAck.id = "proj_ack_test";

@@ -126,27 +126,10 @@ struct InputArtifactRef
     @optional @asName("task_fingerprint") string taskFingerprint;
     @optional @asName("artifact_id") string artifactId;
     @optional @asName("storage_uri") string storageUri;
-    @optional @asName("target_path") string targetPath; // deprecated legacy alias
     @optional @asName("destination") string destination;
     @optional @asName("sha256") string sha256;
 }
 
-/**
- * Deprecated dual representation retained only for serialization compatibility.
- * New code must use InputArtifactRef via TaskExecutionPayload.inputArtifacts.
- */
-struct UpstreamArtifactLocation
-{
-    @asName("task_id") string taskId;
-    @optional @asName("task_fingerprint") string taskFingerprint;
-    @optional @asName("artifact_id") string artifactId;
-    @optional @asName("artifact_path") string artifactPath;
-    @optional @asName("destination") string destination;
-    @optional @asName("storage_backend") string storageBackend = "local";
-    @optional @asName("storage_uri") string storageUri;
-    @optional @asName("sha256") string sha256;
-    @optional @asName("target_path") string targetPath;
-}
 
 /**
  * Self-contained execution payload for worker tasks.
@@ -157,12 +140,9 @@ struct TaskExecutionPayload
     @optional @asName("commit_sha") string commitSha;
     @optional @asName("allowed_repositories") string[] allowedRepositories;
     @optional @asName("repository_map") string[string] repositoryMap;
-    @optional string script;
     @optional string[string] environment;
     /// Single authoritative list of upstream artifacts to unpack before execution.
     @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
-    /// Deprecated: no longer populated by coordinator; kept for wire compatibility.
-    @optional @asName("upstream_artifact_locations") UpstreamArtifactLocation[] upstreamArtifactLocations;
     /// Map of upstream taskId -> task fingerprint (content-addressed).
     @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
     @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
@@ -340,7 +320,6 @@ unittest
     node.id = "build";
     node.name = "Compile Application";
     node.dependsOn = ["lint"];
-    node.script = "dub build";
     node.inputs.repositories = ["confector-repo", "common-utils"];
     node.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports/lint.json", "reports")];
     node.outputs.artifacts = [OutputArtifactDecl("binary", "bin/confector")];
@@ -385,7 +364,6 @@ unittest
     // Test ECS component helpers
     assert(node.getRepositoryInputComponent().repositories == ["confector-repo", "common-utils"]);
     assert(node.getUpstreamArtifactInputComponent().upstreamArtifacts.length == 1);
-    assert(node.getProcessExecutionComponent().script == "dub build");
     assert(node.getArtifactOutputComponent().artifacts.length == 1);
 
     node.setCustomComponent("s3_source", JSONValue(["bucket": JSONValue("my-bucket"), "key": JSONValue("data.tar.gz")]));
@@ -402,7 +380,7 @@ unittest
     step1.parameters = ["repository": "https://github.com/example/repo.git", "branch": "main"];
     BuildStep step2;
     step2.name = "Build App";
-    step2.type = "process";
+    step2.type = "bash";
     step2.script = "dub build";
     stepNode.steps = [step1, step2];
     assert(stepNode.steps.length == 2);
@@ -426,7 +404,6 @@ unittest
     wo.requirements = ["arch": "x86_64", "gpu": "true"];
     wo.timeoutSeconds = 600;
     wo.createdAt = "2026-10-04T12:00:00Z";
-    wo.payload.script = "dub build";
     wo.payload.workspaceDir = "/tmp/workspace";
     wo.payload.inputArtifacts = [InputArtifactRef("upstream_task", "fp_upstream", "art_1", "s3://bucket/art_1.tar.gz")];
 
@@ -437,7 +414,6 @@ unittest
     assert(woJson["executor_type"].get!string == "local");
     assert(woJson["requirements"]["arch"].get!string == "x86_64");
     assert(woJson["requirements"]["gpu"].get!string == "true");
-    assert(woJson["payload"]["script"].get!string == "dub build");
     assert(woJson["payload"]["input_artifacts"].length == 1);
 
     WorkOrder woDeserialized = deserializeJson!WorkOrder(woJson);
@@ -448,7 +424,6 @@ unittest
     assert(woDeserialized.requirements["arch"] == "x86_64");
     assert(woDeserialized.requirements["gpu"] == "true");
     assert(woDeserialized.timeoutSeconds == 600);
-    assert(woDeserialized.payload.script == "dub build");
     assert(woDeserialized.payload.inputArtifacts.length == 1);
     assert(woDeserialized.payload.inputArtifacts[0].taskId == "upstream_task");
     assert(woDeserialized.payload.inputArtifacts[0].taskFingerprint == "fp_upstream");
@@ -474,7 +449,6 @@ unittest
     assert(msg.nodeFingerprint == "fp_abc123");
     assert(msg.executorType == "local");
     assert(msg.timeoutSeconds == 600);
-    assert(msg.executionPayload.script == "dub build");
     assert(msg.retryCount == 2);
     assert(msg.attempt == 3);
 

@@ -683,14 +683,12 @@ unittest
         @property PluginCategory category() const { return PluginCategory.runner; }
         ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const { return "mock-engine-system"; }
-        @property string stepType() const { return "process"; }
-
         void initialize(PluginContext context = null) {}
         void shutdown() {}
 
         bool canExecuteStep(in BuildStep step) const
         {
-            return step.type == "process" || step.type == "bash" || step.type == "powershell" || step.type == "sh" || step.type == "pwsh";
+            return step.type == "bash" || step.type == "powershell" || step.type == "sh" || step.type == "pwsh";
         }
 
         StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
@@ -762,11 +760,11 @@ unittest
     node1.name = "Step 1";
     version(Windows)
     {
-        node1.steps = [BuildStep("Write Output", "process", null, "cmd /c \"echo hello > output.txt\"")];
+        node1.steps = [BuildStep("Write Output", "bash", null, "cmd /c \"echo hello > output.txt\"")];
     }
     else
     {
-        node1.steps = [BuildStep("Write Output", "process", null, "echo hello > output.txt")];
+        node1.steps = [BuildStep("Write Output", "bash", null, "echo hello > output.txt")];
     }
     node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 
@@ -798,11 +796,11 @@ unittest
     node2.inputs.upstreamArtifacts = [UpstreamArtifactRef("step1", "output.txt")];
     version(Windows)
     {
-        node2.steps = [BuildStep("Process Output", "process", null, "cmd /c \"type output.txt > result.txt\"")];
+        node2.steps = [BuildStep("Process Output", "bash", null, "cmd /c \"type output.txt > result.txt\"")];
     }
     else
     {
-        node2.steps = [BuildStep("Process Output", "process", null, "cat output.txt > result.txt")];
+        node2.steps = [BuildStep("Process Output", "bash", null, "cat output.txt > result.txt")];
     }
     node2.outputs.artifacts = [OutputArtifactDecl("result.txt", "result.txt")];
 
@@ -835,7 +833,7 @@ unittest
     TaskNode nodeBad;
     nodeBad.id = "bad_step";
     nodeBad.inputs.upstreamArtifacts = [UpstreamArtifactRef("non_existent_task", "missing.txt")];
-    nodeBad.steps = [BuildStep("Bad Step", "process", null, "echo should not run")];
+    nodeBad.steps = [BuildStep("Bad Step", "bash", null, "echo should not run")];
     auto badRes = engine.executeTask("build_bad", nodeBad, testDir);
     assert(badRes.status == TaskStatus.failed);
     assert(badRes.errorMessage.length > 0);
@@ -847,15 +845,15 @@ unittest
     version(Windows)
     {
         stepTask.steps = [
-            BuildStep("Step 1", "process", null, "cmd /c \"echo first_step > seq.txt\""),
-            BuildStep("Step 2", "process", null, "cmd /c \"echo second_step >> seq.txt\"")
+            BuildStep("Step 1", "bash", null, "cmd /c \"echo first_step > seq.txt\""),
+            BuildStep("Step 2", "bash", null, "cmd /c \"echo second_step >> seq.txt\"")
         ];
     }
     else
     {
         stepTask.steps = [
-            BuildStep("Step 1", "process", null, "echo first_step > seq.txt"),
-            BuildStep("Step 2", "process", null, "echo second_step >> seq.txt")
+            BuildStep("Step 1", "bash", null, "echo first_step > seq.txt"),
+            BuildStep("Step 2", "bash", null, "echo second_step >> seq.txt")
         ];
     }
     stepTask.outputs.artifacts = [OutputArtifactDecl("seq.txt", "seq.txt")];
@@ -871,15 +869,15 @@ unittest
     version(Windows)
     {
         failingStepTask.steps = [
-            BuildStep("Fail Step", "process", null, "cmd /c \"exit 1\""),
-            BuildStep("Never Run Step", "process", null, "cmd /c \"echo should_not_exist > never.txt\"")
+            BuildStep("Fail Step", "bash", null, "cmd /c \"exit 1\""),
+            BuildStep("Never Run Step", "bash", null, "cmd /c \"echo should_not_exist > never.txt\"")
         ];
     }
     else
     {
         failingStepTask.steps = [
-            BuildStep("Fail Step", "process", null, "exit 1"),
-            BuildStep("Never Run Step", "process", null, "echo should_not_exist > never.txt")
+            BuildStep("Fail Step", "bash", null, "exit 1"),
+            BuildStep("Never Run Step", "bash", null, "echo should_not_exist > never.txt")
         ];
     }
     auto failStepRes = engine.executeTask("build_steps_fail", failingStepTask, testDir);
@@ -935,7 +933,7 @@ unittest
         @property PluginCategory category() const { return PluginCategory.worker; }
         @property string providerType() const { return "local"; }
         @property string displayName() const { return "Local Process Executor"; }
-        @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+        @property string[] supportedStepTypes() const { return ["bash", "powershell", "git"]; }
         ConfigDefinition[] configDefinitions() const { return null; }
 
         void initialize(PluginContext context = null) {}
@@ -959,7 +957,7 @@ unittest
                 @property string id() const { return m_rec.id; }
                 @property string providerType() const { return m_rec.providerType; }
                 @property bool isEnabled() const { return m_rec.enabled; }
-                @property string[] supportedStepTypes() const { return ["process", "bash", "powershell", "git"]; }
+                @property string[] supportedStepTypes() const { return ["bash", "powershell", "git"]; }
 
                 ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
                 {

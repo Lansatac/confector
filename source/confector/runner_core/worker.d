@@ -409,10 +409,6 @@ class HttpWorkerRunner
             taskNode.id = taskId;
         }
 
-        if (taskNode.script.length == 0 && msg.executionPayload.script.length > 0)
-        {
-            taskNode.script = msg.executionPayload.script;
-        }
         if (taskNode.environment.length == 0 && msg.executionPayload.environment.length > 0)
         {
             foreach (k, v; msg.executionPayload.environment)
@@ -429,7 +425,7 @@ class HttpWorkerRunner
                 UpstreamArtifactRef refArt;
                 refArt.taskId = inArt.taskId;
                 refArt.artifactId = inArt.artifactId;
-                refArt.destination = inArt.destination.length > 0 ? inArt.destination : inArt.targetPath;
+                refArt.destination = inArt.destination;
                 refArt.sha256 = inArt.sha256;
                 taskNode.inputs.upstreamArtifacts ~= refArt;
             }

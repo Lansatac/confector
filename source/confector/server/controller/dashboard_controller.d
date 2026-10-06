@@ -948,13 +948,13 @@ unittest
     p.name = "Dashboard Project";
     TaskNode tNode1;
     tNode1.id = "test_node_1";
-    tNode1.script = "echo dashboard test 1";
+    tNode1.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 1")];
     tNode1.inputs.repositories = ["repo_main"];
     tNode1.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
     TaskNode tNode2;
     tNode2.id = "test_node_2";
     tNode2.dependsOn = ["test_node_1"];
-    tNode2.script = "echo dashboard test 2";
+    tNode2.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 2")];
     tNode2.triggers = [TriggerRule(TriggerType.webhook, null, null, "/api/v1/deploy")];
     p.tasks = [tNode1, tNode2];
     stateRepo.saveProject(p);
@@ -1134,7 +1134,7 @@ unittest
     }
     assert(foundDetailTask);
     assert(detailTask.id == "test_node_2");
-    assert(detailTask.script == "echo dashboard test 2");
+    assert(detailTask.steps.length == 1);
     assert(detailTask.dependsOn == ["test_node_1"]);
 
     auto node2History = stateRepo.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
