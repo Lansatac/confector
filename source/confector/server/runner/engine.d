@@ -135,10 +135,16 @@ class TaskEngine
             }
         }
 
-        // 3. Mark task running
+        // 3. Mark task running and transition build status from queued to running
         if (m_stateRepo !is null)
         {
             m_stateRepo.setTaskStatus(buildId, task.id, TaskStatus.running);
+            BuildRecord b;
+            if (m_stateRepo.getBuild(buildId, b) && b.status == "queued")
+            {
+                b.status = "running";
+                m_stateRepo.recordBuild(b);
+            }
         }
 
         // Effective working directory defaults to workspace directory

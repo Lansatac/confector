@@ -268,7 +268,7 @@ class BuildCoordinator
             buildRecord.buildId = buildId;
             buildRecord.projectId = project.id;
             buildRecord.projectName = project.name.length > 0 ? project.name : "default";
-            buildRecord.status = "running";
+            buildRecord.status = "queued";
             buildRecord.triggerSource = triggerSource;
             buildRecord.targetTaskId = targetTaskId;
             buildRecord.workspaceDir = workspaceDir;
@@ -486,7 +486,7 @@ class BuildCoordinator
                 auto statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
                 foreach (tId, status; statuses)
                 {
-                    if (status == TaskStatus.pending || status == TaskStatus.running)
+                    if (status == TaskStatus.pending || status == TaskStatus.queued || status == TaskStatus.running)
                     {
                         m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cancelled, "Build cancelled by user");
                     }
@@ -581,7 +581,7 @@ class BuildCoordinator
             foreach (tId; active.targetTaskIds)
             {
                 auto pStat = tId in statuses;
-                if (pStat is null || *pStat == TaskStatus.pending)
+                if (pStat is null || *pStat == TaskStatus.pending || *pStat == TaskStatus.queued)
                 {
                     if (m_stateRepo !is null)
                     {
@@ -625,7 +625,7 @@ class BuildCoordinator
             {
                 TaskStatus currentStatus = statuses.get(tId, TaskStatus.pending);
 
-                // Only evaluate tasks that have not completed/failed/cancelled
+                // Only evaluate tasks that have not completed/failed/cancelled/queued
                 if (currentStatus != TaskStatus.pending)
                 {
                     continue;
@@ -935,6 +935,12 @@ class BuildCoordinator
                 if (m_workQueue !is null)
                 {
                     m_workQueue.enqueue(msg);
+                }
+
+                // Mark task as queued — it will transition to running when a worker picks it up
+                if (m_stateRepo !is null)
+                {
+                    m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.queued);
                 }
             }
         }

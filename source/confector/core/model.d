@@ -16,7 +16,7 @@ struct TaskExecutionRecord
     @optional @asName("build_id") string buildId;
     @optional @asName("project_id") string projectId;
     @optional @asName("project_name") string projectName;
-    @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached, skipped, cancelled
+    @optional @asName("status") string status = "pending"; // pending, queued, running, succeeded, failed, cached, skipped, cancelled
     @optional @asName("fingerprint") string fingerprint;
     @optional @asName("exit_code") int exitCode = 0;
     @optional @asName("error_message") string errorMessage;
@@ -54,7 +54,7 @@ struct BuildRecord
     @optional @asName("build_id") string buildId;
     @optional @asName("project_id") string projectId;
     @optional @asName("project_name") string projectName = "default";
-    @optional @asName("status") string status = "pending"; // pending, running, succeeded, failed, cached, cancelled
+    @optional @asName("status") string status = "pending"; // pending, queued, running, succeeded, failed, cached, cancelled
     @optional @asName("trigger_source") string triggerSource = "manual";
     @optional @asName("target_task_id") string targetTaskId;
     @optional @asName("workspace_dir") string workspaceDir;

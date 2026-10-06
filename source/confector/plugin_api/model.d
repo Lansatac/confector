@@ -9,6 +9,7 @@ import vibe.data.serialization : asName = name, optional, ignore;
 enum TaskStatus : string
 {
     pending = "pending",
+    queued = "queued",
     running = "running",
     succeeded = "succeeded",
     failed = "failed",
