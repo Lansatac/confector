@@ -518,6 +518,7 @@ unittest
         string[] validateConfig(in JSONValue config) const { return null; }
         string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Config</div>"; }
         ComputeInstance createExecutor(in WorkerRecord record) { return null; }
+        ComputeProvisioner createProvisioner(in WorkerRecord record) { return null; }
     }
 
     auto computePl = new MockComputeProvider();

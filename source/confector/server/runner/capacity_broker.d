@@ -151,6 +151,13 @@ class DefaultCapacityBroker : CapacityBroker
         // For each demand, find matching provisioners and request capacity
         synchronized (m_mutex)
         {
+            if (m_provisioners.length == 0)
+            {
+                logError("[capacity_broker] evaluateDemand: %d pending work order(s) but 0 provisioners registered — builds will not execute.", pending.length);
+                logError("[capacity_broker] evaluateDemand: ensure ComputeProvider plugins are loaded and createProvisioner() returns non-null.");
+                return;
+            }
+
             foreach (key, demand; demandMap)
             {
                 logDebug("[capacity_broker] evaluateDemand: matching provisioners for demand key '%s' (executorType='%s', pendingCount=%d)",

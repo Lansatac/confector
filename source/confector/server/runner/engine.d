@@ -974,6 +974,8 @@ unittest
             }
             return new MockComputeInstance(record);
         }
+
+        ComputeProvisioner createProvisioner(in WorkerRecord record) { return null; }
     }
 
     auto localExecPlugin = new MockEngineComputeProvider();

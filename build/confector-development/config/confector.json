@@ -23,7 +23,6 @@
       "workspaceDir": ".confector/workspaces",
       "storageDir": ".confector/artifacts",
       "pluginsDir": "plugins",
-      "secretToken": "",
       "maxConcurrency": 0,
       "supportedExecutorTypes": ["local", "local_process", ""]
     }

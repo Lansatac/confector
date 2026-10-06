@@ -25,10 +25,12 @@ import vibe.data.json : Json;
 class LocalProcessInstance : ComputeInstance
 {
     private WorkerRecord m_record;
+    private LocalProcessProvisionerConfig m_pluginConfig;
 
-    this(in WorkerRecord record)
+    this(in WorkerRecord record, LocalProcessProvisionerConfig pluginConfig = LocalProcessProvisionerConfig.init)
     {
         m_record = cast()record;
+        m_pluginConfig = pluginConfig;
     }
 
     @property string id() const
@@ -111,19 +113,11 @@ class LocalProcessInstance : ComputeInstance
             }
         }
 
-        string runnerBinary = "bin/confector-runner";
         string defaultShell = "powershell";
         bool isolateEnv = false;
-        string secretToken = "";
 
         if (m_record.configuration.type == JSONType.object)
         {
-            auto pRunner = "runnerBinary" in m_record.configuration;
-            if (pRunner !is null && pRunner.type == JSONType.string && pRunner.str.length > 0)
-            {
-                runnerBinary = pRunner.str;
-            }
-
             auto pShell = "defaultShell" in m_record.configuration;
             if (pShell !is null && pShell.type == JSONType.string && pShell.str.length > 0)
             {
@@ -136,13 +130,12 @@ class LocalProcessInstance : ComputeInstance
                 if (pIso.type == JSONType.true_) isolateEnv = true;
                 else if (pIso.type == JSONType.false_) isolateEnv = false;
             }
-
-            auto pTok = "secretToken" in m_record.configuration;
-            if (pTok !is null && pTok.type == JSONType.string)
-            {
-                secretToken = pTok.str;
-            }
         }
+
+        // Use runner binary from plugin config (passed at construction time)
+        string runnerBinary = m_pluginConfig.runnerBinary.length > 0 ? m_pluginConfig.runnerBinary : "bin/confector-runner";
+        // Generate a unique token for this runner agent so the server can verify its identity
+        string secretToken = randomUUID().toString();
 
         // Resolve runner binary executable path
         string resolvedRunner = runnerBinary;
@@ -425,17 +418,13 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         long defaultConcurrency = cast(long)(m_scopedConfig.maxConcurrency > 0 ? m_scopedConfig.maxConcurrency : totalCPUs);
         if (defaultConcurrency <= 0) defaultConcurrency = 1;
 
-        string runnerBin = m_scopedConfig.runnerBinary.length > 0 ? m_scopedConfig.runnerBinary : "bin/confector-runner";
         string workDir = m_scopedConfig.workspaceDir.length > 0 ? m_scopedConfig.workspaceDir : ".confector/workspaces";
-        string secretTok = m_scopedConfig.secretToken;
 
         JSONValue cfg = JSONValue([
             "maxConcurrency": JSONValue(defaultConcurrency),
             "workspaceDir": JSONValue(workDir),
-            "runnerBinary": JSONValue(runnerBin),
             "defaultShell": JSONValue("powershell"),
             "isolateEnvironment": JSONValue(false),
-            "secretToken": JSONValue(secretTok),
             "allowedStepTypes": JSONValue([
                 JSONValue("process"),
                 JSONValue("bash"),
@@ -471,14 +460,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             }
         }
 
-        if (auto p = "runnerBinary" in config)
-        {
-            if (p.type != JSONType.string || p.str.length == 0)
-            {
-                errors ~= "runnerBinary cannot be empty";
-            }
-        }
-
         return errors;
     }
 
@@ -492,10 +473,8 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         int concurrency = totalCPUs > 0 ? cast(int)totalCPUs : 1;
         int hostCores = concurrency;
         string workspaceDir = ".confector/workspaces";
-        string runnerBinary = "bin/confector-runner";
         string defaultShell = "powershell";
         bool isolateEnvironment = false;
-        string secretToken = "";
         string allowedStepsStr = "";
 
         if (currentConfig.type == JSONType.object)
@@ -508,10 +487,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             {
                 if (p.type == JSONType.string) workspaceDir = p.str;
             }
-            if (auto p = "runnerBinary" in currentConfig)
-            {
-                if (p.type == JSONType.string) runnerBinary = p.str;
-            }
             if (auto p = "defaultShell" in currentConfig)
             {
                 if (p.type == JSONType.string) defaultShell = p.str;
@@ -520,10 +495,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             {
                 if (p.type == JSONType.true_) isolateEnvironment = true;
                 else if (p.type == JSONType.false_) isolateEnvironment = false;
-            }
-            if (auto p = "secretToken" in currentConfig)
-            {
-                if (p.type == JSONType.string) secretToken = p.str;
             }
             if (auto p = "allowedStepTypes" in currentConfig)
             {
@@ -543,19 +514,19 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             }
         }
 
-        compileHTMLDietFile!("config.dt", concurrency, hostCores, workspaceDir, runnerBinary, defaultShell, isolateEnvironment, secretToken, allowedStepsStr)(html);
+        compileHTMLDietFile!("config.dt", concurrency, hostCores, workspaceDir, defaultShell, isolateEnvironment, allowedStepsStr)(html);
 
         return html.data;
     }
 
     ComputeInstance createExecutor(in WorkerRecord record)
     {
-        return new LocalProcessInstance(record);
+        return new LocalProcessInstance(record, m_scopedConfig);
     }
 
     ComputeProvisioner createProvisioner(in WorkerRecord record)
     {
-        LocalProcessProvisionerConfig cfg;
+        LocalProcessProvisionerConfig cfg = m_scopedConfig;
         if (record.configuration.type == JSONType.object)
         {
             if (auto p = "maxConcurrency" in record.configuration)
@@ -565,14 +536,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
             if (auto p = "workspaceDir" in record.configuration)
             {
                 if (p.type == JSONType.string) cfg.workspaceDir = p.str;
-            }
-            if (auto p = "runnerBinary" in record.configuration)
-            {
-                if (p.type == JSONType.string) cfg.runnerBinary = p.str;
-            }
-            if (auto p = "secretToken" in record.configuration)
-            {
-                if (p.type == JSONType.string) cfg.secretToken = p.str;
             }
         }
         return new LocalProcessProvisioner(cfg);
@@ -608,9 +571,6 @@ struct LocalProcessProvisionerConfig
 
     @Description("Directory for bundled plugins")
     string pluginsDir = "plugins";
-
-    @Description("Secret authentication token for runner")
-    string secretToken = "";
 
     @Description("Maximum concurrent runner subprocesses allowed (0 = auto-detect CPU count)")
     size_t maxConcurrency = 0;
@@ -793,10 +753,9 @@ class LocalProcessProvisioner : ComputeProvisioner
                         "--max-tasks=1",
                         "--poll-interval=1"
                     ];
-                    if (m_config.secretToken.length > 0)
-                    {
-                        runnerArgs ~= format("--token=%s", m_config.secretToken);
-                    }
+                    // Generate a unique token for this runner agent so the server can verify its identity
+                    string spawnToken = randomUUID().toString();
+                    runnerArgs ~= format("--token=%s", spawnToken);
 
                     auto pid = spawnProcess(runnerArgs);
                     wait(pid);
@@ -842,23 +801,28 @@ unittest
     auto defConfig = provider.defaultConfig();
     assert(defConfig.type == JSONType.object);
     assert(defConfig["maxConcurrency"].integer >= 1);
-    assert(defConfig["runnerBinary"].str == "bin/confector-runner");
     assert(defConfig["workspaceDir"].str == ".confector/workspaces");
     assert(defConfig["isolateEnvironment"].type == JSONType.false_);
 
+    // runnerBinary comes from plugin config at construction time
+    // secretToken is server-generated and comes from environment
+    assert(("runnerBinary" in defConfig) is null);
+    assert(("secretToken" in defConfig) is null);
+
     assert(provider.validateConfig(defConfig).length == 0);
 
-    JSONValue invalidConfig = JSONValue(["maxConcurrency": JSONValue(0), "runnerBinary": JSONValue("")]);
+    JSONValue invalidConfig = JSONValue(["maxConcurrency": JSONValue(0)]);
     auto errors = provider.validateConfig(invalidConfig);
-    assert(errors.length == 2);
+    assert(errors.length == 1);
 
     string formHtml = provider.renderConfigFormHtml(defConfig);
     assert(formHtml.length > 0);
     import std.string : indexOf;
     assert(formHtml.indexOf("config_maxConcurrency") != -1);
-    assert(formHtml.indexOf("config_runnerBinary") != -1);
     assert(formHtml.indexOf("config_isolateEnvironment") != -1);
-    assert(formHtml.indexOf("config_secretToken") != -1);
+    // runnerBinary and secretToken are no longer in the instance config form
+    assert(formHtml.indexOf("config_runnerBinary") == -1);
+    assert(formHtml.indexOf("config_secretToken") == -1);
 
     WorkerRecord rec;
     rec.id = "worker_1";

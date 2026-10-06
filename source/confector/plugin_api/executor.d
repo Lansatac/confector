@@ -117,6 +117,7 @@ interface ComputeProvider
     string[] validateConfig(in JSONValue config) const;
     string renderConfigFormHtml(in JSONValue currentConfig) const;
     ComputeInstance createExecutor(in WorkerRecord record);
+    ComputeProvisioner createProvisioner(in WorkerRecord record);
 }
 
 /**

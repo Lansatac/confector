@@ -126,18 +126,6 @@ URLRouter executorRouter(
             config["defaultShell"] = defaultShellStr;
         }
 
-        string runnerBinaryStr = req.form.get("config_runnerBinary", "");
-        if (runnerBinaryStr.length > 0)
-        {
-            config["runnerBinary"] = runnerBinaryStr;
-        }
-
-        string secretTokenStr = req.form.get("config_secretToken", "");
-        if (secretTokenStr.length > 0)
-        {
-            config["secretToken"] = secretTokenStr;
-        }
-
         string isolateEnvStr = req.form.get("config_isolateEnvironment", "");
         if (isolateEnvStr.length > 0)
         {
@@ -336,6 +324,7 @@ unittest
         string[] validateConfig(in JSONValue config) const { return null; }
         string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Mock Config</div>"; }
         ComputeInstance createExecutor(in WorkerRecord record) { return null; }
+        ComputeProvisioner createProvisioner(in WorkerRecord record) { return null; }
     }
 
     auto repo = new InMemoryBuildStateRepository();

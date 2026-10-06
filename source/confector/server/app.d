@@ -14,7 +14,7 @@ import vibe.vibe;
 
 import confector.config;
 import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig;
-import confector.core.executor : CapacityBroker, ComputeProvisioner;
+import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
 import confector.core.storage : BuildStateRepository, LocalArtifactStorage, InMemoryBuildStateRepository;
@@ -333,14 +333,37 @@ void main()
     // Initialize capacity broker
     auto capacityBroker = new DefaultCapacityBroker(storage.workQueue, buildCoordinator);
 
-    // Register any provisioners from loaded plugins
+    // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
     foreach (plugin; PluginRegistry.instance.allPlugins())
     {
-        if (auto prov = cast(ComputeProvisioner) plugin)
+        if (auto provider = cast(ComputeProvider) plugin)
         {
-            capacityBroker.registerProvisioner(prov);
-            logInfo("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)", prov.providerType, prov.maxCapacity);
+            WorkerRecord record;
+            record.providerType = provider.providerType;
+            record.enabled = true;
+            record.configuration = provider.defaultConfig();
+            auto prov = provider.createProvisioner(record);
+            if (prov !is null)
+            {
+                capacityBroker.registerProvisioner(prov);
+                logInfo("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)", prov.providerType, prov.maxCapacity);
+            }
+            else
+            {
+                logWarn("[capacity_broker] ComputeProvider '%s' returned null from createProvisioner(), skipping", provider.providerType);
+            }
         }
+    }
+
+    // Warn if no provisioners were registered — builds will silently fail without them
+    if (capacityBroker.provisioners.length == 0)
+    {
+        logError("[capacity_broker] CRITICAL: No compute provisioners registered. Builds will queue but never execute.");
+        logError("[capacity_broker] Ensure at least one ComputeProvider plugin (e.g., local_process) is loaded in '%s'.", serverConfig.plugins.bundledPluginsDir);
+    }
+    else
+    {
+        logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
     // Start capacity broker evaluation loop

@@ -14,11 +14,6 @@ div.executor-config-subform
     small.form-help-text Local filesystem path where task workspaces and temporary staging areas are provisioned.
 
   div.form-group
-    label(for="config_runnerBinary") Confector Runner Binary Path
-    input#config_runnerBinary.form-control(type="text", name="config_runnerBinary", value=runnerBinary, placeholder="bin/confector-runner")
-    small.form-help-text Path to the standalone confector-runner binary used for subprocess execution.
-
-  div.form-group
     label(for="config_defaultShell") Default Shell
     select#config_defaultShell.form-control(name="config_defaultShell")
       - if (defaultShell == "powershell")
@@ -48,11 +43,6 @@ div.executor-config-subform
       strong Enable Process Environment Sandboxing
     small(style="color: #64748b; display: block; margin-top: 4px; margin-left: 24px;")
       | When enabled, isolates runner process execution from host environment variables.
-
-  div.form-group
-    label(for="config_secretToken") Brokered Worker Secret / Token
-    input#config_secretToken.form-control(type="password", name="config_secretToken", value=secretToken, placeholder="Optional shared secret or authorization token")
-    small.form-help-text Brokered credential or registration token injected into worker subprocesses.
 
   div.form-group
     label(for="config_allowedStepTypes") Allowed Step Types (comma-separated)
