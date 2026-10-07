@@ -31,7 +31,7 @@ final class ZipPackager
      *
      * Params:
      *   baseDir = The root workspace directory to search and package files from.
-     *   patterns = Array of glob patterns or relative file paths (e.g. ["bin/*", "dist/app.js"]).
+     *   patterns = Array of glob patterns or relative file paths (e.g. ["out/*", "dist/app.js"]).
      *   sink = Chunk sink delegate receiving the zip archive byte chunks.
      */
     static void pack(string baseDir, string[] patterns, void delegate(const(ubyte)[]) sink)
@@ -279,7 +279,7 @@ final class ZipPackager
             if (globMatch(baseName(normRel), normPat)) return true;
         }
 
-        // 4. Wildcard prefix directory match: e.g. "bin/*" or "bin/**"
+        // 4. Wildcard prefix directory match: e.g. "out/*" or "out/**"
         if (normPat.endsWith("/*"))
         {
             string prefix = normPat[0 .. $ - 2];
@@ -377,7 +377,7 @@ unittest
     write(buildPath(wsDir, "src", "nested", "main.d"), "void main() {}");
 
     // Test 1: Pack with multiple glob patterns and unpack
-    ubyte[] zipBytes = ZipPackager.packToBytes(wsDir, ["bin/*", "config/*.json"]);
+    ubyte[] zipBytes = ZipPackager.packToBytes(wsDir, ["out/*", "config/*.json"]);
     assert(zipBytes.length > 0);
 
     ZipPackager.unpack(zipBytes, outDir);
@@ -423,7 +423,7 @@ unittest
     // Test 5: Stream-based pack and unpack
     string outDir3 = buildPath(testRoot, "extracted3");
     Appender!(ubyte[]) streamBuffer;
-    ZipPackager.pack(wsDir, ["bin/app.exe"], (const(ubyte)[] chunk) {
+    ZipPackager.pack(wsDir, ["out/app.exe"], (const(ubyte)[] chunk) {
         streamBuffer.put(chunk);
     });
     ZipPackager.unpackStream((sink) {

@@ -78,7 +78,7 @@ int handleRun(string[] args)
     }
 
     // Load execution step plugins from search paths
-    string[] searchDirs = [pluginsDir, "bin/plugins", "plugins"];
+    string[] searchDirs = [pluginsDir, "out/plugins", "plugins"];
     foreach (dir; searchDirs)
     {
         if (exists(dir) && isDir(dir))

@@ -12,13 +12,12 @@
     },
     "plugins": {
       "pluginsUploadDir": "",
-      "bundledPluginsDir": "/code/bin/plugins",
       "confectorPlugins": ""
     }
   },
   "plugins": {
     "local-process": {
-      "runnerBinary": "/code/bin/runner/confector-runner",
+      "runnerBinary": "/code/out/runner/confector-runner",
       "serverUrl": "http://localhost:8080",
       "workspaceDir": "/runner/workspace",
       "storageDir": "/runner/artifacts",

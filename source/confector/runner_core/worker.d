@@ -342,7 +342,7 @@ class HttpWorkerRunner
         }
 
         // Load runner category plugins
-        string[] searchDirs = [m_config.pluginsDir, "bin/plugins", "plugins"];
+        string[] searchDirs = [m_config.pluginsDir, "out/plugins", "plugins"];
         foreach (dir; searchDirs)
         {
             if (exists(dir) && isDir(dir))

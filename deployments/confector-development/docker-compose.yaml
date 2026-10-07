@@ -2,7 +2,7 @@ services:
   development:
     build:
       context: ../../
-      dockerfile: build/confector-development/dev-container/Dockerfile
+      dockerfile: deployments/confector-development/dev-container/Dockerfile
     secrets:
       - mongo-readwrite-password
     depends_on:
@@ -17,7 +17,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     # Build output is temporary, and binaries must be executable from this mount.
     tmpfs:
-      - /code/bin:rw,exec,mode=0777
+      - /code/out:rw,exec,mode=0777
+      - /code/build:rw,exec,mode=0777
     environment:
       - DUB_CACHE_DIR=/home/dev/.dub
 

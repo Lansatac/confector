@@ -450,7 +450,7 @@ unittest
 
     // 8. Invalidation when declared output artifacts change
     TaskNode taskOutputs = task;
-    taskOutputs.outputs.artifacts = [OutputArtifactDecl("binaries", "bin/*")];
+    taskOutputs.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
     string fpOutputs = computeNodeFingerprint(taskOutputs, artifacts1);
     assert(fpOutputs != fp1, "Fingerprint must change when declared output artifacts are added");
 

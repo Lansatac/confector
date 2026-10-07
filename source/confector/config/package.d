@@ -774,7 +774,7 @@ unittest
         "plugins": {
             "local_process": {
                 "maxConcurrency": 8,
-                "runnerBinary": "bin/custom-runner"
+                "runnerBinary": "out/custom-runner"
             }
         }
     }`;
@@ -782,9 +782,9 @@ unittest
     auto pluginScope = registry.getScope("plugins.local_process");
 
     assert(pluginScope.get!size_t("maxConcurrency") == 8);
-    assert(pluginScope.get!string("runnerBinary") == "bin/custom-runner");
+    assert(pluginScope.get!string("runnerBinary") == "out/custom-runner");
     assert(pluginScope.getInt("maxConcurrency") == 8);
-    assert(pluginScope.getString("runnerBinary") == "bin/custom-runner");
+    assert(pluginScope.getString("runnerBinary") == "out/custom-runner");
 
     // Test 3: Environment Variable Override for Plugins (via automatic CONFECTOR_LOCAL_PROCESS_MAX_CONCURRENCY mapping)
     environment["CONFECTOR_LOCAL_PROCESS_MAX_CONCURRENCY"] = "16";
@@ -799,7 +799,7 @@ unittest
     struct LocalProcessProvisionerConfig
     {
         size_t maxConcurrency = 4;
-        string runnerBinary = "bin/confector-runner";
+        string runnerBinary = "out/confector-runner";
         bool enabled = true;
     }
 
@@ -807,7 +807,7 @@ unittest
         "plugins": {
             "local_process": {
                 "maxConcurrency": 12,
-                "runnerBinary": "bin/alt-runner"
+                "runnerBinary": "out/alt-runner"
             }
         }
     }`;
@@ -816,7 +816,7 @@ unittest
 
     auto cfg = pluginScope.bind!LocalProcessProvisionerConfig();
     assert(cfg.maxConcurrency == 12);
-    assert(cfg.runnerBinary == "bin/alt-runner");
+    assert(cfg.runnerBinary == "out/alt-runner");
     assert(cfg.enabled == true); // Default preserved when absent
 }
 

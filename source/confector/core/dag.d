@@ -541,7 +541,7 @@ unittest
     // 7. Test upstream artifact dependency linkage
     TaskNode a; a.id = "A";
     TaskNode b; b.id = "B";
-    b.inputs.upstreamArtifacts = [UpstreamArtifactRef("A", "bin/app")];
+    b.inputs.upstreamArtifacts = [UpstreamArtifactRef("A", "out/app")];
 
     auto graph = new TaskGraph([a, b]);
     assert(graph.getDependencies("B") == ["A"]);
@@ -573,7 +573,7 @@ unittest
     // 9. Test deterministic upfront fingerprint calculation and propagation
     TaskNode a; a.id = "compile";
     a.steps = [BuildStep("Build", "bash", null, "dub build")];
-    a.outputs.artifacts = [OutputArtifactDecl("binaries", "bin/*")];
+    a.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
 
     TaskNode b; b.id = "test"; b.dependsOn = ["compile"];
     b.inputs.upstreamArtifacts = [UpstreamArtifactRef("compile", "binaries", "dist")];

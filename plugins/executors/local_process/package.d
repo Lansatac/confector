@@ -555,7 +555,7 @@ void registerLocalProcessConfigDefinitions(ConfigRegistry registry)
 struct LocalProcessProvisionerConfig
 {
     @Description("Path to confector-runner binary")
-    string runnerBinary = "bin/confector-runner";
+    string runnerBinary = "./confector-runner";
 
     @Description("Base URL of Confector server")
     string serverUrl = "http://localhost:8080";

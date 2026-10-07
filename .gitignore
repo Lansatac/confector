@@ -26,8 +26,11 @@ __dummy.html
 docs/
 __dub_cache__/
 
-#build
-bin/
+# Build outputs
+out/
+
+# Intermediate build files
+build/
 .reggae
 *.ninja*
 compile_commands.json

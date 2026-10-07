@@ -122,7 +122,7 @@ StorageContext initStorage(string mongoHost = "mongo:27017/confector", string se
 /// Discovers and loads bundled plugins as well as dynamically configured plugins via server config / CONFECTOR_PLUGINS.
 void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
 {
-    // Automatically load bundled plugins from bin/plugins and plugins directories (definition and worker plugins only)
+    // Automatically load bundled plugins from out/plugins and plugins directories (definition and worker plugins only)
     Plugin[] bundledPlugins;
     string[] searchDirs = bundledPluginsDir.length > 0
         ? [bundledPluginsDir]

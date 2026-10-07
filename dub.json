@@ -19,7 +19,7 @@
 			"targetType": "library",
 			"sourcePaths": ["source/confector/config"],
 			"importPaths": ["source"],
-			"targetPath": "lib",
+			"targetPath": "out/lib",
 			"dependencies": {
 				"vibe-serialization": "~>1.2.0"
 			}
@@ -27,8 +27,8 @@
     {
       "name": "server",
       "targetType": "executable",
-      "targetPath": "bin/server",
-      "workingDirectory": "bin/server",
+      "targetPath": "out/server",
+      "workingDirectory": "out/server",
       "sourcePaths": ["source/confector/server"],
       "copyFiles": ["public"],
       "dependencies": {
@@ -44,7 +44,7 @@
 			"targetType": "library",
 			"sourcePaths": ["source/confector/plugin_api"],
 			"importPaths": ["source"],
-			"targetPath": "lib",
+			"targetPath": "out/lib",
 			"dependencies": {
 				"confector:config": "*",
 				"vibe-serialization": "~>1.2.0"
@@ -55,7 +55,7 @@
 			"targetType": "library",
 			"sourcePaths": ["source/confector/core", "source/confector/queue"],
 			"importPaths": ["source"],
-			"targetPath": "lib",
+			"targetPath": "out/lib",
 			"dependencies": {
 				"confector:config": "*",
 				"confector:plugin_api": "*",
@@ -67,7 +67,7 @@
 			"targetType": "library",
 			"sourcePaths": ["source/confector/runner_core"],
 			"importPaths": ["source"],
-			"targetPath": "lib",
+			"targetPath": "out/lib",
 			"dependencies": {
 				"confector:core": "*"
 			}
@@ -78,8 +78,8 @@
 			"targetName": "confector-runner",
 			"sourcePaths": ["source/confector/runner_app"],
 			"importPaths": ["source"],
-			"targetPath": "bin/runner",
-			"workingDirectory": "bin",
+			"targetPath": "out/runner",
+			"workingDirectory": "out",
 			"dependencies": {
 				"confector:runner_core": "*",
 				"confector:core": "*"

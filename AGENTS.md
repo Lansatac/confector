@@ -45,10 +45,12 @@ This document outlines the architectural principles, key design decisions, subsy
 - **`source/confector/core/`**: Stateless core library containing domain models and entity definitions (`model.d`), DAG cycle detection & sorting (`dag.d`), fingerprint calculation (`fingerprinter.d`), trigger evaluation (`trigger.d`), plugin lifecycle interfaces (`plugin.d`, `executor.d`, `vcs.d`), dynamic plugin loading (`plugin_loader.d`), and decoupled system contracts (`system.d`). Must have no persistent database or HTTP server dependencies.
 - **`source/confector/runner/`**: Execution runners for evaluating task payloads locally via child processes (`process_runner.d`) or serverless invocation handlers (`serverless_runner.d`).
 - **`source/confector/queue/`**: Work queue abstractions (`queue.d`) and storage implementations (MongoDB collection queue, cloud queue driver).
-- **`plugins/`**: Built-in plugin packages (`bash`, `git`, `powershell`, `executors/local_process`) containing component data definitions, Diet-NG view templates, and processing systems, compiled as dynamic libraries (`bin/plugins/*.dll` or `*.so`).
+- **`plugins/`**: Built-in plugin packages (`bash`, `git`, `powershell`, `executors/local_process`) containing component data definitions, Diet-NG view templates, and processing systems, compiled as dynamic libraries (`out/plugins/*.dll` or `*.so`).
 - **`source/controller/` & `source/app.d`**: Persistent Vibe.d web service handling HTTP routing, webhooks, UI rendering, and database persistence.
-- **`reggaefile.d`**: Top-level Reggae build script coordinating DUB package compilation, dynamic plugin builds, and file synchronization into the `bin/` artifact directory.
-- **`bin/`**: Self-contained runtime artifact directory containing the executable, `plugins/` directory, `views/`, and `public/` web assets.
+- **`reggaefile.d`**: Top-level Reggae build script coordinating DUB package compilation, dynamic plugin builds, and file synchronization into the `out/` artifact directory.
+- **`out/`**: Self-contained runtime artifact directory containing the executable, `plugins/` directory, `views/`, and `public/` web assets.
+- **`build/`**: Intermediate build files (ninja files, `.reggae/`, etc.) isolated per environment.
+- **`deployments/`**: Deployment and environment configurations (Docker Compose, dev container, etc.).
 
 ---
 

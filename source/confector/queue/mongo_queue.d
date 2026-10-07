@@ -525,14 +525,14 @@ unittest
     node.setCustomComponent("custom_prop", parseJSON("{\"enabled\": true}"));
     msg.taskNode = node;
 
-    msg.executionPayload.expectedOutputs = [OutputArtifactDecl("app", "bin/app")];
-
+    msg.executionPayload.expectedOutputs = [OutputArtifactDecl("app", "out/app")];
+    Bson nodeBson = serializeToBson(msg.taskNode);
     Bson payloadBson = serializeToBson(msg.executionPayload);
     Bson nodeBson = serializeToBson(msg.taskNode);
-
+    Bson nodeBson = serializeToBson(msg.taskNode);
     TaskExecutionPayload deserializedPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(payloadBson));
     assert(deserializedPayload.expectedOutputs.length == 1);
-    assert(deserializedPayload.expectedOutputs[0].path == "bin/app");
+    assert(deserializedPayload.expectedOutputs[0].path == "out/app");
 
     TaskNode deserializedNode = deserializeBson!TaskNode(sanitizeBson(nodeBson));
     assert(deserializedNode.id == "build-task");

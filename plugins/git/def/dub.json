@@ -3,7 +3,7 @@
 	"description": "Git Step Definition Plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_git_def",
-	"targetPath": "../../../bin/plugins",
+	"targetPath": "../../../out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"stringImportPaths": ["."],

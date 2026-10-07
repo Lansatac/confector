@@ -1,6 +1,6 @@
 {
   "name": "Confector Development",
-  "dockerComposeFile": ["../build/development/docker-compose.yaml"],
+  "dockerComposeFile": ["../deployments/confector-development/docker-compose.yaml"],
   "service": "development",
   "workspaceFolder": "/code",
   "customizations": {

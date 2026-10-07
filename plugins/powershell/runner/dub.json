@@ -3,7 +3,7 @@
 	"description": "PowerShell Step Runner Plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_powershell_runner",
-	"targetPath": "../../../bin/plugins",
+	"targetPath": "../../../out/runner/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {
