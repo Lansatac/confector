@@ -19,6 +19,7 @@ services:
     tmpfs:
       - /code/out:rw,exec,mode=0777
       - /code/build:rw,exec,mode=0777
+      - /code/.reggae:rw,exec,mode=0777
     environment:
       - DUB_CACHE_DIR=/home/dev/.dub
 
