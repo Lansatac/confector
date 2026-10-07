@@ -198,12 +198,12 @@ class DefaultCapacityBroker : CapacityBroker
             m_running = true;
         }
 
-        logInfo("[capacity_broker] Starting capacity broker evaluation loop (pollInterval=%s)", m_pollInterval);
+        logTrace("[capacity_broker] Starting capacity broker evaluation loop (pollInterval=%s)", m_pollInterval);
 
         m_brokerTask = runTask(() nothrow {
             try
             {
-                logInfo("[capacity_broker] Broker evaluation task started");
+                logTrace("[capacity_broker] Broker evaluation task started");
                 while (isRunning)
                 {
                     try
@@ -223,7 +223,7 @@ class DefaultCapacityBroker : CapacityBroker
                         break;
                     }
                 }
-                logInfo("[capacity_broker] Broker evaluation task stopped");
+                logTrace("[capacity_broker] Broker evaluation task stopped");
             }
             catch (Throwable) {}
         });
@@ -265,7 +265,7 @@ unittest
     // Test Mock Provisioner
     class MockProvisioner : ComputeProvisioner
     {
-        private string m_type;
+        private string m_type; 
         private size_t m_max;
         private size_t m_active = 0;
         size_t requestedDemandCount = 0;

@@ -375,7 +375,6 @@ void main()
 
     // Start capacity broker evaluation loop
     capacityBroker.start();
-    logInfo("[capacity_broker] Started capacity evaluation loop.");
 
     // Configure router and server settings
     auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, capacityBroker);
