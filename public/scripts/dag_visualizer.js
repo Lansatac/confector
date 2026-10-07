@@ -3,6 +3,14 @@
  * Interactive HTML5 Canvas graph visualizer for DAG nodes, repository inputs, and dependency edges.
  */
 (function() {
+  // Stored node bounding boxes for click hit-detection
+  var nodeBounds = [];
+  var selectedNodeId = null;
+  var onNodeSelectedCallback = null;
+  var currentCanvasId = null;
+  var cachedNodes = [];
+  var cachedEdges = [];
+
   function drawArrow(ctx, fromX, fromY, toX, toY, color) {
     var headLen = 8;
     var angle = Math.atan2(toY - fromY, toX - fromX);
@@ -44,7 +52,7 @@
     return [];
   }
 
-  function renderGraph(canvasId, nodes, edges) {
+  function renderGraph(canvasId, nodes, edges, selectedId) {
     var canvas = document.getElementById(canvasId);
     if (!canvas) return;
     var ctx = canvas.getContext("2d");
@@ -59,16 +67,24 @@
     var nodeWidth = 115;
     var nodeHeight = 44;
 
+    // Clear and rebuild node bounds for hit-detection
+    nodeBounds = [];
+
     nodes.forEach(function(n, index) {
       var x = n.x !== undefined ? n.x : 50 + index * 140;
       var y = n.y !== undefined ? n.y : (index % 2 === 0 ? 60 : 130);
+      var isRepo = !!n.isRepo || n.type === "repository" || n.status === "repository";
       nodePositions[n.id] = {
         x: x,
         y: y,
         name: n.name || n.id,
         status: n.status || "ready",
-        isRepo: !!n.isRepo || n.type === "repository" || n.status === "repository"
+        isRepo: isRepo
       };
+      // Store bounding box for hit-detection (only task nodes)
+      if (!isRepo) {
+        nodeBounds.push({ id: n.id, x: x, y: y, w: nodeWidth, h: nodeHeight });
+      }
     });
 
     // Draw edges
@@ -94,6 +110,7 @@
       var bgColor = "#ffffff";
       var borderColor = "#2196f3";
       var textColor = "#222222";
+      var isSelected = (id === selectedId);
 
       if (pos.isRepo || pos.status === "repository") {
         bgColor = "#f5f3ff";
@@ -121,7 +138,7 @@
 
       ctx.fillStyle = bgColor;
       ctx.strokeStyle = borderColor;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = isSelected ? 4 : 2;
 
       // Rounded rect
       var r = pos.isRepo ? 10 : 6;
@@ -172,9 +189,22 @@
     });
   }
 
-  window.renderTaskGraph = function(canvasId, tasks, taskStatuses) {
+  window.renderTaskGraph = function(canvasId, tasks, taskStatuses, onNodeSelected) {
     if (!tasks || !tasks.length) return;
     taskStatuses = taskStatuses || {};
+    if (typeof onNodeSelected === "function") {
+      onNodeSelectedCallback = onNodeSelected;
+    }
+    currentCanvasId = canvasId;
+    selectedNodeId = null;
+
+    // Remove old click listener and add new one
+    var canvas = document.getElementById(canvasId);
+    if (canvas) {
+      canvas.removeEventListener("click", handleCanvasClick);
+      canvas.addEventListener("click", handleCanvasClick);
+      canvas.style.cursor = "pointer";
+    }
 
     // 1. Collect all repository dependencies across tasks
     var repoSet = {};
@@ -367,8 +397,47 @@
       });
     });
 
-    renderGraph(canvasId, nodes, edges);
+    // Cache nodes and edges for click re-rendering
+    cachedNodes = nodes;
+    cachedEdges = edges;
+    renderGraph(canvasId, nodes, edges, selectedNodeId);
   };
+
+  // Click handler for canvas — hit-detect task nodes
+  function handleCanvasClick(event) {
+    var canvas = event.target;
+    var rect = canvas.getBoundingClientRect();
+    var mx = event.clientX - rect.left;
+    var my = event.clientY - rect.top;
+
+    // Find which node was clicked (reverse order so top-drawn nodes are hit first)
+    for (var i = nodeBounds.length - 1; i >= 0; i--) {
+      var b = nodeBounds[i];
+      if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
+        // Toggle selection: clicking the same node deselects it
+        if (selectedNodeId === b.id) {
+          selectedNodeId = null;
+        } else {
+          selectedNodeId = b.id;
+        }
+        // Re-render with selection highlight
+        renderGraph(currentCanvasId, cachedNodes, cachedEdges, selectedNodeId);
+        // Fire callback
+        if (onNodeSelectedCallback) {
+          onNodeSelectedCallback(selectedNodeId);
+        }
+        return;
+      }
+    }
+    // Clicked empty space — clear selection
+    if (selectedNodeId) {
+      selectedNodeId = null;
+      renderGraph(currentCanvasId, cachedNodes, cachedEdges, null);
+      if (onNodeSelectedCallback) {
+        onNodeSelectedCallback(null);
+      }
+    }
+  }
 
   window.renderDAG = window.renderTaskGraph;
 

@@ -94,8 +94,9 @@ block maincontent
       div.log-controls
         button.btn.btn-sm.btn-outline#btn-autoscroll Auto-scroll: ON
         button.btn.btn-sm.btn-primary#btn-refresh-logs Refresh Logs
+        button.btn.btn-sm.btn-outline#btn-show-all-logs(style="display: none;") Show All Logs
 
-    div.terminal-box#live-terminal(data-build-id="#{build.buildId}")
+    div.terminal-box#live-terminal(data-build-id="#{build.buildId}", data-selected-task="")
       - if (logs.length == 0)
         div.log-empty No log output recorded for this build.
       - else
@@ -107,8 +108,49 @@ block maincontent
     document.addEventListener("DOMContentLoaded", function() {
       var tasksData = !{tasksJson};
       var taskStatusesData = !{taskStatusesJson};
+      var terminal = document.getElementById("live-terminal");
+      var showAllBtn = document.getElementById("btn-show-all-logs");
+
+      function selectTask(taskId) {
+        if (taskId) {
+          terminal.setAttribute("data-selected-task", taskId);
+          showAllBtn.style.display = "inline-block";
+          // Highlight selected node card
+          document.querySelectorAll(".dag-node-card").forEach(function(card) {
+            card.classList.remove("selected");
+            if (card.getAttribute("data-task") === taskId) {
+              card.classList.add("selected");
+            }
+          });
+        } else {
+          terminal.setAttribute("data-selected-task", "");
+          showAllBtn.style.display = "none";
+          document.querySelectorAll(".dag-node-card").forEach(function(card) {
+            card.classList.remove("selected");
+          });
+        }
+      }
+
       if (tasksData && tasksData.length && window.renderTaskGraph) {
-        window.renderTaskGraph("dag-canvas", tasksData, taskStatusesData);
+        window.renderTaskGraph("dag-canvas", tasksData, taskStatusesData, selectTask);
+      }
+
+      // Node card click handlers
+      document.querySelectorAll(".dag-node-card").forEach(function(card) {
+        card.addEventListener("click", function(e) {
+          var taskId = card.getAttribute("data-task");
+          if (taskId) {
+            e.preventDefault();
+            selectTask(taskId);
+          }
+        });
+      });
+
+      // Show All Logs button
+      if (showAllBtn) {
+        showAllBtn.addEventListener("click", function() {
+          selectTask(null);
+        });
       }
     });
   script(src="/static/scripts/live_logs.js")

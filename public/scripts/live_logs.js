@@ -26,8 +26,12 @@
     }
 
     function fetchLogs() {
-      var logsUrl = taskId
-        ? "/api/v1/builds/" + encodeURIComponent(buildId) + "/tasks/" + encodeURIComponent(taskId) + "/logs"
+      // Check for dynamically selected task (build page task selection)
+      var selectedTask = terminal.getAttribute("data-selected-task");
+      var effectiveTaskId = selectedTask || taskId;
+
+      var logsUrl = effectiveTaskId
+        ? "/api/v1/builds/" + encodeURIComponent(buildId) + "/tasks/" + encodeURIComponent(effectiveTaskId) + "/logs"
         : "/api/v1/builds/logs?id=" + encodeURIComponent(buildId);
       fetch(logsUrl)
         .then(function(res) {
@@ -46,6 +50,9 @@
             if (autoScroll) {
               terminal.scrollTop = terminal.scrollHeight;
             }
+          } else if (effectiveTaskId) {
+            // Task selected but no logs yet
+            terminal.innerHTML = '<div class="log-empty">No log output recorded for this task yet.</div>';
           }
         })
         .catch(function(err) {
