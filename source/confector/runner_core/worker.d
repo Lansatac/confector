@@ -343,12 +343,33 @@ class HttpWorkerRunner
 
         // Load runner category plugins
         string[] searchDirs = [m_config.pluginsDir, "out/plugins", "plugins"];
+        size_t totalPluginsLoaded = 0;
         foreach (dir; searchDirs)
         {
             if (exists(dir) && isDir(dir))
             {
-                PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner]);
+                totalPluginsLoaded += loaded.length;
+                logInfo("[worker] Loaded %d plugin(s) from '%s'", loaded.length, dir);
+                foreach (p; loaded)
+                {
+                    logInfo("[worker]   - %s v%s (category: %s)", p.name, p.versionString, p.category);
+                }
             }
+            else
+            {
+                logWarn("[worker] Plugins directory '%s' does not exist or is not accessible", dir);
+            }
+        }
+        if (totalPluginsLoaded == 0)
+        {
+            logError("[worker] WARNING: No runner plugins loaded! Task execution will fail.");
+            logError("[worker] Searched directories: %s", searchDirs);
+            logError("[worker] Ensure plugin .so/.dll files are present in one of the searched directories.");
+        }
+        else
+        {
+            logInfo("[worker] Total runner plugins loaded: %d", totalPluginsLoaded);
         }
 
         m_storage = new LocalArtifactStorage(m_config.storageDir);

@@ -770,10 +770,10 @@ class LocalProcessProvisioner : ComputeProvisioner
 
                 auto pid = spawnProcess(runnerArgs);
                 if (m_context !is null)
-                    m_context.info(format("[local_process] Runner worker spawned with PID %d", pid));
-                wait(pid);
+                    m_context.info(format("[local_process] Runner worker spawned with PID %d", pid.processID));
+                auto exitStatus = wait(pid);
                 if (m_context !is null)
-                    m_context.info(format("[local_process] Runner worker (PID %d) exited", pid));
+                    m_context.info(format("[local_process] Runner worker (PID %d) exited with status %d", pid.processID, exitStatus));
             }
             catch (Exception e)
             {

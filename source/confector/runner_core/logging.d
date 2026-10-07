@@ -2,7 +2,7 @@ module confector.runner_core.logging;
 
 import confector.plugin_api.executor : LogDelegate;
 import std.format : format;
-import std.stdio : stderr, writeln;
+import std.stdio : stderr, writeln, writefln;
 import core.sync.mutex : Mutex;
 
 /**
@@ -10,17 +10,29 @@ import core.sync.mutex : Mutex;
  */
 void logInfo(Args...)(string fmt, Args args)
 {
-    // runner info logs can be suppressed or formatted
+    try
+    {
+        stderr.writefln("[INFO] " ~ fmt, args);
+    }
+    catch (Exception) {}
 }
 
 void logDebug(Args...)(string fmt, Args args)
 {
-    // runner debug logs
+    try
+    {
+        stderr.writefln("[DEBUG] " ~ fmt, args);
+    }
+    catch (Exception) {}
 }
 
 void logTrace(Args...)(string fmt, Args args)
 {
-    // runner trace logs
+    try
+    {
+        stderr.writefln("[TRACE] " ~ fmt, args);
+    }
+    catch (Exception) {}
 }
 
 void logWarn(Args...)(string fmt, Args args)

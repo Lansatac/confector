@@ -21,7 +21,7 @@
       "serverUrl": "http://localhost:8080",
       "workspaceDir": "/runner/workspace",
       "storageDir": "/runner/artifacts",
-      "pluginsDir": "plugins",
+      "pluginsDir": "/code/out/runner/plugins",
       "maxConcurrency": 0,
       "supportedExecutorTypes": ["local", "local_process", ""]
     }

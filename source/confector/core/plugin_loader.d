@@ -2,11 +2,12 @@ module confector.core.plugin_loader;
 
 import confector.core.plugin;
 import std.string : toStringz, strip, toLower;
-import std.path : isAbsolute, absolutePath;
+import std.path : isAbsolute, absolutePath, buildPath;
 import std.file : exists, isFile, isDir, dirEntries, SpanMode, DirEntry;
 import std.format : format;
 import std.conv : to;
 import std.algorithm.searching : endsWith, canFind;
+import vibe.core.log : logDebug, logInfo, logWarn;
 
 version (Windows)
 {
@@ -168,7 +169,6 @@ final class PluginLoader
 
         void* handle = null;
 
-        import vibe.core.log : logDebug;
         logDebug("[plugin_loader] About to dlopen: %s", absPath);
 
         version (Windows)
@@ -331,15 +331,24 @@ final class PluginLoader
                 {
                     try
                     {
-                        auto p = loadPlugin(entry.name, true, allowedCategories);
+                        string fullPath = entry.name;
+                        logDebug("[plugin_loader] Loading bundled plugin from: %s", fullPath);
+                        auto p = loadPlugin(fullPath, true, allowedCategories);
                         if (p !is null)
                         {
+                            logInfo("[plugin_loader] Loaded plugin '%s' v%s (category: %s) from %s",
+                                p.name, p.versionString, p.category, fullPath);
                             loaded ~= p;
+                        }
+                        else
+                        {
+                            logDebug("[plugin_loader] Plugin filtered out by category: %s", fullPath);
                         }
                     }
                     catch (Throwable e)
                     {
-                        // Non-plugin libraries or incompatible binaries in directory are skipped
+                        logWarn("[plugin_loader] Failed to load plugin from '%s': %s",
+                            entry.name, e.msg);
                     }
                 }
             }
