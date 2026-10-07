@@ -535,7 +535,7 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
                 if (p.type == JSONType.string) cfg.workspaceDir = p.str;
             }
         }
-        return new LocalProcessProvisioner(cfg);
+        return new LocalProcessProvisioner(cfg, m_context);
     }
 }
 
@@ -546,7 +546,7 @@ void registerLocalProcessConfigDefinitions(ConfigRegistry registry)
 {
     if (registry is null) return;
 
-    registry.bindDefinition!LocalProcessProvisionerConfig("plugins.local_process");
+    registry.bindDefinition!LocalProcessProvisionerConfig("plugins.local-process");
 }
 
 /**
@@ -583,12 +583,15 @@ struct LocalProcessProvisionerConfig
 class LocalProcessProvisioner : ComputeProvisioner
 {
     private LocalProcessProvisionerConfig m_config;
+    private PluginContext m_context;
     private size_t m_activeInstances = 0;
+    private bool m_disabled = false;
     private Mutex m_mutex;
 
-    this(LocalProcessProvisionerConfig config = LocalProcessProvisionerConfig.init)
+    this(LocalProcessProvisionerConfig config = LocalProcessProvisionerConfig.init, PluginContext context = null)
     {
         m_config = config;
+        m_context = context;
         if (m_config.maxConcurrency == 0)
         {
             m_config.maxConcurrency = totalCPUs > 0 ? totalCPUs : 4;
@@ -620,6 +623,7 @@ class LocalProcessProvisioner : ComputeProvisioner
 
     bool canProvision(in QueueDemand demand) const
     {
+        if (m_disabled) return false;
         string exec = demand.executorType;
         bool matchesType = false;
         foreach (t; m_config.supportedExecutorTypes)
@@ -652,8 +656,18 @@ class LocalProcessProvisioner : ComputeProvisioner
 
     void requestCapacity(in QueueDemand demand)
     {
+        if (m_disabled)
+        {
+            if (m_context !is null)
+                m_context.info("[local_process] requestCapacity: provisioner is disabled, skipping");
+            return;
+        }
+
         if (!canProvision(demand))
         {
+            if (m_context !is null)
+                m_context.info(format("[local_process] requestCapacity: cannot provision demand (executorType='%s', pendingCount=%d)",
+                    demand.executorType, demand.pendingWorkOrderCount));
             return;
         }
 
@@ -662,6 +676,9 @@ class LocalProcessProvisioner : ComputeProvisioner
         {
             if (m_activeInstances >= m_config.maxConcurrency)
             {
+                if (m_context !is null)
+                    m_context.info(format("[local_process] requestCapacity: at max capacity (%d/%d), cannot spawn more runners",
+                        m_activeInstances, m_config.maxConcurrency));
                 return;
             }
             size_t available = m_config.maxConcurrency - m_activeInstances;
@@ -672,6 +689,10 @@ class LocalProcessProvisioner : ComputeProvisioner
             }
             m_activeInstances += toSpawn;
         }
+
+        if (m_context !is null)
+            m_context.info(format("[local_process] requestCapacity: spawning %d runner(s) for demand (executorType='%s', pendingCount=%d, active=%d/%d)",
+                toSpawn, demand.executorType, demand.pendingWorkOrderCount, m_activeInstances, m_config.maxConcurrency));
 
         for (size_t i = 0; i < toSpawn; i++)
         {
@@ -685,7 +706,14 @@ class LocalProcessProvisioner : ComputeProvisioner
         {
             try
             {
+                if (m_context !is null)
+                    m_context.info("[local_process] Spawning custom runner instance");
                 m_config.customLauncher(["custom"]);
+            }
+            catch (Exception e)
+            {
+                if (m_context !is null)
+                    m_context.error(format("[local_process] Custom runner launcher failed: %s", e.msg));
             }
             finally
             {
@@ -712,54 +740,45 @@ class LocalProcessProvisioner : ComputeProvisioner
 
                 if (!exists(binPath))
                 {
-                    string[] fallbacks = ["bin/confector-runner", "../bin/confector-runner", "./confector-runner", "confector-runner"];
-                    try
+                    bool shouldLog;
+                    synchronized (m_mutex)
                     {
-                        import std.file : thisExePath;
-                        import std.path : dirName, buildPath;
-                        string exeDir = dirName(thisExePath());
-                        fallbacks ~= buildPath(exeDir, "confector-runner");
+                        shouldLog = !m_disabled;
+                        m_disabled = true;
                     }
-                    catch (Exception) {}
-
-                    foreach (fb; fallbacks)
-                    {
-                        string candidate = fb;
-                        version (Windows)
-                        {
-                            import std.string : endsWith;
-                            if (!candidate.endsWith(".exe")) candidate ~= ".exe";
-                        }
-                        if (exists(candidate))
-                        {
-                            binPath = candidate;
-                            break;
-                        }
-                    }
+                    if (shouldLog && m_context !is null)
+                        m_context.critical(format("[local_process] Cannot find confector-runner binary at configured path '%s'. Disabling provisioner — builds will queue but never execute.", binPath));
+                    return;
                 }
 
-                if (exists(binPath))
-                {
-                    string[] runnerArgs = [
-                        binPath,
-                        "worker",
-                        format("--server-url=%s", m_config.serverUrl),
-                        format("--workspace=%s", m_config.workspaceDir),
-                        format("--storage-dir=%s", m_config.storageDir),
-                        format("--plugins-dir=%s", m_config.pluginsDir),
-                        "--max-tasks=1",
-                        "--poll-interval=1"
-                    ];
-                    // Generate a unique token for this runner agent so the server can verify its identity
-                    string spawnToken = randomUUID().toString();
-                    runnerArgs ~= format("--token=%s", spawnToken);
+                string[] runnerArgs = [
+                    binPath,
+                    "worker",
+                    format("--server-url=%s", m_config.serverUrl),
+                    format("--workspace=%s", m_config.workspaceDir),
+                    format("--storage-dir=%s", m_config.storageDir),
+                    format("--plugins-dir=%s", m_config.pluginsDir),
+                    "--max-tasks=1",
+                    "--poll-interval=1"
+                ];
+                // Generate a unique token for this runner agent so the server can verify its identity
+                string spawnToken = randomUUID().toString();
+                runnerArgs ~= format("--token=%s", spawnToken);
 
-                    auto pid = spawnProcess(runnerArgs);
-                    wait(pid);
-                }
+                if (m_context !is null)
+                    m_context.info(format("[local_process] Spawning runner worker: %s (token=%s...)", runnerArgs[0], spawnToken[0..8]));
+
+                auto pid = spawnProcess(runnerArgs);
+                if (m_context !is null)
+                    m_context.info(format("[local_process] Runner worker spawned with PID %d", pid));
+                wait(pid);
+                if (m_context !is null)
+                    m_context.info(format("[local_process] Runner worker (PID %d) exited", pid));
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                if (m_context !is null)
+                    m_context.error(format("[local_process] Failed to spawn or run confector-runner worker: %s", e.msg));
             }
             finally
             {
@@ -896,7 +915,7 @@ unittest
     // Test ConfigRegistry integration with LocalProcessProvider using bindDefinition!T
     auto configReg = new ConfigRegistry();
     registerLocalProcessConfigDefinitions(configReg);
-    auto pluginCtx = new NullPluginContext("local_process", configReg.getScope("plugins.local_process"));
+    auto pluginCtx = new NullPluginContext("local-process", configReg.getScope("plugins.local-process"));
     auto localPlugin2 = new LocalProcessProvider();
     localPlugin2.initialize(pluginCtx);
     assert(localPlugin2.scopedConfig.runnerBinary == "bin/confector-runner");

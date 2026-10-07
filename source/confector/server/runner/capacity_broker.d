@@ -103,17 +103,14 @@ class DefaultCapacityBroker : CapacityBroker
             return;
         }
 
-        logDebug("[capacity_broker] evaluateDemand: inspecting work queue backlog (registered provisioners: %d)", m_provisioners.length);
-
         // Inspect pending queue backlog
         TaskQueueMessage[] pending = m_workQueue.getPendingMessages(100);
         if (pending.length == 0)
         {
-            logDebug("[capacity_broker] evaluateDemand: no pending work queue messages found");
             return;
         }
 
-        logDebug("[capacity_broker] evaluateDemand: found %d pending queue message(s)", pending.length);
+        logInfo("[capacity_broker] evaluateDemand: found %d pending queue message(s)", pending.length);
 
         // Group pending messages by (executorType, requirements) into QueueDemand items
         QueueDemand[string] demandMap;
@@ -129,7 +126,7 @@ class DefaultCapacityBroker : CapacityBroker
                 }
             }
 
-            logDebug("[capacity_broker] evaluateDemand: pending msg '%s' (task '%s', build '%s', executorType='%s', reqKey='%s')",
+            logInfo("[capacity_broker] evaluateDemand: pending msg '%s' (task '%s', build '%s', executorType='%s', reqKey='%s')",
                 msg.id, msg.workOrder.taskId, msg.workOrder.buildId, execType, reqKey);
 
             if (auto p = reqKey in demandMap)
@@ -146,7 +143,7 @@ class DefaultCapacityBroker : CapacityBroker
             }
         }
 
-        logDebug("[capacity_broker] evaluateDemand: grouped into %d distinct demand specification(s)", demandMap.length);
+        logInfo("[capacity_broker] evaluateDemand: grouped into %d distinct demand specification(s)", demandMap.length);
 
         // For each demand, find matching provisioners and request capacity
         synchronized (m_mutex)
@@ -160,19 +157,19 @@ class DefaultCapacityBroker : CapacityBroker
 
             foreach (key, demand; demandMap)
             {
-                logDebug("[capacity_broker] evaluateDemand: matching provisioners for demand key '%s' (executorType='%s', pendingCount=%d)",
+                logInfo("[capacity_broker] evaluateDemand: matching provisioners for demand key '%s' (executorType='%s', pendingCount=%d)",
                     key, demand.executorType, demand.pendingWorkOrderCount);
 
                 bool matched = false;
                 foreach (prov; m_provisioners)
                 {
                     bool canProv = prov.canProvision(demand);
-                    logDebug("[capacity_broker] evaluateDemand: provisioner '%s' (active=%d, max=%d) canProvision=%s for '%s'",
+                    logInfo("[capacity_broker] evaluateDemand: provisioner '%s' (active=%d, max=%d) canProvision=%s for '%s'",
                         prov.providerType, prov.activeInstanceCount, prov.maxCapacity, canProv, key);
 
                     if (canProv)
                     {
-                        logDebug("[capacity_broker] evaluateDemand: requesting capacity from provisioner '%s' for %d work order(s)",
+                        logInfo("[capacity_broker] evaluateDemand: requesting capacity from provisioner '%s' for %d work order(s)",
                             prov.providerType, demand.pendingWorkOrderCount);
                         prov.requestCapacity(demand);
                         matched = true;
@@ -201,12 +198,12 @@ class DefaultCapacityBroker : CapacityBroker
             m_running = true;
         }
 
-        logDebug("[capacity_broker] Starting capacity broker evaluation loop (pollInterval=%s)", m_pollInterval);
+        logInfo("[capacity_broker] Starting capacity broker evaluation loop (pollInterval=%s)", m_pollInterval);
 
         m_brokerTask = runTask(() nothrow {
             try
             {
-                logDebug("[capacity_broker] Broker evaluation task started");
+                logInfo("[capacity_broker] Broker evaluation task started");
                 while (isRunning)
                 {
                     try
@@ -226,7 +223,7 @@ class DefaultCapacityBroker : CapacityBroker
                         break;
                     }
                 }
-                logDebug("[capacity_broker] Broker evaluation task stopped");
+                logInfo("[capacity_broker] Broker evaluation task stopped");
             }
             catch (Throwable) {}
         });

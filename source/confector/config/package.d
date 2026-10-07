@@ -338,7 +338,7 @@ string keyToDefaultEnvVar(string key)
 }
 
 /**
- * Helper to traverse nested Json by dot-separated path (e.g. "plugins.local_process.maxConcurrency").
+ * Helper to traverse nested Json by dot-separated path (e.g. "plugins.local-process.maxConcurrency").
  */
 Json getNestedJson(in Json root, string dotPath)
 {
@@ -913,3 +913,4 @@ unittest
     assert(directHttpCfg.port == 7070);
     environment.remove("CONFECTOR_HTTP_PORT");
 }
+

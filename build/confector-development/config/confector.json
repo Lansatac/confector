@@ -12,16 +12,16 @@
     },
     "plugins": {
       "pluginsUploadDir": "",
-      "bundledPluginsDir": "../plugins",
+      "bundledPluginsDir": "/code/bin/plugins",
       "confectorPlugins": ""
     }
   },
   "plugins": {
-    "local_process": {
-      "runnerBinary": "../runner/confector-runner",
+    "local-process": {
+      "runnerBinary": "/code/bin/runner/confector-runner",
       "serverUrl": "http://localhost:8080",
-      "workspaceDir": ".confector/workspaces",
-      "storageDir": ".confector/artifacts",
+      "workspaceDir": "/runner/workspace",
+      "storageDir": "/runner/artifacts",
       "pluginsDir": "plugins",
       "maxConcurrency": 0,
       "supportedExecutorTypes": ["local", "local_process", ""]

@@ -273,15 +273,17 @@ ConfigRegistry loadConfigRegistry()
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
 
+    auto configLoaded = false;
+
     foreach (cfgPath; [configDir.buildPath("confector.json"), configDir.buildPath("confector.yaml")])
     {
-        logInfo("[config] Trying to load from configuration file %s", cfgPath);
         if (exists(cfgPath))
         {
             try
             {
                 configRegistry.loadConfigFile(cfgPath);
                 logInfo("[config] Loaded configuration file from %s", cfgPath);
+                configLoaded = true;
                 break;
             }
             catch (Exception e)
@@ -289,6 +291,11 @@ ConfigRegistry loadConfigRegistry()
                 logWarn("[config] Failed to load config file '%s': %s", cfgPath, e.msg);
             }
         }
+    }
+
+    if (!configLoaded)
+    {
+        logWarn("[config] No valid configuration file found, continuing with defaults.");
     }
 
     return configRegistry;
