@@ -9,7 +9,8 @@ enum PluginCategory : string
 {
     definition = "definition",  // Step Definition Plugins (BuildStepProvider, UI templates, validation schemas)
     runner = "runner",          // Step Execution Plugins (BuildStepSystem, InputResolverSystem)
-    worker = "worker"           // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
+    worker = "worker",          // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
+    artifact = "artifact"        // Artifact Storage Plugins (content-addressed artifact backend)
 }
 
 /**
@@ -60,6 +61,14 @@ interface StepExecutionPlugin : Plugin
  * Loaded by the server/control plane to manage compute fleets, worker lifecycles, and credential injection.
  */
 interface WorkerPlugin : Plugin
+{
+}
+
+/**
+ * Interface for Artifact Storage Plugins.
+ * Provides a content-addressed artifact backend (local filesystem, S3, Artifactory, etc.).
+ */
+interface ArtifactStoragePlugin : Plugin
 {
 }
 

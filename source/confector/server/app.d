@@ -131,7 +131,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
     {
         if (exists(pluginDir) && isDir(pluginDir))
         {
-            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker]);
+            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact]);
         }
     }
 
@@ -339,8 +339,13 @@ void main()
         return;
     }
 
-    // Initialize execution engine, coordinator & storage
-    auto artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
+    // Resolve artifact storage from plugin registry (falls back to direct instantiation if no plugin loaded)
+    auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
+    if (artifactStorage is null)
+    {
+        logWarn("[storage] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
+        artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
+    }
     auto taskEngine = new TaskEngine(artifactStorage, storage.stateRepo, serverConfig.storage.artifactsDir);
     auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
     logInfo("Initialized Confector execution engine and build coordinator.");

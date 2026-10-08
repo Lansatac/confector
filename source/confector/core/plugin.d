@@ -107,6 +107,9 @@ final class PluginRegistry
     private BuildStepSystem[] _stepSystems;
     private BuildStepProvider[] _stepProviders;
     private ComputeProvider[] _computeProviders;
+    private ArtifactStorage[] _artifactStorages;
+    private ArtifactStorage[string] _artifactStoragesByType;
+    private string _defaultArtifactStorageType;
     private PluginLogCallback _logCallback;
     private ConfigRegistry _configRegistry;
 
@@ -194,6 +197,10 @@ final class PluginRegistry
         {
             registerComputeProvider(provider);
         }
+        if (auto storage = cast(ArtifactStorage) plugin)
+        {
+            registerArtifactStorage(storage);
+        }
         logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
     }
 
@@ -248,6 +255,21 @@ final class PluginRegistry
         if (!_computeProviders.canFind(provider))
         {
             _computeProviders ~= provider;
+        }
+    }
+
+    public void registerArtifactStorage(ArtifactStorage storage)
+    {
+        import std.algorithm : canFind;
+        if (!_artifactStorages.canFind(storage))
+        {
+            _artifactStorages ~= storage;
+            _artifactStoragesByType[storage.backendType] = storage;
+            // First registered storage becomes the default
+            if (_defaultArtifactStorageType.length == 0)
+            {
+                _defaultArtifactStorageType = storage.backendType;
+            }
         }
     }
 
@@ -308,6 +330,29 @@ final class PluginRegistry
                     else i++;
                 }
             }
+            if (auto storage = cast(ArtifactStorage) plugin)
+            {
+                for (size_t i = 0; i < _artifactStorages.length; )
+                {
+                    if (_artifactStorages[i] is storage) _artifactStorages = _artifactStorages.remove(i);
+                    else i++;
+                }
+                if (auto it = storage.backendType in _artifactStoragesByType)
+                {
+                    if (*it is storage)
+                    {
+                        _artifactStoragesByType.remove(storage.backendType);
+                        if (_defaultArtifactStorageType == storage.backendType && _artifactStorages.length > 0)
+                        {
+                            _defaultArtifactStorageType = _artifactStorages[0].backendType;
+                        }
+                        else if (_artifactStorages.length == 0)
+                        {
+                            _defaultArtifactStorageType = "";
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -365,6 +410,25 @@ final class PluginRegistry
         return null;
     }
 
+    public ArtifactStorage[] getArtifactStorages()
+    {
+        return _artifactStorages;
+    }
+
+    public ArtifactStorage getArtifactStorage(string backendType)
+    {
+        if (auto s = backendType in _artifactStoragesByType)
+            return *s;
+        return null;
+    }
+
+    public ArtifactStorage getDefaultArtifactStorage()
+    {
+        if (_defaultArtifactStorageType.length > 0)
+            return getArtifactStorage(_defaultArtifactStorageType);
+        return null;
+    }
+
     public BuildStepSystem findStepSystem(in BuildStep step)
     {
         foreach (sys; _stepSystems)
@@ -415,6 +479,9 @@ final class PluginRegistry
         _stepSystems.length = 0;
         _stepProviders.length = 0;
         _computeProviders.length = 0;
+        _artifactStorages.length = 0;
+        _artifactStoragesByType.clear();
+        _defaultArtifactStorageType = "";
     }
 }
 

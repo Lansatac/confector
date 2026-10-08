@@ -95,15 +95,17 @@
         "confector:git_runner": "*",
         "confector:powershell_def": "*",
         "confector:powershell_runner": "*",
-        "confector:local_process": "*"
+        "confector:local_process": "*",
+        "confector:local_artifact": "*"
       }
     },
-		"./plugins/bash/def",
-		"./plugins/bash/runner",
-		"./plugins/git/def",
-		"./plugins/git/runner",
-		"./plugins/powershell/def",
-		"./plugins/powershell/runner",
-		"./plugins/executors/local_process"
+		"./plugins/definition/bash",
+		"./plugins/definition/git",
+		"./plugins/definition/powershell",
+		"./plugins/runner/bash",
+		"./plugins/runner/git",
+		"./plugins/runner/powershell",
+		"./plugins/worker/local_process",
+		"./plugins/artifact/local"
 	]
 }

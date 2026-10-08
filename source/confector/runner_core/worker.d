@@ -341,14 +341,14 @@ class HttpWorkerRunner
             mkdirRecurse(m_config.storageDir);
         }
 
-        // Load runner category plugins
+        // Load runner and artifact storage plugins
         string[] searchDirs = [m_config.pluginsDir, "out/plugins", "plugins"];
         size_t totalPluginsLoaded = 0;
         foreach (dir; searchDirs)
         {
             if (exists(dir) && isDir(dir))
             {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner, PluginCategory.artifact]);
                 totalPluginsLoaded += loaded.length;
                 logInfo("[worker] Loaded %d plugin(s) from '%s'", loaded.length, dir);
                 foreach (p; loaded)
@@ -372,7 +372,12 @@ class HttpWorkerRunner
             logInfo("[worker] Total runner plugins loaded: %d", totalPluginsLoaded);
         }
 
-        m_storage = new LocalArtifactStorage(m_config.storageDir);
+        m_storage = PluginRegistry.instance.getDefaultArtifactStorage();
+        if (m_storage is null)
+        {
+            logWarn("[worker] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
+            m_storage = new LocalArtifactStorage(m_config.storageDir);
+        }
         m_engine = new TaskEngine(m_storage, null, m_config.storageDir);
     }
 

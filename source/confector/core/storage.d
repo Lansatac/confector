@@ -168,131 +168,9 @@ class LocalArtifactStorage : ArtifactStorage
         }
     }
 
-    override ArtifactMetadata storeArtifact(string buildId, string taskId, string localFilePath, string artifactType = "file")
+    @property string backendType() const pure nothrow @safe
     {
-        import confector.core.fingerprinter : computeFileSha256;
-        import std.file : getSize;
-
-        if (!exists(localFilePath) || !isFile(localFilePath))
-        {
-            throw new Exception(format("Cannot store artifact; local file does not exist: %s", localFilePath));
-        }
-
-        string sha256 = computeFileSha256(localFilePath);
-        ulong sizeBytes = getSize(localFilePath);
-        string filename = baseName(localFilePath);
-
-        string relativeStoragePath = buildPath(buildId, taskId, filename);
-        string destPath = buildPath(m_baseStorageDir, relativeStoragePath);
-
-        string destDir = dirName(destPath);
-        if (!exists(destDir))
-        {
-            mkdirRecurse(destDir);
-        }
-
-        copy(localFilePath, destPath);
-
-        ArtifactMetadata meta;
-        meta.artifactId = format("%s_%s_%s", buildId, taskId, filename);
-        meta.buildId = buildId;
-        meta.taskId = taskId;
-        meta.filePath = localFilePath;
-        meta.sha256 = sha256;
-        meta.sizeBytes = sizeBytes;
-        meta.storageBackend = "local";
-        meta.storageUri = destPath;
-        meta.createdAt = Clock.currTime.toISOString();
-
-        return meta;
-    }
-
-    override void retrieveArtifact(string buildId, string taskId, string artifactPath, string targetLocalPath)
-    {
-        string filename = baseName(artifactPath);
-        string sourcePath = buildPath(m_baseStorageDir, buildId, taskId, filename);
-
-        if (!exists(sourcePath) || !isFile(sourcePath))
-        {
-            if (exists(m_baseStorageDir))
-            {
-                import std.file : dirEntries, SpanMode;
-                foreach (entry; dirEntries(m_baseStorageDir, SpanMode.shallow))
-                {
-                    if (entry.isDir)
-                    {
-                        string altPath = buildPath(entry.name, taskId, filename);
-                        if (exists(altPath) && isFile(altPath))
-                        {
-                            sourcePath = altPath;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!exists(sourcePath) || !isFile(sourcePath))
-        {
-            throw new Exception(format("Artifact not found in storage: %s (looked at %s)", artifactPath, sourcePath));
-        }
-
-        string targetDir = dirName(targetLocalPath);
-        if (targetDir.length > 0 && !exists(targetDir))
-        {
-            mkdirRecurse(targetDir);
-        }
-
-        copy(sourcePath, targetLocalPath);
-    }
-
-    override bool artifactExists(string buildId, string taskId, string artifactPath)
-    {
-        string filename = baseName(artifactPath);
-        string sourcePath = buildPath(m_baseStorageDir, buildId, taskId, filename);
-        if (exists(sourcePath) && isFile(sourcePath)) return true;
-
-        if (exists(m_baseStorageDir))
-        {
-            import std.file : dirEntries, SpanMode;
-            foreach (entry; dirEntries(m_baseStorageDir, SpanMode.shallow))
-            {
-                if (entry.isDir)
-                {
-                    string altPath = buildPath(entry.name, taskId, filename);
-                    if (exists(altPath) && isFile(altPath))
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    override bool getArtifactMetadata(string buildId, string taskId, string artifactPath, out ArtifactMetadata metadata)
-    {
-        import confector.core.fingerprinter : computeFileSha256;
-        import std.file : getSize, timeLastModified;
-
-        string filename = baseName(artifactPath);
-        string sourcePath = buildPath(m_baseStorageDir, buildId, taskId, filename);
-
-        if (!exists(sourcePath) || !isFile(sourcePath))
-        {
-            return false;
-        }
-
-        metadata.artifactId = format("%s_%s_%s", buildId, taskId, filename);
-        metadata.buildId = buildId;
-        metadata.taskId = taskId;
-        metadata.filePath = artifactPath;
-        metadata.sha256 = computeFileSha256(sourcePath);
-        metadata.sizeBytes = getSize(sourcePath);
-        metadata.storageBackend = "local";
-        metadata.storageUri = sourcePath;
-        metadata.createdAt = timeLastModified(sourcePath).toISOString();
-        return true;
+        return "local";
     }
 }
 
@@ -854,27 +732,40 @@ unittest
     auto storage = new LocalArtifactStorage(testDir);
     auto stateRepo = new InMemoryBuildStateRepository();
 
-    // Create a dummy file
-    string sampleFile = buildPath(testDir, "output.txt");
-    mkdirRecurse(testDir);
-    write(sampleFile, "test artifact contents");
+    // Test stream-based content-addressed artifact storage
+    string fingerprint = "fp123";
+    string artifactId = "output.txt";
+    string contents = "test artifact contents";
 
-    auto meta = storage.storeArtifact("b1", "t1", sampleFile, "file");
-    assert(meta.buildId == "b1");
-    assert(meta.taskId == "t1");
-    assert(meta.sha256.length > 0);
-    assert(storage.artifactExists("b1", "t1", "output.txt"));
+    // Store artifact via stream
+    storage.storeArtifactStream(fingerprint, artifactId, (void delegate(const(ubyte)[]) sink) {
+        sink(cast(ubyte[])contents.dup);
+    });
 
-    string retrievedFile = buildPath(testDir, "retrieved.txt");
-    storage.retrieveArtifact("b1", "t1", "output.txt", retrievedFile);
-    assert(exists(retrievedFile));
-    assert(read(retrievedFile) == "test artifact contents");
+    // Verify artifact exists
+    assert(storage.artifactExists(fingerprint, artifactId));
+    assert(!storage.artifactExists(fingerprint, "nonexistent"));
+    assert(!storage.artifactExists("", artifactId));
 
-    stateRepo.saveCachedFingerprint("t1", "hash123", [meta]);
+    // Retrieve artifact via stream
+    import std.array : Appender;
+    Appender!(ubyte[]) retrievedBuffer;
+    storage.retrieveArtifactStream(fingerprint, artifactId, (const(ubyte)[] chunk) {
+        retrievedBuffer.put(chunk);
+    });
+    assert(retrievedBuffer.data == contents.dup);
+
+    // Delete artifact
+    storage.deleteArtifact(fingerprint, artifactId);
+    assert(!storage.artifactExists(fingerprint, artifactId));
+
+    ArtifactMetadata testMeta;
+    testMeta.sha256 = "abc123";
+    stateRepo.saveCachedFingerprint("t1", "hash123", [testMeta]);
     ArtifactMetadata[] cachedMetas;
     assert(stateRepo.getCachedFingerprint("t1", "hash123", cachedMetas));
     assert(cachedMetas.length == 1);
-    assert(cachedMetas[0].sha256 == meta.sha256);
+    assert(cachedMetas[0].sha256 == "abc123");
 
     // Build recording and logging
     BuildRecord bRecord;
@@ -975,7 +866,7 @@ unittest
     taskRec.status = "succeeded";
     taskRec.fingerprint = "fp_t1";
     taskRec.durationMs = 150;
-    taskRec.producedArtifacts = [meta];
+    taskRec.producedArtifacts = [testMeta];
     taskRec.upstreamArtifactHashes = ["t0": "hash0"];
     stateRepo.recordTaskExecution(taskRec);
 

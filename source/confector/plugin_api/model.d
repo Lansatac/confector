@@ -344,17 +344,33 @@ struct ArtifactMetadata
 }
 
 /**
- * Abstract storage interface for content-addressed artifacts and archive streams.
+ * Abstract storage interface for content-addressed artifact streams.
+ * Implementations are provided by ArtifactStoragePlugin instances.
  */
 interface ArtifactStorage
 {
     /**
+     * Unique backend identifier (e.g., "local", "s3", "artifactory").
+     */
+    @property string backendType() const;
+
+    /**
      * Stores an artifact by streaming bytes from writer into storage, addressed by task fingerprint and artifact ID.
+     *
+     * Params:
+     *   taskFingerprint = Cryptographic fingerprint of the producing task
+     *   artifactId = Logical artifact identifier within the task
+     *   writer = Delegate that invokes the provided sink with chunks of artifact data
      */
     void storeArtifactStream(string taskFingerprint, string artifactId, void delegate(void delegate(const(ubyte)[])) writer);
 
     /**
      * Retrieves an artifact from storage and streams chunks of bytes into sink.
+     *
+     * Params:
+     *   taskFingerprint = Cryptographic fingerprint of the producing task
+     *   artifactId = Logical artifact identifier within the task
+     *   sink = Delegate that receives chunks of artifact data
      */
     void retrieveArtifactStream(string taskFingerprint, string artifactId, void delegate(const(ubyte)[]) sink);
 
@@ -367,26 +383,6 @@ interface ArtifactStorage
      * Deletes an artifact from storage by task fingerprint and artifact ID.
      */
     void deleteArtifact(string taskFingerprint, string artifactId);
-
-    /**
-     * Legacy store method (buildId, taskId, localFilePath).
-     */
-    ArtifactMetadata storeArtifact(string buildId, string taskId, string localFilePath, string artifactType = "file");
-
-    /**
-     * Legacy retrieve method.
-     */
-    void retrieveArtifact(string buildId, string taskId, string artifactPath, string targetLocalPath);
-
-    /**
-     * Legacy artifact existence check.
-     */
-    bool artifactExists(string buildId, string taskId, string artifactPath);
-
-    /**
-     * Legacy metadata lookup.
-     */
-    bool getArtifactMetadata(string buildId, string taskId, string artifactPath, out ArtifactMetadata metadata);
 }
 
 unittest

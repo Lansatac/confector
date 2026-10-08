@@ -1,1 +1,0 @@
-ninja -C build && cd out/server && ./confector_server.exe

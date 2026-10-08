@@ -528,8 +528,6 @@ unittest
     msg.executionPayload.expectedOutputs = [OutputArtifactDecl("app", "out/app")];
     Bson nodeBson = serializeToBson(msg.taskNode);
     Bson payloadBson = serializeToBson(msg.executionPayload);
-    Bson nodeBson = serializeToBson(msg.taskNode);
-    Bson nodeBson = serializeToBson(msg.taskNode);
     TaskExecutionPayload deserializedPayload = deserializeBson!TaskExecutionPayload(sanitizeBson(payloadBson));
     assert(deserializedPayload.expectedOutputs.length == 1);
     assert(deserializedPayload.expectedOutputs[0].path == "out/app");

@@ -88,7 +88,7 @@ int handleRun(string[] args)
         return 1;
     }
 
-    // Load execution step plugins from search paths
+    // Load execution step plugins and artifact storage plugins from search paths
     string[] searchDirs = [pluginsDir, "out/plugins", "plugins"];
     foreach (dir; searchDirs)
     {
@@ -96,7 +96,7 @@ int handleRun(string[] args)
         {
             try
             {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner, PluginCategory.artifact]);
                 foreach (p; loaded)
                 {
                     stderr.writefln("[runner] Loaded plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
@@ -174,7 +174,12 @@ int handleRun(string[] args)
         mkdirRecurse(workspaceDir);
     }
 
-    auto storage = new LocalArtifactStorage(storageDir);
+    auto storage = PluginRegistry.instance.getDefaultArtifactStorage();
+    if (storage is null)
+    {
+        stderr.writeln("[runner] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
+        storage = new LocalArtifactStorage(storageDir);
+    }
     auto engine = new TaskEngine(storage, null, storageDir);
 
     auto result = engine.executeTask(
