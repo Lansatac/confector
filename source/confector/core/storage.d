@@ -95,6 +95,16 @@ class InMemoryArtifactStorage : ArtifactStorage
     {
         return "<p>In-memory storage (test only) — no configuration required.</p>";
     }
+
+    override string presignUpload(string taskFingerprint, string artifactId)
+    {
+        return null; // In-memory storage does not support presigned URLs; fall back to proxy
+    }
+
+    override string presignDownload(string taskFingerprint, string artifactId)
+    {
+        return null; // In-memory storage does not support presigned URLs; fall back to proxy
+    }
 }
 
 
@@ -226,6 +236,16 @@ class ConfiguredArtifactStorage : ArtifactStorage
         {
             return "<p>No artifact storage configured. Please configure one in the Artifacts tab.</p>";
         }
+    }
+
+    override string presignUpload(string taskFingerprint, string artifactId)
+    {
+        return activeStorage().presignUpload(taskFingerprint, artifactId);
+    }
+
+    override string presignDownload(string taskFingerprint, string artifactId)
+    {
+        return activeStorage().presignDownload(taskFingerprint, artifactId);
     }
 }
 

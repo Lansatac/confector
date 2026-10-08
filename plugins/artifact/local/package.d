@@ -258,6 +258,24 @@ class LocalArtifactStoragePlugin : ArtifactStoragePlugin, ArtifactStorage
             catch (Exception) {}
         }
     }
+
+    /**
+     * Local filesystem storage does not support presigned URLs.
+     * Returns null so callers fall back to server-proxied upload.
+     */
+    override string presignUpload(string taskFingerprint, string artifactId)
+    {
+        return null;
+    }
+
+    /**
+     * Local filesystem storage does not support presigned URLs.
+     * Returns null so callers fall back to server-proxied download.
+     */
+    override string presignDownload(string taskFingerprint, string artifactId)
+    {
+        return null;
+    }
 }
 
 /**

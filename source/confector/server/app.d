@@ -204,7 +204,8 @@ URLRouter createRouter(
     WorkQueue workQueue,
     BuildCoordinator buildCoordinator,
     BuildStateRepository stateRepo,
-    CapacityBroker capacityBroker = null)
+    CapacityBroker capacityBroker = null,
+    ConfiguredArtifactStorage configuredStorage = null)
 {
     auto router = new URLRouter();
 
@@ -245,7 +246,7 @@ URLRouter createRouter(
     router.any("/repositories/*", repositoryRouter(stateRepo));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
-    router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance));
+    router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
     router.get("/artifacts", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/artifacts/"); });
 
     return router;
@@ -390,7 +391,7 @@ void main()
     capacityBroker.start();
 
     // Configure router and server settings
-    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, capacityBroker);
+    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, capacityBroker, configuredStorage);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {

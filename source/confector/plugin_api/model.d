@@ -409,6 +409,36 @@ interface ArtifactStorage
      * Deletes an artifact from storage by task fingerprint and artifact ID.
      */
     void deleteArtifact(string taskFingerprint, string artifactId);
+
+    /**
+     * Requests a presigned upload URL for an artifact.
+     *
+     * If the storage backend supports presigned URLs (e.g., S3-compatible), returns the URL.
+     * Returns null to indicate the caller should fall back to server-proxied upload.
+     *
+     * Params:
+     *   taskFingerprint = Cryptographic fingerprint of the producing task
+     *   artifactId = Logical artifact identifier within the task
+     *
+     * Returns:
+     *   Presigned upload URL, or null if presigned URLs are not supported.
+     */
+    string presignUpload(string taskFingerprint, string artifactId);
+
+    /**
+     * Requests a presigned download URL for an artifact.
+     *
+     * If the storage backend supports presigned URLs (e.g., S3-compatible), returns the URL.
+     * Returns null to indicate the caller should fall back to server-proxied download.
+     *
+     * Params:
+     *   taskFingerprint = Cryptographic fingerprint of the producing task
+     *   artifactId = Logical artifact identifier within the task
+     *
+     * Returns:
+     *   Presigned download URL, or null if presigned URLs are not supported.
+     */
+    string presignDownload(string taskFingerprint, string artifactId);
 }
 
 unittest

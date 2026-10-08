@@ -7,6 +7,7 @@ import confector.core.plugin_loader;
 import confector.queue.queue;
 import confector.runner_core.engine;
 import confector.runner_core.artifacts;
+import confector.runner_core.http_artifact_storage;
 import confector.runner_core.logging;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, serializeToJsonString, parseJsonString;
@@ -336,19 +337,16 @@ class HttpWorkerDaemon
         {
             mkdirRecurse(m_config.workspaceDir);
         }
-        if (!exists(m_config.storageDir))
-        {
-            mkdirRecurse(m_config.storageDir);
-        }
 
-        // Load runner and artifact storage plugins
+        // Load step executor plugins only — artifact storage is handled via HTTP (HttpArtifactStorage)
+        // so agents no longer need to know about storage backends.
         string[] searchDirs = [m_config.pluginsDir, "out/plugins", "plugins"];
         size_t totalPluginsLoaded = 0;
         foreach (dir; searchDirs)
         {
             if (exists(dir) && isDir(dir))
             {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor, PluginCategory.artifact]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor]);
                 totalPluginsLoaded += loaded.length;
                 logInfo("[worker] Loaded %d plugin(s) from '%s'", loaded.length, dir);
                 foreach (p; loaded)
@@ -372,11 +370,9 @@ class HttpWorkerDaemon
             logInfo("[worker] Total runner plugins loaded: %d", totalPluginsLoaded);
         }
 
-        m_storage = PluginRegistry.instance.getDefaultArtifactStorage();
-        if (m_storage is null)
-        {
-            throw new Exception("[worker] No artifact storage plugin registered.");
-        }
+        // Use HttpArtifactStorage so the worker communicates with the server for all
+        // artifact operations. The server decides whether to use presigned URLs or proxy.
+        m_storage = new HttpArtifactStorage(m_config.serverUrl, m_config.workerToken);
         m_engine = new TaskEngine(m_storage);
     }
 

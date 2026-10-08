@@ -3,7 +3,9 @@ module confector.runner_app.main;
 import confector.core.model;
 import confector.core.plugin;
 import confector.core.plugin_loader;
+import confector.plugin_api.model : ArtifactStorage;
 import confector.runner_core;
+import confector.runner_core.http_artifact_storage;
 
 import std.getopt;
 import std.stdio : writeln, writefln, stderr, stdin, readln;
@@ -60,13 +62,15 @@ int handleRun(string[] args)
     string payloadArg;
     string workspaceDir = "";
     string storageDir = "";
+    string serverUrl = "";
     string pluginsDir = "plugins";
 
     auto helpInfo = getopt(
         args,
         "payload", "Task payload JSON file path, JSON string, or '-' for stdin", &payloadArg,
         "workspace", "Workspace directory path", &workspaceDir,
-        "storage-dir", "Artifact storage directory", &storageDir,
+        "storage-dir", "Artifact storage directory (required for offline mode)", &storageDir,
+        "server-url", "Confector server URL for HTTP artifact storage", &serverUrl,
         "plugins-dir", "Directory containing runner plugins", &pluginsDir
     );
 
@@ -81,13 +85,8 @@ int handleRun(string[] args)
         stderr.writeln("Error: --workspace is required for run command.");
         return 1;
     }
-    if (storageDir.length == 0)
-    {
-        stderr.writeln("Error: --storage-dir is required for run command.");
-        return 1;
-    }
 
-    // Load execution step plugins and artifact storage plugins from search paths
+    // Load execution step plugins from search paths (artifact storage is handled via HTTP or local plugin)
     string[] searchDirs = [pluginsDir, "out/plugins", "plugins"];
     foreach (dir; searchDirs)
     {
@@ -95,7 +94,7 @@ int handleRun(string[] args)
         {
             try
             {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor, PluginCategory.artifact]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor]);
                 foreach (p; loaded)
                 {
                     stderr.writefln("[runner] Loaded plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
@@ -173,11 +172,33 @@ int handleRun(string[] args)
         mkdirRecurse(workspaceDir);
     }
 
-    auto storage = PluginRegistry.instance.getDefaultArtifactStorage();
-    if (storage is null)
+    // Resolve artifact storage: prefer HTTP (server-mediated), fall back to local plugin
+    ArtifactStorage storage;
+    if (serverUrl.length > 0)
     {
-        stderr.writeln("Error: No artifact storage plugin registered. Please ensure an artifact plugin is loaded.");
-        return 1;
+        storage = new HttpArtifactStorage(serverUrl);
+    }
+    else
+    {
+        // Offline mode: load artifact storage plugins locally
+        foreach (dir; searchDirs)
+        {
+            if (exists(dir) && isDir(dir))
+            {
+                try
+                {
+                    PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.artifact]);
+                }
+                catch (Exception) {}
+            }
+        }
+        storage = PluginRegistry.instance.getDefaultArtifactStorage();
+        if (storage is null)
+        {
+            stderr.writeln("Error: No artifact storage plugin registered and no --server-url provided.");
+            stderr.writeln("Please provide --server-url or ensure an artifact plugin is loaded.");
+            return 1;
+        }
     }
     auto engine = new TaskEngine(storage);
 
