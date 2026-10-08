@@ -355,6 +355,32 @@ interface ArtifactStorage
     @property string backendType() const;
 
     /**
+     * Human-readable display name for the storage backend.
+     */
+    @property string displayName() const;
+
+    /**
+     * Short description of the storage backend.
+     */
+    @property string description() const;
+
+    /**
+     * Returns the default configuration as a JSON value.
+     */
+    JSONValue defaultConfig() const;
+
+    /**
+     * Validates a configuration JSON value and returns an array of error messages.
+     * Returns an empty array if the configuration is valid.
+     */
+    string[] validateConfig(in JSONValue config) const;
+
+    /**
+     * Renders an HTML form for configuring the artifact storage backend.
+     */
+    string renderConfigFormHtml(in JSONValue currentConfig) const;
+
+    /**
      * Stores an artifact by streaming bytes from writer into storage, addressed by task fingerprint and artifact ID.
      *
      * Params:

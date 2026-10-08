@@ -1,0 +1,55 @@
+extends layout
+
+block maincontent
+  div.admin-container
+    div.header-section
+      h1 Artifact Storage
+      p Configure the artifact storage backend for storing and retrieving build artifacts. Select a backend and set its configuration.
+
+    - if (errorMessage.length > 0)
+      div.alert.alert-danger(style="margin-top: 15px; padding: 12px; background-color: #fee2e2; border: 1px solid #ef4444; color: #b91c1c; border-radius: 6px;")
+        strong Error:
+        span #{errorMessage}
+
+    - if (successMessage.length > 0)
+      div.alert.alert-success(style="margin-top: 15px; padding: 12px; background-color: #dcfce7; border: 1px solid #22c55e; color: #15803d; border-radius: 6px;")
+        strong Success:
+        span #{successMessage}
+
+    div.stats-grid(style="margin-top: 20px;")
+      div.stat-card
+        div.stat-value #{storages.length}
+        div.stat-label Available Backends
+      div.stat-card
+        div.stat-value #{defaultType.length > 0 ? defaultType : "none"}
+        div.stat-label Default Backend
+
+    - if (storages.length == 0)
+      div.card(style="margin-top: 25px; padding: 30px; text-align: center; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;")
+        h3(style="color: #64748b;") No Artifact Storage Backends Available
+        p(style="color: #94a3b8;") Load an artifact plugin to enable artifact storage. Artifact plugins can be loaded via the Admin panel.
+    - else
+      div.card(style="margin-top: 25px; padding: 20px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;")
+        h3(style="margin-top: 0; margin-bottom: 16px;") Select Artifact Storage Backend
+
+        form(action="/artifacts/select", method="POST", style="display: flex; gap: 10px; align-items: center; margin-bottom: 20px;")
+          select.form-control(name="backendType", style="flex: 1; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px;")
+            - foreach(s; storages)
+              - if (defaultType == s.backendType)
+                option(value="#{s.backendType}", selected) #{s.displayName} (#{s.backendType})
+              - else
+                option(value="#{s.backendType}") #{s.displayName} (#{s.backendType})
+          button.btn.btn-primary(type="submit", style="padding: 8px 16px;") Select as Default
+
+      - if (selectedStorage !is null)
+        div.card(style="margin-top: 20px; padding: 20px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;")
+          h3(style="margin-top: 0; margin-bottom: 8px;") Configure: #{selectedStorage.displayName}
+          p(style="color: #64748b; font-size: 0.9em; margin-bottom: 16px;") #{selectedStorage.description}
+
+          form(action="/artifacts/configure", method="POST")
+            input(type="hidden", name="backendType", value="#{selectedStorage.backendType}")
+
+            != configFormHtml
+
+            div(style="margin-top: 20px;")
+              button.btn.btn-primary(type="submit", style="padding: 8px 16px;") Save Configuration

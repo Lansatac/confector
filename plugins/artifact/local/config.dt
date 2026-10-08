@@ -1,0 +1,5 @@
+div.artifact-config-subform
+  div.form-group
+    label(for="config_baseDir") Base Storage Directory
+    input#config_baseDir.form-control(type="text", name="config_baseDir", value=baseDir, required)
+    small.form-help-text Local filesystem path where content-addressed artifact archives are stored, organized by task fingerprint.

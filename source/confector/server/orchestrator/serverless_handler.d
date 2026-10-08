@@ -19,7 +19,6 @@ struct ServerlessTaskRequest
     @asName("workspace_dir") string workspaceDir;
     @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
     bool force = false;
-    @asName("storage_base_dir") string storageBaseDir;
     @optional @asName("allowed_repositories") string[] allowedRepositories;
     @optional @asName("repository_map") string[string] repositoryMap;
 }
@@ -61,6 +60,10 @@ struct JsonRpcResponse
 
 /**
  * Executes a single task request in a stateless serverless context.
+ *
+ * Params:
+ *   request = The serverless task request payload.
+ *   customEngine = Optional pre-configured TaskEngine; if null, one is created from the PluginRegistry default storage.
  */
 ServerlessTaskResponse executeServerlessTask(
     in ServerlessTaskRequest request,
@@ -70,17 +73,10 @@ ServerlessTaskResponse executeServerlessTask(
     TaskEngine engine = customEngine;
     if (engine is null)
     {
-        if (request.storageBaseDir.length == 0)
-        {
-            ServerlessTaskResponse errorResponse;
-            errorResponse.taskId = request.task.id;
-            errorResponse.buildId = request.buildId;
-            errorResponse.status = TaskStatus.failed;
-            errorResponse.errorMessage = "storageBaseDir is required";
-            return errorResponse;
-        }
-        auto storage = new LocalArtifactStorage(request.storageBaseDir);
-        engine = new TaskEngine(storage, request.storageBaseDir);
+        // Use ConfiguredArtifactStorage so the engine always forwards to the currently
+        // configured storage, supporting runtime config changes.
+        auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
+        engine = new TaskEngine(configuredStorage);
     }
 
     auto res = engine.executeTask(
@@ -175,6 +171,7 @@ unittest
 
     PluginRegistry.instance.shutdownAll();
     PluginRegistry.instance.registerPlugin(new MockServerlessStepRunner());
+    PluginRegistry.instance.registerArtifactStorage(new InMemoryArtifactStorage());
 
     string testDir = "test_serverless_run";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -184,7 +181,6 @@ unittest
     ServerlessTaskRequest req;
     req.buildId = "srv_bld_1";
     req.workspaceDir = testDir;
-    req.storageBaseDir = buildPath(testDir, "artifacts");
 
     TaskNode node;
     node.id = "echo_step";

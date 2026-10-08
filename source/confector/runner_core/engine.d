@@ -23,12 +23,10 @@ import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
 class TaskEngine
 {
     private ArtifactStorage m_artifactStorage;
-    private string m_storageBaseDir;
 
-    this(ArtifactStorage artifactStorage = null, string storageBaseDir = "")
+    this(ArtifactStorage artifactStorage = null)
     {
         m_artifactStorage = artifactStorage;
-        m_storageBaseDir = storageBaseDir;
     }
 
     @property ArtifactStorage artifactStorage() { return m_artifactStorage; }
@@ -371,7 +369,7 @@ unittest
     PluginRegistry.instance.shutdownAll();
     PluginRegistry.instance.registerPlugin(new MockStepRunner());
 
-    auto storage = new LocalArtifactStorage(buildPath(testDir, "storage"));
+    auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
 
     TaskNode node1;

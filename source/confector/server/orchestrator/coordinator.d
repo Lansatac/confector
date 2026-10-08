@@ -993,7 +993,7 @@ class BuildCoordinator
 unittest
 {
     // Unit tests for BuildCoordinator
-    auto storage = new LocalArtifactStorage(".confector/test_coord_artifacts");
+    auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue, "http://127.0.0.1:8080");

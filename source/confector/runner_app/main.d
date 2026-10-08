@@ -1,7 +1,6 @@
 module confector.runner_app.main;
 
 import confector.core.model;
-import confector.core.storage;
 import confector.core.plugin;
 import confector.core.plugin_loader;
 import confector.runner_core;
@@ -177,10 +176,10 @@ int handleRun(string[] args)
     auto storage = PluginRegistry.instance.getDefaultArtifactStorage();
     if (storage is null)
     {
-        stderr.writeln("[runner] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
-        storage = new LocalArtifactStorage(storageDir);
+        stderr.writeln("Error: No artifact storage plugin registered. Please ensure an artifact plugin is loaded.");
+        return 1;
     }
-    auto engine = new TaskEngine(storage, storageDir);
+    auto engine = new TaskEngine(storage);
 
     auto result = engine.executeTask(
         buildId,

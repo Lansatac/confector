@@ -17,7 +17,7 @@ import confector.server.config : ServerConfig, registerServerConfigDefinitions, 
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.storage : BuildStateRepository, LocalArtifactStorage, InMemoryBuildStateRepository;
+import confector.core.storage : BuildStateRepository, InMemoryBuildStateRepository, InMemoryArtifactStorage, ConfiguredArtifactStorage;
 import confector.queue.mongo_queue : MongoWorkQueue;
 import confector.queue.queue : WorkQueue, InMemoryWorkQueue;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
@@ -27,6 +27,7 @@ import confector.storage.mongo_repository : MongoBuildStateRepository;
 
 import controller.admin_controller : adminRouter;
 import controller.api_controller : apiRouter;
+import controller.artifacts_controller : artifactsRouter;
 import controller.dashboard_controller : dashboardRouter;
 import controller.executor_controller : executorRouter;
 import controller.repositorycontroller : repositoryRouter;
@@ -244,6 +245,9 @@ URLRouter createRouter(
     router.any("/repositories/*", repositoryRouter(stateRepo));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
+    router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance));
+    router.get("/artifacts", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/artifacts/"); });
+
     return router;
 }
 
@@ -331,23 +335,19 @@ void main()
     // Automatically load plugins
     initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
 
-    // Validate required configuration
-    if (serverConfig.storage.artifactsDir.length == 0)
-    {
-        logError("FATAL: storage.artifactsDir is required but was not configured.");
-        logError("Please set CONFECTOR_SERVER_STORAGE_ARTIFACTSDIR or provide it in the config.");
-        return;
-    }
-
-    // Resolve artifact storage from plugin registry (falls back to direct instantiation if no plugin loaded)
+    // Validate that at least one artifact storage plugin is registered
     auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
     if (artifactStorage is null)
     {
-        logWarn("[storage] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
-        artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
+        logError("[storage] No artifact storage plugin registered! Please ensure a valid artifact plugin is available.");
+        return;
     }
-    auto taskEngine = new TaskEngine(artifactStorage, serverConfig.storage.artifactsDir);
-    auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
+
+    // Use ConfiguredArtifactStorage so that TaskEngine and BuildCoordinator always forward
+    // to the currently configured storage, allowing runtime changes via the Artifacts UI.
+    auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
+    auto taskEngine = new TaskEngine(configuredStorage);
+    auto buildCoordinator = new BuildCoordinator(configuredStorage, storage.stateRepo, storage.workQueue);
     logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Initialize capacity broker
@@ -411,7 +411,7 @@ unittest
 
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
-    auto storage = new LocalArtifactStorage("test_app_storage");
+    auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
     auto broker = new DefaultCapacityBroker(queue, coordinator);
@@ -432,7 +432,4 @@ unittest
 
     assert(broker.provisioners.length == 1);
     assert(broker.maxCapacity >= 1);
-
-    import std.file : exists, rmdirRecurse;
-    if (exists("test_app_storage")) rmdirRecurse("test_app_storage");
 }

@@ -375,10 +375,9 @@ class HttpWorkerDaemon
         m_storage = PluginRegistry.instance.getDefaultArtifactStorage();
         if (m_storage is null)
         {
-            logWarn("[worker] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
-            m_storage = new LocalArtifactStorage(m_config.storageDir);
+            throw new Exception("[worker] No artifact storage plugin registered.");
         }
-        m_engine = new TaskEngine(m_storage, m_config.storageDir);
+        m_engine = new TaskEngine(m_storage);
     }
 
     TaskExecutionResult processOneMessage(in TaskQueueMessage msg)

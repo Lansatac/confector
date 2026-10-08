@@ -429,6 +429,19 @@ final class PluginRegistry
         return null;
     }
 
+    public string getDefaultArtifactStorageType()
+    {
+        return _defaultArtifactStorageType;
+    }
+
+    public void setDefaultArtifactStorage(string backendType)
+    {
+        if (backendType in _artifactStoragesByType)
+        {
+            _defaultArtifactStorageType = backendType;
+        }
+    }
+
     public BuildStepSystem findStepSystem(in BuildStep step)
     {
         foreach (sys; _stepSystems)

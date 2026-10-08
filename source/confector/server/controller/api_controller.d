@@ -1111,9 +1111,9 @@ unittest
     }
 
     PluginRegistry.instance.registerPlugin(new MockApiPlugin());
-    auto storage = new LocalArtifactStorage(buildPath(testDir, "storage"));
+    auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
-    auto engine = new TaskEngine(storage, stateRepo);
+    auto engine = new TaskEngine(storage);
     auto queue = new InMemoryWorkQueue();
 
     auto router = apiRouter(engine, queue);

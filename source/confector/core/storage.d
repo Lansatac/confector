@@ -2,175 +2,230 @@ module confector.core.storage;
 
 import confector.core.model;
 import confector.core.executor : WorkerRecord;
+import confector.core.plugin : PluginRegistry;
 import std.file : exists, isFile, isDir, mkdirRecurse, read, write, copy, remove, rename, rmdir, dirEntries, SpanMode;
 import std.path : buildPath, dirName, baseName;
 import std.format : format;
 import std.datetime.systime : Clock;
+import std.json : JSONValue, JSONType;
 
 
 /**
- * Local filesystem implementation of ArtifactStorage.
+ * In-memory implementation of ArtifactStorage for unit testing.
+ * Stores artifacts as byte arrays in a hash map keyed by (fingerprint, artifactId).
  */
-class LocalArtifactStorage : ArtifactStorage
+class InMemoryArtifactStorage : ArtifactStorage
 {
-    private string m_baseStorageDir;
+    private ubyte[][string] m_artifacts;
 
-    this(string baseStorageDir)
+    private static string artifactKey(string taskFingerprint, string artifactId) pure nothrow @safe
     {
-        if (baseStorageDir.length == 0)
-        {
-            throw new Exception("baseStorageDir must not be empty");
-        }
-        m_baseStorageDir = baseStorageDir;
-        if (!exists(m_baseStorageDir))
-        {
-            mkdirRecurse(m_baseStorageDir);
-        }
-    }
-
-    private static void validateStorageKey(string key, string paramName)
-    {
-        if (key.length == 0)
-        {
-            throw new Exception(format("Invalid %s: key cannot be empty", paramName));
-        }
-        import std.algorithm.searching : canFind;
-        if (key.canFind("..") || key.canFind('/') || key.canFind('\\') || key.canFind(':') || key.canFind('\0'))
-        {
-            throw new Exception(format("Invalid %s '%s': contains illegal path characters or traversal sequence", paramName, key));
-        }
+        return taskFingerprint ~ "\0" ~ artifactId;
     }
 
     override void storeArtifactStream(string taskFingerprint, string artifactId, void delegate(void delegate(const(ubyte)[])) writer)
     {
         if (writer is null)
-        {
             throw new Exception("Writer delegate cannot be null");
-        }
-        validateStorageKey(taskFingerprint, "taskFingerprint");
-        validateStorageKey(artifactId, "artifactId");
+        if (taskFingerprint.length == 0)
+            throw new Exception("taskFingerprint cannot be empty");
+        if (artifactId.length == 0)
+            throw new Exception("artifactId cannot be empty");
 
-        string destDir = buildPath(m_baseStorageDir, taskFingerprint);
-        if (!exists(destDir))
-        {
-            mkdirRecurse(destDir);
-        }
-
-        string destPath = buildPath(destDir, artifactId ~ ".zip");
-
-        import std.process : thisProcessID;
-        import std.random : unpredictableSeed;
-        string tempPath = format("%s.tmp.%d.%d", destPath, thisProcessID, unpredictableSeed);
-
-        import std.stdio : File;
-        {
-            auto f = File(tempPath, "wb");
-            scope(failure)
-            {
-                if (exists(tempPath))
-                {
-                    try { remove(tempPath); } catch (Exception) {}
-                }
-            }
-
-            writer((const(ubyte)[] chunk) {
-                if (chunk.length > 0)
-                {
-                    f.rawWrite(chunk);
-                }
-            });
-            f.flush();
-            f.close();
-        }
-
-        import std.file : rename, remove;
-        if (exists(destPath))
-        {
-            remove(destPath);
-        }
-        rename(tempPath, destPath);
+        import std.array : Appender;
+        Appender!(ubyte[]) buffer;
+        writer((const(ubyte)[] chunk) {
+            if (chunk.length > 0)
+                buffer.put(chunk);
+        });
+        m_artifacts[artifactKey(taskFingerprint, artifactId)] = buffer.data;
     }
 
     override void retrieveArtifactStream(string taskFingerprint, string artifactId, void delegate(const(ubyte)[]) sink)
     {
         if (sink is null)
-        {
             throw new Exception("Sink delegate cannot be null");
-        }
-        validateStorageKey(taskFingerprint, "taskFingerprint");
-        validateStorageKey(artifactId, "artifactId");
 
-        string sourcePath = buildPath(m_baseStorageDir, taskFingerprint, artifactId ~ ".zip");
-        if (!exists(sourcePath) || !isFile(sourcePath))
-        {
-            throw new Exception(format("Artifact not found in storage: fingerprint='%s', artifactId='%s' (looked at %s)", taskFingerprint, artifactId, sourcePath));
-        }
+        string key = artifactKey(taskFingerprint, artifactId);
+        if (key !in m_artifacts)
+            throw new Exception(format("Artifact not found in storage: fingerprint='%s', artifactId='%s'", taskFingerprint, artifactId));
 
-        import std.stdio : File;
-        auto f = File(sourcePath, "rb");
-        ubyte[64 * 1024] buffer;
-        while (!f.eof)
-        {
-            ubyte[] chunk = f.rawRead(buffer[]);
-            if (chunk.length > 0)
-            {
-                sink(chunk);
-            }
-        }
+        sink(m_artifacts[key]);
     }
 
     override bool artifactExists(string taskFingerprint, string artifactId)
     {
         if (taskFingerprint.length == 0 || artifactId.length == 0) return false;
+        return (artifactKey(taskFingerprint, artifactId) in m_artifacts) !is null;
+    }
+
+    override void deleteArtifact(string taskFingerprint, string artifactId)
+    {
+        string key = artifactKey(taskFingerprint, artifactId);
+        if (key in m_artifacts)
+            m_artifacts.remove(key);
+    }
+
+    @property string backendType() const pure nothrow @safe
+    {
+        return "memory";
+    }
+
+    @property string displayName() const pure nothrow @safe
+    {
+        return "In-Memory (Test)";
+    }
+
+    @property string description() const
+    {
+        return "In-memory artifact storage for unit testing only.";
+    }
+
+    JSONValue defaultConfig() const
+    {
+        return JSONValue(string[string].init);
+    }
+
+    string[] validateConfig(in JSONValue config) const
+    {
+        return null;
+    }
+
+    string renderConfigFormHtml(in JSONValue currentConfig) const
+    {
+        return "<p>In-memory storage (test only) — no configuration required.</p>";
+    }
+}
+
+
+/**
+ * Meta-storage that forwards all ArtifactStorage calls to the currently configured
+ * storage from the PluginRegistry. Throws when no storage is configured.
+ */
+class ConfiguredArtifactStorage : ArtifactStorage
+{
+    private PluginRegistry m_registry;
+
+    this(PluginRegistry registry)
+    {
+        m_registry = registry;
+    }
+
+    private ArtifactStorage activeStorage()
+    {
+        if (m_registry is null)
+            throw new Exception("ConfiguredArtifactStorage: no PluginRegistry configured");
+
+        auto storage = m_registry.getDefaultArtifactStorage();
+        if (storage is null)
+            throw new Exception("ConfiguredArtifactStorage: no default artifact storage configured in PluginRegistry");
+
+        return storage;
+    }
+
+    override void storeArtifactStream(string taskFingerprint, string artifactId, void delegate(void delegate(const(ubyte)[])) writer)
+    {
+        activeStorage().storeArtifactStream(taskFingerprint, artifactId, writer);
+    }
+
+    override void retrieveArtifactStream(string taskFingerprint, string artifactId, void delegate(const(ubyte)[]) sink)
+    {
+        activeStorage().retrieveArtifactStream(taskFingerprint, artifactId, sink);
+    }
+
+    override bool artifactExists(string taskFingerprint, string artifactId)
+    {
         try
         {
-            validateStorageKey(taskFingerprint, "taskFingerprint");
-            validateStorageKey(artifactId, "artifactId");
+            return activeStorage().artifactExists(taskFingerprint, artifactId);
         }
         catch (Exception)
         {
             return false;
         }
-
-        string filePath = buildPath(m_baseStorageDir, taskFingerprint, artifactId ~ ".zip");
-        return exists(filePath) && isFile(filePath);
     }
 
     override void deleteArtifact(string taskFingerprint, string artifactId)
     {
-        validateStorageKey(taskFingerprint, "taskFingerprint");
-        validateStorageKey(artifactId, "artifactId");
+        activeStorage().deleteArtifact(taskFingerprint, artifactId);
+    }
 
-        string filePath = buildPath(m_baseStorageDir, taskFingerprint, artifactId ~ ".zip");
-        if (exists(filePath))
+    @property string backendType() const
+    {
+        try
         {
-            import std.file : remove, rmdir, dirEntries, SpanMode;
-            remove(filePath);
-
-            string parentDir = buildPath(m_baseStorageDir, taskFingerprint);
-            try
-            {
-                if (exists(parentDir))
-                {
-                    bool empty = true;
-                    foreach (entry; dirEntries(parentDir, SpanMode.shallow))
-                    {
-                        empty = false;
-                        break;
-                    }
-                    if (empty)
-                    {
-                        rmdir(parentDir);
-                    }
-                }
-            }
-            catch (Exception) {}
+            auto self = cast(ConfiguredArtifactStorage)this;
+            return self.activeStorage().backendType;
+        }
+        catch (Exception)
+        {
+            return "configured";
         }
     }
 
-    @property string backendType() const pure nothrow @safe
+    @property string displayName() const
     {
-        return "local";
+        try
+        {
+            auto self = cast(ConfiguredArtifactStorage)this;
+            return self.activeStorage().displayName;
+        }
+        catch (Exception)
+        {
+            return "Configured Storage";
+        }
+    }
+
+    @property string description() const
+    {
+        try
+        {
+            auto self = cast(ConfiguredArtifactStorage)this;
+            return self.activeStorage().description;
+        }
+        catch (Exception)
+        {
+            return "Meta-storage forwarding to the currently configured artifact storage backend.";
+        }
+    }
+
+    JSONValue defaultConfig() const
+    {
+        try
+        {
+            auto self = cast(ConfiguredArtifactStorage)this;
+            return self.activeStorage().defaultConfig();
+        }
+        catch (Exception)
+        {
+            return JSONValue(string[string].init);
+        }
+    }
+
+    string[] validateConfig(in JSONValue config) const
+    {
+        try
+        {
+            auto self = cast(ConfiguredArtifactStorage)this;
+            return self.activeStorage().validateConfig(config);
+        }
+        catch (Exception)
+        {
+            return ["No artifact storage configured"];
+        }
+    }
+
+    string renderConfigFormHtml(in JSONValue currentConfig) const
+    {
+        try
+        {
+            auto self = cast(ConfiguredArtifactStorage)this;
+            return self.activeStorage().renderConfigFormHtml(currentConfig);
+        }
+        catch (Exception)
+        {
+            return "<p>No artifact storage configured. Please configure one in the Artifacts tab.</p>";
+        }
     }
 }
 
@@ -723,13 +778,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
 
 unittest
 {
-    import std.file : rmdirRecurse;
-
-    string testDir = "test_artifacts_storage";
-    if (exists(testDir)) rmdirRecurse(testDir);
-    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
-
-    auto storage = new LocalArtifactStorage(testDir);
+    auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
 
     // Test stream-based content-addressed artifact storage
@@ -939,7 +988,6 @@ unittest
     });
 
     assert(storage.artifactExists(fp1, art1));
-    assert(exists(buildPath(testDir, fp1, art1 ~ ".zip")));
 
     // Test stream storage read
     Appender!(ubyte[]) retrievedBytes;
@@ -948,9 +996,14 @@ unittest
     });
     assert(cast(string) retrievedBytes.data == "zip payload chunk 1; zip payload chunk 2;");
 
-    // Test ZipPackager round-trip with LocalArtifactStorage
-    string wsDir = buildPath(testDir, "ws_source");
-    string unpackDir = buildPath(testDir, "ws_unpacked");
+    // Test ZipPackager round-trip with InMemoryArtifactStorage
+    import std.file : rmdirRecurse;
+    string testDir2 = "test_artifacts_storage_zip";
+    if (exists(testDir2)) rmdirRecurse(testDir2);
+    scope(exit) if (exists(testDir2)) rmdirRecurse(testDir2);
+
+    string wsDir = buildPath(testDir2, "ws_source");
+    string unpackDir = buildPath(testDir2, "ws_unpacked");
     mkdirRecurse(buildPath(wsDir, "dist"));
     write(buildPath(wsDir, "dist", "bundle.js"), "console.log('hello');");
     write(buildPath(wsDir, "dist", "style.css"), "body { margin: 0; }");
@@ -976,20 +1029,6 @@ unittest
     // Test deletion
     storage.deleteArtifact(fp1, art1);
     assert(!storage.artifactExists(fp1, art1));
-    assert(!exists(buildPath(testDir, fp1, art1 ~ ".zip")));
-
-    // Test key traversal validation
-    bool caughtBadKey = false;
-    try
-    {
-        storage.storeArtifactStream("../escape", "art", (sink) { sink([1, 2, 3]); });
-    }
-    catch (Exception)
-    {
-        caughtBadKey = true;
-    }
-    assert(caughtBadKey);
-    assert(!storage.artifactExists("../escape", "art"));
 
     // Test retrieval of nonexistent artifact
     bool caughtNotFound = false;

@@ -919,7 +919,7 @@ unittest
 {
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
-    auto storage = new LocalArtifactStorage("test_dashboard_storage");
+    auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage, stateRepo);
 
     auto router = dashboardRouter(engine, queue, stateRepo);

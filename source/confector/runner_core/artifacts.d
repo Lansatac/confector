@@ -156,7 +156,7 @@ final class ArtifactStager
 unittest
 {
     import std.file : exists, rmdirRecurse, mkdirRecurse, write, readText;
-    import confector.core.storage : LocalArtifactStorage;
+    import confector.core.storage : InMemoryArtifactStorage;
 
     string testDir = "test_artifact_stager_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -164,14 +164,13 @@ unittest
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
     string wsDir = buildPath(testDir, "ws");
-    string storageDir = buildPath(testDir, "storage");
     string destDir = buildPath(testDir, "dest");
     mkdirRecurse(wsDir);
     mkdirRecurse(destDir);
 
     write(buildPath(wsDir, "out.txt"), "hello world artifact");
 
-    auto storage = new LocalArtifactStorage(storageDir);
+    auto storage = new InMemoryArtifactStorage();
     auto decl = OutputArtifactDecl("my_art", "out.txt");
     auto meta = ArtifactStager.packOutputArtifact(storage, "fp123", "build1", "task1", wsDir, decl);
 

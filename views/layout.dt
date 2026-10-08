@@ -32,6 +32,8 @@ html(lang="en")
             isActive = true;
           } else if (route === 'admin' && currentPath.indexOf('/admin') === 0) {
             isActive = true;
+          } else if (route === 'artifacts' && currentPath.indexOf('/artifacts') === 0) {
+            isActive = true;
           }
           if (isActive) {
             link.classList.add('active');

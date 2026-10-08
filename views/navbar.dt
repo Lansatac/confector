@@ -10,4 +10,5 @@ div.navbar-container
     a.nav-item(href="/builds/", data-route="builds") Builds
     a.nav-item(href="/executors/", data-route="executors") Executors
     a.nav-item(href="/repositories/", data-route="repositories") Repositories
+    a.nav-item(href="/artifacts/", data-route="artifacts") Artifacts
     a.nav-item(href="/admin/plugins", data-route="admin") Admin

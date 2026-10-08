@@ -416,7 +416,7 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         long defaultConcurrency = cast(long)(m_scopedConfig.maxConcurrency > 0 ? m_scopedConfig.maxConcurrency : totalCPUs);
         if (defaultConcurrency <= 0) defaultConcurrency = 1;
 
-        string workDir = m_scopedConfig.workspaceDir.length > 0 ? m_scopedConfig.workspaceDir : ".confector/workspaces";
+        string workDir = m_scopedConfig.workspaceDir.length > 0 ? m_scopedConfig.workspaceDir : "/workspaces";
 
         JSONValue cfg = JSONValue([
             "maxConcurrency": JSONValue(defaultConcurrency),
@@ -469,7 +469,7 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
 
         int concurrency = totalCPUs > 0 ? cast(int)totalCPUs : 1;
         int hostCores = concurrency;
-        string workspaceDir = ".confector/workspaces";
+        string workspaceDir = "/workspaces";
         string defaultShell = "powershell";
         bool isolateEnvironment = false;
         string allowedStepsStr = "";
@@ -561,10 +561,10 @@ struct LocalProcessProvisionerConfig
     string serverUrl = "http://localhost:8080";
 
     @Description("Base directory for runner workspaces")
-    string workspaceDir = ".confector/workspaces";
+    string workspaceDir = "/workspaces";
 
     @Description("Base directory for runner artifacts")
-    string storageDir = ".confector/artifacts";
+    string storageDir = "/artifacts";
 
     @Description("Directory for bundled plugins")
     string pluginsDir = "plugins";
@@ -817,7 +817,7 @@ unittest
     auto defConfig = provider.defaultConfig();
     assert(defConfig.type == JSONType.object);
     assert(defConfig["maxConcurrency"].integer >= 1);
-    assert(defConfig["workspaceDir"].str == ".confector/workspaces");
+    assert(defConfig["workspaceDir"].str == "/workspaces");
     assert(defConfig["isolateEnvironment"].type == JSONType.false_);
 
     // runnerBinary comes from plugin config at construction time

@@ -364,8 +364,8 @@ unittest
     assert(!broker.isRunning);
 
     // 2. End-to-end integration: BuildCoordinator + WorkQueue + DefaultCapacityBroker
-    import confector.core.storage : LocalArtifactStorage, InMemoryBuildStateRepository;
-    auto storage = new LocalArtifactStorage(".confector/test_broker_artifacts");
+    import confector.core.storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
     auto e2eQueue = new InMemoryWorkQueue();
     auto coord = new BuildCoordinator(storage, stateRepo, e2eQueue);

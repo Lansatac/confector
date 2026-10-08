@@ -6,6 +6,7 @@ import std.path : buildPath;
 import std.process : thisProcessID;
 import std.random : unpredictableSeed;
 import std.stdio : File;
+import std.json : JSONValue, JSONType;
 
 import confector.plugin_api.model : ArtifactStorage;
 import confector.plugin_api.plugin : Plugin, PluginContext, PluginCategory, ArtifactStoragePlugin, ConfigDefinition;
@@ -29,7 +30,7 @@ class LocalArtifactStoragePlugin : ArtifactStoragePlugin, ArtifactStorage
     {
         import vibe.data.json : Json;
         return [
-            ConfigDefinition("baseDir", "", Json(".confector/artifacts"), "Base directory for artifact storage", false)
+            ConfigDefinition("baseDir", "", Json("/artifacts"), "Base directory for artifact storage", false)
         ];
     }
 
@@ -38,11 +39,11 @@ class LocalArtifactStoragePlugin : ArtifactStoragePlugin, ArtifactStorage
         m_context = context;
         if (context !is null)
         {
-            m_baseStorageDir = context.config.getString("baseDir", ".confector/artifacts");
+            m_baseStorageDir = context.config.getString("baseDir", "/artifacts");
         }
         else
         {
-            m_baseStorageDir = ".confector/artifacts";
+            m_baseStorageDir = "/artifacts";
         }
 
         if (!exists(m_baseStorageDir))
@@ -58,6 +59,57 @@ class LocalArtifactStoragePlugin : ArtifactStoragePlugin, ArtifactStorage
     @property string backendType() const pure nothrow @safe
     {
         return "local";
+    }
+
+    @property string displayName() const pure nothrow @safe
+    {
+        return "Local Filesystem";
+    }
+
+    override JSONValue defaultConfig() const
+    {
+        return JSONValue(["baseDir": JSONValue(m_baseStorageDir)]);
+    }
+
+    string[] validateConfig(in JSONValue config) const
+    {
+        string[] errors;
+        if (config.type != JSONType.object)
+        {
+            errors ~= "Configuration must be a JSON object";
+            return errors;
+        }
+
+        if (auto p = "baseDir" in config)
+        {
+            if (p.type != JSONType.string || p.str.length == 0)
+            {
+                errors ~= "baseDir cannot be empty";
+            }
+        }
+
+        return errors;
+    }
+
+    string renderConfigFormHtml(in JSONValue currentConfig) const
+    {
+        import diet.html : compileHTMLDietFile;
+        import std.array : appender;
+
+        auto html = appender!string;
+
+        string baseDir = "/artifacts";
+        if (currentConfig.type == JSONType.object)
+        {
+            if (auto p = "baseDir" in currentConfig)
+            {
+                if (p.type == JSONType.string) baseDir = p.str;
+            }
+        }
+
+        compileHTMLDietFile!("config.dt", baseDir)(html);
+
+        return html.data;
     }
 
     private static void validateStorageKey(string key, string paramName)
