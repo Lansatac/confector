@@ -4,7 +4,83 @@ This document outlines the architectural principles, key design decisions, subsy
 
 ---
 
-## 1. Architectural Principles & Design Decisions
+## What is Confector?
+
+Confector is a modular, cloud-native CI/CD engine written in D (Dlang) that executes workflows as directed acyclic graphs (DAGs). It provides deterministic content-addressed caching, arbitrary node-level triggers, and elastic, plugin-driven execution. The system is designed around a strict separation between a **stateless execution core** (embeddable as a library, deployable to serverless/FaaS) and a **persistent management server** (Vibe.d HTTP service with MongoDB).
+
+Key design pillars:
+- **DAG-based execution** — Workflows are explicit DAGs, not linear pipelines, enabling maximal parallelism and fine-grained dependency modeling.
+- **Content-addressed caching** — Task fingerprints are computed from task definitions and transitive upstream hashes, enabling cache hits across any compute backend.
+- **Serverless-first design** — The entire system is designed so that a version of the server can be deployed in a serverless/FaaS context. The execution core is stateless and embeddable as a library. Even the orchestrator logic should eventually be splittable into stateless functions triggered by queue events. Always keep serverless deployability in mind when making architectural decisions.
+- **Plugin-driven extensibility** — Build steps, VCS integrations, compute backends, and artifact storage are all decoupled plugins loaded dynamically.
+- **Queue-based workers** — Tasks are dispatched via message queues to decoupled workers that may be local processes, serverless functions, or Kubernetes jobs.
+
+---
+
+## Where to Look
+
+### Core Library — `source/confector/core/`
+Stateless DAG engine, fingerprinting, trigger matching, and plugin lifecycle. Key files:
+- `dag.d` — DAG construction, cycle detection, topological sort, subgraph slicing
+- `fingerprinter.d` — Deterministic SHA-256 fingerprint computation
+- `trigger.d` — Trigger rule evaluation against events
+- `plugin.d` / `plugin_loader.d` — Plugin registry and dynamic library loading
+- `model.d` — Domain models for tasks, builds, projects, and persistence
+- `storage.d` — `BuildStateRepository` interface and local artifact storage
+
+### Plugin API — `source/confector/plugin_api/`
+Public interfaces and data models that plugins implement. Key files:
+- `plugin.d` — `Plugin` base interface, categories (definition, step_executor, worker, artifact)
+- `system.d` — ECS-inspired system contracts (`BuildStepSystem`, `InputResolverSystem`, etc.)
+- `executor.d` — Compute provider and worker pool abstractions
+- `model.d` — Core domain structs (`TaskNode`, `BuildStep`, `TaskQueueMessage`, etc.)
+
+### Execution Engine — `source/confector/runner_core/`
+**Stateless** single-task execution orchestration (input resolution → build steps → artifact publishing). This is the core component deployable to serverless/FaaS.
+- `engine.d` — `TaskEngine`: stateless orchestrator for the full execution pipeline with cache support
+- `artifacts.d` — Artifact staging and checksum verification
+- `worker.d` — HTTP-based remote worker daemon
+
+### Server (Control Plane) — `source/confector/server/`
+Persistent Vibe.d web service with MongoDB persistence. **Goal:** a version of this should be deployable in a serverless context — see serverless design pillar above.
+- `app.d` — Application bootstrap (MongoDB, plugins, routing). Currently stateful; serverless target requires splitting orchestration into event-driven functions.
+- `config.d` — Server configuration structs
+- `controller/` — HTTP endpoints: `api_controller.d` (REST API), `dashboard_controller.d` (web UI), `admin_controller.d` (plugin management), `executor_controller.d`, `repositorycontroller.d`
+- `orchestrator/coordinator.d` — `BuildCoordinator`: central build orchestration, trigger handling, subgraph computation, in-flight deduplication. **Currently stateful** (in-memory registries, MongoDB persistence); for serverless deployment, this logic needs to be decomposed into stateless functions.
+- `orchestrator/capacity_broker.d` — Queue backlog monitoring and compute provisioning
+- `orchestrator/serverless_handler.d` — **Stateless** serverless/FaaS execution handler; entry point for serverless task execution via JSON-RPC
+- `storage/mongo_repository.d` — MongoDB implementation of `BuildStateRepository`
+
+### Work Queue — `source/confector/queue/`
+Queue abstractions and implementations.
+- `queue.d` — `WorkQueue` interface and in-memory implementation
+- `mongo_queue.d` — MongoDB-backed persistent queue with visibility timeouts
+
+### Configuration — `source/confector/config/`
+Type-safe hierarchical configuration with environment variable override support.
+- `package.d` — Struct-based config definitions with UDA annotations
+
+### Standalone Runner — `source/confector/runner_app/`
+CLI tool for single-task execution or HTTP worker daemon mode.
+- `main.d` — Entry point with `run` and `worker` subcommands
+
+### Plugins — `plugins/`
+Dynamic libraries compiled to `out/plugins/`. Four categories:
+- **`definition/`** (server-side) — Step UI forms and validation (e.g., `git/`, `bash/`, `powershell/`)
+- **`step_executor/`** (runner-side) — Build step execution and input resolution (e.g., `git/`, `bash/`, `powershell/`)
+- **`worker/`** (server-side) — Compute provisioning (e.g., `local_process/`)
+- **`artifact/`** (runner-side) — Artifact storage backends (e.g., `local/`)
+
+### Other Key Directories
+- **`views/`** — 26 Diet-NG templates for the web UI (dashboard, projects, tasks, builds, etc.)
+- **`out/`** — Self-contained runtime artifact directory (executable, plugins, views, public assets)
+- **`deployments/`** — Deployment configs (Docker Compose, dev container)
+- **`dub.json`** — DUB package manifest defining sub-packages
+- **`reggaefile.d`** — Reggae build script coordinating compilation and asset sync
+
+---
+
+## Architectural Principles & Design Decisions
 
 ### 1.1 Explicit Directed Acyclic Graph (DAG) Execution
 - **Decision**: Workflows are modeled strictly as directed acyclic graphs of discrete tasks rather than linear stages.
@@ -18,9 +94,11 @@ This document outlines the architectural principles, key design decisions, subsy
 - **Decision**: Triggers (git events, webhooks, cron, manual dispatches) can target any arbitrary node in the DAG, not just root nodes.
 - **Rationale**: Allows targeted operations (such as running an isolated deployment or a specific test suite) by evaluating only the required subgraph. If upstream cached artifacts exist, ancestors do not re-run.
 
-### 1.4 Stateless Core vs. Persistent Control Plane
-- **Decision**: Strict architectural separation between the execution core (`confector:core` / `confector:serverless`) and the persistent management server (`confector:server` / `source/app.d`).
-- **Rationale**: The core graph engine, hashing logic, and single-task execution must remain completely stateless, embeddable as a library, and deployable to serverless/FaaS runtimes. The persistent server acts as a consumer of this core library.
+### 1.4 Serverless-First Design
+- **Decision**: The entire system is designed so that a version of the server can be deployed in a serverless/FaaS context. The execution core (`confector:core` / `confector:runner_core`) is stateless and embeddable as a library. The serverless handler (`serverless_handler.d`) provides a JSON-RPC entry point for stateless task execution.
+- **Rationale**: Serverless deployment enables elastic scaling from zero, pay-per-use cost models, and no persistent infrastructure overhead. The current persistent server (`confector:server`) is the reference implementation, but the goal is to decompose its orchestration logic (trigger matching, subgraph slicing, task coordination) into stateless, event-driven functions.
+- **Current status**: `TaskEngine` and `serverless_handler.d` are already stateless. `BuildCoordinator`, `CapacityBroker`, and `app.d` bootstrap are still stateful and represent the primary target for future serverless decomposition.
+- **Guideline for agents**: When making changes to the server module, always consider whether the change could prevent or complicate a future serverless deployment. Prefer passing state via abstractions (interfaces, parameters) over embedding it in class members or global state.
 
 ### 1.5 Decoupled Queue-Based Worker Delegation
 - **Decision**: Compute tasks are dispatched via standard message queues (e.g., MongoDB Queue for local development, cloud message queues) to decoupled workers.
@@ -40,41 +118,29 @@ This document outlines the architectural principles, key design decisions, subsy
 
 ---
 
-## 2. Subsystem Boundaries & Responsibilities
-
-- **`source/confector/core/`**: Stateless core library containing domain models and entity definitions (`model.d`), DAG cycle detection & sorting (`dag.d`), fingerprint calculation (`fingerprinter.d`), trigger evaluation (`trigger.d`), plugin lifecycle interfaces (`plugin.d`, `executor.d`, `vcs.d`), dynamic plugin loading (`plugin_loader.d`), and decoupled system contracts (`system.d`). Must have no persistent database or HTTP server dependencies.
-- **`source/confector/runner/`**: Execution runners for evaluating task payloads locally via child processes (`process_runner.d`) or serverless invocation handlers (`serverless_runner.d`).
-- **`source/confector/queue/`**: Work queue abstractions (`queue.d`) and storage implementations (MongoDB collection queue, cloud queue driver).
-- **`plugins/`**: Built-in plugin packages (`bash`, `git`, `powershell`, `executors/local_process`) containing component data definitions, Diet-NG view templates, and processing systems, compiled as dynamic libraries (`out/plugins/*.dll` or `*.so`).
-- **`source/controller/` & `source/app.d`**: Persistent Vibe.d web service handling HTTP routing, webhooks, UI rendering, and database persistence.
-- **`reggaefile.d`**: Top-level Reggae build script coordinating DUB package compilation, dynamic plugin builds, and file synchronization into the `out/` artifact directory.
-- **`out/`**: Self-contained runtime artifact directory containing the executable, `plugins/` directory, `views/`, and `public/` web assets.
-- **`build/`**: Intermediate build files (ninja files, `.reggae/`, etc.) isolated per environment.
-- **`deployments/`**: Deployment and environment configurations (Docker Compose, dev container, etc.).
-
----
-
-## 3. Developer & Agent Conventions
+## Developer & Agent Conventions
 
 1. **Stateless Core Invariant**:
-   - `confector.core` modules must remain pure and stateless. External state and storage systems must be passed via abstractions.
-2. **Plugin Extensibility & Component-System Isolation**:
+   - `confector.core` and `confector.runner_core` modules must remain pure and stateless. External state and storage systems must be passed via abstractions (interfaces, parameters). Never introduce persistent state, global singletons with mutable state, or implicit I/O dependencies in these modules.
+2. **Serverless Deployability Check**:
+   - Before making architectural changes to the server module, ask: "Could this logic run as a stateless function?" If the answer should be yes, ensure state is passed explicitly rather than stored. The `BuildCoordinator` and `CapacityBroker` are known targets for future serverless decomposition.
+3. **Plugin Extensibility & Component-System Isolation**:
    - New execution environments, input resolvers, or version control integrations should model data as passive components and logic as stateless systems, registering via `PluginRegistry`.
-3. **Explicit Error Diagnostics**:
+4. **Explicit Error Diagnostics**:
    - Prefer domain-specific exceptions (e.g., `DAGValidationException`, `FingerprintException`) with descriptive diagnostics (such as exact cycle paths in cyclic graphs).
-4. **D Idioms & Safety**:
+5. **D Idioms & Safety**:
    - Use standard D type qualifiers (`immutable`, `const`, `pure`, `@safe` / `@trusted` where appropriate).
    - Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.
-5. **Build & Execution Workflow**:
+6. **Build & Execution Workflow**:
    - Build all targets (app, plugins, assets): `dub build`
    - Build specific components: `dub build :server`, `dub build :plugins`, etc
    - Run the server: `dub run :server`
-6. **Unit Testing**:
+7. **Unit Testing**:
    - Every core algorithm (DAG resolution, cycle detection, fingerprinting, trigger matching, plugin registration) must be accompanied by comprehensive unit tests (`dub test confector:core`).
 
 ---
 
-## 4. Schemas & Specifications Reference
+## Schemas & Specifications Reference
 
 For specific JSON/YAML schemas, payload formats, and data contracts, refer to the documentation in [`docs/`](docs/):
 - **[Data Contracts & Schemas](docs/schemas.md)**: Task DAG YAML definitions, fingerprint hash formula, queue task messages, and artifact metadata.
