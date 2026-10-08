@@ -1,4 +1,4 @@
-module confector.runner.coordinator;
+module confector.orchestrator.coordinator;
 
 import confector.core.model;
 import confector.core.dag;

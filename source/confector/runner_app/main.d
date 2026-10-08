@@ -96,7 +96,7 @@ int handleRun(string[] args)
         {
             try
             {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner, PluginCategory.artifact]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor, PluginCategory.artifact]);
                 foreach (p; loaded)
                 {
                     stderr.writefln("[runner] Loaded plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
@@ -180,7 +180,7 @@ int handleRun(string[] args)
         stderr.writeln("[runner] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
         storage = new LocalArtifactStorage(storageDir);
     }
-    auto engine = new TaskEngine(storage, null, storageDir);
+    auto engine = new TaskEngine(storage, storageDir);
 
     auto result = engine.executeTask(
         buildId,
@@ -266,7 +266,7 @@ int handleWorker(string[] args)
     int exitCode = 0;
     try
     {
-        auto runner = new HttpWorkerRunner(config);
+        auto runner = new HttpWorkerDaemon(config);
         runner.run();
     }
     catch (Throwable e)

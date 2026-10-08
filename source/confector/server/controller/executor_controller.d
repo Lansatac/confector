@@ -366,7 +366,7 @@ unittest
 
     // Test with CapacityBroker and WorkQueue
     import confector.queue.queue : InMemoryWorkQueue;
-    import confector.runner.capacity_broker : DefaultCapacityBroker;
+    import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 
     class TestComputeProvisioner : ComputeProvisioner
     {

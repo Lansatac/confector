@@ -1,4 +1,4 @@
-module plugins.git.runner;
+module plugins.step_executor.git;
 
 import std.format;
 import std.process;
@@ -109,7 +109,7 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
     @property string name() const { return "git-runner"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "Git version control execution, input resolution, and build step runner plugin"; }
-    @property PluginCategory category() const { return PluginCategory.runner; }
+    @property PluginCategory category() const { return PluginCategory.step_executor; }
 
     ConfigDefinition[] configDefinitions() const { return null; }
     @property string providerType() const { return "git"; }
@@ -477,7 +477,7 @@ unittest
     auto plugin = new GitRunnerPlugin();
     plugin.initialize(new NullPluginContext("git-runner"));
     assert(plugin.name == "git-runner");
-    assert(plugin.category == PluginCategory.runner);
+    assert(plugin.category == PluginCategory.step_executor);
     assert(plugin.providerType == "git");
     assert(plugin.systemName == "git-input-resolver");
 

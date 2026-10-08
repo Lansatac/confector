@@ -7,8 +7,8 @@ import confector.core.storage;
 import confector.core.dag;
 import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
-import confector.runner.engine;
-import confector.runner.coordinator;
+import confector.runner_core.engine;
+import confector.orchestrator.coordinator;
 import confector.queue.queue;
 
 import std.algorithm : filter, count, canFind;

@@ -1,4 +1,4 @@
-module plugins.bash.runner;
+module plugins.step_executor.bash;
 
 import std.format;
 import std.process;
@@ -22,7 +22,7 @@ class BashRunnerPlugin : StepExecutionPlugin, BuildStepSystem
     @property string name() const { return "bash-runner"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "Bash script execution and runner plugin"; }
-    @property PluginCategory category() const { return PluginCategory.runner; }
+    @property PluginCategory category() const { return PluginCategory.step_executor; }
 
     ConfigDefinition[] configDefinitions() const { return null; }
     @property string systemName() const { return "bash-step-system"; }
@@ -142,7 +142,7 @@ unittest
     auto plugin = new BashRunnerPlugin();
     plugin.initialize(new NullPluginContext("bash-runner"));
     assert(plugin.name == "bash-runner");
-    assert(plugin.category == PluginCategory.runner);
+    assert(plugin.category == PluginCategory.step_executor);
     assert(plugin.systemName == "bash-step-system");
 
     BuildStep bStep;

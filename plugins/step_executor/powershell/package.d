@@ -1,4 +1,4 @@
-module plugins.powershell.runner;
+module plugins.step_executor.powershell;
 
 import std.format;
 import std.process;
@@ -22,7 +22,7 @@ class PowerShellRunnerPlugin : StepExecutionPlugin, BuildStepSystem
     @property string name() const { return "powershell-runner"; }
     @property string versionString() const { return "1.0.0"; }
     @property string description() const { return "PowerShell script execution and runner plugin"; }
-    @property PluginCategory category() const { return PluginCategory.runner; }
+    @property PluginCategory category() const { return PluginCategory.step_executor; }
 
     ConfigDefinition[] configDefinitions() const { return null; }
     @property string systemName() const { return "powershell-step-system"; }
@@ -151,7 +151,7 @@ unittest
     auto plugin = new PowerShellRunnerPlugin();
     plugin.initialize(new NullPluginContext("powershell-runner"));
     assert(plugin.name == "powershell-runner");
-    assert(plugin.category == PluginCategory.runner);
+    assert(plugin.category == PluginCategory.step_executor);
     assert(plugin.systemName == "powershell-step-system");
 
     BuildStep psStep;

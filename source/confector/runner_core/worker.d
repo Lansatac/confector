@@ -304,7 +304,7 @@ class HttpWorkerClient
  * Runner loop handling task dequeuing, execution via TaskEngine, heartbeat renewals,
  * artifact packing/unpacking, and completion reporting over HTTP.
  */
-class HttpWorkerRunner
+class HttpWorkerDaemon
 {
     private HttpWorkerConfig m_config;
     private HttpWorkerClient m_client;
@@ -348,7 +348,7 @@ class HttpWorkerRunner
         {
             if (exists(dir) && isDir(dir))
             {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.runner, PluginCategory.artifact]);
+                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor, PluginCategory.artifact]);
                 totalPluginsLoaded += loaded.length;
                 logInfo("[worker] Loaded %d plugin(s) from '%s'", loaded.length, dir);
                 foreach (p; loaded)
@@ -378,7 +378,7 @@ class HttpWorkerRunner
             logWarn("[worker] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
             m_storage = new LocalArtifactStorage(m_config.storageDir);
         }
-        m_engine = new TaskEngine(m_storage, null, m_config.storageDir);
+        m_engine = new TaskEngine(m_storage, m_config.storageDir);
     }
 
     TaskExecutionResult processOneMessage(in TaskQueueMessage msg)
@@ -606,7 +606,7 @@ unittest
         @property string name() const pure nothrow @safe { return "mock_runner"; }
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Step Runner"; }
-        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.step_executor; }
         ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-step-system"; }
         void initialize(PluginContext context = null) {}
@@ -711,7 +711,7 @@ unittest
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
 
-    auto workerRunner = new HttpWorkerRunner(config);
+    auto workerRunner = new HttpWorkerDaemon(config);
     auto workerThread = new Thread({
         workerRunner.run();
     });
@@ -745,7 +745,7 @@ unittest
         @property string name() const pure nothrow @safe { return "mock_multistep_runner"; }
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Multistep Runner"; }
-        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.step_executor; }
         ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-multistep-system"; }
         void initialize(PluginContext context = null) {}
@@ -859,7 +859,7 @@ unittest
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
 
-    auto workerRunner = new HttpWorkerRunner(config);
+    auto workerRunner = new HttpWorkerDaemon(config);
     auto workerThread = new Thread({
         workerRunner.run();
     });

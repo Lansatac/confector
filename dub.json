@@ -102,9 +102,9 @@
 		"./plugins/definition/bash",
 		"./plugins/definition/git",
 		"./plugins/definition/powershell",
-		"./plugins/runner/bash",
-		"./plugins/runner/git",
-		"./plugins/runner/powershell",
+		"./plugins/step_executor/bash",
+		"./plugins/step_executor/git",
+		"./plugins/step_executor/powershell",
 		"./plugins/worker/local_process",
 		"./plugins/artifact/local"
 	]

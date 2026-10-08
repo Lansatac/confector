@@ -5,15 +5,15 @@ import confector.core.model;
 import confector.core.dag;
 import confector.core.storage;
 import confector.core.trigger;
-import confector.runner.engine;
-import confector.runner.coordinator;
+import confector.runner_core.engine;
+import confector.orchestrator.coordinator;
 import confector.queue.queue;
 
 import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null)
+URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null, BuildStateRepository stateRepo = null)
 {
     import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
@@ -182,7 +182,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     getRoute("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             string statusFilter = req.query.get("status", "");
             string projectFilter = req.query.get("project_id", "");
             string limitStr = req.query.get("limit", "50");
@@ -206,7 +206,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         {
             string buildId = req.params["build_id"];
             string taskId = req.params["task_id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
 
             TaskExecutionRecord record;
             if (repo !is null && repo.getTaskExecution(buildId, taskId, record))
@@ -235,7 +235,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         {
             string buildId = req.params["build_id"];
             string taskId = req.params["task_id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
 
             string[] logs = repo !is null ? repo.getTaskLogs(buildId, taskId) : [];
             Json resp = Json.emptyObject;
@@ -272,11 +272,11 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             {
                 coordinator.onTaskCompleted(fingerprint, result);
             }
-            else if (engine.stateRepository !is null)
+            else if (stateRepo !is null)
             {
                 if (result.buildId.length > 0 && result.taskId.length > 0)
                 {
-                    engine.stateRepository.setTaskStatus(result.buildId, result.taskId, result.status, result.errorMessage);
+                    stateRepo.setTaskStatus(result.buildId, result.taskId, result.status, result.errorMessage);
                 }
             }
 
@@ -311,9 +311,9 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             {
                 coordinator.onTaskCompleted(buildId, taskId, result);
             }
-            else if (engine.stateRepository !is null)
+            else if (stateRepo !is null)
             {
-                engine.stateRepository.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
+                stateRepo.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
             }
 
             Json resp = Json.emptyObject;
@@ -351,7 +351,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
                 lines = [bodyJson["line"].get!string];
             }
 
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             if (repo !is null)
             {
                 foreach (line; lines)
@@ -389,7 +389,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             bool force = pForce !is null ? pForce.get!bool : false;
             string workspaceDir = pWorkspace !is null ? pWorkspace.get!string : "";
 
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo is null || !repo.getProject(projectId, proj))
             {
@@ -516,7 +516,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     getRoute("/builds", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             if (repo is null)
             {
                 res.writeJsonBody(Json.emptyArray);
@@ -538,7 +538,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string buildId = req.query.get("id", "");
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             if (repo is null)
             {
                 res.statusCode = HTTPStatus.notFound;
@@ -577,7 +577,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string buildId = req.query.get("id", "");
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             string[] logs = repo !is null ? repo.getBuildLogs(buildId) : [];
             Json resp = Json.emptyObject;
             resp["build_id"] = Json(buildId);
@@ -597,7 +597,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     getRoute("/triggers", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             auto rules = repo !is null ? repo.listTriggerRules() : [];
             res.writeJsonBody(rules);
         }
@@ -623,7 +623,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
                 rule.createdAt = Clock.currTime.toISOString();
             }
 
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             if (repo !is null)
             {
                 repo.saveTriggerRule(rule);
@@ -643,7 +643,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string ruleId = req.json["id"].get!string;
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             bool ok = repo !is null && repo.deleteTriggerRule(ruleId);
             Json resp = Json.emptyObject;
             resp["deleted"] = Json(ok);
@@ -662,7 +662,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
     getRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             auto projects = repo !is null ? repo.listProjects() : [];
             res.writeJsonBody(projects);
         }
@@ -690,7 +690,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
             proj.updatedAt = now;
 
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             if (repo !is null)
             {
                 repo.saveProject(proj);
@@ -710,7 +710,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string projId = req.params["id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo !is null && repo.getProject(projId, proj))
             {
@@ -737,7 +737,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string projId = req.params["id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             bool ok = repo !is null && repo.deleteProject(projId);
             if (ok)
             {
@@ -767,7 +767,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string projId = req.params["id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo !is null && repo.getProject(projId, proj))
             {
@@ -794,7 +794,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string projId = req.params["id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo is null || !repo.getProject(projId, proj))
             {
@@ -849,7 +849,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         {
             string projId = req.params["id"];
             string taskId = req.params["taskId"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo !is null && repo.getProject(projId, proj))
             {
@@ -888,7 +888,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         {
             string projId = req.params["id"];
             string taskId = req.params["taskId"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo is null || !repo.getProject(projId, proj))
             {
@@ -944,7 +944,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         try
         {
             string projId = req.params["id"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo is null || !repo.getProject(projId, proj))
             {
@@ -1008,7 +1008,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         {
             string projId = req.params["id"];
             string targetTaskId = req.params["taskId"];
-            auto repo = engine.stateRepository;
+            auto repo = stateRepo;
             ProjectRecord proj;
             if (repo is null || !repo.getProject(projId, proj))
             {

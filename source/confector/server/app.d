@@ -20,9 +20,9 @@ import confector.core.plugin_loader : PluginLoader;
 import confector.core.storage : BuildStateRepository, LocalArtifactStorage, InMemoryBuildStateRepository;
 import confector.queue.mongo_queue : MongoWorkQueue;
 import confector.queue.queue : WorkQueue, InMemoryWorkQueue;
-import confector.runner.capacity_broker : DefaultCapacityBroker;
-import confector.runner.coordinator : BuildCoordinator;
-import confector.runner.engine : TaskEngine;
+import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
+import confector.orchestrator.coordinator : BuildCoordinator;
+import confector.runner_core.engine : TaskEngine;
 import confector.storage.mongo_repository : MongoBuildStateRepository;
 
 import controller.admin_controller : adminRouter;
@@ -219,7 +219,7 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, workQueue, buildCoordinator);
+    auto api = apiRouter(taskEngine, workQueue, buildCoordinator, stateRepo);
     router.any("/api/v1/*", api);
     router.any("/api/*", api);
 
@@ -346,7 +346,7 @@ void main()
         logWarn("[storage] No artifact storage plugin registered; falling back to LocalArtifactStorage.");
         artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
     }
-    auto taskEngine = new TaskEngine(artifactStorage, storage.stateRepo, serverConfig.storage.artifactsDir);
+    auto taskEngine = new TaskEngine(artifactStorage, serverConfig.storage.artifactsDir);
     auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
     logInfo("Initialized Confector execution engine and build coordinator.");
 
@@ -412,7 +412,7 @@ unittest
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
     auto storage = new LocalArtifactStorage("test_app_storage");
-    auto engine = new TaskEngine(storage, stateRepo);
+    auto engine = new TaskEngine(storage);
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
     auto broker = new DefaultCapacityBroker(queue, coordinator);
 

@@ -497,7 +497,7 @@ unittest
         @property string name() const { return "mock-plugin"; }
         @property string versionString() const { return "0.1.0"; }
         @property string description() const { return "Mock plugin for testing"; }
-        @property PluginCategory category() const { return PluginCategory.runner; }
+        @property PluginCategory category() const { return PluginCategory.step_executor; }
 
         ConfigDefinition[] configDefinitions() const { return null; }
 
@@ -523,7 +523,7 @@ unittest
         @property string name() const { return "integrated-plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Integrated test plugin"; }
-        @property PluginCategory category() const { return PluginCategory.runner; }
+        @property PluginCategory category() const { return PluginCategory.step_executor; }
         @property string systemName() const { return "integrated-system"; }
         @property string stepType() const { return "test-step"; }
         @property string displayName() const { return "Test Step"; }
@@ -617,7 +617,7 @@ unittest
         @property string name() const { return "configurable_plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Plugin with config"; }
-        @property PluginCategory category() const { return PluginCategory.runner; }
+        @property PluginCategory category() const { return PluginCategory.step_executor; }
 
         ConfigDefinition[] configDefinitions() const
         {

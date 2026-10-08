@@ -18,17 +18,6 @@ import std.datetime.stopwatch : StopWatch, AutoStart;
 import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
 
 /**
- * Result of a task execution.
- */
-struct GraphExecutionResult
-{
-    string buildId;
-    bool success;
-    TaskExecutionResult[string] taskResults;
-    string[] executedOrder;
-}
-
-/**
  * Core stateless execution engine capable of executing single nodes.
  */
 class TaskEngine
@@ -36,7 +25,7 @@ class TaskEngine
     private ArtifactStorage m_artifactStorage;
     private string m_storageBaseDir;
 
-    this(ArtifactStorage artifactStorage = null, BuildStateRepository stateRepo = null, string storageBaseDir = "")
+    this(ArtifactStorage artifactStorage = null, string storageBaseDir = "")
     {
         m_artifactStorage = artifactStorage;
         m_storageBaseDir = storageBaseDir;
@@ -338,7 +327,7 @@ unittest
         @property string name() const pure nothrow @safe { return "mock_runner"; }
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Step Runner"; }
-        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.step_executor; }
         ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-step-system"; }
         void initialize(PluginContext context = null) {}

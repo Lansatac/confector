@@ -47,6 +47,17 @@ struct TaskExecutionResult
 }
 
 /**
+ * Result of a task graph or build execution.
+ */
+struct GraphExecutionResult
+{
+    string buildId;
+    bool success;
+    TaskExecutionResult[string] taskResults;
+    string[] executedOrder;
+}
+
+/**
  * Persisted record of a build execution.
  */
 struct BuildRecord

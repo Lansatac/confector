@@ -1,8 +1,8 @@
-module confector.runner.serverless_runner;
+module confector.orchestrator.serverless_handler;
 
 import confector.core.model;
 import confector.core.storage;
-import confector.runner.engine;
+import confector.runner_core.engine;
 import confector.core.plugin;
 
 import vibe.data.json;
@@ -80,8 +80,7 @@ ServerlessTaskResponse executeServerlessTask(
             return errorResponse;
         }
         auto storage = new LocalArtifactStorage(request.storageBaseDir);
-        auto stateRepo = new InMemoryBuildStateRepository();
-        engine = new TaskEngine(storage, stateRepo, request.storageBaseDir);
+        engine = new TaskEngine(storage, request.storageBaseDir);
     }
 
     auto res = engine.executeTask(
@@ -158,7 +157,7 @@ unittest
         @property string name() const pure nothrow @safe { return "mock_serverless_runner"; }
         @property string versionString() const pure nothrow @safe { return "1.0.0"; }
         @property string description() const pure nothrow @safe { return "Mock Serverless Step Runner"; }
-        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.runner; }
+        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.step_executor; }
         ConfigDefinition[] configDefinitions() const { return null; }
         @property string systemName() const pure nothrow @safe { return "mock-serverless-step-system"; }
         void initialize(PluginContext context = null) {}

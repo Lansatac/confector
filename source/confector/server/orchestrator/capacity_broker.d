@@ -1,9 +1,9 @@
-module confector.runner.capacity_broker;
+module confector.orchestrator.capacity_broker;
 
 import confector.core.model;
 import confector.core.executor;
 import confector.queue.queue;
-import confector.runner.coordinator;
+import confector.orchestrator.coordinator;
 
 import core.sync.mutex : Mutex;
 import core.time : Duration, seconds, msecs;
