@@ -70,10 +70,18 @@ ServerlessTaskResponse executeServerlessTask(
     TaskEngine engine = customEngine;
     if (engine is null)
     {
-        string storageDir = request.storageBaseDir.length > 0 ? request.storageBaseDir : ".confector/artifacts";
-        auto storage = new LocalArtifactStorage(storageDir);
+        if (request.storageBaseDir.length == 0)
+        {
+            ServerlessTaskResponse errorResponse;
+            errorResponse.taskId = request.task.id;
+            errorResponse.buildId = request.buildId;
+            errorResponse.status = TaskStatus.failed;
+            errorResponse.errorMessage = "storageBaseDir is required";
+            return errorResponse;
+        }
+        auto storage = new LocalArtifactStorage(request.storageBaseDir);
         auto stateRepo = new InMemoryBuildStateRepository();
-        engine = new TaskEngine(storage, stateRepo);
+        engine = new TaskEngine(storage, stateRepo, request.storageBaseDir);
     }
 
     auto res = engine.executeTask(

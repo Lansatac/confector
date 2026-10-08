@@ -33,11 +33,13 @@ class TaskEngine
 {
     private ArtifactStorage m_artifactStorage;
     private BuildStateRepository m_stateRepo;
+    private string m_storageBaseDir;
 
-    this(ArtifactStorage artifactStorage, BuildStateRepository stateRepo)
+    this(ArtifactStorage artifactStorage, BuildStateRepository stateRepo, string storageBaseDir = "")
     {
         m_artifactStorage = artifactStorage;
         m_stateRepo = stateRepo;
+        m_storageBaseDir = storageBaseDir;
     }
 
     @property ArtifactStorage artifactStorage() { return m_artifactStorage; }
@@ -423,7 +425,14 @@ class TaskEngine
                         meta.taskId = task.id;
                         meta.filePath = artPath;
                         meta.storageBackend = "local";
-                        meta.storageUri = format(".confector/artifacts/%s/%s.zip", fingerprint, artId);
+                        if (m_storageBaseDir.length > 0)
+                        {
+                            meta.storageUri = format("%s/%s/%s.zip", m_storageBaseDir, fingerprint, artId);
+                        }
+                        else
+                        {
+                            meta.storageUri = format("%s/%s.zip", fingerprint, artId);
+                        }
                         meta.createdAt = Clock.currTime.toISOString();
                         producedArtifacts ~= meta;
 

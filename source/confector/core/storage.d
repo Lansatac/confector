@@ -15,8 +15,12 @@ class LocalArtifactStorage : ArtifactStorage
 {
     private string m_baseStorageDir;
 
-    this(string baseStorageDir = ".confector/artifacts")
+    this(string baseStorageDir)
     {
+        if (baseStorageDir.length == 0)
+        {
+            throw new Exception("baseStorageDir must not be empty");
+        }
         m_baseStorageDir = baseStorageDir;
         if (!exists(m_baseStorageDir))
         {

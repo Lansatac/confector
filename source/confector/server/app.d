@@ -331,9 +331,17 @@ void main()
     // Automatically load plugins
     initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
 
+    // Validate required configuration
+    if (serverConfig.storage.artifactsDir.length == 0)
+    {
+        logError("FATAL: storage.artifactsDir is required but was not configured.");
+        logError("Please set CONFECTOR_SERVER_STORAGE_ARTIFACTSDIR or provide it in the config.");
+        return;
+    }
+
     // Initialize execution engine, coordinator & storage
     auto artifactStorage = new LocalArtifactStorage(serverConfig.storage.artifactsDir);
-    auto taskEngine = new TaskEngine(artifactStorage, storage.stateRepo);
+    auto taskEngine = new TaskEngine(artifactStorage, storage.stateRepo, serverConfig.storage.artifactsDir);
     auto buildCoordinator = new BuildCoordinator(artifactStorage, storage.stateRepo, storage.workQueue);
     logInfo("Initialized Confector execution engine and build coordinator.");
 

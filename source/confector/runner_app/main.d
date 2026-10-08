@@ -38,16 +38,16 @@ void printUsage()
     writeln();
     writeln("Run options:");
     writeln("  --payload=<path|json|->  JSON payload string, file path, or '-' for stdin");
-    writeln("  --workspace=<dir>        Workspace directory path (default: current directory)");
-    writeln("  --storage-dir=<dir>      Artifact storage directory (default: .confector/artifacts)");
+    writeln("  --workspace=<dir>        Workspace directory path (required)");
+    writeln("  --storage-dir=<dir>      Artifact storage directory (required)");
     writeln("  --plugins-dir=<dir>      Directory to load dynamic step plugins from (default: plugins)");
     writeln();
     writeln("Worker options:");
     writeln("  --server-url=<url>       Confector server base URL (default: http://localhost:8080)");
     writeln("  --worker-id=<id>         Unique worker identifier");
     writeln("  --token=<token>          Worker authorization secret token");
-    writeln("  --workspace=<dir>        Worker workspace directory (default: .confector/worker_workspace)");
-    writeln("  --storage-dir=<dir>      Artifact storage directory (default: .confector/worker_storage)");
+    writeln("  --workspace=<dir>        Worker workspace directory (required)");
+    writeln("  --storage-dir=<dir>      Artifact storage directory (required)");
     writeln("  --plugins-dir=<dir>      Directory to load dynamic step plugins from (default: plugins)");
     writeln("  --poll-interval=<sec>    Queue poll interval in seconds (default: 2)");
     writeln("  --visibility-timeout=<s  Visibility timeout in seconds (default: 60)");
@@ -59,8 +59,8 @@ void printUsage()
 int handleRun(string[] args)
 {
     string payloadArg;
-    string workspaceDir = ".";
-    string storageDir = ".confector/artifacts";
+    string workspaceDir = "";
+    string storageDir = "";
     string pluginsDir = "plugins";
 
     auto helpInfo = getopt(
@@ -75,6 +75,17 @@ int handleRun(string[] args)
     {
         defaultGetoptPrinter("Usage: confector-runner run [options]", helpInfo.options);
         return 0;
+    }
+
+    if (workspaceDir.length == 0)
+    {
+        stderr.writeln("Error: --workspace is required for run command.");
+        return 1;
+    }
+    if (storageDir.length == 0)
+    {
+        stderr.writeln("Error: --storage-dir is required for run command.");
+        return 1;
     }
 
     // Load execution step plugins from search paths
@@ -164,7 +175,7 @@ int handleRun(string[] args)
     }
 
     auto storage = new LocalArtifactStorage(storageDir);
-    auto engine = new TaskEngine(storage);
+    auto engine = new TaskEngine(storage, null, storageDir);
 
     auto result = engine.executeTask(
         buildId,
@@ -190,8 +201,8 @@ int handleWorker(string[] args)
     string serverUrl = environment.get("CONFECTOR_SERVER_URL", "http://localhost:8080");
     string workerId = environment.get("CONFECTOR_WORKER_ID", "");
     string token = environment.get("CONFECTOR_WORKER_TOKEN", environment.get("CONFECTOR_SECRET_TOKEN", ""));
-    string workspaceDir = ".confector/worker_workspace";
-    string storageDir = ".confector/worker_storage";
+    string workspaceDir = "";
+    string storageDir = "";
     string pluginsDir = "plugins";
     size_t pollInterval = 2;
     size_t visibilityTimeout = 60;
@@ -218,6 +229,17 @@ int handleWorker(string[] args)
     {
         defaultGetoptPrinter("Usage: confector-runner worker [options]", helpInfo.options);
         return 0;
+    }
+
+    if (workspaceDir.length == 0)
+    {
+        stderr.writeln("Error: --workspace is required for worker command.");
+        return 1;
+    }
+    if (storageDir.length == 0)
+    {
+        stderr.writeln("Error: --storage-dir is required for worker command.");
+        return 1;
     }
 
     printBanner();

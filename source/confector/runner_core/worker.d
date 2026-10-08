@@ -31,8 +31,8 @@ struct HttpWorkerConfig
     string serverUrl = "http://localhost:8080";
     string workerId = "";
     string workerToken = "";
-    string workspaceDir = ".confector/worker_workspace";
-    string storageDir = ".confector/worker_storage";
+    string workspaceDir = "";
+    string storageDir = "";
     string pluginsDir = "plugins";
     size_t pollIntervalSeconds = 2;
     size_t visibilityTimeoutSeconds = 60;
@@ -373,7 +373,7 @@ class HttpWorkerRunner
         }
 
         m_storage = new LocalArtifactStorage(m_config.storageDir);
-        m_engine = new TaskEngine(m_storage);
+        m_engine = new TaskEngine(m_storage, null, m_config.storageDir);
     }
 
     TaskExecutionResult processOneMessage(in TaskQueueMessage msg)

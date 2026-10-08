@@ -26,8 +26,9 @@ struct StorageConfig
     @Description("Path to MongoDB authentication secret file")
     string secretPath = "/run/secrets/mongo-readwrite-password";
 
-    @Description("Base directory for artifact storage")
-    string artifactsDir = ".confector/artifacts";
+    @Required
+    @Description("Base directory for artifact storage (required)")
+    string artifactsDir = "";
 }
 
 /**
@@ -93,6 +94,6 @@ unittest
     assert(cfg.http.port == 8080);
     assert(cfg.http.bindAddress == "0.0.0.0");
     assert(cfg.storage.mongoHost == "mongo:27017/confector");
-    assert(cfg.storage.artifactsDir == ".confector/artifacts");
+    assert(cfg.storage.artifactsDir == "");
     assert(cfg.plugins.bundledPluginsDir == "plugins");
 }

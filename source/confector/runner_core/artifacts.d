@@ -93,7 +93,8 @@ final class ArtifactStager
         string buildId,
         string taskId,
         string workspaceDir,
-        in OutputArtifactDecl decl
+        in OutputArtifactDecl decl,
+        string storageBaseDir = ""
     )
     {
         string artId = decl.effectiveId;
@@ -139,7 +140,14 @@ final class ArtifactStager
         meta.sha256 = sha256Hex;
         meta.sizeBytes = totalBytes;
         meta.storageBackend = "local";
-        meta.storageUri = format(".confector/artifacts/%s/%s.zip", taskFingerprint, artId);
+        if (storageBaseDir.length > 0)
+        {
+            meta.storageUri = format("%s/%s/%s.zip", storageBaseDir, taskFingerprint, artId);
+        }
+        else
+        {
+            meta.storageUri = format("%s/%s.zip", taskFingerprint, artId);
+        }
         meta.createdAt = Clock.currTime.toISOString();
         return meta;
     }

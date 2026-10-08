@@ -34,10 +34,12 @@ struct GraphExecutionResult
 class TaskEngine
 {
     private ArtifactStorage m_artifactStorage;
+    private string m_storageBaseDir;
 
-    this(ArtifactStorage artifactStorage = null)
+    this(ArtifactStorage artifactStorage = null, BuildStateRepository stateRepo = null, string storageBaseDir = "")
     {
         m_artifactStorage = artifactStorage;
+        m_storageBaseDir = storageBaseDir;
     }
 
     @property ArtifactStorage artifactStorage() { return m_artifactStorage; }
