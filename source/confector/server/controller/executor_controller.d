@@ -6,7 +6,7 @@ import confector.core.storage : BuildStateRepository;
 import confector.core.plugin : PluginRegistry;
 import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance, CapacityBroker, ComputeProvisioner;
 import confector.queue.queue : WorkQueue;
-import confector.core.json_compat : toStdJson, toVibeJson;
+import confector.queue.json_compat : toStdJson, toVibeJson;
 
 import std.algorithm : filter, count;
 import std.array : array;

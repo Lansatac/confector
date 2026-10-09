@@ -1,9 +1,9 @@
 module confector.orchestrator.serverless_handler;
 
 import confector.core.model;
-import confector.core.storage;
 import confector.runner_core.engine;
 import confector.core.plugin;
+import confector.storage.configured_storage : ConfiguredArtifactStorage;
 
 import vibe.data.json;
 import vibe.data.serialization : asName = name;

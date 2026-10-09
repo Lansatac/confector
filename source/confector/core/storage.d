@@ -2,12 +2,8 @@ module confector.core.storage;
 
 import confector.core.model;
 import confector.core.executor : WorkerRecord;
-import confector.core.plugin : PluginRegistry;
-import std.file : exists, isFile, isDir, mkdirRecurse, read, write, copy, remove, rename, rmdir, dirEntries, SpanMode;
-import std.path : buildPath, dirName, baseName;
 import std.format : format;
-import std.datetime.systime : Clock;
-import std.json : JSONValue, JSONType;
+import std.json : JSONValue;
 
 
 /**
@@ -107,147 +103,6 @@ class InMemoryArtifactStorage : ArtifactStorage
     }
 }
 
-
-/**
- * Meta-storage that forwards all ArtifactStorage calls to the currently configured
- * storage from the PluginRegistry. Throws when no storage is configured.
- */
-class ConfiguredArtifactStorage : ArtifactStorage
-{
-    private PluginRegistry m_registry;
-
-    this(PluginRegistry registry)
-    {
-        m_registry = registry;
-    }
-
-    private ArtifactStorage activeStorage()
-    {
-        if (m_registry is null)
-            throw new Exception("ConfiguredArtifactStorage: no PluginRegistry configured");
-
-        auto storage = m_registry.getDefaultArtifactStorage();
-        if (storage is null)
-            throw new Exception("ConfiguredArtifactStorage: no default artifact storage configured in PluginRegistry");
-
-        return storage;
-    }
-
-    override void storeArtifactStream(string taskFingerprint, string artifactId, void delegate(void delegate(const(ubyte)[])) writer)
-    {
-        activeStorage().storeArtifactStream(taskFingerprint, artifactId, writer);
-    }
-
-    override void retrieveArtifactStream(string taskFingerprint, string artifactId, void delegate(const(ubyte)[]) sink)
-    {
-        activeStorage().retrieveArtifactStream(taskFingerprint, artifactId, sink);
-    }
-
-    override bool artifactExists(string taskFingerprint, string artifactId)
-    {
-        try
-        {
-            return activeStorage().artifactExists(taskFingerprint, artifactId);
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
-
-    override void deleteArtifact(string taskFingerprint, string artifactId)
-    {
-        activeStorage().deleteArtifact(taskFingerprint, artifactId);
-    }
-
-    @property string backendType() const
-    {
-        try
-        {
-            auto self = cast(ConfiguredArtifactStorage)this;
-            return self.activeStorage().backendType;
-        }
-        catch (Exception)
-        {
-            return "configured";
-        }
-    }
-
-    @property string displayName() const
-    {
-        try
-        {
-            auto self = cast(ConfiguredArtifactStorage)this;
-            return self.activeStorage().displayName;
-        }
-        catch (Exception)
-        {
-            return "Configured Storage";
-        }
-    }
-
-    @property string description() const
-    {
-        try
-        {
-            auto self = cast(ConfiguredArtifactStorage)this;
-            return self.activeStorage().description;
-        }
-        catch (Exception)
-        {
-            return "Meta-storage forwarding to the currently configured artifact storage backend.";
-        }
-    }
-
-    JSONValue defaultConfig() const
-    {
-        try
-        {
-            auto self = cast(ConfiguredArtifactStorage)this;
-            return self.activeStorage().defaultConfig();
-        }
-        catch (Exception)
-        {
-            return JSONValue(string[string].init);
-        }
-    }
-
-    string[] validateConfig(in JSONValue config) const
-    {
-        try
-        {
-            auto self = cast(ConfiguredArtifactStorage)this;
-            return self.activeStorage().validateConfig(config);
-        }
-        catch (Exception)
-        {
-            return ["No artifact storage configured"];
-        }
-    }
-
-    string renderConfigFormHtml(in JSONValue currentConfig) const
-    {
-        try
-        {
-            auto self = cast(ConfiguredArtifactStorage)this;
-            return self.activeStorage().renderConfigFormHtml(currentConfig);
-        }
-        catch (Exception)
-        {
-            return "<p>No artifact storage configured. Please configure one in the Artifacts tab.</p>";
-        }
-    }
-
-    override string presignUpload(string taskFingerprint, string artifactId)
-    {
-        return activeStorage().presignUpload(taskFingerprint, artifactId);
-    }
-
-    override string presignDownload(string taskFingerprint, string artifactId)
-    {
-        return activeStorage().presignDownload(taskFingerprint, artifactId);
-    }
-}
 
 /**
  * Interface for build and task state persistence (caching, status tracking, metadata).
@@ -1017,8 +872,9 @@ unittest
     assert(cast(string) retrievedBytes.data == "zip payload chunk 1; zip payload chunk 2;");
 
     // Test ZipPackager round-trip with InMemoryArtifactStorage
-    import std.file : rmdirRecurse;
-    string testDir2 = "test_artifacts_storage_zip";
+    import std.file : exists, mkdirRecurse, read, rmdirRecurse, write, tempDir;
+    import std.path : buildPath;
+    string testDir2 = buildPath(tempDir, "test_artifacts_storage_zip");
     if (exists(testDir2)) rmdirRecurse(testDir2);
     scope(exit) if (exists(testDir2)) rmdirRecurse(testDir2);
 

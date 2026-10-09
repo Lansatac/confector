@@ -2,7 +2,7 @@ module confector.queue.mongo_queue;
 
 import confector.queue.queue;
 import confector.core.model;
-import confector.core.json_compat : sanitizeBson, getBsonLong, getBsonInt;
+import confector.queue.json_compat : sanitizeBson, getBsonLong, getBsonInt;
 
 import vibe.db.mongo.client : MongoClient;
 import vibe.db.mongo.collection : MongoCollection, FindOptions, UpdateOptions;

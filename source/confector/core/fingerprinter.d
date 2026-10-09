@@ -8,7 +8,6 @@ import std.digest.sha : SHA256;
 import std.algorithm.sorting : sort;
 import std.array : appender;
 import std.format : format;
-import std.file : exists, isFile, read;
 import std.json : JSONValue, JSONType, toJSON;
 
 /**
@@ -19,26 +18,6 @@ string sha256Hex(in string input) pure nothrow @safe
     SHA256 sha;
     sha.start();
     sha.put(cast(const(ubyte)[]) input);
-    auto digest = sha.finish();
-
-    import std.digest : toHexString, LetterCase;
-    return toHexString!(LetterCase.lower)(digest).idup;
-}
-
-/**
- * Computes deterministic SHA256 hex digest for file content.
- */
-string computeFileSha256(in string filePath) @trusted
-{
-    if (!exists(filePath) || !isFile(filePath))
-    {
-        throw new FingerprintException(format("Cannot compute hash: file does not exist or is not regular file: %s", filePath));
-    }
-
-    auto content = cast(ubyte[]) read(filePath);
-    SHA256 sha;
-    sha.start();
-    sha.put(content);
     auto digest = sha.finish();
 
     import std.digest : toHexString, LetterCase;

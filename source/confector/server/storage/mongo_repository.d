@@ -3,7 +3,7 @@ module confector.storage.mongo_repository;
 import confector.core.model;
 import confector.core.storage;
 import confector.core.executor : WorkerRecord;
-import confector.core.json_compat : sanitizeBson;
+import confector.queue.json_compat : sanitizeBson;
 
 import vibe.db.mongo.client : MongoClient;
 import vibe.db.mongo.collection : MongoCollection, FindOptions, UpdateOptions;

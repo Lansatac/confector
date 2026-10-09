@@ -17,7 +17,8 @@ import confector.server.config : ServerConfig, registerServerConfigDefinitions, 
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.storage : BuildStateRepository, InMemoryBuildStateRepository, InMemoryArtifactStorage, ConfiguredArtifactStorage;
+import confector.core.storage : BuildStateRepository, InMemoryBuildStateRepository, InMemoryArtifactStorage;
+import confector.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.queue.mongo_queue : MongoWorkQueue;
 import confector.queue.queue : WorkQueue, InMemoryWorkQueue;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;

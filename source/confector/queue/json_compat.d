@@ -1,4 +1,4 @@
-module confector.core.json_compat;
+module confector.queue.json_compat;
 
 import vibe.data.json : Json;
 import vibe.data.bson : Bson;

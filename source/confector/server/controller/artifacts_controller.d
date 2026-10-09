@@ -3,7 +3,7 @@ module controller.artifacts_controller;
 import vibe.vibe;
 import vibe.core.log : logInfo, logError;
 import confector.core.plugin : PluginRegistry;
-import confector.core.storage : ConfiguredArtifactStorage;
+import confector.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.plugin_api.model : ArtifactStorage;
 import std.json : JSONValue, JSONType, parseJSON;
 import std.string : strip;
