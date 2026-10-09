@@ -156,7 +156,7 @@ final class ArtifactStager
 unittest
 {
     import std.file : exists, rmdirRecurse, mkdirRecurse, write, readText;
-    import confector.core.storage : InMemoryArtifactStorage;
+    import confector.core.test_storage : InMemoryArtifactStorage;
 
     string testDir = "test_artifact_stager_suite";
     if (exists(testDir)) rmdirRecurse(testDir);

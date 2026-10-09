@@ -30,25 +30,31 @@ class LocalArtifactStoragePlugin : ArtifactStoragePlugin, ArtifactStorage
     {
         import vibe.data.json : Json;
         return [
-            ConfigDefinition("baseDir", "", Json("/artifacts"), "Base directory for artifact storage", false)
+            ConfigDefinition("baseDir", "", Json("./artifacts"), "Base directory for artifact storage", false)
         ];
     }
 
     void initialize(PluginContext context = null)
     {
+        if (context is null)
+        {
+            throw new Exception("[plugin:local-artifact] PluginContext must not be null; the host failed to provide configuration.");
+        }
+
         m_context = context;
-        if (context !is null)
-        {
-            m_baseStorageDir = context.config.getString("baseDir", "/artifacts");
-        }
-        else
-        {
-            m_baseStorageDir = "/artifacts";
-        }
+        m_baseStorageDir = context.config.getString("baseDir", "./artifacts");
 
         if (!exists(m_baseStorageDir))
         {
-            mkdirRecurse(m_baseStorageDir);
+            try
+            {
+                mkdirRecurse(m_baseStorageDir);
+            }
+            catch (Exception e)
+            {
+                context.error(format("Could not create base directory '%s': %s", m_baseStorageDir, e.msg));
+                throw new Exception(format("[plugin:local-artifact] Could not create base directory '%s': %s", m_baseStorageDir, e.msg));
+            }
         }
     }
 
@@ -98,7 +104,7 @@ class LocalArtifactStoragePlugin : ArtifactStoragePlugin, ArtifactStorage
 
         auto html = appender!string;
 
-        string baseDir = "/artifacts";
+        string baseDir = "./artifacts";
         if (currentConfig.type == JSONType.object)
         {
             if (auto p = "baseDir" in currentConfig)

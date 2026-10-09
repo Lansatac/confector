@@ -128,14 +128,19 @@ Dynamic libraries compiled to `out/plugins/`. Four categories:
    - New execution environments, input resolvers, or version control integrations should model data as passive components and logic as stateless systems, registering via `PluginRegistry`.
 4. **Explicit Error Diagnostics**:
    - Prefer domain-specific exceptions (e.g., `DAGValidationException`, `FingerprintException`) with descriptive diagnostics (such as exact cycle paths in cyclic graphs).
-5. **D Idioms & Safety**:
+5. **No Silent Fallbacks — Fail Fast and Loudly**:
+   - Never add silent fallbacks or "reasonable" default behavior when configuration is missing, invalid, or ambiguous. Historically, agents have introduced fallbacks that hid serious errors (e.g., missing plugin context, wrong database connection strings, absent artifact directories).
+   - If a required configuration value, plugin context, or dependency is missing, throw an explicit exception with a clear error message immediately. Do not log a warning and continue.
+   - If a fallback is intentionally designed and obvious (e.g., a well-documented optional feature with a clear default), document it explicitly in the code and configuration schema. Otherwise, fail fast.
+   - Plugins must enforce non-null `PluginContext` in `initialize()` and throw if the host fails to provide configuration. Do not accept null contexts and degrade silently.
+6. **D Idioms & Safety**:
    - Use standard D type qualifiers (`immutable`, `const`, `pure`, `@safe` / `@trusted` where appropriate).
    - Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.
-6. **Build & Execution Workflow**:
+7. **Build & Execution Workflow**:
    - Build all targets (app, plugins, assets): `dub build`
    - Build specific components: `dub build :server`, `dub build :plugins`, etc
    - Run the server: `dub run :server`
-7. **Unit Testing**:
+8. **Unit Testing**:
    - Every core algorithm (DAG resolution, cycle detection, fingerprinting, trigger matching, plugin registration) must be accompanied by comprehensive unit tests (`dub test confector:core`).
 
 ---

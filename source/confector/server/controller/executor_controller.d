@@ -6,7 +6,6 @@ import confector.core.storage : BuildStateRepository;
 import confector.core.plugin : PluginRegistry;
 import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance, CapacityBroker, ComputeProvisioner;
 import confector.queue.queue : WorkQueue;
-import confector.queue.json_compat : toStdJson, toVibeJson;
 
 import std.algorithm : filter, count;
 import std.array : array;
@@ -17,6 +16,85 @@ import std.json : JSONValue, JSONType, parseJSON;
 import std.string : split, strip;
 import std.uri : encodeComponent;
 import std.uuid : randomUUID;
+
+// --- JSON converters (inlined from json_compat.d) ---
+
+/**
+ * Converts a vibe.data.json.Json instance into a std.json.JSONValue.
+ */
+private JSONValue toStdJson(in Json vibeJson)
+{
+    switch (vibeJson.type)
+    {
+        case Json.Type.undefined:
+        case Json.Type.null_:
+            return JSONValue(null);
+        case Json.Type.bool_:
+            return JSONValue(vibeJson.get!bool);
+        case Json.Type.int_:
+            return JSONValue(vibeJson.get!long);
+        case Json.Type.float_:
+            return JSONValue(vibeJson.get!double);
+        case Json.Type.string:
+            return JSONValue(vibeJson.get!string);
+        case Json.Type.array:
+            JSONValue[] arr;
+            foreach (item; vibeJson)
+            {
+                arr ~= toStdJson(item);
+            }
+            return JSONValue(arr);
+        case Json.Type.object:
+            JSONValue[string] obj;
+            foreach (string k, item; vibeJson)
+            {
+                obj[k] = toStdJson(item);
+            }
+            return JSONValue(obj);
+        default:
+            return JSONValue(null);
+    }
+}
+
+/**
+ * Converts a std.json.JSONValue instance into a vibe.data.json.Json.
+ */
+private Json toVibeJson(in JSONValue stdJson)
+{
+    switch (stdJson.type)
+    {
+        case JSONType.null_:
+            return Json(null);
+        case JSONType.true_:
+            return Json(true);
+        case JSONType.false_:
+            return Json(false);
+        case JSONType.integer:
+            return Json(stdJson.integer);
+        case JSONType.uinteger:
+            return Json(stdJson.uinteger);
+        case JSONType.float_:
+            return Json(stdJson.floating);
+        case JSONType.string:
+            return Json(stdJson.str);
+        case JSONType.array:
+            Json arr = Json.emptyArray;
+            foreach (ref const item; stdJson.array)
+            {
+                arr ~= toVibeJson(item);
+            }
+            return arr;
+        case JSONType.object:
+            Json obj = Json.emptyObject;
+            foreach (string k, ref const item; stdJson.object)
+            {
+                obj[k] = toVibeJson(item);
+            }
+            return obj;
+        default:
+            return Json.undefined;
+    }
+}
 
 /**
  * Creates the URL router for the /executors endpoints.
@@ -296,7 +374,7 @@ URLRouter executorRouter(
 
 unittest
 {
-    import confector.core.storage : InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryBuildStateRepository;
     import confector.core.plugin : Plugin, PluginContext, PluginCategory;
     import confector.core.executor : ComputeProvider, ComputeInstance, WorkerRecord;
     import confector.config : ConfigDefinition;
@@ -365,7 +443,7 @@ unittest
     assert(repo.listExecutors().length == 0);
 
     // Test with CapacityBroker and WorkQueue
-    import confector.queue.queue : InMemoryWorkQueue;
+    import confector.core.test_storage : InMemoryWorkQueue;
     import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 
     class TestComputeProvisioner : ComputeProvisioner

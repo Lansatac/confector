@@ -169,6 +169,8 @@ unittest
         }
     }
 
+    import confector.core.test_storage : InMemoryArtifactStorage;
+
     PluginRegistry.instance.shutdownAll();
     PluginRegistry.instance.registerPlugin(new MockServerlessStepRunner());
     PluginRegistry.instance.registerArtifactStorage(new InMemoryArtifactStorage());

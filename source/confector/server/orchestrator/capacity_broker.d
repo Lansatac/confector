@@ -262,6 +262,8 @@ class DefaultCapacityBroker : CapacityBroker
 
 unittest
 {
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository, InMemoryWorkQueue;
+
     // Test Mock Provisioner
     class MockProvisioner : ComputeProvisioner
     {
@@ -364,7 +366,6 @@ unittest
     assert(!broker.isRunning);
 
     // 2. End-to-end integration: BuildCoordinator + WorkQueue + DefaultCapacityBroker
-    import confector.core.storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
     auto e2eQueue = new InMemoryWorkQueue();

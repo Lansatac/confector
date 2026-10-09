@@ -992,6 +992,8 @@ class BuildCoordinator
 
 unittest
 {
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository, InMemoryWorkQueue;
+
     // Unit tests for BuildCoordinator
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();

@@ -51,6 +51,17 @@
 			}
 		},
 		{
+			"name": "mongo_helpers",
+			"targetType": "library",
+			"sourcePaths": ["source/confector/mongo_helpers"],
+			"importPaths": ["source"],
+			"targetPath": "out/lib",
+			"dependencies": {
+				"mongo-standalone": "~>0.0.15",
+				"vibe-serialization": "~>1.2.0"
+			}
+		},
+		{
 			"name": "core",
 			"targetType": "library",
 			"sourcePaths": ["source/confector/core", "source/confector/queue"],
@@ -96,7 +107,9 @@
         "confector:powershell_def": "*",
         "confector:powershell_runner": "*",
         "confector:local_process": "*",
-        "confector:local_artifact": "*"
+        "confector:local_artifact": "*",
+        "confector:mongo_storage": "*",
+        "confector:mongo_queue": "*"
       }
     },
 		"./plugins/definition/bash",
@@ -106,6 +119,8 @@
 		"./plugins/step_executor/git",
 		"./plugins/step_executor/powershell",
 		"./plugins/worker/local_process",
-		"./plugins/artifact/local"
+		"./plugins/artifact/local",
+		"./plugins/storage/mongo",
+		"./plugins/queue/mongo"
 	]
 }

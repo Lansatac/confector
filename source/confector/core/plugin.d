@@ -7,6 +7,8 @@ public import confector.plugin_api.executor;
 public import confector.plugin_api.system;
 public import confector.plugin_api.vcs;
 public import confector.config;
+public import confector.core.storage;
+public import confector.queue.queue;
 
 import vibe.core.log : logDebug, logInfo, logWarn, logError;
 import vibe.data.json : Json;
@@ -110,6 +112,12 @@ final class PluginRegistry
     private ArtifactStorage[] _artifactStorages;
     private ArtifactStorage[string] _artifactStoragesByType;
     private string _defaultArtifactStorageType;
+    private BuildStateRepository[] _stateRepositories;
+    private BuildStateRepository[string] _stateRepositoriesByType;
+    private string _defaultStateRepositoryType;
+    private WorkQueue[] _workQueues;
+    private WorkQueue[string] _workQueuesByType;
+    private string _defaultWorkQueueType;
     private PluginLogCallback _logCallback;
     private ConfigRegistry _configRegistry;
 
@@ -201,6 +209,14 @@ final class PluginRegistry
         {
             registerArtifactStorage(storage);
         }
+        if (auto stateRepo = cast(BuildStateRepository) plugin)
+        {
+            registerStateRepository(stateRepo);
+        }
+        if (auto workQueue = cast(WorkQueue) plugin)
+        {
+            registerWorkQueue(workQueue);
+        }
         logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
     }
 
@@ -269,6 +285,34 @@ final class PluginRegistry
             if (_defaultArtifactStorageType.length == 0)
             {
                 _defaultArtifactStorageType = storage.backendType;
+            }
+        }
+    }
+
+    public void registerStateRepository(BuildStateRepository repo)
+    {
+        import std.algorithm : canFind;
+        if (!_stateRepositories.canFind(repo))
+        {
+            _stateRepositories ~= repo;
+            _stateRepositoriesByType[repo.backendType] = repo;
+            if (_defaultStateRepositoryType.length == 0)
+            {
+                _defaultStateRepositoryType = repo.backendType;
+            }
+        }
+    }
+
+    public void registerWorkQueue(WorkQueue queue)
+    {
+        import std.algorithm : canFind;
+        if (!_workQueues.canFind(queue))
+        {
+            _workQueues ~= queue;
+            _workQueuesByType[queue.backendType] = queue;
+            if (_defaultWorkQueueType.length == 0)
+            {
+                _defaultWorkQueueType = queue.backendType;
             }
         }
     }
@@ -349,6 +393,52 @@ final class PluginRegistry
                         else if (_artifactStorages.length == 0)
                         {
                             _defaultArtifactStorageType = "";
+                        }
+                    }
+                }
+            }
+            if (auto stateRepo = cast(BuildStateRepository) plugin)
+            {
+                for (size_t i = 0; i < _stateRepositories.length; )
+                {
+                    if (_stateRepositories[i] is stateRepo) _stateRepositories = _stateRepositories.remove(i);
+                    else i++;
+                }
+                if (auto it = stateRepo.backendType in _stateRepositoriesByType)
+                {
+                    if (*it is stateRepo)
+                    {
+                        _stateRepositoriesByType.remove(stateRepo.backendType);
+                        if (_defaultStateRepositoryType == stateRepo.backendType && _stateRepositories.length > 0)
+                        {
+                            _defaultStateRepositoryType = _stateRepositories[0].backendType;
+                        }
+                        else if (_stateRepositories.length == 0)
+                        {
+                            _defaultStateRepositoryType = "";
+                        }
+                    }
+                }
+            }
+            if (auto workQueue = cast(WorkQueue) plugin)
+            {
+                for (size_t i = 0; i < _workQueues.length; )
+                {
+                    if (_workQueues[i] is workQueue) _workQueues = _workQueues.remove(i);
+                    else i++;
+                }
+                if (auto it = workQueue.backendType in _workQueuesByType)
+                {
+                    if (*it is workQueue)
+                    {
+                        _workQueuesByType.remove(workQueue.backendType);
+                        if (_defaultWorkQueueType == workQueue.backendType && _workQueues.length > 0)
+                        {
+                            _defaultWorkQueueType = _workQueues[0].backendType;
+                        }
+                        else if (_workQueues.length == 0)
+                        {
+                            _defaultWorkQueueType = "";
                         }
                     }
                 }
@@ -442,6 +532,70 @@ final class PluginRegistry
         }
     }
 
+    public BuildStateRepository[] getStateRepositories()
+    {
+        return _stateRepositories;
+    }
+
+    public BuildStateRepository getStateRepository(string backendType)
+    {
+        if (auto s = backendType in _stateRepositoriesByType)
+            return *s;
+        return null;
+    }
+
+    public BuildStateRepository getDefaultStateRepository()
+    {
+        if (_defaultStateRepositoryType.length > 0)
+            return getStateRepository(_defaultStateRepositoryType);
+        return null;
+    }
+
+    public string getDefaultStateRepositoryType()
+    {
+        return _defaultStateRepositoryType;
+    }
+
+    public void setDefaultStateRepository(string backendType)
+    {
+        if (backendType in _stateRepositoriesByType)
+        {
+            _defaultStateRepositoryType = backendType;
+        }
+    }
+
+    public WorkQueue[] getWorkQueues()
+    {
+        return _workQueues;
+    }
+
+    public WorkQueue getWorkQueue(string backendType)
+    {
+        if (auto s = backendType in _workQueuesByType)
+            return *s;
+        return null;
+    }
+
+    public WorkQueue getDefaultWorkQueue()
+    {
+        if (_defaultWorkQueueType.length > 0)
+            return getWorkQueue(_defaultWorkQueueType);
+        return null;
+    }
+
+    public string getDefaultWorkQueueType()
+    {
+        return _defaultWorkQueueType;
+    }
+
+    public void setDefaultWorkQueue(string backendType)
+    {
+        if (backendType in _workQueuesByType)
+        {
+            _defaultWorkQueueType = backendType;
+        }
+    }
+
     public BuildStepSystem findStepSystem(in BuildStep step)
     {
         foreach (sys; _stepSystems)
@@ -495,6 +649,12 @@ final class PluginRegistry
         _artifactStorages.length = 0;
         _artifactStoragesByType.clear();
         _defaultArtifactStorageType = "";
+        _stateRepositories.length = 0;
+        _stateRepositoriesByType.clear();
+        _defaultStateRepositoryType = "";
+        _workQueues.length = 0;
+        _workQueuesByType.clear();
+        _defaultWorkQueueType = "";
     }
 }
 

@@ -41,8 +41,8 @@ ARG USER_UID=1000
 ARG USER_GID=$USER_UID
 RUN groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME \
-    && mkdir -p /code/.dub /code/out /code/build /code/.reggae /home/$USERNAME/.dub /runner /logs \
-    && chown -R $USERNAME:$USERNAME /code /home/$USERNAME/.dub /runner /logs \
+    && mkdir -p /code/.dub /code/out /code/build /code/.reggae /home/$USERNAME/.dub /runner /logs /artifacts \
+    && chown -R $USERNAME:$USERNAME /code /home/$USERNAME/.dub /runner /logs /artifacts \
     && mkdir -p /etc/confector
 
 ENV CONFECTOR_CONFIG_DIR=/etc/confector

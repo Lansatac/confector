@@ -917,10 +917,12 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
 
 unittest
 {
+    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage, InMemoryWorkQueue;
+
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
     auto storage = new InMemoryArtifactStorage();
-    auto engine = new TaskEngine(storage, stateRepo);
+    auto engine = new TaskEngine(storage);
 
     auto router = dashboardRouter(engine, queue, stateRepo);
     assert(router !is null);

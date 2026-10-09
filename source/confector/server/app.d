@@ -17,14 +17,12 @@ import confector.server.config : ServerConfig, registerServerConfigDefinitions, 
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.storage : BuildStateRepository, InMemoryBuildStateRepository, InMemoryArtifactStorage;
+import confector.core.storage : BuildStateRepository;
 import confector.storage.configured_storage : ConfiguredArtifactStorage;
-import confector.queue.mongo_queue : MongoWorkQueue;
-import confector.queue.queue : WorkQueue, InMemoryWorkQueue;
+import confector.queue.queue : WorkQueue;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 import confector.orchestrator.coordinator : BuildCoordinator;
 import confector.runner_core.engine : TaskEngine;
-import confector.storage.mongo_repository : MongoBuildStateRepository;
 
 import controller.admin_controller : adminRouter;
 import controller.api_controller : apiRouter;
@@ -79,48 +77,6 @@ string readSecretFile(string path)
     }
 }
 
-/// Holds database client, state repository, and work queue instances.
-struct StorageContext
-{
-    MongoClient client;
-    BuildStateRepository stateRepo;
-    WorkQueue workQueue;
-}
-
-/// Initializes MongoDB storage and queue. Fails fast if MongoDB connection fails.
-StorageContext initStorage(string mongoHost = "mongo:27017/confector", string secretPath = "/run/secrets/mongo-readwrite-password")
-{
-    StorageContext ctx;
-    string password = readSecretFile(secretPath);
-
-    string mongoUri;
-    if (password.length > 0)
-    {
-        mongoUri = "mongodb://dev-read-write:" ~ password ~ "@" ~ mongoHost;
-        logInfo("Connecting to mongo at %s (authenticated)...", mongoHost);
-    }
-    else
-    {
-        mongoUri = "mongodb://" ~ mongoHost;
-        logInfo("Connecting to mongo at %s...", mongoHost);
-    }
-
-    try
-    {
-        ctx.client = connectMongoDB(mongoUri);
-        ctx.stateRepo = new MongoBuildStateRepository(ctx.client);
-        ctx.workQueue = new MongoWorkQueue(ctx.client);
-        logInfo("Connected to mongo.");
-    }
-    catch (Exception e)
-    {
-        logError("Fatal: Failed to connect to MongoDB at %s: %s", mongoUri, e.msg);
-        throw new Exception(format("Failed to connect to MongoDB at %s: %s", mongoUri, e.msg), e);
-    }
-
-    return ctx;
-}
-
 /// Discovers and loads bundled plugins as well as dynamically configured plugins via server config / CONFECTOR_PLUGINS.
 void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
 {
@@ -133,7 +89,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
     {
         if (exists(pluginDir) && isDir(pluginDir))
         {
-            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact]);
+            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue]);
         }
     }
 
@@ -178,7 +134,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
             {
                 try
                 {
-                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker]);
+                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue]);
                     if (p !is null)
                     {
                         logInfo("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
@@ -331,11 +287,22 @@ void main()
     }
     setLogLevel(configuredLogLevel);
 
-    // Initialize database & work queues
-    auto storage = initStorage(serverConfig.storage.mongoHost, serverConfig.storage.secretPath);
-
-    // Automatically load plugins
+    // Load all plugins (storage, queue, definition, worker, artifact) via plugin loader
     initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
+
+    // Use plugin-based storage and queue
+    BuildStateRepository stateRepo = PluginRegistry.instance.getDefaultStateRepository();
+    WorkQueue workQueue = PluginRegistry.instance.getDefaultWorkQueue();
+
+    if (stateRepo is null || workQueue is null)
+    {
+        logError("Fatal: No state repository or work queue plugin registered.");
+        return;
+    }
+
+    logInfo("Using plugin-based storage (%s) and queue (%s).",
+        PluginRegistry.instance.getDefaultStateRepositoryType(),
+        PluginRegistry.instance.getDefaultWorkQueueType());
 
     // Validate that at least one artifact storage plugin is registered
     auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
@@ -349,11 +316,11 @@ void main()
     // to the currently configured storage, allowing runtime changes via the Artifacts UI.
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
     auto taskEngine = new TaskEngine(configuredStorage);
-    auto buildCoordinator = new BuildCoordinator(configuredStorage, storage.stateRepo, storage.workQueue);
+    auto buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, workQueue);
     logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Initialize capacity broker
-    auto capacityBroker = new DefaultCapacityBroker(storage.workQueue, buildCoordinator);
+    auto capacityBroker = new DefaultCapacityBroker(workQueue, buildCoordinator);
 
     // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
     foreach (plugin; PluginRegistry.instance.allPlugins())
@@ -392,7 +359,7 @@ void main()
     capacityBroker.start();
 
     // Configure router and server settings
-    auto router = createRouter(taskEngine, storage.workQueue, buildCoordinator, storage.stateRepo, capacityBroker, configuredStorage);
+    auto router = createRouter(taskEngine, workQueue, buildCoordinator, stateRepo, capacityBroker, configuredStorage);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -407,6 +374,8 @@ void main()
 
 unittest
 {
+    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage, InMemoryWorkQueue;
+
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
     PluginRegistry.instance.setConfigRegistry(configRegistry);

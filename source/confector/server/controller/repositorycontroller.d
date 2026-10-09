@@ -10,7 +10,7 @@ import std.typecons : Tuple, tuple;
 import std.uri : encodeComponent;
 
 import confector.core.model : ProjectRecord, RepositoryRecord;
-import confector.core.storage : BuildStateRepository, InMemoryBuildStateRepository;
+import confector.core.storage : BuildStateRepository;
 
 /// View model for repository listing.
 struct RepositoryViewModel
@@ -197,6 +197,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
 
 unittest
 {
+    import confector.core.test_storage : InMemoryBuildStateRepository;
     auto stateRepo = new InMemoryBuildStateRepository();
 
     RepositoryRecord r1;

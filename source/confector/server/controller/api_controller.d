@@ -1091,6 +1091,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
 unittest
 {
     import confector.core.plugin;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository, InMemoryWorkQueue;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
 

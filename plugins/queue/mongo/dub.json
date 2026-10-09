@@ -1,0 +1,14 @@
+{
+	"name": "mongo_queue",
+	"description": "MongoDB queue plugin for Confector",
+	"targetType": "dynamicLibrary",
+	"targetName": "confector_mongo_queue",
+	"targetPath": "../../../out/server/plugins",
+	"sourcePaths": ["."],
+	"importPaths": ["."],
+	"dependencies": {
+		"confector:plugin_api": "*",
+		"confector:mongo_helpers": "*"
+	},
+	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
+}
