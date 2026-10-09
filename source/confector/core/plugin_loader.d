@@ -537,9 +537,9 @@ unittest
     // 7. Bundled directory loader tests
     assert(loader.loadBundledPlugins("non_existent_plugins_dir_99999").length == 0);
 
-    import std.file : mkdirRecurse, rmdirRecurse, write;
+    import std.file : mkdirRecurse, rmdirRecurse, write, tempDir;
     import std.path : buildPath;
-    string testPluginsDir = buildPath(".test_confector_plugins_tmp");
+    string testPluginsDir = buildPath(tempDir, "test_confector_plugins_tmp");
     if (exists(testPluginsDir)) rmdirRecurse(testPluginsDir);
     mkdirRecurse(testPluginsDir);
     scope(exit) { if (exists(testPluginsDir)) rmdirRecurse(testPluginsDir); }

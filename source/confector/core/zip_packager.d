@@ -359,9 +359,9 @@ final class ZipPackager
 
 unittest
 {
-    import std.file : rmdirRecurse;
+    import std.file : rmdirRecurse, tempDir;
 
-    string testRoot = buildPath(".test_zip_packager_work");
+    string testRoot = buildPath(tempDir, "test_zip_packager_work");
     if (exists(testRoot)) rmdirRecurse(testRoot);
     scope(exit) if (exists(testRoot)) rmdirRecurse(testRoot);
 
@@ -377,7 +377,7 @@ unittest
     write(buildPath(wsDir, "src", "nested", "main.d"), "void main() {}");
 
     // Test 1: Pack with multiple glob patterns and unpack
-    ubyte[] zipBytes = ZipPackager.packToBytes(wsDir, ["out/*", "config/*.json"]);
+    ubyte[] zipBytes = ZipPackager.packToBytes(wsDir, ["bin/*", "config/*.json"]);
     assert(zipBytes.length > 0);
 
     ZipPackager.unpack(zipBytes, outDir);
@@ -423,7 +423,7 @@ unittest
     // Test 5: Stream-based pack and unpack
     string outDir3 = buildPath(testRoot, "extracted3");
     Appender!(ubyte[]) streamBuffer;
-    ZipPackager.pack(wsDir, ["out/app.exe"], (const(ubyte)[] chunk) {
+    ZipPackager.pack(wsDir, ["bin/app.exe"], (const(ubyte)[] chunk) {
         streamBuffer.put(chunk);
     });
     ZipPackager.unpackStream((sink) {
