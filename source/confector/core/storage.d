@@ -274,4 +274,85 @@ unittest
         caughtNotFound = true;
     }
     assert(caughtNotFound);
+
+    // ==========================================
+    // VCS Repository State & Change Record Tests
+    // ==========================================
+    import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
+
+    // Test save and get repository state
+    VcsRepositoryState vcsState;
+    vcsState.repositoryUrl = "https://github.com/confector/confector.git";
+    vcsState.providerType = "git";
+    vcsState.targetRef = "main";
+    vcsState.revision = "abc123def456";
+    vcsState.author = "dev@example.com";
+    vcsState.message = "Initial commit";
+    vcsState.updatedAt = "2026-10-09T10:00:00Z";
+
+    stateRepo.saveRepositoryState(vcsState);
+
+    VcsRepositoryState fetchedState;
+    assert(stateRepo.getRepositoryState("https://github.com/confector/confector.git", "main", fetchedState));
+    assert(fetchedState.revision == "abc123def456");
+    assert(fetchedState.providerType == "git");
+    assert(fetchedState.author == "dev@example.com");
+
+    // Test that non-existent state returns false
+    VcsRepositoryState missingState;
+    assert(!stateRepo.getRepositoryState("https://github.com/other/repo.git", "main", missingState));
+
+    // Test change record recording and listing
+    VcsChangeRecord change1;
+    change1.id = "change-001";
+    change1.repositoryUrl = "https://github.com/confector/confector.git";
+    change1.providerType = "git";
+    change1.targetRef = "main";
+    change1.fromRevision = "abc123def456";
+    change1.toRevision = "789xyz000";
+    change1.detectedAt = "2026-10-09T11:00:00Z";
+    change1.triggerSource = "webhook";
+
+    VcsChangeRecord change2;
+    change2.id = "change-002";
+    change2.repositoryUrl = "https://github.com/confector/confector.git";
+    change2.providerType = "git";
+    change2.targetRef = "main";
+    change2.fromRevision = "789xyz000";
+    change2.toRevision = "newrevision123";
+    change2.detectedAt = "2026-10-09T12:00:00Z";
+    change2.triggerSource = "polling";
+
+    VcsChangeRecord change3;
+    change3.id = "change-003";
+    change3.repositoryUrl = "https://github.com/other/repo.git";
+    change3.providerType = "git";
+    change3.targetRef = "develop";
+    change3.fromRevision = "old1";
+    change3.toRevision = "new1";
+    change3.detectedAt = "2026-10-09T13:00:00Z";
+    change3.triggerSource = "manual";
+
+    stateRepo.recordRepositoryChange(change1);
+    stateRepo.recordRepositoryChange(change2);
+    stateRepo.recordRepositoryChange(change3);
+
+    auto changes = stateRepo.listRepositoryChanges("https://github.com/confector/confector.git");
+    assert(changes.length == 2);
+    assert(changes[0].id == "change-001");
+    assert(changes[1].id == "change-002");
+
+    // Test limit parameter
+    auto limitedChanges = stateRepo.listRepositoryChanges("https://github.com/confector/confector.git", 1);
+    assert(limitedChanges.length == 1);
+    assert(limitedChanges[0].id == "change-002"); // last one due to slicing
+
+    // Test filtering by repository URL
+    auto otherChanges = stateRepo.listRepositoryChanges("https://github.com/other/repo.git");
+    assert(otherChanges.length == 1);
+    assert(otherChanges[0].id == "change-003");
+
+    // Test empty result for unknown repository
+    auto noChanges = stateRepo.listRepositoryChanges("https://github.com/unknown/repo.git");
+    assert(noChanges.length == 0);
 }

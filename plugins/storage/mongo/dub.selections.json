@@ -5,6 +5,7 @@
 		"during": "0.3.0",
 		"eventcore": "0.9.39",
 		"mir-linux-kernel": "1.2.1",
+		"mongo-standalone": "0.0.15",
 		"openssl": "3.4.0",
 		"openssl-static": "1.0.5+3.0.8",
 		"silly": "1.1.1",

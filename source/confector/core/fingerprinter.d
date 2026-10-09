@@ -461,4 +461,72 @@ unittest
     PluginRegistry.instance.shutdownAll();
     string fpWithoutSys = Fingerprinter.computeNodeFingerprint(task, ".", artifacts1);
     assert(fpWithSys != fpWithoutSys);
+
+    // 11. VCS revision state drives fingerprint invalidation
+    class VcsRevisionFingerprintSystem : FingerprintContributionSystem
+    {
+        @property string systemName() const { return "vcs-revision"; }
+        bool canContribute(in TaskNode t) const
+        {
+            return (t.inputs.repositories.length > 0) || (t.inputs.repositoryConfigs.length > 0);
+        }
+        string contributeFingerprint(in TaskNode t, in FingerprintContributionContext ctx) const
+        {
+            import std.array : appender;
+            auto app = appender!string();
+            if (ctx.vcsRepositoryStates)
+            {
+                string[] keys;
+                foreach (k; ctx.vcsRepositoryStates.byKey) keys ~= k;
+                keys.sort();
+                foreach (k; keys)
+                {
+                    auto st = ctx.vcsRepositoryStates[k];
+                    app.put(k);
+                    app.put(":");
+                    app.put(st.revision);
+                    app.put("|");
+                }
+            }
+            return app.data;
+        }
+    }
+
+    auto vcsSys = new VcsRevisionFingerprintSystem();
+    PluginRegistry.instance.registerFingerprintContributor(vcsSys);
+
+    // Task with repository input
+    TaskNode repoTask;
+    repoTask.id = "compile";
+    repoTask.inputs.repositories = ["https://github.com/example/repo.git"];
+    repoTask.steps = [BuildStep("Build", "bash", null, "make")];
+
+    // First revision state
+    VcsRepositoryState state1;
+    state1.repositoryUrl = "https://github.com/example/repo.git";
+    state1.providerType = "git";
+    state1.targetRef = "main";
+    state1.revision = "aaa111bbb222";
+
+    FingerprintContributionContext ctx1;
+    ctx1.vcsRepositoryStates = ["https://github.com/example/repo.git": state1];
+
+    // Second revision state (different revision)
+    VcsRepositoryState state2;
+    state2.repositoryUrl = "https://github.com/example/repo.git";
+    state2.providerType = "git";
+    state2.targetRef = "main";
+    state2.revision = "ccc333ddd444";
+
+    FingerprintContributionContext ctx2;
+    ctx2.vcsRepositoryStates = ["https://github.com/example/repo.git": state2];
+
+    // Verify the system can contribute and produces different strings for different revisions
+    assert(vcsSys.canContribute(repoTask));
+    string contrib1 = vcsSys.contributeFingerprint(repoTask, ctx1);
+    string contrib2 = vcsSys.contributeFingerprint(repoTask, ctx2);
+    assert(contrib1 != contrib2, "VCS contribution should differ when revision changes");
+    assert(contrib1.length > 0);
+
+    PluginRegistry.instance.shutdownAll();
 }

@@ -6,13 +6,17 @@ import std.stdio;
 import std.file;
 import std.path : buildPath, baseName, isAbsolute, buildNormalizedPath, absolutePath, relativePath, dirSeparator;
 import std.algorithm.searching : canFind, startsWith, endsWith;
+import std.array : split;
+import std.string : strip, toLower, indexOf;
 import std.json : JSONValue, JSONType;
 
 import confector.plugin_api.model;
 import confector.plugin_api.plugin;
 import confector.plugin_api.vcs;
-import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult;
+import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult, FingerprintContributionSystem, FingerprintContributionContext;
 import confector.plugin_api.executor : LogDelegate;
+import std.json : parseJSON;
+import std.datetime : Clock;
 
 private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
 {
@@ -102,7 +106,7 @@ private bool isRepoMatch(string candidate, string target, in string[string] repo
  * Git repository provider, input resolution, and build step execution plugin.
  * Encapsulates Git-specific cloning, command operations, and input staging.
  */
-class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSystem, BuildStepSystem
+class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSystem, BuildStepSystem, VcsStateResolver, FingerprintContributionSystem
 {
     private PluginContext m_context;
 
@@ -462,6 +466,455 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
 
         return res;
     }
+
+    // ===================== VcsStateResolver implementation =====================
+
+    VcsRepositoryState fetchLatestState(string repositoryUrl, string targetRef = null)
+    {
+        VcsRepositoryState state;
+        state.repositoryUrl = repositoryUrl;
+        state.providerType = "git";
+        state.targetRef = targetRef !is null ? targetRef : "";
+        state.updatedAt = Clock.currTime().toString();
+
+        string[] args;
+        args ~= ["git", "ls-remote", repositoryUrl];
+
+        try
+        {
+            auto pipe = pipeProcess(args, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr);
+            scope(exit) wait(pipe.pid);
+
+            foreach (line; pipe.stdout.byLineCopy)
+            {
+                auto trimmedLine = strip(line);
+                if (trimmedLine.length == 0) continue;
+
+                // Format: <SHA>\t<ref> (e.g., abc123\trefs/heads/main or abc123\tHEAD)
+                auto tabPos = trimmedLine.indexOf('\t');
+                if (tabPos < 0) continue;
+
+                string sha = strip(trimmedLine[0 .. tabPos]);
+                string refName = strip(trimmedLine[tabPos + 1 .. $]);
+
+                if (sha.length == 0) continue;
+
+                // If no target ref specified, prefer HEAD, then refs/heads/master, then refs/heads/main
+                if (state.revision.length == 0)
+                {
+                    if (refName == "HEAD" || refName == "refs/heads/master" || refName == "refs/heads/main")
+                    {
+                        state.revision = sha;
+                        if (refName == "HEAD")
+                        {
+                            // Try to resolve HEAD to a branch name
+                            auto symref = line[0 .. tabPos]; // already have sha
+                            state.targetRef = "HEAD";
+                        }
+                        else if (refName.startsWith("refs/heads/"))
+                        {
+                            state.targetRef = refName["refs/heads/".length .. $];
+                        }
+                    }
+                }
+
+                // If targetRef is specified, match it
+                if (targetRef !is null && targetRef.length > 0)
+                {
+                    string expectedRef = "refs/heads/" ~ targetRef;
+                    if (refName == expectedRef || refName == targetRef)
+                    {
+                        state.revision = sha;
+                        state.targetRef = targetRef;
+                    }
+                }
+            }
+
+            // If we found HEAD but need to resolve the actual branch, do a second pass
+            if (state.revision.length > 0 && state.targetRef == "HEAD" && targetRef is null)
+            {
+                // Try to get the symbolic ref
+                string[] symArgs = ["git", "ls-remote", "--symref", repositoryUrl, "HEAD"];
+                try
+                {
+                    auto symPipe = pipeProcess(symArgs, Redirect.stdout | Redirect.stderrToStdout, null, Config.retainStderr);
+                    scope(exit) wait(symPipe.pid);
+
+                    foreach (line; symPipe.stdout.byLineCopy)
+                    {
+                        auto trimmedLine2 = strip(line);
+                        if (trimmedLine2.startsWith("ref:"))
+                        {
+                            // Format: ref: refs/heads/main\tHEAD
+                            auto parts = split(trimmedLine2, '\t');
+                            if (parts.length >= 1)
+                            {
+                                auto refPart = strip(parts[0]);
+                                if (refPart.startsWith("ref: refs/heads/"))
+                                {
+                                    state.targetRef = refPart["ref: refs/heads/".length .. $];
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Throwable)
+                {
+                    // Ignore errors resolving symbolic ref
+                }
+            }
+
+            if (m_context !is null && state.revision.length > 0)
+            {
+                m_context.info(format("[git] Fetched latest state for %s: %s (%s)", repositoryUrl, state.revision, state.targetRef));
+            }
+        }
+        catch (Exception e)
+        {
+            if (m_context !is null)
+            {
+                m_context.error(format("[git] Failed to fetch latest state for %s: %s", repositoryUrl, e.msg));
+            }
+            // Return empty state on error; caller should handle missing revision
+        }
+
+        return state;
+    }
+
+    bool canHandleWebhook(in string[string] headers, in JSONValue payload) const
+    {
+        // Detect GitHub webhooks by X-GitHub-Event header
+        foreach (header, value; headers)
+        {
+            if (toLower(header) == "x-github-event") return true;
+            if (toLower(header) == "x-gitlab-event") return true;
+            if (toLower(header) == "x-gitlab-token") return true;
+        }
+
+        // Detect by payload structure: look for common Git webhook fields
+        if (payload.type == JSONType.object)
+        {
+            // GitHub push webhook has "ref" and "repository"
+            if ("ref" in payload && "repository" in payload) return true;
+            // GitLab push webhook has "ref" and "project"
+            if ("ref" in payload && "project" in payload) return true;
+            // Generic Git webhook with "commits" array
+            if ("commits" in payload) return true;
+        }
+
+        return false;
+    }
+
+    bool parseWebhookPayload(
+        in string[string] headers,
+        in JSONValue payload,
+        out VcsRepositoryState resolvedState
+    )
+    {
+        resolvedState = VcsRepositoryState();
+        resolvedState.providerType = "git";
+        resolvedState.updatedAt = Clock.currTime().toString();
+
+        try
+        {
+            if (payload.type != JSONType.object) return false;
+
+            bool isGitHub = false;
+            bool isGitLab = false;
+
+            // Detect provider by headers
+            foreach (header, value; headers)
+            {
+                auto h = header.toLower();
+                if (h == "x-github-event") isGitHub = true;
+                if (h == "x-gitlab-event" || h == "x-gitlab-token") isGitLab = true;
+            }
+
+            if (isGitHub)
+            {
+                // Parse GitHub webhook payload
+                if ("repository" in payload && payload["repository"].type == JSONType.object)
+                {
+                    auto repo = payload["repository"];
+                    if ("html_url" in repo) resolvedState.repositoryUrl = repo["html_url"].str;
+                    else if ("clone_url" in repo) resolvedState.repositoryUrl = repo["clone_url"].str;
+                    else if ("url" in repo) resolvedState.repositoryUrl = repo["url"].str;
+                }
+
+                if ("ref" in payload)
+                {
+                    string refValue = payload["ref"].str;
+                    if (refValue.startsWith("refs/heads/"))
+                    {
+                        resolvedState.targetRef = refValue["refs/heads/".length .. $];
+                    }
+                    else
+                    {
+                        resolvedState.targetRef = refValue;
+                    }
+                }
+
+                // After a push, "after" contains the new HEAD SHA
+                if ("after" in payload)
+                {
+                    string after = payload["after"].str;
+                    // GitHub sends 0000...0000 for deleted refs
+                    if (after != "0000000000000000000000000000000000000000")
+                    {
+                        resolvedState.revision = after;
+                    }
+                }
+
+                if ("head_commit" in payload && payload["head_commit"].type == JSONType.object)
+                {
+                    auto commit = payload["head_commit"];
+                    if ("id" in commit) resolvedState.revision = commit["id"].str;
+                    if ("message" in commit) resolvedState.message = commit["message"].str;
+                    if ("author" in commit && commit["author"].type == JSONType.object)
+                    {
+                        auto author = commit["author"];
+                        if ("name" in author) resolvedState.author = author["name"].str;
+                    }
+                }
+
+                // For tag pushes, extract tag name
+                if ("ref" in payload)
+                {
+                    string refValue = payload["ref"].str;
+                    if (refValue.startsWith("refs/tags/"))
+                    {
+                        resolvedState.targetRef = refValue["refs/tags/".length .. $];
+                        if ("pusher" in payload && payload["pusher"].type == JSONType.object)
+                        {
+                            auto pusher = payload["pusher"];
+                            if ("name" in pusher) resolvedState.author = pusher["name"].str;
+                        }
+                    }
+                }
+            }
+            else if (isGitLab)
+            {
+                // Parse GitLab webhook payload
+                if ("project" in payload && payload["project"].type == JSONType.object)
+                {
+                    auto project = payload["project"];
+                    if ("http_url_to_repo" in project) resolvedState.repositoryUrl = project["http_url_to_repo"].str;
+                    else if ("git_http_url" in project) resolvedState.repositoryUrl = project["git_http_url"].str;
+                    else if ("web_url" in project) resolvedState.repositoryUrl = project["web_url"].str;
+                }
+
+                if ("ref" in payload)
+                {
+                    string refValue = payload["ref"].str;
+                    if (refValue.startsWith("refs/heads/"))
+                    {
+                        resolvedState.targetRef = refValue["refs/heads/".length .. $];
+                    }
+                    else
+                    {
+                        resolvedState.targetRef = refValue;
+                    }
+                }
+
+                if ("after" in payload)
+                {
+                    string after = payload["after"].str;
+                    if (after != "0000000000000000000000000000000000000000")
+                    {
+                        resolvedState.revision = after;
+                    }
+                }
+
+                if ("commits" in payload && payload["commits"].type == JSONType.array)
+                {
+                    auto commits = payload["commits"].array;
+                    if (commits.length > 0)
+                    {
+                        auto lastCommit = commits[$ - 1];
+                        if (lastCommit.type == JSONType.object)
+                        {
+                            if ("id" in lastCommit) resolvedState.revision = lastCommit["id"].str;
+                            if ("message" in lastCommit) resolvedState.message = lastCommit["message"].str;
+                            if ("author_name" in lastCommit) resolvedState.author = lastCommit["author_name"].str;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Generic Git webhook parsing
+                if ("repository" in payload)
+                {
+                    auto repo = payload["repository"];
+                    if (repo.type == JSONType.object)
+                    {
+                        if ("url" in repo) resolvedState.repositoryUrl = repo["url"].str;
+                        else if ("clone_url" in repo) resolvedState.repositoryUrl = repo["clone_url"].str;
+                    }
+                    else
+                    {
+                        resolvedState.repositoryUrl = repo.str;
+                    }
+                }
+
+                if ("ref" in payload)
+                {
+                    string refValue = payload["ref"].str;
+                    if (refValue.startsWith("refs/heads/"))
+                    {
+                        resolvedState.targetRef = refValue["refs/heads/".length .. $];
+                    }
+                    else
+                    {
+                        resolvedState.targetRef = refValue;
+                    }
+                }
+
+                if ("commit" in payload)
+                {
+                    resolvedState.revision = payload["commit"].str;
+                }
+                else if ("sha" in payload)
+                {
+                    resolvedState.revision = payload["sha"].str;
+                }
+
+                if ("message" in payload) resolvedState.message = payload["message"].str;
+                if ("author" in payload)
+                {
+                    auto author = payload["author"];
+                    if (author.type == JSONType.object && "name" in author)
+                    {
+                        resolvedState.author = author["name"].str;
+                    }
+                    else
+                    {
+                        resolvedState.author = author.str;
+                    }
+                }
+            }
+
+            if (m_context !is null)
+            {
+                m_context.info(format("[git] Parsed webhook: %s @ %s (%s)", resolvedState.repositoryUrl, resolvedState.revision, resolvedState.targetRef));
+            }
+
+            return resolvedState.repositoryUrl.length > 0 && resolvedState.revision.length > 0;
+        }
+        catch (Exception e)
+        {
+            if (m_context !is null)
+            {
+                m_context.error(format("[git] Failed to parse webhook payload: %s", e.msg));
+            }
+            return false;
+        }
+    }
+
+    // ===================== FingerprintContributionSystem implementation =====================
+
+    bool canContribute(in TaskNode task) const
+    {
+        // Contribute if the task has repository inputs or git-related build steps
+        if (task.inputs.repositories.length > 0) return true;
+        if (task.hasCustomComponent("git_source")) return true;
+        foreach (step; task.steps)
+        {
+            if (canExecuteStep(step)) return true;
+        }
+        return false;
+    }
+
+    string contributeFingerprint(in TaskNode task, in FingerprintContributionContext context) const
+    {
+        import std.array : appender;
+
+        auto ap = appender!string();
+
+        // Collect all repository URLs from the task
+        string[] repoUrls;
+
+        // From repository inputs
+        foreach (repo; task.inputs.repositories)
+        {
+            if (canHandle(repo)) repoUrls ~= repo;
+        }
+
+        // From git_source component
+        if (task.hasCustomComponent("git_source"))
+        {
+            auto comp = task.getCustomComponent("git_source");
+            if (comp.type == JSONType.object && "url" in comp)
+            {
+                repoUrls ~= comp["url"].str;
+            }
+        }
+
+        // From build steps
+        foreach (step; task.steps)
+        {
+            if (canExecuteStep(step))
+            {
+                string repoParam;
+                foreach (key; ["repository", "url", "address", "repo"])
+                {
+                    if (key in step.parameters)
+                    {
+                        repoParam = step.parameters[key];
+                        break;
+                    }
+                }
+                if (repoParam.length > 0 && canHandle(repoParam))
+                {
+                    repoUrls ~= repoParam;
+                }
+            }
+        }
+
+        if (repoUrls.length == 0) return "";
+
+        // Sort for determinism
+        import std.algorithm.sorting : sort;
+        repoUrls.sort();
+
+        foreach (repoUrl; repoUrls)
+        {
+            ap.put("repo:");
+            ap.put(normalizeRepoUrl(repoUrl));
+            ap.put(':');
+
+            // Try to get the resolved VCS state from context
+            if (context.vcsRepositoryStates !is null)
+            {
+                bool found = false;
+                foreach (key, state; context.vcsRepositoryStates)
+                {
+                    if (isRepoMatch(key, repoUrl))
+                    {
+                        ap.put(state.revision);
+                        ap.put('|');
+                        ap.put(state.targetRef);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    // No resolved state available; use empty revision marker
+                    ap.put("unknown|");
+                }
+            }
+            else
+            {
+                // No VCS state map provided; use empty revision marker
+                ap.put("unknown|");
+            }
+
+            ap.put('\n');
+        }
+
+        return ap.data;
+    }
 }
 
 /**
@@ -529,4 +982,281 @@ unittest
     // Should pass whitelist auth check (not 403) and fail on boundary escape (code 1)
     assert(aliasRes.exitCode != 403);
     assert(!aliasRes.success);
+}
+
+unittest
+{
+    // Test VcsStateResolver interface methods
+    auto plugin = new GitRunnerPlugin();
+    plugin.initialize(new NullPluginContext("git-runner"));
+
+    // Test canHandleWebhook with GitHub headers
+    {
+        string[string] githubHeaders = ["X-GitHub-Event": "push"];
+        auto payload = parseJSON(`{"ref": "refs/heads/main", "repository": {"html_url": "https://github.com/example/repo"}}`);
+        assert(plugin.canHandleWebhook(githubHeaders, payload));
+    }
+
+    // Test canHandleWebhook with GitLab headers
+    {
+        string[string] gitlabHeaders = ["X-GitLab-Event": "push"];
+        auto payload = parseJSON(`{"ref": "refs/heads/main", "project": {"http_url_to_repo": "https://gitlab.com/example/repo"}}`);
+        assert(plugin.canHandleWebhook(gitlabHeaders, payload));
+    }
+
+    // Test canHandleWebhook with payload structure (no headers)
+    {
+        string[string] emptyHeaders;
+        auto payload = parseJSON(`{"ref": "refs/heads/main", "repository": {"url": "https://github.com/example/repo"}}`);
+        assert(plugin.canHandleWebhook(emptyHeaders, payload));
+    }
+
+    // Test canHandleWebhook returns false for non-Git payloads
+    {
+        string[string] emptyHeaders;
+        auto payload = parseJSON(`{"event": "deploy", "status": "success"}`);
+        assert(!plugin.canHandleWebhook(emptyHeaders, payload));
+    }
+
+    // Test parseWebhookPayload for GitHub push
+    {
+        string[string] githubHeaders = ["X-GitHub-Event": "push"];
+        auto payload = parseJSON(`{
+            "ref": "refs/heads/main",
+            "after": "abc123def456789012345678901234567890abcd",
+            "repository": {
+                "html_url": "https://github.com/example/repo"
+            },
+            "head_commit": {
+                "id": "abc123def456789012345678901234567890abcd",
+                "message": "Fix bug",
+                "author": {"name": "Dev User"}
+            }
+        }`);
+        VcsRepositoryState state;
+        assert(plugin.parseWebhookPayload(githubHeaders, payload, state));
+        assert(state.repositoryUrl == "https://github.com/example/repo");
+        assert(state.targetRef == "main");
+        assert(state.revision == "abc123def456789012345678901234567890abcd");
+        assert(state.providerType == "git");
+        assert(state.message == "Fix bug");
+        assert(state.author == "Dev User");
+    }
+
+    // Test parseWebhookPayload for GitLab push
+    {
+        string[string] gitlabHeaders = ["X-GitLab-Event": "push"];
+        auto payload = parseJSON(`{
+            "ref": "refs/heads/develop",
+            "after": "1234567890abcdef1234567890abcdef12345678",
+            "project": {
+                "http_url_to_repo": "https://gitlab.com/example/project"
+            },
+            "commits": [{
+                "id": "1234567890abcdef1234567890abcdef12345678",
+                "message": "Update feature",
+                "author_name": "GitLab User"
+            }]
+        }`);
+        VcsRepositoryState state;
+        assert(plugin.parseWebhookPayload(gitlabHeaders, payload, state));
+        assert(state.repositoryUrl == "https://gitlab.com/example/project");
+        assert(state.targetRef == "develop");
+        assert(state.revision == "1234567890abcdef1234567890abcdef12345678");
+        assert(state.providerType == "git");
+    }
+
+    // Test parseWebhookPayload for generic webhook
+    {
+        string[string] emptyHeaders;
+        auto payload = parseJSON(`{
+            "repository": "https://github.com/example/repo",
+            "ref": "refs/heads/main",
+            "commit": "deadbeef1234567890abcdef1234567890abcdef",
+            "message": "Generic commit"
+        }`);
+        VcsRepositoryState state;
+        assert(plugin.parseWebhookPayload(emptyHeaders, payload, state));
+        assert(state.repositoryUrl == "https://github.com/example/repo");
+        assert(state.targetRef == "main");
+        assert(state.revision == "deadbeef1234567890abcdef1234567890abcdef");
+    }
+
+    // Test parseWebhookPayload returns false for invalid payload
+    {
+        string[string] emptyHeaders;
+        auto payload = parseJSON(`{"event": "unknown"}`);
+        VcsRepositoryState state;
+        assert(!plugin.parseWebhookPayload(emptyHeaders, payload, state));
+    }
+
+    // Test parseWebhookPayload for GitHub tag push
+    {
+        string[string] githubHeaders = ["X-GitHub-Event": "push"];
+        auto payload = parseJSON(`{
+            "ref": "refs/tags/v1.0.0",
+            "after": "tagsha123456789012345678901234567890123456",
+            "repository": {
+                "html_url": "https://github.com/example/repo"
+            },
+            "pusher": {"name": "Tag Pusher"}
+        }`);
+        VcsRepositoryState state;
+        assert(plugin.parseWebhookPayload(githubHeaders, payload, state));
+        assert(state.targetRef == "v1.0.0");
+        assert(state.author == "Tag Pusher");
+    }
+
+    // Test parseWebhookPayload ignores deleted refs (all zeros)
+    {
+        string[string] githubHeaders = ["X-GitHub-Event": "push"];
+        auto payload = parseJSON(`{
+            "ref": "refs/heads/deleted-branch",
+            "after": "0000000000000000000000000000000000000000",
+            "repository": {
+                "html_url": "https://github.com/example/repo"
+            }
+        }`);
+        VcsRepositoryState state;
+        // Should return false because revision is empty (deleted ref)
+        assert(!plugin.parseWebhookPayload(githubHeaders, payload, state));
+    }
+}
+
+unittest
+{
+    // Test FingerprintContributionSystem interface methods
+    auto plugin = new GitRunnerPlugin();
+    plugin.initialize(new NullPluginContext("git-runner"));
+
+    // Test canContribute with repository inputs
+    {
+        TaskNode task;
+        task.id = "build";
+        task.inputs.repositories = ["https://github.com/example/repo.git"];
+        assert(plugin.canContribute(task));
+    }
+
+    // Test canContribute with git_source component
+    {
+        TaskNode task;
+        task.id = "build";
+        task.setCustomComponent("git_source", JSONValue([
+            "url": JSONValue("https://github.com/example/repo.git"),
+            "branch": JSONValue("main")
+        ]));
+        assert(plugin.canContribute(task));
+    }
+
+    // Test canContribute with git build step
+    {
+        TaskNode task;
+        task.id = "build";
+        task.steps = [BuildStep("Clone", "clone_repository", ["repository": "https://github.com/example/repo.git"])];
+        assert(plugin.canContribute(task));
+    }
+
+    // Test canContribute returns false for non-git task
+    {
+        TaskNode task;
+        task.id = "build";
+        task.steps = [BuildStep("Build", "bash", null, "dub build")];
+        assert(!plugin.canContribute(task));
+    }
+
+    // Test contributeFingerprint with repository inputs and VCS state
+    {
+        TaskNode task;
+        task.id = "build";
+        task.inputs.repositories = ["https://github.com/example/repo.git"];
+
+        FingerprintContributionContext ctx;
+        ctx.vcsRepositoryStates = [
+            "https://github.com/example/repo.git": VcsRepositoryState(
+                "https://github.com/example/repo.git",
+                "git",
+                "main",
+                "abc123def456"
+            )
+        ];
+
+        auto contribution = plugin.contributeFingerprint(task, ctx);
+        assert(contribution.length > 0);
+        assert(contribution.canFind("abc123def456"));
+        assert(contribution.canFind("main"));
+    }
+
+    // Test contributeFingerprint with different revisions produces different output
+    {
+        TaskNode task;
+        task.id = "build";
+        task.inputs.repositories = ["https://github.com/example/repo.git"];
+
+        FingerprintContributionContext ctx1;
+        ctx1.vcsRepositoryStates = [
+            "https://github.com/example/repo.git": VcsRepositoryState(
+                "https://github.com/example/repo.git",
+                "git",
+                "main",
+                "abc123def456"
+            )
+        ];
+
+        FingerprintContributionContext ctx2;
+        ctx2.vcsRepositoryStates = [
+            "https://github.com/example/repo.git": VcsRepositoryState(
+                "https://github.com/example/repo.git",
+                "git",
+                "main",
+                "789xyz000000"
+            )
+        ];
+
+        auto contrib1 = plugin.contributeFingerprint(task, ctx1);
+        auto contrib2 = plugin.contributeFingerprint(task, ctx2);
+        assert(contrib1 != contrib2, "Different revisions should produce different fingerprint contributions");
+    }
+
+    // Test contributeFingerprint with no VCS state
+    {
+        TaskNode task;
+        task.id = "build";
+        task.inputs.repositories = ["https://github.com/example/repo.git"];
+
+        FingerprintContributionContext ctx;
+
+        auto contribution = plugin.contributeFingerprint(task, ctx);
+        assert(contribution.canFind("unknown|"));
+    }
+
+    // Test contributeFingerprint returns empty for non-git task
+    {
+        TaskNode task;
+        task.id = "build";
+        task.steps = [BuildStep("Build", "bash", null, "dub build")];
+
+        FingerprintContributionContext ctx;
+        auto contribution = plugin.contributeFingerprint(task, ctx);
+        assert(contribution.length == 0);
+    }
+
+    // Test contributeFingerprint with build step repository
+    {
+        TaskNode task;
+        task.id = "build";
+        task.steps = [BuildStep("Clone", "git:clone", ["url": "https://github.com/example/repo.git"])];
+
+        FingerprintContributionContext ctx;
+        ctx.vcsRepositoryStates = [
+            "https://github.com/example/repo.git": VcsRepositoryState(
+                "https://github.com/example/repo.git",
+                "git",
+                "main",
+                "deadbeef1234"
+            )
+        ];
+
+        auto contribution = plugin.contributeFingerprint(task, ctx);
+        assert(contribution.canFind("deadbeef1234"));
+    }
 }

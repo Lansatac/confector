@@ -38,6 +38,8 @@ struct FingerprintContributionContext
     string[string] upstreamArtifactHashes;
     @optional string[string] upstreamFingerprints;
     string[string] parameters;
+    /// Optional map of repository URL -> resolved VCS state, allowing plugins to contribute revision hashes.
+    @optional VcsRepositoryState[string] vcsRepositoryStates;
 }
 
 /**

@@ -1058,22 +1058,356 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    // Webhook receiver endpoint
-    postRoute("/triggers/webhook", (HTTPServerRequest req, HTTPServerResponse res) {
+    // Generic VCS-agnostic webhook ingestion endpoint
+    postRoute("/webhooks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            Json bodyJson = req.json;
-            TriggerEvent event;
-            event.type = TriggerType.webhook;
-            if ("branch" in bodyJson) event.branch = bodyJson["branch"].get!string;
-            if ("tag" in bodyJson) event.tag = bodyJson["tag"].get!string;
-            if ("endpoint" in bodyJson) event.endpoint = bodyJson["endpoint"].get!string;
-            if ("target_task_id" in bodyJson) event.targetTaskId = bodyJson["target_task_id"].get!string;
-            if ("force" in bodyJson) event.force = bodyJson["force"].get!bool;
+            import confector.core.plugin : PluginRegistry;
+            import confector.plugin_api.vcs : VcsStateResolver;
+            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
+            import std.json : parseJSON, JSONValue;
+
+            // Collect HTTP headers
+            string[string] headers;
+            foreach (name, values; req.headers.byKeyValue())
+            {
+                string joined;
+                foreach (v; values)
+                {
+                    if (joined.length > 0) joined ~= ", ";
+                    joined ~= v;
+                }
+                headers[name] = joined;
+            }
+
+            auto payload = parseJSON(req.json.toString());
+
+            // Find a VCS resolver that can handle this webhook
+            VcsStateResolver matchedResolver = null;
+            foreach (resolver; PluginRegistry.instance.getVcsResolvers())
+            {
+                if (resolver.canHandleWebhook(headers, payload))
+                {
+                    matchedResolver = resolver;
+                    break;
+                }
+            }
+
+            if (matchedResolver is null)
+            {
+                res.statusCode = HTTPStatus.badRequest;
+                Json err = Json.emptyObject;
+                err["error"] = Json("No registered VCS plugin could handle this webhook payload");
+                res.writeJsonBody(err);
+                return;
+            }
+
+            // Parse the webhook payload
+            VcsRepositoryState resolvedState;
+            if (!matchedResolver.parseWebhookPayload(headers, payload, resolvedState))
+            {
+                res.statusCode = HTTPStatus.badRequest;
+                Json err = Json.emptyObject;
+                err["error"] = Json("VCS plugin failed to parse webhook payload");
+                res.writeJsonBody(err);
+                return;
+            }
+
+            // Check for revision change and persist state
+            VcsRepositoryState previousState;
+            bool changed = false;
+            string fromRevision = "";
+
+            if (stateRepo && stateRepo.getRepositoryState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
+            {
+                fromRevision = previousState.revision;
+                if (previousState.revision != resolvedState.revision)
+                {
+                    changed = true;
+                }
+            }
+            else
+            {
+                changed = true;
+            }
+
+            // Save the new state
+            if (stateRepo)
+            {
+                resolvedState.updatedAt = Clock.currTime.toISOString();
+                stateRepo.saveRepositoryState(resolvedState);
+
+                if (changed)
+                {
+                    VcsChangeRecord change;
+                    change.id = "change_" ~ randomUUID().toString();
+                    change.repositoryUrl = resolvedState.repositoryUrl;
+                    change.providerType = resolvedState.providerType;
+                    change.targetRef = resolvedState.targetRef;
+                    change.fromRevision = fromRevision;
+                    change.toRevision = resolvedState.revision;
+                    change.detectedAt = Clock.currTime.toISOString();
+                    change.triggerSource = "webhook";
+                    stateRepo.recordRepositoryChange(change);
+                }
+            }
 
             Json resp = Json.emptyObject;
-            resp["status"] = Json("received");
-            resp["event"] = serializeToJson(event);
+            resp["status"] = Json("processed");
+            resp["provider"] = Json(matchedResolver.providerType());
+            resp["repository"] = Json(resolvedState.repositoryUrl);
+            resp["revision"] = Json(resolvedState.revision);
+            resp["changed"] = Json(changed);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Generic VCS-agnostic webhook ingestion with trigger ID routing
+    postRoute("/webhooks/:triggerId", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            import confector.core.plugin : PluginRegistry;
+            import confector.plugin_api.vcs : VcsStateResolver;
+            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
+            import std.json : parseJSON, JSONValue;
+
+            string triggerId = req.params["triggerId"];
+
+            // Look up the trigger rule to find the associated repository
+            VcsRepositoryState resolvedState;
+            if (stateRepo)
+            {
+                auto rules = stateRepo.listTriggerRules();
+                string targetRepoUrl = "";
+                foreach (rule; rules)
+                {
+                    if (rule.id == triggerId)
+                    {
+                        // Try to find the project associated with this trigger
+                        ProjectRecord proj;
+                        if (stateRepo.getProject(rule.projectId, proj))
+                        {
+                            targetRepoUrl = proj.repositoryUrl;
+                            break;
+                        }
+                    }
+                }
+
+                if (targetRepoUrl.length == 0)
+                {
+                    res.statusCode = HTTPStatus.notFound;
+                    Json err = Json.emptyObject;
+                    err["error"] = Json("Trigger not found or no associated repository: " ~ triggerId);
+                    res.writeJsonBody(err);
+                    return;
+                }
+
+                // Find the VCS resolver for this repository
+                auto resolver = PluginRegistry.instance.findVcsResolver(targetRepoUrl);
+                if (resolver is null)
+                {
+                    res.statusCode = HTTPStatus.badRequest;
+                    Json err = Json.emptyObject;
+                    err["error"] = Json("No VCS plugin registered for repository: " ~ targetRepoUrl);
+                    res.writeJsonBody(err);
+                    return;
+                }
+
+                // Collect HTTP headers
+                string[string] headers;
+                foreach (name, values; req.headers.byKeyValue())
+                {
+                    string joined;
+                    foreach (v; values)
+                    {
+                        if (joined.length > 0) joined ~= ", ";
+                        joined ~= v;
+                    }
+                    headers[name] = joined;
+                }
+
+                auto payload = parseJSON(req.json.toString());
+
+                if (!resolver.parseWebhookPayload(headers, payload, resolvedState))
+                {
+                    res.statusCode = HTTPStatus.badRequest;
+                    Json err = Json.emptyObject;
+                    err["error"] = Json("VCS plugin failed to parse webhook payload");
+                    res.writeJsonBody(err);
+                    return;
+                }
+
+                // Check for revision change and persist
+                VcsRepositoryState previousState;
+                bool changed = false;
+                string fromRevision = "";
+
+                if (stateRepo.getRepositoryState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
+                {
+                    fromRevision = previousState.revision;
+                    if (previousState.revision != resolvedState.revision)
+                    {
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    changed = true;
+                }
+
+                resolvedState.updatedAt = Clock.currTime.toISOString();
+                stateRepo.saveRepositoryState(resolvedState);
+
+                if (changed)
+                {
+                    VcsChangeRecord change;
+                    change.id = "change_" ~ randomUUID().toString();
+                    change.repositoryUrl = resolvedState.repositoryUrl;
+                    change.providerType = resolvedState.providerType;
+                    change.targetRef = resolvedState.targetRef;
+                    change.fromRevision = fromRevision;
+                    change.toRevision = resolvedState.revision;
+                    change.detectedAt = Clock.currTime.toISOString();
+                    change.triggerSource = "webhook";
+                    stateRepo.recordRepositoryChange(change);
+                }
+            }
+            else
+            {
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("No state repository available");
+                res.writeJsonBody(err);
+                return;
+            }
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("processed");
+            resp["trigger_id"] = Json(triggerId);
+            resp["repository"] = Json(resolvedState.repositoryUrl);
+            resp["revision"] = Json(resolvedState.revision);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Generic polling endpoint for VCS state refresh
+    postRoute("/repositories/poll", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            import confector.core.plugin : PluginRegistry;
+            import confector.plugin_api.vcs : VcsStateResolver;
+            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
+
+            Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
+            string[] repoUrls;
+
+            if ("repositories" in bodyJson && bodyJson["repositories"].type == Json.Type.array)
+            {
+                auto reposJson = bodyJson["repositories"];
+                foreach (item; reposJson)
+                {
+                    repoUrls ~= item.get!string;
+                }
+            }
+            else if (stateRepo)
+            {
+                // If no specific repos provided, poll all tracked repos
+                foreach (proj; stateRepo.listProjects())
+                {
+                    if (proj.repositoryUrl.length > 0)
+                    {
+                        repoUrls ~= proj.repositoryUrl;
+                    }
+                }
+            }
+
+            int changedCount = 0;
+            int errorCount = 0;
+            Json changes = Json.emptyArray;
+
+            foreach (repoUrl; repoUrls)
+            {
+                auto resolver = PluginRegistry.instance.findVcsResolver(repoUrl);
+                if (resolver is null)
+                {
+                    errorCount++;
+                    continue;
+                }
+
+                try
+                {
+                    auto newState = resolver.fetchLatestState(repoUrl);
+
+                    VcsRepositoryState previousState;
+                    bool changed = false;
+                    string fromRevision = "";
+
+                    if (stateRepo && stateRepo.getRepositoryState(newState.repositoryUrl, newState.targetRef, previousState))
+                    {
+                        fromRevision = previousState.revision;
+                        if (previousState.revision != newState.revision)
+                        {
+                            changed = true;
+                        }
+                    }
+                    else
+                    {
+                        changed = true;
+                    }
+
+                    if (stateRepo)
+                    {
+                        newState.updatedAt = Clock.currTime.toISOString();
+                        stateRepo.saveRepositoryState(newState);
+
+                        if (changed)
+                        {
+                            VcsChangeRecord change;
+                            change.id = "change_" ~ randomUUID().toString();
+                            change.repositoryUrl = newState.repositoryUrl;
+                            change.providerType = newState.providerType;
+                            change.targetRef = newState.targetRef;
+                            change.fromRevision = fromRevision;
+                            change.toRevision = newState.revision;
+                            change.detectedAt = Clock.currTime.toISOString();
+                            change.triggerSource = "polling";
+                            stateRepo.recordRepositoryChange(change);
+                            changedCount++;
+
+                            Json changeJson = Json.emptyObject;
+                            changeJson["repository"] = Json(newState.repositoryUrl);
+                            changeJson["from"] = Json(fromRevision);
+                            changeJson["to"] = Json(newState.revision);
+                            changes ~= changeJson;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    errorCount++;
+                }
+            }
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("completed");
+            resp["polled"] = Json(repoUrls.length);
+            resp["changed"] = Json(changedCount);
+            resp["errors"] = Json(errorCount);
+            resp["changes"] = changes;
             res.writeJsonBody(resp);
         }
         catch (Exception e)

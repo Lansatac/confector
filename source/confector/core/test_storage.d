@@ -139,6 +139,8 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private ProjectRecord[string] m_projects;
     private RepositoryRecord[string] m_repositories;
     private WorkerRecord[string] m_executors;
+    private VcsRepositoryState[string] m_repositoryStates;
+    private VcsChangeRecord[] m_changeRecords;
 
     private static string statusKey(string buildId, string taskId) pure nothrow @safe
     {
@@ -501,6 +503,50 @@ class InMemoryBuildStateRepository : BuildStateRepository
             return true;
         }
         return false;
+    }
+
+    private static string repoStateKey(string repositoryUrl, string targetRef) pure nothrow @safe
+    {
+        return repositoryUrl ~ ":" ~ targetRef;
+    }
+
+    override void saveRepositoryState(in VcsRepositoryState state)
+    {
+        string key = repoStateKey(state.repositoryUrl, state.targetRef);
+        m_repositoryStates[key] = cast(VcsRepositoryState)state;
+    }
+
+    override bool getRepositoryState(string repositoryUrl, string targetRef, out VcsRepositoryState state)
+    {
+        auto p = repoStateKey(repositoryUrl, targetRef) in m_repositoryStates;
+        if (p !is null)
+        {
+            state = *p;
+            return true;
+        }
+        return false;
+    }
+
+    override void recordRepositoryChange(in VcsChangeRecord change)
+    {
+        m_changeRecords ~= change;
+    }
+
+    override VcsChangeRecord[] listRepositoryChanges(string repositoryUrl, size_t limit = 20)
+    {
+        VcsChangeRecord[] list;
+        foreach (rec; m_changeRecords)
+        {
+            if (rec.repositoryUrl == repositoryUrl)
+            {
+                list ~= rec;
+            }
+        }
+        if (list.length > limit)
+        {
+            list = list[$ - limit .. $];
+        }
+        return list;
     }
 }
 

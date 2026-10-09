@@ -118,6 +118,7 @@ final class PluginRegistry
     private WorkQueue[] _workQueues;
     private WorkQueue[string] _workQueuesByType;
     private string _defaultWorkQueueType;
+    private VcsStateResolver[] _vcsResolvers;
     private PluginLogCallback _logCallback;
     private ConfigRegistry _configRegistry;
 
@@ -217,6 +218,10 @@ final class PluginRegistry
         {
             registerWorkQueue(workQueue);
         }
+        if (auto vcsResolver = cast(VcsStateResolver) plugin)
+        {
+            registerVcsResolver(vcsResolver);
+        }
         logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
     }
 
@@ -314,6 +319,15 @@ final class PluginRegistry
             {
                 _defaultWorkQueueType = queue.backendType;
             }
+        }
+    }
+
+    public void registerVcsResolver(VcsStateResolver resolver)
+    {
+        import std.algorithm : canFind;
+        if (!_vcsResolvers.canFind(resolver))
+        {
+            _vcsResolvers ~= resolver;
         }
     }
 
@@ -441,6 +455,14 @@ final class PluginRegistry
                             _defaultWorkQueueType = "";
                         }
                     }
+                }
+            }
+            if (auto vcsResolver = cast(VcsStateResolver) plugin)
+            {
+                for (size_t i = 0; i < _vcsResolvers.length; )
+                {
+                    if (_vcsResolvers[i] is vcsResolver) _vcsResolvers = _vcsResolvers.remove(i);
+                    else i++;
                 }
             }
         }
@@ -580,6 +602,21 @@ final class PluginRegistry
     {
         if (_defaultWorkQueueType.length > 0)
             return getWorkQueue(_defaultWorkQueueType);
+        return null;
+    }
+
+    public VcsStateResolver[] getVcsResolvers()
+    {
+        return _vcsResolvers;
+    }
+
+    public VcsStateResolver findVcsResolver(string repositoryUrl)
+    {
+        foreach (resolver; _vcsResolvers)
+        {
+            if (resolver.canHandle(repositoryUrl))
+                return resolver;
+        }
         return null;
     }
 

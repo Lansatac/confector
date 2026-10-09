@@ -377,6 +377,40 @@ class MongoStoragePlugin : StateStoragePlugin, BuildStateRepository
     {
         return m_db.deleteOne("executors", "id", id);
     }
+
+    override void saveRepositoryState(in VcsRepositoryState state)
+    {
+        auto json = toJsonString(state);
+        m_db.upsert("vcs_repository_states", "repository_url", state.repositoryUrl, json);
+    }
+
+    override bool getRepositoryState(string repositoryUrl, string targetRef, out VcsRepositoryState state)
+    {
+        auto json = m_db.findOneByKeys("vcs_repository_states", repositoryUrl, targetRef);
+        if (json is null || json.length == 0)
+            return false;
+        state = fromJsonString!VcsRepositoryState(json);
+        return true;
+    }
+
+    override void recordRepositoryChange(in VcsChangeRecord change)
+    {
+        auto json = toJsonString(change);
+        m_db.insertOne("vcs_change_records", json);
+    }
+
+    override VcsChangeRecord[] listRepositoryChanges(string repositoryUrl, size_t limit = 20)
+    {
+        VcsChangeRecord[] list;
+        auto query = document([bson_value("repository_url", repositoryUrl.idup)]);
+        auto results = m_db.findMany("vcs_change_records", query, cast(int)limit);
+        foreach (jsonStr; results)
+        {
+            try { list ~= fromJsonString!VcsChangeRecord(jsonStr); }
+            catch (Exception e) { m_context.error(format("Failed to deserialize VcsChangeRecord: %s", e.msg)); }
+        }
+        return list;
+    }
 }
 
 /**

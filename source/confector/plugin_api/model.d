@@ -538,6 +538,37 @@ struct RepositoryRecord
 }
 
 /**
+ * Generic snapshot of a repository's latest revision state.
+ * Completely agnostic of VCS backend (Git commit, Perforce changelist, Plastic changeset).
+ */
+struct VcsRepositoryState
+{
+    @asName("repository_url") string repositoryUrl;
+    @asName("provider_type") string providerType;   // "git", "perforce", "plastic", etc.
+    @asName("target_ref") string targetRef;         // branch name, stream path, or depot path
+    @asName("revision") string revision;           // commit SHA, changelist number, changeset GUID
+    @optional @asName("author") string author;
+    @optional @asName("message") string message;
+    @optional @asName("updated_at") string updatedAt;
+    @optional @asName("metadata") string[string] metadata;
+}
+
+/**
+ * Persisted record of a detected repository change event.
+ */
+struct VcsChangeRecord
+{
+    @asName("id") string id;
+    @asName("repository_url") string repositoryUrl;
+    @asName("provider_type") string providerType;
+    @asName("target_ref") string targetRef;
+    @asName("from_revision") string fromRevision;
+    @asName("to_revision") string toRevision;
+    @asName("detected_at") string detectedAt;
+    @asName("trigger_source") string triggerSource; // "webhook", "polling", "manual"
+}
+
+/**
  * Persisted record of a project, repository, and task registry.
  */
 struct ProjectRecord
@@ -925,6 +956,26 @@ interface BuildStateRepository
      * Deletes an executor record by ID.
      */
     bool deleteExecutor(string id);
+
+    /**
+     * Saves or updates the latest revision state for a repository.
+     */
+    void saveRepositoryState(in VcsRepositoryState state);
+
+    /**
+     * Retrieves the latest revision state for a repository and target ref.
+     */
+    bool getRepositoryState(string repositoryUrl, string targetRef, out VcsRepositoryState state);
+
+    /**
+     * Records a detected repository change event.
+     */
+    void recordRepositoryChange(in VcsChangeRecord change);
+
+    /**
+     * Lists recent change records for a repository.
+     */
+    VcsChangeRecord[] listRepositoryChanges(string repositoryUrl, size_t limit = 20);
 }
 
 /**
