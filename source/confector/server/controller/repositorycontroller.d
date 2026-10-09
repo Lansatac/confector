@@ -12,11 +12,20 @@ import std.uri : encodeComponent;
 import confector.core.model : ProjectRecord, RepositoryRecord;
 import confector.core.storage : BuildStateRepository;
 
+/// Refresh policy options for repository change detection.
+enum RefreshPolicy : string
+{
+    webhook = "webhook",
+    polling = "polling",
+    both = "both"
+}
+
 /// View model for repository listing.
 struct RepositoryViewModel
 {
     string name;
     string address;
+    string refreshPolicy;
     string createdAt;
     ulong projectCount;
 }
@@ -53,6 +62,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
             RepositoryViewModel rvm;
             rvm.name = r.name;
             rvm.address = r.address;
+            rvm.refreshPolicy = r.refreshPolicy.length > 0 ? r.refreshPolicy : "webhook";
             rvm.createdAt = r.createdAt;
 
             ulong count = 0;
@@ -101,11 +111,17 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
     {
         string name = req.form.get("name", req.form.get("repository-name", "")).strip;
         string address = req.form.get("address", req.form.get("repository-address", "")).strip;
+        string refreshPolicy = req.form.get("refresh-policy", "webhook").strip;
 
         if (name.length == 0 || address.length == 0)
         {
             res.redirect("/repositories/add?error=Name+and+address+are+required");
             return;
+        }
+
+        if (refreshPolicy != "webhook" && refreshPolicy != "polling" && refreshPolicy != "both")
+        {
+            refreshPolicy = "webhook";
         }
 
         if (stateRepo !is null)
@@ -120,6 +136,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
             RepositoryRecord record;
             record.name = name;
             record.address = address;
+            record.refreshPolicy = refreshPolicy;
             record.createdAt = Clock.currTime.toISOString();
             stateRepo.saveRepository(record);
         }
@@ -130,10 +147,45 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
     router.post("/repositories/add", &handleAddSubmit);
     router.post("/repositories/add_repo", &handleAddSubmit);
 
+    // 3.5. Post edit repository
+    void handleEditSubmit(HTTPServerRequest req, HTTPServerResponse res)
+    {
+        string name = req.form.get("name", "").strip;
+        string address = req.form.get("address", "").strip;
+        string refreshPolicy = req.form.get("refresh-policy", "webhook").strip;
+
+        if (name.length == 0 || address.length == 0)
+        {
+            res.redirect("/repositories/details?name=" ~ encodeComponent(name) ~ "&error=Name+and+address+are+required");
+            return;
+        }
+
+        if (refreshPolicy != "webhook" && refreshPolicy != "polling" && refreshPolicy != "both")
+        {
+            refreshPolicy = "webhook";
+        }
+
+        if (stateRepo !is null)
+        {
+            RepositoryRecord record;
+            if (stateRepo.getRepository(name, record))
+            {
+                record.address = address;
+                record.refreshPolicy = refreshPolicy;
+                stateRepo.saveRepository(record);
+            }
+        }
+
+        res.redirect("/repositories/details?name=" ~ encodeComponent(name));
+    }
+
+    router.post("/repositories/edit", &handleEditSubmit);
+
     // 4. Repository details view
     void handleDetails(HTTPServerRequest req, HTTPServerResponse res)
     {
         string name = req.query.get("name", req.query.get("repo_name", ""));
+        string errorMessage = req.query.get("error", "");
         if (name.length == 0)
         {
             res.redirect("/repositories/");
@@ -151,7 +203,10 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
         {
             repo.name = name;
             repo.address = "";
+            repo.refreshPolicy = "webhook";
         }
+
+        string repoRefreshPolicy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
 
         auto allProjects = stateRepo !is null ? stateRepo.listProjects() : [];
         ConnectedProjectViewModel[] connectedProjects;
@@ -186,7 +241,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
         string repoAddress = repo.address;
         string repoCreatedAt = repo.createdAt;
 
-        res.render!("repository/repository-details.dt", repo, repoName, repoAddress, repoCreatedAt, connectedProjects);
+        res.render!("repository/repository-details.dt", repo, repoName, repoAddress, repoCreatedAt, repoRefreshPolicy, errorMessage, connectedProjects);
     }
 
     router.get("/repositories/details", &handleDetails);
@@ -203,6 +258,7 @@ unittest
     RepositoryRecord r1;
     r1.name = "confector-core";
     r1.address = "https://github.com/example/confector.git";
+    r1.refreshPolicy = "polling";
     r1.createdAt = "2026-10-04T12:00:00Z";
     stateRepo.saveRepository(r1);
 

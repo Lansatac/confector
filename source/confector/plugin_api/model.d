@@ -534,6 +534,7 @@ struct RepositoryRecord
 {
     @optional @asName("name") string name;
     @optional @asName("address") string address;
+    @optional @asName("refresh_policy") string refreshPolicy = "webhook";  // "webhook", "polling", "both"
     @optional @asName("created_at") string createdAt;
 }
 

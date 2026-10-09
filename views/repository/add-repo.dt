@@ -25,6 +25,14 @@ block maincontent
           label(for="address") Remote Address / URL:
           input.form-control#address(type="text", name="address", placeholder="e.g. https://github.com/org/repo.git", required)
 
+        div.form-group
+          label(for="refresh-policy") Change Detection Policy:
+          select.form-control#refresh-policy(name="refresh-policy")
+            option(value="webhook", selected) Webhook — React to push events from the VCS provider
+            option(value="polling") Polling — Periodically check for new revisions
+            option(value="both") Both — Use webhooks and polling together
+          small.text-muted(style="display: block; margin-top: 4px;") Webhooks require the VCS provider to send events to this server. Polling works without external configuration.
+
         div(style="margin-top: 20px; display: flex; gap: 10px;")
           button.btn.btn-primary(type="submit") Register Repository
           a.btn.btn-outline(href="/repositories/") Cancel

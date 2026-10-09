@@ -31,6 +31,7 @@ block maincontent
           tr
             th Repository Name
             th Remote Address / URL
+            th Refresh Policy
             th Linked Projects
             th Registered At
             th Actions
@@ -42,6 +43,13 @@ block maincontent
                   a(href="/repositories/details?name=#{r.name}", style="text-decoration: none;") #{r.name}
               td
                 code(style="font-size: 0.9em;") #{r.address}
+              td
+                - if (r.refreshPolicy == "webhook")
+                  span.badge.badge-primary Webhook
+                - else if (r.refreshPolicy == "polling")
+                  span.badge.badge-warning Polling
+                - else
+                  span.badge.badge-info Both
               td
                 - if (r.projectCount > 0)
                   span.badge.badge-primary #{r.projectCount} #{r.projectCount == 1 ? "project" : "projects"}

@@ -14,6 +14,11 @@ block maincontent
         div(style="display: flex; gap: 10px;")
           a.btn.btn-outline(href="/repositories/") &larr; Back to Repositories
 
+    - if (errorMessage.length > 0)
+      div.alert.alert-danger(style="max-width: 680px; margin-top: 15px; padding: 12px 16px; background-color: #fee2e2; color: #991b1b; border-radius: 6px; border: 1px solid #f87171;")
+        strong Error: 
+        span #{errorMessage}
+
     div.grid-2col(style="margin-top: 20px;")
       div.card
         h3 Repository Information
@@ -29,10 +34,47 @@ block maincontent
                 code #{repoAddress}
               - else
                 span.text-muted Not specified
+          tr
+            th Refresh Policy
+            td
+              - if (repoRefreshPolicy == "webhook")
+                span.badge.badge-primary Webhook
+              - else if (repoRefreshPolicy == "polling")
+                span.badge.badge-warning Polling
+              - else
+                span.badge.badge-info Both
           - if (repoCreatedAt.length > 0)
             tr
               th Registered At
               td #{repoCreatedAt}
+
+      div.card
+        h3 Configuration
+        form(action="/repositories/edit", method="POST")
+          input(type="hidden", name="name", value=repoName)
+          div.form-group
+            label(for="edit-address") Remote Address / URL:
+            input.form-control#edit-address(type="text", name="address", value=repoAddress, required)
+
+          div.form-group
+            label(for="edit-refresh-policy") Change Detection Policy:
+            select.form-control#edit-refresh-policy(name="refresh-policy")
+              - if (repoRefreshPolicy == "webhook")
+                option(value="webhook", selected) Webhook — React to push events from the VCS provider
+                option(value="polling") Polling — Periodically check for new revisions
+                option(value="both") Both — Use webhooks and polling together
+              - else if (repoRefreshPolicy == "polling")
+                option(value="webhook") Webhook — React to push events from the VCS provider
+                option(value="polling", selected) Polling — Periodically check for new revisions
+                option(value="both") Both — Use webhooks and polling together
+              - else
+                option(value="webhook") Webhook — React to push events from the VCS provider
+                option(value="polling") Polling — Periodically check for new revisions
+                option(value="both", selected) Both — Use webhooks and polling together
+            small.text-muted(style="display: block; margin-top: 4px;") Webhooks require the VCS provider to send events to this server. Polling works without external configuration.
+
+          div(style="margin-top: 20px;")
+            button.btn.btn-primary(type="submit") Save Changes
 
       div.card
         h3 Usage Summary

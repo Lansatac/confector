@@ -1310,7 +1310,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         {
             import confector.core.plugin : PluginRegistry;
             import confector.plugin_api.vcs : VcsStateResolver;
-            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
+            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord, RepositoryRecord;
 
             Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
             string[] repoUrls;
@@ -1325,12 +1325,38 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
             else if (stateRepo)
             {
-                // If no specific repos provided, poll all tracked repos
+                // If no specific repos provided, poll only repos configured for polling
+                auto allRepos = stateRepo.listRepositories();
+                foreach (repo; allRepos)
+                {
+                    string policy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
+                    if (policy == "polling" || policy == "both")
+                    {
+                        if (repo.address.length > 0)
+                        {
+                            repoUrls ~= repo.address;
+                        }
+                    }
+                }
+                // Also include project-level repository URLs not in the repository registry
                 foreach (proj; stateRepo.listProjects())
                 {
                     if (proj.repositoryUrl.length > 0)
                     {
-                        repoUrls ~= proj.repositoryUrl;
+                        // Check if this URL is already in the list
+                        bool found = false;
+                        foreach (url; repoUrls)
+                        {
+                            if (url == proj.repositoryUrl)
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found)
+                        {
+                            repoUrls ~= proj.repositoryUrl;
+                        }
                     }
                 }
             }
