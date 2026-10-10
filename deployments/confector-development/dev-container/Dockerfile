@@ -22,6 +22,8 @@ RUN git config --system --add safe.directory /code
 # Install official DMD compiler and DUB, configure system-wide PATH and libraries
 RUN curl -fsS https://dlang.org/install.sh | bash -s install dmd -p /opt/dlang \
     && DMD_DIR=$(find /opt/dlang -maxdepth 1 -name "dmd-*" | head -n 1) \
+    && ln -s "${DMD_DIR}/src" /usr/include/dmd \
+    && printf '[Environment64]\nDFLAGS=-I%s/src/phobos -I%s/src/druntime/import\n' "$DMD_DIR" "$DMD_DIR" > /etc/dmd.conf \
     && ln -s ${DMD_DIR}/linux/bin64/dmd /usr/local/bin/dmd \
     && ln -s ${DMD_DIR}/linux/bin64/dub /usr/local/bin/dub \
     && ln -s ${DMD_DIR}/linux/bin64/rdmd /usr/local/bin/rdmd \

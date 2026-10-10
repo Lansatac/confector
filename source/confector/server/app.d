@@ -91,7 +91,15 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
     {
         if (exists(pluginDir) && isDir(pluginDir))
         {
-            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue, PluginCategory.scheduler]);
+            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(
+              pluginDir,
+              [PluginCategory.definition,
+               PluginCategory.worker,
+               PluginCategory.artifact,
+               PluginCategory.storage,
+               PluginCategory.queue,
+               PluginCategory.scheduler]
+              );
         }
     }
 
@@ -337,11 +345,13 @@ void main()
             if (prov !is null)
             {
                 capacityBroker.registerProvisioner(prov);
-                logInfo("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)", prov.providerType, prov.maxCapacity);
+                logInfo("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)",
+                  prov.providerType, prov.maxCapacity);
             }
             else
             {
-                logWarn("[capacity_broker] ComputeProvider '%s' returned null from createProvisioner(), skipping", provider.providerType);
+                logWarn("[capacity_broker] ComputeProvider '%s' returned null from createProvisioner(), skipping",
+                  provider.providerType);
             }
         }
     }
@@ -349,8 +359,9 @@ void main()
     // Warn if no provisioners were registered — builds will silently fail without them
     if (capacityBroker.provisioners.length == 0)
     {
-        logError("[capacity_broker] CRITICAL: No compute provisioners registered. Builds will queue but never execute.");
-        logError("[capacity_broker] Ensure at least one ComputeProvider plugin (e.g., local_process) is loaded in '%s'.", serverConfig.plugins.bundledPluginsDir);
+        logWarn("[capacity_broker] No compute provisioners registered. Builds will queue but never execute. " ~
+         "Ensure at least one ComputeProvider plugin (e.g., local_process) is loaded in '%s'.",
+          serverConfig.plugins.bundledPluginsDir);
     }
     else
     {
@@ -364,7 +375,14 @@ void main()
     auto scheduler = PluginRegistry.instance.getDefaultScheduler();
 
     // Configure router and server settings
-    auto router = createRouter(taskEngine, workQueue, buildCoordinator, stateRepo, capacityBroker, configuredStorage, scheduler, serverConfig.http.port);
+    auto router = createRouter(taskEngine,
+      workQueue,
+      buildCoordinator,
+      stateRepo,
+      capacityBroker,
+      configuredStorage,
+      scheduler,
+      serverConfig.http.port);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {

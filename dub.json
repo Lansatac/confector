@@ -1,138 +1,62 @@
 {
-	"authors": [
-		"Jason Yegge"
-	],
-	"copyright": "Copyright © 2023, Jason Yegge",
-	"description": "A build system.",
-	"license": "The Unlicense",
-	"name": "confector",
-	"targetType": "none",
-
-    "dependencies": {
-      "confector:server": "*",
-      "confector:runner": "*",
-      "confector:plugins": "*"
-    },
-	"subPackages": [
-		{
-			"name": "config",
-			"targetType": "library",
-			"sourcePaths": ["source/confector/config"],
-			"importPaths": ["source"],
-			"targetPath": "out/lib",
-			"dependencies": {
-				"vibe-serialization": "~>1.2.0"
-			}
-		},
-    {
-      "name": "server",
-      "targetType": "executable",
-      "targetPath": "out/server",
-      "workingDirectory": "out/server",
-      "sourcePaths": ["source/confector/server"],
-      "copyFiles": ["public"],
-      "dependencies": {
-        "diet-ng": "~>1.8",
-        "vibe-d": "~>0.10.3",
-        "confector-config": {
-          "path": "source/confector/config"
-        },
-        "confector-core": {
-          "path": "source/confector/core"
-        },
-        "confector-runner-core": {
-          "path": "source/confector/runner_core"
-        }
-      }
-    },
-		{
-			"name": "plugin_api",
-			"targetType": "library",
-			"sourcePaths": ["source/confector/plugin_api"],
-			"importPaths": ["source"],
-			"targetPath": "out/lib",
-			"dependencies": {
-				"confector:config": "*",
-				"vibe-serialization": "~>1.2.0"
-			}
-		},
-		{
-			"name": "mongo_helpers",
-			"targetType": "library",
-			"sourcePaths": ["source/confector/mongo_helpers"],
-			"importPaths": ["source"],
-			"targetPath": "out/lib",
-			"dependencies": {
-				"mongo-standalone": "~>0.0.15",
-				"vibe-serialization": "~>1.2.0"
-			}
-		},
-		{
-			"name": "core",
-			"targetType": "library",
-			"sourcePaths": ["source/confector/core", "source/confector/queue"],
-			"importPaths": ["source"],
-			"targetPath": "out/lib",
-			"dependencies": {
-				"confector:config": "*",
-				"confector:plugin_api": "*",
-				"vibe-d": "~>0.10.3"
-			}
-		},
-		{
-			"name": "runner_core",
-			"targetType": "library",
-			"sourcePaths": ["source/confector/runner_core"],
-			"importPaths": ["source"],
-			"targetPath": "out/lib",
-			"dependencies": {
-				"confector:core": "*"
-			}
-		},
-		{
-			"name": "runner",
-			"targetType": "executable",
-			"targetName": "confector-runner",
-			"sourcePaths": ["source/confector/runner_app"],
-			"importPaths": ["source"],
-			"targetPath": "out/runner",
-			"workingDirectory": "out",
-			"dependencies": {
-				"confector-core": {
-				  "path": "source/confector/core"
-				},
-				"confector-runner-core": {
-				  "path": "source/confector/runner_core"
-				}
-			}
-		},
+  "authors": [
+    "Jason Yegge"
+  ],
+  "copyright": "Copyright © 2023, Jason Yegge",
+  "description": "A build system.",
+  "license": "The Unlicense",
+  "name": "confector",
+  "targetType": "none",
+  "dependencies": {
+    "confector-server": { "path": "source/confector/server" },
+    "confector-runner": { "path": "source/confector/runner" },
+    "bash_def": { "path": "plugins/definition/bash" },
+    "git_def": { "path": "plugins/definition/git" },
+    "powershell_def": { "path": "plugins/definition/powershell" },
+    "bash_runner": { "path": "plugins/step_executor/bash" },
+    "git_runner": { "path": "plugins/step_executor/git" },
+    "powershell_runner": { "path": "plugins/step_executor/powershell" },
+    "local_process": { "path": "plugins/worker/local_process" },
+    "local_artifact": { "path": "plugins/artifact/local" },
+    "mongo_storage": { "path": "plugins/storage/mongo" },
+    "mongo_queue": { "path": "plugins/queue/mongo" },
+    "local_scheduler": { "path": "plugins/scheduler/local" }
+  },
+  "subPackages": [
+    "source/confector/config",
+    "source/confector/server",
+    "source/confector/plugin_api",
+    "source/confector/mongo_helpers",
+    "source/confector/core",
+    "source/confector/runner_core",
+    "source/confector/runner",
+    "./plugins/definition/bash",
+    "./plugins/definition/git",
+    "./plugins/definition/powershell",
+    "./plugins/step_executor/bash",
+    "./plugins/step_executor/git",
+    "./plugins/step_executor/powershell",
+    "./plugins/worker/local_process",
+    "./plugins/artifact/local",
+    "./plugins/storage/mongo",
+    "./plugins/queue/mongo",
+    "./plugins/scheduler/local",
     {
       "name": "plugins",
       "targetType": "none",
       "dependencies": {
-        "confector:bash_def": "*",
-        "confector:bash_runner": "*",
-        "confector:git_def": "*",
-        "confector:git_runner": "*",
-        "confector:powershell_def": "*",
-        "confector:powershell_runner": "*",
-        "confector:local_process": "*",
-        "confector:local_artifact": "*",
-        "confector:mongo_storage": "*",
-        "confector:mongo_queue": "*",
-        "confector:local_scheduler": "*"
+        "bash_def": { "path": "plugins/definition/bash" },
+        "bash_runner": { "path": "plugins/step_executor/bash" },
+        "git_def": { "path": "plugins/definition/git" },
+        "git_runner": { "path": "plugins/step_executor/git" },
+        "powershell_def": { "path": "plugins/definition/powershell" },
+        "powershell_runner": { "path": "plugins/step_executor/powershell" },
+        "local_process": { "path": "plugins/worker/local_process" },
+        "local_artifact": { "path": "plugins/artifact/local" },
+        "mongo_storage": { "path": "plugins/storage/mongo" },
+        "mongo_queue": { "path": "plugins/queue/mongo" },
+        "local_scheduler": { "path": "plugins/scheduler/local" }
       }
-    },
-		"./plugins/definition/bash",
-		"./plugins/definition/git",
-		"./plugins/definition/powershell",
-		"./plugins/step_executor/bash",
-		"./plugins/step_executor/git",
-		"./plugins/step_executor/powershell",
-		"./plugins/worker/local_process",
-		"./plugins/artifact/local",
-		"./plugins/storage/mongo",
-		"./plugins/queue/mongo",
-		"./plugins/scheduler/local"
-	]
+    }
+  ]
 }

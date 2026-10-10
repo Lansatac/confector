@@ -40,7 +40,7 @@ Target server()
 
 Target runner()
 {
-  return dubPathTarget("source/confector/runner_app");
+  return dubPathTarget("source/confector/runner");
 }
 
 Target configLib()
