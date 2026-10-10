@@ -4,6 +4,7 @@ import confector.core.model;
 import confector.core.dag;
 import confector.core.storage;
 import confector.core.fingerprinter;
+import confector.core.executor : CapacityBroker;
 import confector.queue.queue;
 
 import std.algorithm : canFind, filter;
@@ -198,6 +199,7 @@ class BuildCoordinator
     private ArtifactStorage m_artifactStorage;
     private BuildStateRepository m_stateRepo;
     private WorkQueue m_workQueue;
+    private CapacityBroker m_capacityBroker;
     private string m_callbackBaseUrl;
     private Mutex m_mutex;
     private ActiveBuild[string] m_activeBuilds;
@@ -207,12 +209,14 @@ class BuildCoordinator
         ArtifactStorage artifactStorage,
         BuildStateRepository stateRepo,
         WorkQueue workQueue,
+        CapacityBroker capacityBroker = null,
         string callbackBaseUrl = ""
     )
     {
         m_artifactStorage = artifactStorage;
         m_stateRepo = stateRepo;
         m_workQueue = workQueue;
+        m_capacityBroker = capacityBroker;
         m_callbackBaseUrl = callbackBaseUrl;
         m_mutex = new Mutex();
         m_inFlightRegistry = new InFlightTaskRegistry();
@@ -936,6 +940,12 @@ class BuildCoordinator
                     m_workQueue.enqueue(msg);
                 }
 
+                // Trigger capacity evaluation so provisioners can respond immediately to new queue demand
+                if (m_capacityBroker !is null)
+                {
+                    m_capacityBroker.evaluateDemand();
+                }
+
                 // Mark task as queued — it will transition to running when a worker picks it up
                 if (m_stateRepo !is null)
                 {
@@ -998,7 +1008,7 @@ unittest
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
     auto queue = new InMemoryWorkQueue();
-    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, "http://127.0.0.1:8080");
+    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "http://127.0.0.1:8080");
 
     // 1. Single Task Graph
     TaskNode singleTask;

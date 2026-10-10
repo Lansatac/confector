@@ -48,6 +48,15 @@ struct PluginsConfig
 }
 
 /**
+ * Capacity broker configuration.
+ */
+struct CapacityConfig
+{
+    @Description("Interval in minutes between periodic capacity evaluations (default: 1)")
+    int evaluationIntervalMinutes = 1;
+}
+
+/**
  * Top-level Server configuration.
  */
 struct ServerConfig
@@ -58,6 +67,7 @@ struct ServerConfig
     HttpConfig http;
     StorageConfig storage;
     PluginsConfig plugins;
+    CapacityConfig capacity;
 }
 
 /**

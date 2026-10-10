@@ -320,11 +320,9 @@ void main()
     // to the currently configured storage, allowing runtime changes via the Artifacts UI.
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
     auto taskEngine = new TaskEngine(configuredStorage);
-    auto buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, workQueue);
-    logInfo("Initialized Confector execution engine and build coordinator.");
 
-    // Initialize capacity broker
-    auto capacityBroker = new DefaultCapacityBroker(workQueue, buildCoordinator);
+    // Initialize capacity broker before coordinator so it can be passed through
+    auto capacityBroker = new DefaultCapacityBroker(workQueue);
 
     // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
     foreach (plugin; PluginRegistry.instance.allPlugins())
@@ -359,6 +357,9 @@ void main()
         logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
+    auto buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, workQueue, capacityBroker);
+    logInfo("Initialized Confector execution engine and build coordinator.");
+
     // Load scheduler plugin
     auto scheduler = PluginRegistry.instance.getDefaultScheduler();
 
@@ -384,10 +385,15 @@ void main()
         capacityEntry.name = "Capacity Broker Evaluation";
         capacityEntry.uri = format("http://127.0.0.1:%d/api/v1/broker/evaluate", serverConfig.http.port);
         capacityEntry.httpMethod = "POST";
-        capacityEntry.cronExpression = "* * * * *";  // Every minute
+        int evalInterval = serverConfig.capacity.evaluationIntervalMinutes;
+        if (evalInterval < 1) evalInterval = 1;
+        if (evalInterval == 1)
+            capacityEntry.cronExpression = "* * * * *";
+        else
+            capacityEntry.cronExpression = format("*/%d * * * *", evalInterval);
         capacityEntry.recurring = true;
         scheduler.schedule(capacityEntry);
-        logInfo("[scheduler] Registered capacity evaluation entry (every minute)");
+        logInfo("[scheduler] Registered capacity evaluation entry (every %d min)", evalInterval);
 
         // Register VCS polling schedule entries for repositories with polling policy
         import confector.plugin_api.model : RepositoryRecord;
