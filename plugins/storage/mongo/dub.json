@@ -3,7 +3,7 @@
 	"description": "MongoDB storage plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_mongo_storage",
-	"targetPath": "../../../build/out/server/plugins",
+	"targetPath": "../../../out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {

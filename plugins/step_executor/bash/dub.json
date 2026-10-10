@@ -3,7 +3,7 @@
 	"description": "Bash Step Runner Plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_bash_runner",
-	"targetPath": "../../../build/out/runner/plugins",
+	"targetPath": "../../../out/runner/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {
