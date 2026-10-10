@@ -133,7 +133,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
         {
             string trimmed = path.strip;
             if (trimmed.length > 0)
-            {
+            { 
                 try
                 {
                     auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue, PluginCategory.scheduler]);
@@ -382,7 +382,7 @@ void main()
         ScheduleEntry capacityEntry;
         capacityEntry.id = "capacity-evaluate";
         capacityEntry.name = "Capacity Broker Evaluation";
-        capacityEntry.uri = format("http://127.0.0.1:{}/api/v1/broker/evaluate", serverConfig.http.port);
+        capacityEntry.uri = format("http://127.0.0.1:%d/api/v1/broker/evaluate", serverConfig.http.port);
         capacityEntry.httpMethod = "POST";
         capacityEntry.cronExpression = "* * * * *";  // Every minute
         capacityEntry.recurring = true;
@@ -400,7 +400,7 @@ void main()
                 ScheduleEntry pollEntry;
                 pollEntry.id = "vcs-poll-" ~ repo.name;
                 pollEntry.name = format("VCS Poll: %s", repo.name);
-                pollEntry.uri = format("http://127.0.0.1:{}/api/v1/repositories/%s/poll", serverConfig.http.port, encodeComponent(repo.name));
+                pollEntry.uri = format("http://127.0.0.1:%d/api/v1/repositories/%s/poll", serverConfig.http.port, encodeComponent(repo.name));
                 pollEntry.httpMethod = "POST";
                 pollEntry.cronExpression = "*/5 * * * *";  // Every 5 minutes
                 pollEntry.recurring = true;
@@ -427,7 +427,7 @@ void main()
             ScheduleEntry cronEntry;
             cronEntry.id = "cron-" ~ rule.id;
             cronEntry.name = format("Cron Trigger: %s (%s)", rule.name, rule.criteria);
-            cronEntry.uri = format("http://127.0.0.1:{}/api/v1/projects/%s/run", serverConfig.http.port, encodeComponent(rule.projectId));
+            cronEntry.uri = format("http://127.0.0.1:%d/api/v1/projects/%s/run", serverConfig.http.port, encodeComponent(rule.projectId));
             cronEntry.httpMethod = "POST";
             cronEntry.cronExpression = rule.criteria;
             cronEntry.recurring = true;

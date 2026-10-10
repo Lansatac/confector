@@ -133,7 +133,8 @@ block maincontent
   script.
     document.addEventListener("DOMContentLoaded", function() {
       var tasksData = !{tasksJson};
+      var pendingCommits = !{pendingCommitsJson};
       if (tasksData && tasksData.length && window.renderTaskGraph) {
-        window.renderTaskGraph("project-dag-canvas", tasksData);
+        window.renderTaskGraph("project-dag-canvas", tasksData, null, null, pendingCommits || {});
       }
     });

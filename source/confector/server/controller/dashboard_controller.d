@@ -219,8 +219,67 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             project.id = projId;
             project.name = "Unknown Project";
         }
+
+        // Collect all repository names used by tasks in this project
+        string[] repoNames;
+        {
+            bool[string] seenRepos;
+            foreach (task; project.tasks)
+            {
+                foreach (repo; task.inputs.repositories)
+                {
+                    string trimmed = repo.strip;
+                    if (trimmed.length > 0 && !(trimmed in seenRepos))
+                    {
+                        seenRepos[trimmed] = true;
+                        repoNames ~= trimmed;
+                    }
+                }
+            }
+        }
+
+        // Count pending changes (VcsChangeRecords) per repository
+        ulong[string] pendingCommitCounts;
+        if (stateRepo !is null && repoNames.length > 0)
+        {
+            import confector.plugin_api.model : VcsChangeRecord;
+            // Get all repositories to map names to addresses
+            auto allRepos = stateRepo.listRepositories();
+            string[string] repoNameToAddress;
+            foreach (r; allRepos)
+            {
+                if (r.name.length > 0 && r.address.length > 0)
+                {
+                    repoNameToAddress[r.name] = r.address;
+                }
+            }
+
+            // Get all change records and count by repository
+            auto allChanges = stateRepo.listRepositoryChanges("", 1000);
+            foreach (change; allChanges)
+            {
+                // Match change's repository URL to a repo name
+                foreach (rName; repoNames)
+                {
+                    string addr = rName in repoNameToAddress ? repoNameToAddress[rName] : rName;
+                    if (change.repositoryUrl == addr || change.repositoryUrl == rName)
+                    {
+                        pendingCommitCounts[rName]++;
+                    }
+                }
+            }
+        }
+
+        // Convert counts to string map for JSON serialization
+        string[string] pendingCommits;
+        foreach (rName, cnt; pendingCommitCounts)
+        {
+            pendingCommits[rName] = cnt.to!string;
+        }
+
         string tasksJson = serializeToJson(project.tasks).toString();
-        res.render!("project/project-details.dt", project, tasksJson);
+        string pendingCommitsJson = serializeToJson(pendingCommits).toString();
+        res.render!("project/project-details.dt", project, tasksJson, pendingCommitsJson);
     });
 
     router.get("/projects/edit", (HTTPServerRequest req, HTTPServerResponse res) {
