@@ -9,7 +9,7 @@ public import confector.plugin_api.vcs;
 public import confector.plugin_api.scheduler;
 public import confector.config;
 public import confector.core.storage;
-public import confector.queue.queue;
+public import confector.core.queue;
 
 import vibe.core.log : logDebug, logInfo, logWarn, logError;
 import vibe.data.json : Json;

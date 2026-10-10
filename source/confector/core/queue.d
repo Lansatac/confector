@@ -1,4 +1,4 @@
-module confector.queue.queue;
+module confector.core.queue;
 
 /// Re-export WorkQueue and all domain models from plugin_api for backward compatibility.
 /// All types defined here are now owned by plugin_api.model; this module exists solely

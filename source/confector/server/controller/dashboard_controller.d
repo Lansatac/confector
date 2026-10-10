@@ -9,7 +9,7 @@ import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
 import confector.runner_core.engine;
 import confector.orchestrator.coordinator;
-import confector.queue.queue;
+import confector.core.queue;
 
 import std.algorithm : filter, count, canFind;
 import std.datetime.systime : Clock;

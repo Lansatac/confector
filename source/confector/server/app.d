@@ -21,7 +21,7 @@ import confector.core.plugin_loader : PluginLoader;
 import confector.core.storage : BuildStateRepository;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 import confector.storage.configured_storage : ConfiguredArtifactStorage;
-import confector.queue.queue : WorkQueue;
+import confector.core.queue : WorkQueue;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 import confector.orchestrator.coordinator : BuildCoordinator;
 import confector.runner_core.engine : TaskEngine;

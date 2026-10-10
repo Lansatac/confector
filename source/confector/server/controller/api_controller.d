@@ -8,7 +8,7 @@ import confector.core.trigger;
 import confector.core.executor : CapacityBroker;
 import confector.runner_core.engine;
 import confector.orchestrator.coordinator;
-import confector.queue.queue;
+import confector.core.queue;
 
 import std.format : format;
 import std.uuid : randomUUID;

@@ -5,7 +5,7 @@ import confector.core.dag;
 import confector.core.storage;
 import confector.core.fingerprinter;
 import confector.core.executor : CapacityBroker;
-import confector.queue.queue;
+import confector.core.queue;
 
 import std.algorithm : canFind, filter;
 import std.array : array;

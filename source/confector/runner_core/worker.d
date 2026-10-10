@@ -4,7 +4,7 @@ import confector.core.model;
 import confector.core.storage;
 import confector.core.plugin;
 import confector.core.plugin_loader;
-import confector.queue.queue;
+import confector.core.queue;
 import confector.runner_core.engine;
 import confector.runner_core.artifacts;
 import confector.runner_core.http_artifact_storage;

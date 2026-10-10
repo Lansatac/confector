@@ -5,7 +5,7 @@ import confector.core.model;
 import confector.core.storage : BuildStateRepository;
 import confector.core.plugin : PluginRegistry;
 import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance, CapacityBroker, ComputeProvisioner;
-import confector.queue.queue : WorkQueue;
+import confector.core.queue : WorkQueue;
 
 import std.algorithm : filter, count;
 import std.array : array;

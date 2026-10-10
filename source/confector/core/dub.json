@@ -3,7 +3,7 @@
 	"targetType": "library",
 	"targetName": "confector_core",
 	"targetPath": "../../../out/lib",
-	"sourcePaths": [".", "../queue"],
+	"sourcePaths": ["."],
 	"importPaths": ["../.."],
 	"dependencies": {
 		"confector-config": {
