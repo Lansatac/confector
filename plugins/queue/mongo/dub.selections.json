@@ -2,8 +2,9 @@
 	"fileVersion": 1,
 	"versions": {
 		"confector-config": {"path":"../../../source/confector/config"},
+		"confector-mongo-helpers": {"path":"../../../source/confector/mongo_helpers"},
 		"confector-plugin-api": {"path":"../../../source/confector/plugin_api"},
-		"diet-ng": "1.8.4",
+		"mongo-standalone": "0.0.15",
 		"stdx-allocator": "2.77.5",
 		"vibe-container": "1.7.1",
 		"vibe-serialization": "1.2.0"

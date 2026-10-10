@@ -7,8 +7,12 @@
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {
-		"confector:plugin_api": "*",
-		"confector:mongo_helpers": "*"
+		"confector-plugin-api": {
+			"path": "../../../source/confector/plugin_api"
+		},
+		"confector-mongo-helpers": {
+			"path": "../../../source/confector/mongo_helpers"
+		}
 	},
 	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
 }

@@ -1,0 +1,12 @@
+{
+	"name": "confector-mongo-helpers",
+	"targetType": "library",
+	"targetName": "confector_mongo_helpers",
+	"targetPath": "../../../out/lib",
+	"sourcePaths": ["."],
+	"importPaths": ["../.."],
+	"dependencies": {
+		"mongo-standalone": "~>0.0.15",
+		"vibe-serialization": "~>1.2.0"
+	}
+}

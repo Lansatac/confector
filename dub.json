@@ -34,9 +34,15 @@
       "dependencies": {
         "diet-ng": "~>1.8",
         "vibe-d": "~>0.10.3",
-        "confector:config": "*",
-        "confector:core": "*",
-        "confector:runner_core": "*"
+        "confector-config": {
+          "path": "source/confector/config"
+        },
+        "confector-core": {
+          "path": "source/confector/core"
+        },
+        "confector-runner-core": {
+          "path": "source/confector/runner_core"
+        }
       }
     },
 		{
@@ -92,8 +98,12 @@
 			"targetPath": "out/runner",
 			"workingDirectory": "out",
 			"dependencies": {
-				"confector:runner_core": "*",
-				"confector:core": "*"
+				"confector-core": {
+				  "path": "source/confector/core"
+				},
+				"confector-runner-core": {
+				  "path": "source/confector/runner_core"
+				}
 			}
 		},
     {

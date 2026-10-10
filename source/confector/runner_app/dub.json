@@ -1,0 +1,17 @@
+{
+	"name": "confector-runner",
+	"targetType": "executable",
+	"targetName": "confector-runner",
+	"targetPath": "../../../out/runner",
+	"workingDirectory": "../../../out",
+	"sourcePaths": ["."],
+	"importPaths": ["../.."],
+	"dependencies": {
+		"confector-core": {
+			"path": "../core"
+		},
+		"confector-runner-core": {
+			"path": "../runner_core"
+		}
+	}
+}

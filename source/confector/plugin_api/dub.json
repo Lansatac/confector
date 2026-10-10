@@ -1,0 +1,14 @@
+{
+	"name": "confector-plugin-api",
+	"targetType": "library",
+	"targetName": "confector_plugin_api",
+	"targetPath": "../../../out/lib",
+	"sourcePaths": ["."],
+	"importPaths": ["../.."],
+	"dependencies": {
+		"confector-config": {
+			"path": "../config"
+		},
+		"vibe-serialization": "~>1.2.0"
+	}
+}

@@ -1,0 +1,17 @@
+{
+	"name": "confector-core",
+	"targetType": "library",
+	"targetName": "confector_core",
+	"targetPath": "../../../out/lib",
+	"sourcePaths": [".", "../queue"],
+	"importPaths": ["../.."],
+	"dependencies": {
+		"confector-config": {
+			"path": "../config"
+		},
+		"confector-plugin-api": {
+			"path": "../plugin_api"
+		},
+		"vibe-d": "~>0.10.3"
+	}
+}

@@ -7,7 +7,9 @@
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {
-		"confector:plugin_api": "*"
+		"confector-plugin-api": {
+			"path": "../../../source/confector/plugin_api"
+		}
 	},
 	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
 }
