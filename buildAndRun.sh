@@ -1,1 +1,1 @@
-ninja -C build && cd out/server && ./confector_server
+ninja -C build && cd build/out/server && ./confector_server

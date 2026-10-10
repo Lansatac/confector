@@ -10,9 +10,32 @@ Target dubPathTarget(string path)
   return dubPackage(opts, DubPath(path, Configuration("default")));
 }
 
+Target serverPublicAssets()
+{
+  import std.file : dirEntries, SpanMode;
+
+  Target[] inputs = [Target("$project/public")];
+  foreach (entry; dirEntries("public", SpanMode.depth))
+  {
+    if (entry.isFile)
+      inputs ~= Target("$project/" ~ entry.name);
+  }
+
+  return Target(
+    "$builddir/out/server/public/.reggae-copy.stamp",
+    "mkdir -p out/server && cp -R $project/public out/server/ && touch $out",
+    inputs,
+  );
+}
+
 Target server()
 {
-  return dubPathTarget("source/confector/server");
+  return Target.phony(
+    "server",
+    "",
+    dubPathTarget("source/confector/server"),
+    serverPublicAssets(),
+  );
 }
 
 Target runner()
