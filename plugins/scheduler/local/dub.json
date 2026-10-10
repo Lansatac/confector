@@ -3,7 +3,7 @@
 	"description": "Confector Local Scheduler Plugin - thread-based HTTP scheduler",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_local_scheduler",
-	"targetPath": "../../../out/server/plugins",
+	"targetPath": "../../../build/out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"stringImportPaths": ["."],

@@ -3,7 +3,7 @@
 	"description": "Confector Local Process Compute Provider Plugin",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_local_process",
-	"targetPath": "../../../out/server/plugins",
+	"targetPath": "../../../build/out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"stringImportPaths": ["."],

@@ -3,7 +3,7 @@
 	"description": "Bash Step Definition Plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_bash_def",
-	"targetPath": "../../../out/server/plugins",
+	"targetPath": "../../../build/out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"stringImportPaths": ["."],

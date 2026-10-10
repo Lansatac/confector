@@ -2,7 +2,7 @@
 	"name": "confector-runner",
 	"targetType": "executable",
 	"targetName": "confector-runner",
-	"targetPath": "../../../out/runner",
+	"targetPath": "../../../build/out/runner",
 	"workingDirectory": "../../../out",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],

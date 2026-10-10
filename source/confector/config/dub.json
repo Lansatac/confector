@@ -2,7 +2,7 @@
 	"name": "confector-config",
 	"targetType": "library",
 	"targetName": "confector_config",
-	"targetPath": "../../../out/lib",
+	"targetPath": "../../../build/out/lib",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],
 	"dependencies": {

@@ -3,7 +3,7 @@
 	"description": "Local filesystem artifact storage plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_local_artifact",
-	"targetPath": "../../../out/server/plugins",
+	"targetPath": "../../../build/out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"stringImportPaths": ["."],

@@ -2,7 +2,7 @@
 	"name": "confector-server",
 	"targetType": "executable",
 	"targetName": "confector_server",
-	"targetPath": "../../../out/server",
+	"targetPath": "../../../build/out/server",
 	"workingDirectory": "../../../out/server",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],

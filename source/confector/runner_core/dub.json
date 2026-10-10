@@ -2,7 +2,7 @@
 	"name": "confector-runner-core",
 	"targetType": "library",
 	"targetName": "confector_runner_core",
-	"targetPath": "../../../out/lib",
+	"targetPath": "../../../build/out/lib",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],
 	"dependencies": {

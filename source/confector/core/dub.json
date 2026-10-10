@@ -2,7 +2,7 @@
 	"name": "confector-core",
 	"targetType": "library",
 	"targetName": "confector_core",
-	"targetPath": "../../../out/lib",
+	"targetPath": "../../../build/out/lib",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],
 	"dependencies": {

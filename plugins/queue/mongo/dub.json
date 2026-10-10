@@ -3,7 +3,7 @@
 	"description": "MongoDB queue plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_mongo_queue",
-	"targetPath": "../../../out/server/plugins",
+	"targetPath": "../../../build/out/server/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {

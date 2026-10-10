@@ -2,7 +2,7 @@
 	"name": "confector-plugin-api",
 	"targetType": "library",
 	"targetName": "confector_plugin_api",
-	"targetPath": "../../../out/lib",
+	"targetPath": "../../../build/out/lib",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],
 	"dependencies": {

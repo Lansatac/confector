@@ -2,7 +2,7 @@
 	"name": "confector-mongo-helpers",
 	"targetType": "library",
 	"targetName": "confector_mongo_helpers",
-	"targetPath": "../../../out/lib",
+	"targetPath": "../../../build/out/lib",
 	"sourcePaths": ["."],
 	"importPaths": ["../.."],
 	"dependencies": {

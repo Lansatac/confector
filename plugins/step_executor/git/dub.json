@@ -3,7 +3,7 @@
 	"description": "Git Step Runner Plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_git_runner",
-	"targetPath": "../../../out/runner/plugins",
+	"targetPath": "../../../build/out/runner/plugins",
 	"sourcePaths": ["."],
 	"importPaths": ["."],
 	"dependencies": {
