@@ -1,0 +1,16 @@
+{
+	"name": "local_scheduler",
+	"description": "Confector Local Scheduler Plugin - thread-based HTTP scheduler",
+	"targetType": "dynamicLibrary",
+	"targetName": "confector_local_scheduler",
+	"targetPath": "../../../out/server/plugins",
+	"sourcePaths": ["."],
+	"importPaths": ["."],
+	"stringImportPaths": ["."],
+ "dependencies": {
+		"confector:config": "*",
+		"confector:plugin_api": "*",
+		"cron": "~>0.1.1"
+	},
+	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
+}

@@ -11,6 +11,8 @@ import std.uri : encodeComponent;
 
 import confector.core.model : ProjectRecord, RepositoryRecord;
 import confector.core.storage : BuildStateRepository;
+import confector.orchestrator.coordinator : BuildCoordinator;
+import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 
 /// Refresh policy options for repository change detection.
 enum RefreshPolicy : string
@@ -41,10 +43,35 @@ struct ConnectedProjectViewModel
     bool isProjectDefault;
 }
 
+/// Registers or unregisters a VCS polling schedule entry for a repository.
+void updateVcsPollingSchedule(Scheduler scheduler, ushort serverPort, string repositoryName, string repositoryAddress, string refreshPolicy)
+{
+    if (scheduler is null) return;
+    string entryId = "vcs-poll-" ~ repositoryName;
+    string policy = refreshPolicy.length > 0 ? refreshPolicy : "webhook";
+
+    if (policy == "polling" || policy == "both")
+    {
+        ScheduleEntry entry;
+        entry.id = entryId;
+        entry.name = format("VCS Poll: %s", repositoryName);
+        entry.uri = format("http://127.0.0.1:%d/api/v1/repositories/%s/poll", serverPort, encodeComponent(repositoryName));
+        entry.httpMethod = "POST";
+        entry.cronExpression = "*/5 * * * *";  // Every 5 minutes
+        entry.recurring = true;
+        scheduler.schedule(entry);
+    }
+    else
+    {
+        scheduler.unschedule(entryId);
+    }
+}
+
 /**
  * Creates the URL router for the /repositories endpoints.
  */
-URLRouter repositoryRouter(BuildStateRepository stateRepo)
+URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coordinator = null,
+    Scheduler scheduler = null, ushort serverPort = 8080)
 {
     auto router = new URLRouter();
 
@@ -139,6 +166,9 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
             record.refreshPolicy = refreshPolicy;
             record.createdAt = Clock.currTime.toISOString();
             stateRepo.saveRepository(record);
+
+            // Register VCS polling schedule entry if needed
+            updateVcsPollingSchedule(scheduler, serverPort, name, address, refreshPolicy);
         }
 
         res.redirect("/repositories/details?name=" ~ encodeComponent(name));
@@ -170,6 +200,16 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
             RepositoryRecord record;
             if (stateRepo.getRepository(name, record))
             {
+                // Unschedule the old entry if the address is changing
+                if (record.address != address)
+                {
+                    updateVcsPollingSchedule(scheduler, serverPort, name, record.address, "webhook");
+                }
+                else
+                {
+                    // Same address, just update the policy
+                    updateVcsPollingSchedule(scheduler, serverPort, name, address, refreshPolicy);
+                }
                 record.address = address;
                 record.refreshPolicy = refreshPolicy;
                 stateRepo.saveRepository(record);
@@ -181,7 +221,112 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo)
 
     router.post("/repositories/edit", &handleEditSubmit);
 
-    // 4. Repository details view
+    // 4. Per-repository VCS polling endpoint (called by scheduler)
+    if (stateRepo !is null)
+    {
+        router.post("/repositories/:repoName/poll", (HTTPServerRequest req, HTTPServerResponse res) {
+            try
+            {
+                import confector.core.plugin : PluginRegistry;
+                import confector.plugin_api.vcs : VcsStateResolver;
+                import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
+                import std.uuid : randomUUID;
+
+                string repoName = req.params.get("repoName", "");
+                if (repoName.length == 0)
+                {
+                    res.statusCode = HTTPStatus.badRequest;
+                    Json err = Json.emptyObject;
+                    err["error"] = Json("repoName path parameter is required");
+                    res.writeJsonBody(err);
+                    return;
+                }
+
+                // Look up the repository record to get the address
+                RepositoryRecord repoRecord;
+                if (!stateRepo.getRepository(repoName, repoRecord))
+                {
+                    res.statusCode = HTTPStatus.notFound;
+                    Json err = Json.emptyObject;
+                    err["error"] = Json(format("Repository not found: %s", repoName));
+                    res.writeJsonBody(err);
+                    return;
+                }
+
+                string repoUrl = repoRecord.address;
+                auto resolver = PluginRegistry.instance.findVcsResolver(repoUrl);
+                if (resolver is null)
+                {
+                    res.statusCode = HTTPStatus.badRequest;
+                    Json err = Json.emptyObject;
+                    err["error"] = Json(format("No VCS resolver found for repository: %s", repoUrl));
+                    res.writeJsonBody(err);
+                    return;
+                }
+
+                auto newState = resolver.fetchLatestState(repoUrl);
+
+                VcsRepositoryState previousState;
+                bool changed = false;
+                string fromRevision = "";
+
+                if (stateRepo.getRepositoryState(newState.repositoryUrl, newState.targetRef, previousState))
+                {
+                    fromRevision = previousState.revision;
+                    if (previousState.revision != newState.revision)
+                    {
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    changed = true;
+                }
+
+                newState.updatedAt = Clock.currTime.toISOString();
+                stateRepo.saveRepositoryState(newState);
+
+                if (changed && coordinator !is null)
+                {
+                    VcsChangeRecord change;
+                    change.id = "change_" ~ randomUUID().toString();
+                    change.repositoryUrl = newState.repositoryUrl;
+                    change.providerType = newState.providerType;
+                    change.targetRef = newState.targetRef;
+                    change.fromRevision = fromRevision;
+                    change.toRevision = newState.revision;
+                    change.detectedAt = Clock.currTime.toISOString();
+                    change.triggerSource = "polling";
+                    stateRepo.recordRepositoryChange(change);
+
+                    // Find projects that use this repository and start builds
+                    foreach (proj; stateRepo.listProjects())
+                    {
+                        if (proj.repositoryUrl == repoUrl)
+                        {
+                            coordinator.startBuild(proj, null, false, "polling");
+                        }
+                    }
+                }
+
+                Json resp = Json.emptyObject;
+                resp["status"] = Json("ok");
+                resp["repository"] = Json(repoUrl);
+                resp["changed"] = Json(changed);
+                resp["revision"] = Json(newState.revision);
+                res.writeJsonBody(resp);
+            }
+            catch (Exception e)
+            {
+                res.statusCode = HTTPStatus.internalServerError;
+                Json err = Json.emptyObject;
+                err["error"] = Json(e.msg);
+                res.writeJsonBody(err);
+            }
+        });
+    }
+
+    // 5. Repository details view
     void handleDetails(HTTPServerRequest req, HTTPServerResponse res)
     {
         string name = req.query.get("name", req.query.get("repo_name", ""));

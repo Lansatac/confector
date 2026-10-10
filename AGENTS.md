@@ -30,7 +30,8 @@ Stateless DAG engine, fingerprinting, trigger matching, and plugin lifecycle. Ke
 
 ### Plugin API — `source/confector/plugin_api/`
 Public interfaces and data models that plugins implement. Key files:
-- `plugin.d` — `Plugin` base interface, categories (definition, step_executor, worker, artifact)
+- `plugin.d` — `Plugin` base interface, categories (definition, step_executor, worker, artifact, scheduler)
+- `scheduler.d` — `Scheduler` interface and `ScheduleEntry` model (URI-based periodic job scheduling)
 - `system.d` — ECS-inspired system contracts (`BuildStepSystem`, `InputResolverSystem`, etc.)
 - `executor.d` — Compute provider and worker pool abstractions
 - `model.d` — Core domain structs (`TaskNode`, `BuildStep`, `TaskQueueMessage`, etc.)
@@ -47,7 +48,7 @@ Persistent Vibe.d web service with MongoDB persistence. **Goal:** a version of t
 - `config.d` — Server configuration structs
 - `controller/` — HTTP endpoints: `api_controller.d` (REST API), `dashboard_controller.d` (web UI), `admin_controller.d` (plugin management), `executor_controller.d`, `repositorycontroller.d`
 - `orchestrator/coordinator.d` — `BuildCoordinator`: central build orchestration, trigger handling, subgraph computation, in-flight deduplication. **Currently stateful** (in-memory registries, MongoDB persistence); for serverless deployment, this logic needs to be decomposed into stateless functions.
-- `orchestrator/capacity_broker.d` — Queue backlog monitoring and compute provisioning
+- **`orchestrator/capacity_broker.d`** — Queue backlog monitoring and compute provisioning. No longer manages its own polling loop; the scheduler calls the `/api/v1/scheduler/capacity-evaluate` endpoint periodically.
 - `orchestrator/serverless_handler.d` — **Stateless** serverless/FaaS execution handler; entry point for serverless task execution via JSON-RPC
 - `storage/mongo_repository.d` — MongoDB implementation of `BuildStateRepository`
 
@@ -55,6 +56,12 @@ Persistent Vibe.d web service with MongoDB persistence. **Goal:** a version of t
 Queue abstractions and implementations.
 - `queue.d` — `WorkQueue` interface and in-memory implementation
 - `mongo_queue.d` — MongoDB-backed persistent queue with visibility timeouts
+
+### Scheduler — `plugins/scheduler/`
+Plugin-based periodic job scheduling. The scheduler fires **HTTP POST requests** to registered URIs — not in-process delegate callbacks — making it fully compatible with serverless deployment where the scheduler and server may run in completely separate processes.
+- `plugin_api/scheduler.d` — `Scheduler` interface and `ScheduleEntry` model
+- `local/package.d` — `LocalSchedulerPlugin`: reference implementation using a dedicated thread that fires HTTP requests at cron-scheduled times
+- The scheduler is used by: capacity broker (1-minute interval), VCS polling (per-repository, 5-minute interval), and cron triggers (per-rule cron expression). VCS polling entries are registered dynamically when repositories are created or updated.
 
 ### Configuration — `source/confector/config/`
 Type-safe hierarchical configuration with environment variable override support.
@@ -65,11 +72,12 @@ CLI tool for single-task execution or HTTP worker daemon mode.
 - `main.d` — Entry point with `run` and `worker` subcommands
 
 ### Plugins — `plugins/`
-Dynamic libraries compiled to `out/plugins/`. Four categories:
+Dynamic libraries compiled to `out/plugins/`. Categories:
 - **`definition/`** (server-side) — Step UI forms and validation (e.g., `git/`, `bash/`, `powershell/`)
 - **`step_executor/`** (runner-side) — Build step execution and input resolution (e.g., `git/`, `bash/`, `powershell/`)
 - **`worker/`** (server-side) — Compute provisioning (e.g., `local_process/`)
 - **`artifact/`** (runner-side) — Artifact storage backends (e.g., `local/`)
+- **`scheduler/`** (server-side) — Periodic job execution (e.g., `local/` — thread-based HTTP scheduler)
 
 ### Other Key Directories
 - **`views/`** — 26 Diet-NG templates for the web UI (dashboard, projects, tasks, builds, etc.)
@@ -115,6 +123,12 @@ Dynamic libraries compiled to `out/plugins/`. Four categories:
 ### 1.8 Plugin-Defined Ordered Build Steps
 - **Decision**: Task execution consists of an arbitrary ordered list of plugin-defined build steps (such as the Git plugin's `clone_repository` step or the process runner's `process` step).
 - **Rationale**: Replaces rigid, monolithic script execution with composable, sequentially executed step systems. Each plugin exposes step handlers dynamically via `BuildStepSystem`, maximizing reusability and fine-grained error isolation.
+
+### 1.9 Scheduler Plugin — URI-Based Periodic Job Execution
+- **Decision**: Periodic tasks (capacity broker polling, VCS repository polling, cron trigger evaluation) use a plugin-based scheduler that fires HTTP POST requests to registered URIs, not in-process delegate callbacks.
+- **Rationale**: Separates WHAT to schedule (server concern) from HOW to schedule it (plugin concern). The scheduler knows nothing about server internals — it only knows URIs to call. This means the scheduler can run in a completely separate process (e.g., AWS Lambda triggered by CloudWatch Events) from the server, enabling serverless-compatible scheduling. The `LocalSchedulerPlugin` is a reference implementation using a dedicated thread; cloud-based plugins (e.g., AWS CloudWatch Events → HTTP endpoint) can be plugged in.
+- **Components that use the scheduler**: capacity broker (1-minute interval), VCS polling (per-repository, 5-minute interval, dynamically registered on repository create/update), cron triggers (per-rule cron expression).
+- **Key files**: `plugin_api/scheduler.d` (interface), `plugins/scheduler/local/package.d` (reference impl), `api_controller.d` (capacity-evaluate endpoint), `repositorycontroller.d` (per-repo poll endpoint and dynamic scheduler registration).
 
 ---
 

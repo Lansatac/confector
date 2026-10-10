@@ -12,7 +12,8 @@ enum PluginCategory : string
     worker = "worker",              // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
     artifact = "artifact",          // Artifact Storage Plugins (content-addressed artifact backend)
     storage = "storage",            // State Storage Plugins (BuildStateRepository - builds, tasks, projects, etc.)
-    queue = "queue"                 // Work Queue Plugins (WorkQueue - task message distribution)
+    queue = "queue",                // Work Queue Plugins (WorkQueue - task message distribution)
+    scheduler = "scheduler"         // Scheduler Plugins (periodic job execution)
 }
 
 /**
@@ -87,6 +88,17 @@ interface StateStoragePlugin : Plugin
  * Provides a backend for task message distribution (SQS, MongoDB queue, RabbitMQ, etc.).
  */
 interface WorkQueuePlugin : Plugin
+{
+}
+
+/**
+ * Interface for Scheduler Plugins.
+ * Provides a backend for periodic job execution (local thread, CloudWatch Events, Kubernetes CronJob, etc.).
+ * The scheduler fires HTTP POST requests to registered URIs — not in-process delegate callbacks —
+ * making it fully compatible with serverless deployment where the scheduler and server may run
+ * in completely separate processes.
+ */
+interface SchedulerPlugin : Plugin
 {
 }
 

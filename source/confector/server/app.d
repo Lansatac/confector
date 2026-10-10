@@ -9,6 +9,7 @@ import std.functional : toDelegate;
 import std.path : buildPath;
 import std.process : environment;
 import std.string : split, strip;
+import std.uri : encodeComponent;
 
 import vibe.vibe;
 
@@ -18,6 +19,7 @@ import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProv
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
 import confector.core.storage : BuildStateRepository;
+import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 import confector.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.queue.queue : WorkQueue;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
@@ -89,7 +91,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
     {
         if (exists(pluginDir) && isDir(pluginDir))
         {
-            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue]);
+            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(pluginDir, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue, PluginCategory.scheduler]);
         }
     }
 
@@ -134,7 +136,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
             {
                 try
                 {
-                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue]);
+                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue, PluginCategory.scheduler]);
                     if (p !is null)
                     {
                         logInfo("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
@@ -162,7 +164,9 @@ URLRouter createRouter(
     BuildCoordinator buildCoordinator,
     BuildStateRepository stateRepo,
     CapacityBroker capacityBroker = null,
-    ConfiguredArtifactStorage configuredStorage = null)
+    ConfiguredArtifactStorage configuredStorage = null,
+    Scheduler scheduler = null,
+    ushort serverPort = 8080)
 {
     auto router = new URLRouter();
 
@@ -178,7 +182,7 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, workQueue, buildCoordinator, stateRepo);
+    auto api = apiRouter(taskEngine, workQueue, buildCoordinator, stateRepo, capacityBroker);
     router.any("/api/v1/*", api);
     router.any("/api/*", api);
 
@@ -200,7 +204,7 @@ URLRouter createRouter(
 
     router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
 
-    router.any("/repositories/*", repositoryRouter(stateRepo));
+    router.any("/repositories/*", repositoryRouter(stateRepo, buildCoordinator, scheduler, serverPort));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
     router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
@@ -355,11 +359,11 @@ void main()
         logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
-    // Start capacity broker evaluation loop
-    capacityBroker.start();
+    // Load scheduler plugin
+    auto scheduler = PluginRegistry.instance.getDefaultScheduler();
 
     // Configure router and server settings
-    auto router = createRouter(taskEngine, workQueue, buildCoordinator, stateRepo, capacityBroker, configuredStorage);
+    auto router = createRouter(taskEngine, workQueue, buildCoordinator, stateRepo, capacityBroker, configuredStorage, scheduler, serverConfig.http.port);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -367,6 +371,74 @@ void main()
     }
 
     listenHTTP(settings, router);
+
+    // Start the scheduler plugin
+    if (scheduler !is null)
+    {
+        scheduler.start();
+        logInfo("[scheduler] Scheduler plugin started");
+
+        // Register capacity evaluation schedule entry
+        ScheduleEntry capacityEntry;
+        capacityEntry.id = "capacity-evaluate";
+        capacityEntry.name = "Capacity Broker Evaluation";
+        capacityEntry.uri = format("http://127.0.0.1:{}/api/v1/broker/evaluate", serverConfig.http.port);
+        capacityEntry.httpMethod = "POST";
+        capacityEntry.cronExpression = "* * * * *";  // Every minute
+        capacityEntry.recurring = true;
+        scheduler.schedule(capacityEntry);
+        logInfo("[scheduler] Registered capacity evaluation entry (every minute)");
+
+        // Register VCS polling schedule entries for repositories with polling policy
+        import confector.plugin_api.model : RepositoryRecord;
+        auto allRepos = stateRepo.listRepositories();
+        foreach (repo; allRepos)
+        {
+            string policy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
+            if ((policy == "polling" || policy == "both") && repo.address.length > 0)
+            {
+                ScheduleEntry pollEntry;
+                pollEntry.id = "vcs-poll-" ~ repo.name;
+                pollEntry.name = format("VCS Poll: %s", repo.name);
+                pollEntry.uri = format("http://127.0.0.1:{}/api/v1/repositories/%s/poll", serverConfig.http.port, encodeComponent(repo.name));
+                pollEntry.httpMethod = "POST";
+                pollEntry.cronExpression = "*/5 * * * *";  // Every 5 minutes
+                pollEntry.recurring = true;
+                scheduler.schedule(pollEntry);
+                logInfo("[scheduler] Registered VCS polling for '%s' (every 5 min)", repo.name);
+            }
+        }
+
+        // Register schedule entries for each cron trigger rule
+        // Each cron rule points directly to /projects/run with the project ID
+        import confector.plugin_api.model : TriggerRuleRecord;
+        auto cronRules = stateRepo.listTriggerRules();
+        foreach (rule; cronRules)
+        {
+            if (rule.triggerType != "cron")
+            {
+                continue;
+            }
+            if (rule.criteria.length == 0)
+            {
+                continue;
+            }
+
+            ScheduleEntry cronEntry;
+            cronEntry.id = "cron-" ~ rule.id;
+            cronEntry.name = format("Cron Trigger: %s (%s)", rule.name, rule.criteria);
+            cronEntry.uri = format("http://127.0.0.1:{}/api/v1/projects/%s/run", serverConfig.http.port, encodeComponent(rule.projectId));
+            cronEntry.httpMethod = "POST";
+            cronEntry.cronExpression = rule.criteria;
+            cronEntry.recurring = true;
+            scheduler.schedule(cronEntry);
+            logInfo("[scheduler] Registered cron trigger '%s' for project '%s' (cron: %s)", rule.name, rule.projectId, rule.criteria);
+        }
+    }
+    else
+    {
+        logWarn("[scheduler] No scheduler plugin registered — periodic tasks will not run");
+    }
 
     logInfo("Starting server on port %d", serverConfig.http.port);
     runApplication();

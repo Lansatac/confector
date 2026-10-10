@@ -140,8 +140,6 @@ interface CapacityBroker
 {
     void registerProvisioner(ComputeProvisioner provisioner);
     void evaluateDemand();
-    void start();
-    void stop();
     @property size_t activeInstanceCount() const;
     @property size_t maxCapacity() const;
     @property ComputeProvisioner[] provisioners();

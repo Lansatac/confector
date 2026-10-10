@@ -109,7 +109,8 @@
         "confector:local_process": "*",
         "confector:local_artifact": "*",
         "confector:mongo_storage": "*",
-        "confector:mongo_queue": "*"
+        "confector:mongo_queue": "*",
+        "confector:local_scheduler": "*"
       }
     },
 		"./plugins/definition/bash",
@@ -121,6 +122,7 @@
 		"./plugins/worker/local_process",
 		"./plugins/artifact/local",
 		"./plugins/storage/mongo",
-		"./plugins/queue/mongo"
+		"./plugins/queue/mongo",
+		"./plugins/scheduler/local"
 	]
 }

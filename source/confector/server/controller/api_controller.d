@@ -5,6 +5,7 @@ import confector.core.model;
 import confector.core.dag;
 import confector.core.storage;
 import confector.core.trigger;
+import confector.core.executor : CapacityBroker;
 import confector.runner_core.engine;
 import confector.orchestrator.coordinator;
 import confector.queue.queue;
@@ -13,7 +14,7 @@ import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null, BuildStateRepository stateRepo = null)
+URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null, BuildStateRepository stateRepo = null, CapacityBroker capacityBroker = null)
 {
     import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
@@ -377,7 +378,7 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    // Run Project via the queue-backed coordinator
+    // Run Project via the queue-backed coordinator (JSON body)
     postRoute("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
@@ -410,6 +411,47 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
             }
 
             string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, force, "api", workspaceDir);
+            Json resp = Json.emptyObject;
+            resp["build_id"] = Json(buildId);
+            resp["status"] = Json("queued");
+            resp["project_id"] = Json(projectId);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
+    });
+
+    // Run Project by ID (path parameter) — used by scheduler for cron triggers
+    postRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            string projectId = req.params["id"];
+            auto repo = stateRepo;
+            ProjectRecord proj;
+            if (repo is null || !repo.getProject(projectId, proj))
+            {
+                res.statusCode = HTTPStatus.notFound;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Project not found: " ~ projectId);
+                res.writeJsonBody(err);
+                return;
+            }
+
+            if (coordinator is null)
+            {
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build coordinator is required for task execution");
+                res.writeJsonBody(err);
+                return;
+            }
+
+            string buildId = coordinator.startBuild(proj, null, false, "cron", "");
             Json resp = Json.emptyObject;
             resp["build_id"] = Json(buildId);
             resp["status"] = Json("queued");
@@ -1304,146 +1346,29 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     });
 
-    // Generic polling endpoint for VCS state refresh
-    postRoute("/repositories/poll", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            import confector.core.plugin : PluginRegistry;
-            import confector.plugin_api.vcs : VcsStateResolver;
-            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord, RepositoryRecord;
 
-            Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
-            string[] repoUrls;
-
-            if ("repositories" in bodyJson && bodyJson["repositories"].type == Json.Type.array)
+    // Capacity broker endpoint — called by the scheduler plugin via HTTP
+    if (capacityBroker !is null)
+    {
+        postRoute("/broker/evaluate", (HTTPServerRequest req, HTTPServerResponse res) {
+            try
             {
-                auto reposJson = bodyJson["repositories"];
-                foreach (item; reposJson)
-                {
-                    repoUrls ~= item.get!string;
-                }
+                capacityBroker.evaluateDemand();
+                Json resp = Json.emptyObject;
+                resp["status"] = Json("ok");
+                res.writeJsonBody(resp);
             }
-            else if (stateRepo)
+            catch (Exception e)
             {
-                // If no specific repos provided, poll only repos configured for polling
-                auto allRepos = stateRepo.listRepositories();
-                foreach (repo; allRepos)
-                {
-                    string policy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
-                    if (policy == "polling" || policy == "both")
-                    {
-                        if (repo.address.length > 0)
-                        {
-                            repoUrls ~= repo.address;
-                        }
-                    }
-                }
-                // Also include project-level repository URLs not in the repository registry
-                foreach (proj; stateRepo.listProjects())
-                {
-                    if (proj.repositoryUrl.length > 0)
-                    {
-                        // Check if this URL is already in the list
-                        bool found = false;
-                        foreach (url; repoUrls)
-                        {
-                            if (url == proj.repositoryUrl)
-                            {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found)
-                        {
-                            repoUrls ~= proj.repositoryUrl;
-                        }
-                    }
-                }
+                res.statusCode = HTTPStatus.internalServerError;
+                Json err = Json.emptyObject;
+                err["error"] = Json(e.msg);
+                res.writeJsonBody(err);
             }
+        });
+    }
 
-            int changedCount = 0;
-            int errorCount = 0;
-            Json changes = Json.emptyArray;
 
-            foreach (repoUrl; repoUrls)
-            {
-                auto resolver = PluginRegistry.instance.findVcsResolver(repoUrl);
-                if (resolver is null)
-                {
-                    errorCount++;
-                    continue;
-                }
-
-                try
-                {
-                    auto newState = resolver.fetchLatestState(repoUrl);
-
-                    VcsRepositoryState previousState;
-                    bool changed = false;
-                    string fromRevision = "";
-
-                    if (stateRepo && stateRepo.getRepositoryState(newState.repositoryUrl, newState.targetRef, previousState))
-                    {
-                        fromRevision = previousState.revision;
-                        if (previousState.revision != newState.revision)
-                        {
-                            changed = true;
-                        }
-                    }
-                    else
-                    {
-                        changed = true;
-                    }
-
-                    if (stateRepo)
-                    {
-                        newState.updatedAt = Clock.currTime.toISOString();
-                        stateRepo.saveRepositoryState(newState);
-
-                        if (changed)
-                        {
-                            VcsChangeRecord change;
-                            change.id = "change_" ~ randomUUID().toString();
-                            change.repositoryUrl = newState.repositoryUrl;
-                            change.providerType = newState.providerType;
-                            change.targetRef = newState.targetRef;
-                            change.fromRevision = fromRevision;
-                            change.toRevision = newState.revision;
-                            change.detectedAt = Clock.currTime.toISOString();
-                            change.triggerSource = "polling";
-                            stateRepo.recordRepositoryChange(change);
-                            changedCount++;
-
-                            Json changeJson = Json.emptyObject;
-                            changeJson["repository"] = Json(newState.repositoryUrl);
-                            changeJson["from"] = Json(fromRevision);
-                            changeJson["to"] = Json(newState.revision);
-                            changes ~= changeJson;
-                        }
-                    }
-                }
-                catch (Exception e)
-                {
-                    errorCount++;
-                }
-            }
-
-            Json resp = Json.emptyObject;
-            resp["status"] = Json("completed");
-            resp["polled"] = Json(repoUrls.length);
-            resp["changed"] = Json(changedCount);
-            resp["errors"] = Json(errorCount);
-            resp["changes"] = changes;
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
 
     return router;
 }

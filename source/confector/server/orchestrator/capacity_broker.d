@@ -10,7 +10,6 @@ import core.time : Duration, seconds, msecs;
 import std.algorithm.searching : canFind;
 import std.datetime.systime : Clock;
 import std.format : format;
-import vibe.core.core : runTask, sleep, Task;
 import vibe.core.log : logInfo, logError, logWarn, logDebug, logTrace;
 
 /**
@@ -24,17 +23,13 @@ class DefaultCapacityBroker : CapacityBroker
     private BuildCoordinator m_coordinator;
     private ComputeProvisioner[] m_provisioners;
     private Mutex m_mutex;
-    private bool m_running = false;
-    private Task m_brokerTask;
-    private Duration m_pollInterval;
 
     // Allow one-shot local workers time to start and claim work before spawning
     // another worker for the same still-visible queue backlog.
-    this(WorkQueue workQueue, BuildCoordinator coordinator = null, Duration pollInterval = 500.msecs)
+    this(WorkQueue workQueue, BuildCoordinator coordinator = null)
     {
         this.m_workQueue = workQueue;
         this.m_coordinator = coordinator;
-        this.m_pollInterval = pollInterval;
         this.m_mutex = new Mutex();
     }
 
@@ -58,14 +53,6 @@ class DefaultCapacityBroker : CapacityBroker
         synchronized (m_mutex)
         {
             return m_provisioners.dup;
-        }
-    }
-
-    @property bool isRunning() const
-    {
-        synchronized (m_mutex)
-        {
-            return m_running;
         }
     }
 
@@ -185,79 +172,6 @@ class DefaultCapacityBroker : CapacityBroker
             }
         }
     }
-
-    void start()
-    {
-        synchronized (m_mutex)
-        {
-            if (m_running)
-            {
-                logWarn("[capacity_broker] start() called but broker loop is already running");
-                return;
-            }
-            m_running = true;
-        }
-
-        logTrace("[capacity_broker] Starting capacity broker evaluation loop (pollInterval=%s)", m_pollInterval);
-
-        m_brokerTask = runTask(() nothrow {
-            try
-            {
-                logTrace("[capacity_broker] Broker evaluation task started");
-                while (isRunning)
-                {
-                    try
-                    {
-                        evaluateDemand();
-                    }
-                    catch (Exception e)
-                    {
-                        try { logError("[capacity_broker] Error evaluating demand: %s", e.msg); } catch (Exception) {}
-                    }
-                    try
-                    {
-                        sleep(m_pollInterval);
-                    }
-                    catch (Exception)
-                    {
-                        break;
-                    }
-                }
-                logTrace("[capacity_broker] Broker evaluation task stopped");
-            }
-            catch (Throwable) {}
-        });
-    }
-
-    void stop()
-    {
-        synchronized (m_mutex)
-        {
-            if (!m_running)
-            {
-                logDebug("[capacity_broker] stop() called but broker loop is not running");
-                return;
-            }
-            m_running = false;
-        }
-
-        logDebug("[capacity_broker] Stopping capacity broker evaluation loop");
-
-        if (m_brokerTask != Task.init && m_brokerTask.running)
-        {
-            try
-            {
-                m_brokerTask.interrupt();
-                m_brokerTask.join();
-                logDebug("[capacity_broker] Broker evaluation task joined successfully");
-            }
-            catch (Exception e)
-            {
-                logDebug("[capacity_broker] Exception while joining broker task: %s", e.msg);
-            }
-            m_brokerTask = Task.init;
-        }
-    }
 }
 
 unittest
@@ -358,19 +272,12 @@ unittest
     // Total active across broker
     assert(broker.activeInstanceCount == 3);
 
-    // Start & stop broker loop lifecycle
-    assert(!broker.isRunning);
-    broker.start();
-    assert(broker.isRunning);
-    broker.stop();
-    assert(!broker.isRunning);
-
     // 2. End-to-end integration: BuildCoordinator + WorkQueue + DefaultCapacityBroker
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
     auto e2eQueue = new InMemoryWorkQueue();
     auto coord = new BuildCoordinator(storage, stateRepo, e2eQueue);
-    auto e2eBroker = new DefaultCapacityBroker(e2eQueue, coord, 10.msecs);
+    auto e2eBroker = new DefaultCapacityBroker(e2eQueue, coord);
 
     // Provisioner that acts as an automated executor worker
     class AutoExecutingProvisioner : ComputeProvisioner

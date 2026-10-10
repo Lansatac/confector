@@ -6,6 +6,7 @@ public import confector.plugin_api.model;
 public import confector.plugin_api.executor;
 public import confector.plugin_api.system;
 public import confector.plugin_api.vcs;
+public import confector.plugin_api.scheduler;
 public import confector.config;
 public import confector.core.storage;
 public import confector.queue.queue;
@@ -119,6 +120,7 @@ final class PluginRegistry
     private WorkQueue[string] _workQueuesByType;
     private string _defaultWorkQueueType;
     private VcsStateResolver[] _vcsResolvers;
+    private Scheduler _scheduler;
     private PluginLogCallback _logCallback;
     private ConfigRegistry _configRegistry;
 
@@ -221,6 +223,10 @@ final class PluginRegistry
         if (auto vcsResolver = cast(VcsStateResolver) plugin)
         {
             registerVcsResolver(vcsResolver);
+        }
+        if (auto sched = cast(Scheduler) plugin)
+        {
+            registerScheduler(sched);
         }
         logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
     }
@@ -631,6 +637,21 @@ final class PluginRegistry
         {
             _defaultWorkQueueType = backendType;
         }
+    }
+
+    public void registerScheduler(Scheduler scheduler)
+    {
+        _scheduler = scheduler;
+    }
+
+    public Scheduler getDefaultScheduler()
+    {
+        return _scheduler;
+    }
+
+    public void setScheduler(Scheduler scheduler)
+    {
+        _scheduler = scheduler;
     }
 
     public BuildStepSystem findStepSystem(in BuildStep step)

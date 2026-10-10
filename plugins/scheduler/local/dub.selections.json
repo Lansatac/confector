@@ -1,0 +1,10 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"cron": "0.1.1",
+		"stdx-allocator": "2.77.5",
+		"unit-threaded": "2.2.6",
+		"vibe-container": "1.7.1",
+		"vibe-serialization": "1.2.0"
+	}
+}
