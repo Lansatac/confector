@@ -7,20 +7,11 @@
   "license": "The Unlicense",
   "name": "confector",
   "targetType": "none",
+  "importPaths": ["source", "plugins"],
   "dependencies": {
     "confector-server": { "path": "source/confector/server" },
     "confector-runner": { "path": "source/confector/runner" },
-    "bash_def": { "path": "plugins/definition/bash" },
-    "git_def": { "path": "plugins/definition/git" },
-    "powershell_def": { "path": "plugins/definition/powershell" },
-    "bash_runner": { "path": "plugins/step_executor/bash" },
-    "git_runner": { "path": "plugins/step_executor/git" },
-    "powershell_runner": { "path": "plugins/step_executor/powershell" },
-    "local_process": { "path": "plugins/worker/local_process" },
-    "local_artifact": { "path": "plugins/artifact/local" },
-    "mongo_storage": { "path": "plugins/storage/mongo" },
-    "mongo_queue": { "path": "plugins/queue/mongo" },
-    "local_scheduler": { "path": "plugins/scheduler/local" }
+    "confector:plugins": "*"
   },
   "subPackages": [
     "source/confector/config",
