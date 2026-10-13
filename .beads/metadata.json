@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "confector",
+  "project_id": "a1e85cab-0332-460a-b2ea-382f028870a4"
+}
