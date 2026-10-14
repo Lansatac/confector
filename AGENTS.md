@@ -160,7 +160,8 @@ less true.
 2. **Graph evaluation does not execute work, and execution does not decide what to build.**
 3. **Decision logic is pure; state is passed in explicitly.** No hidden global or mutable singleton
    state in decision logic.
-4. **Re-running a task invalidates everything downstream of it.** *(Not yet implemented.)*
+4. **Re-running a task invalidates everything downstream of it**, in every chain that shares its
+   inputs. *(Not yet implemented.)*
 5. **Required configuration is never defaulted silently.**
 
 ---
@@ -215,8 +216,9 @@ Decided October 2026 (design record: bead `confector-z7z.1`).
   different: that fails loudly.)
 - **Each result records the full task definition it ran with**, so it can be inspected and the UI
   can show when a result predates a configuration change.
-- **A build chain freezes** its set of tasks, their declared and resolved inputs, and their
-  fingerprints. It does **not** freeze build configuration, which is read when a task is
+- **A build chain freezes** its set of tasks and their declared and resolved inputs. It does
+  **not** freeze fingerprints, which are computed from the chain plus the current rerun
+  generations (see "Re-running a task"), or build configuration, which is read when a task is
   dispatched. A task deleted from the project after the chain was created fails loudly if asked to
   build; a task added later is not part of the chain.
 
@@ -246,12 +248,35 @@ How they fit together:
 - **A configuration change does not trigger a rebuild** of a chain whose task already succeeded;
   re-run the task to apply it.
 - **Retry and rerun are different.** *Retry* runs a failed or cancelled task again in the same
-  chain. *Rerun* forces a succeeded task to run again; it creates a new chain from that task
-  forward, whose parent is the original.
+  chain, at the same fingerprint. *Rerun* says a succeeded result should not be used anymore; see
+  below.
 - **Cancel means stop**, even when the execution is shared with other chains. Cancelling a task
   also cancels the tasks downstream of it. Before acting, the UI shows everything that will be
   cancelled — including other chains that share the execution — and offers to cancel upstream
   tasks that are still running too.
+
+## Re-running a task
+
+Decided October 2026 (design record: bead `confector-z7z.15`). A rerun means "there was a
+problem with that build; don't use it anymore." Where cases are ambiguous, choose what is least
+surprising given that meaning.
+
+- **A rerun is an input.** Each task has a *rerun generation*, starting at 0 and keyed by the
+  task's fingerprint without it (its *base*). Rerunning increments the generation, recorded durably
+  and append-only. The fingerprint hashes the base and the generation, so the rerun task and
+  everything downstream of it get new fingerprints through ordinary transitive hashing.
+- **Generations are shared, not per chain.** A rerun updates the chain it was requested in — no
+  new chain is created — and every other chain that shares that task's inputs. The rerun prompt
+  lists the affected chains. Each chain keeps a history of reruns; superseded executions remain
+  visible.
+- **A rerun must pass.** Downstream tasks wait for the new generation to succeed; a failed rerun
+  blocks rather than falling back to the earlier success. (An explicit "accept the previous
+  result" override may come later, bead `confector-z7z.22`.)
+- **Stale work in flight is cancelled by default.** Downstream tasks already running from the
+  superseded result are listed in the rerun prompt and cancelled unless the user chooses
+  otherwise.
+- **Reuse means the latest success for a fingerprint.** Old and new generations never share a
+  fingerprint, so this only matters for races.
 
 ---
 
@@ -263,10 +288,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 - **Branches.** Branches should be a first-class concept: branch filters on triggers, which
   branches are visible, how a triggering branch binds to repository inputs, and pull request
   builds. Not yet designed (bead `confector-z7z.19`).
-- **Re-run semantics.** Leading idea: a re-run is itself an input (a "triggering intent") to the
-  re-run task, so its fingerprint and every downstream fingerprint change through normal
-  transitive hashing. Undecided: which result later builds with the same inputs should reuse.
-  (Retry vs. rerun and cancellation are decided; see "What a build is".)
 - **First-class releases.** Possibly unnecessary given node-level targeting; likely just a label
   on a build chain.
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
