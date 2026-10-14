@@ -150,15 +150,51 @@ crosses it, who owns it, what can fail) saves a great deal of rework later.
 Every change must preserve these. Some are not yet true of the current code; do not make them
 less true.
 
-1. **A task's fingerprint is a deterministic function of its declared inputs** and of its upstream
-   tasks' fingerprints. Changing any declared input changes the fingerprint. A repository input
-   contributes its *resolved revision* (commit), not just its URL or branch. *(Currently violated:
-   repository revisions do not reach the fingerprint.)*
+1. **A task's fingerprint is a deterministic function of its identity and its resolved declared
+   inputs** — nothing else. Upstream task outputs are inputs, so upstream fingerprints feed in
+   transitively. Changing any declared input changes the fingerprint. A repository input
+   contributes its *pinned revision* (for git, the commit SHA), not its URL or branch. Build
+   configuration (steps, parameters, environment) is not part of the fingerprint; see "The input
+   model". *(Currently violated: repository revisions do not reach the fingerprint, and build
+   configuration does.)*
 2. **Graph evaluation does not execute work, and execution does not decide what to build.**
 3. **Decision logic is pure; state is passed in explicitly.** No hidden global or mutable singleton
    state in decision logic.
 4. **Re-running a task invalidates everything downstream of it.** *(Not yet implemented.)*
 5. **Required configuration is never defaulted silently.**
+
+---
+
+## The input model
+
+Decided October 2026 (design record: bead `confector-z7z.13`).
+
+- **Inputs are named and typed.** A task declares a map of named inputs, each with a kind and a
+  kind-specific spec. Kinds include *repository* (the primary kind), *value*, and *task output*.
+- **Upstream task outputs are inputs.** Dependencies between tasks are declared as task-output
+  inputs, and graph edges are derived from them. There is no separate dependency list.
+- **A repository input names a repository by id plus a ref selector.** Repositories are defined
+  globally or per project. What ref selectors exist, and how a triggering branch binds to them, is
+  part of the open "Branches" question.
+- **Declared, then resolved, then hashed.** Resolution is its own step: it turns every declared
+  input in the whole DAG into a pinned value (branch to commit, and so on) once, when a build
+  chain is created, so every task in the chain sees the same revisions. Pinned values can come
+  from querying the repository, from the trigger payload, or from an existing chain. Fingerprints
+  are computed only from resolved values.
+- **Each provider defines its own pinned value.** The core treats it as opaque. For git it is the
+  commit SHA alone — not the URL, branch, or checkout path.
+- **Build configuration is not an input.** Steps, parameters, and environment describe *how* to
+  build, not *what*; put configuration that should drive caching in the repository, where the
+  revision covers it. To apply a configuration change to unchanged inputs, re-run the task. Each
+  execution result records a hash of the task definition it ran with, so the UI can show that a
+  result predates a configuration change. *Why:* a configuration change only fails to take
+  effect when the inputs are unchanged, and in that case the user wants explicit control rather
+  than automatic invalidation.
+- **The task's identity is part of its fingerprint.** Two tasks with identical inputs (an
+  internal and an external build of the same commit) must not share cached results.
+- **Checkout is explicit.** Inputs are not materialized automatically. A checkout step takes an
+  input *by name* — never a URL — and checks out exactly its pinned revision. Steps that fetch
+  things outside the input mechanism are allowed but are outside the caching guarantee.
 
 ---
 
@@ -170,14 +206,18 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 - **What is a build?** Today a "build" conflates the *request* (trigger, target node, intent such
   as force or re-run), the *plan* (resolved inputs, selected subgraph, fingerprints), and the
   *execution results* (task outcomes, which are already shared between builds). These probably
-  need to be distinct concepts.
+  need to be distinct concepts. Leading direction: TeamCity-style *build chains*. Each request
+  evaluates the DAG and either joins an existing chain or creates a new one; a chain pins its
+  resolved inputs. A user can ask any not-yet-run task in a chain to build against those pinned
+  inputs, and a rebuild starts a new chain from that task forward.
+- **Branches.** Branches should be a first-class concept: branch filters on triggers, which
+  branches are visible, how a triggering branch binds to repository inputs, and pull request
+  builds. Not yet designed (bead `confector-z7z.19`).
 - **Re-run semantics.** Leading idea: a re-run is itself an input (a "triggering intent") to the
   re-run task, so its fingerprint and every downstream fingerprint change through normal
   transitive hashing. Undecided: which result later builds with the same inputs should reuse.
 - **First-class releases.** Possibly unnecessary given node-level targeting; possibly cheap if a
   release is just a named, pinned build plan.
-- **The input model.** How inputs are declared on a task, resolved to pinned values (branch to
-  commit, and so on), and fed into fingerprints.
 - **Plugin architecture.** Likely direction: formally separate *structural backends* (state store,
   queue, artifact storage, scheduler, compute — exactly one each, chosen at deployment) from
   *extensions* (build step types, version-control integrations — zero or more). Build steps,
