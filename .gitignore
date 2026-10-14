@@ -50,3 +50,4 @@ confector-test-library
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads/interactions.jsonl

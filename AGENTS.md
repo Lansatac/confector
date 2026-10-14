@@ -1,246 +1,253 @@
-# AGENTS.md — Confector System Architecture & Agent Guidelines
+# AGENTS.md — Confector
 
-This document outlines the architectural principles, key design decisions, subsystem boundaries, and coding conventions for contributors and AI agents working on **Confector**.
+This file is written for AI agents working on Confector. It explains what the project is for, why
+it is designed the way it is, and how to make changes that fit. Read all of it before making
+changes; the reasons matter as much as the rules, because you will meet situations the rules
+do not cover.
 
----
-
-## What is Confector?
-
-Confector is a modular, cloud-native CI/CD engine written in D (Dlang) that executes workflows as directed acyclic graphs (DAGs). It provides deterministic content-addressed caching, arbitrary node-level triggers, and elastic, plugin-driven execution. The system is designed around a strict separation between a **stateless execution core** (embeddable as a library, deployable to serverless/FaaS) and a **persistent management server** (Vibe.d HTTP service with MongoDB).
-
-Key design pillars:
-- **DAG-based execution** — Workflows are explicit DAGs, not linear pipelines, enabling maximal parallelism and fine-grained dependency modeling.
-- **Content-addressed caching** — Task fingerprints are computed from task definitions and transitive upstream hashes, enabling cache hits across any compute backend.
-- **Serverless-first design** — The entire system is designed so that a version of the server can be deployed in a serverless/FaaS context. The execution core is stateless and embeddable as a library. Even the orchestrator logic should eventually be splittable into stateless functions triggered by queue events. Always keep serverless deployability in mind when making architectural decisions.
-- **Plugin-driven extensibility** — Build steps, VCS integrations, compute backends, and artifact storage are all decoupled plugins loaded dynamically.
-- **Queue-based workers** — Tasks are dispatched via message queues to decoupled workers that may be local processes, serverless functions, or Kubernetes jobs.
+**Important:** much of the existing code was written by earlier agents and does **not** yet follow
+the principles below. When existing code and this document disagree, this document wins. Do not
+copy a pattern just because it already exists in the codebase. See "The current state of the code".
 
 ---
 
-## Where to Look
+## What Confector is
 
-### Core Library — `source/confector/core/`
-Stateless DAG engine, fingerprinting, trigger matching, and plugin lifecycle. Key files:
-- `dag.d` — DAG construction, cycle detection, topological sort, subgraph slicing
-- `fingerprinter.d` — Deterministic SHA-256 fingerprint computation
-- `trigger.d` — Trigger rule evaluation against events
-- `plugin.d` / `plugin_loader.d` — Plugin registry and dynamic library loading
-- `model.d` — Domain models for tasks, builds, projects, and persistence
-- `storage.d` — `BuildStateRepository` interface and local artifact storage
+Confector is an open-source CI/CD system built around two ideas:
 
-### Plugin API — `source/confector/plugin_api/`
-Public interfaces and data models that plugins implement. Key files:
-- `plugin.d` — `Plugin` base interface, categories (definition, step_executor, worker, artifact, scheduler)
-- `scheduler.d` — `Scheduler` interface and `ScheduleEntry` model (URI-based periodic job scheduling)
-- `system.d` — ECS-inspired system contracts (`BuildStepSystem`, `InputResolverSystem`, etc.)
-- `executor.d` — Compute provider and worker pool abstractions
-- `model.d` — Core domain structs (`TaskNode`, `BuildStep`, `TaskQueueMessage`, etc.)
+1. **Cost proportional to work.** A CI/CD control plane — deciding what to build, tracking builds,
+   serving the UI — sits idle most of the time. It should cost close to nothing while it does. The
+   dominant cost of running Confector should be build agents doing real work, not command and
+   control. Serverless deployment is the main way to achieve this, but it is a means, not a goal
+   in itself.
+2. **Never build the same thing twice.** Builds behave like pure functions. Each task declares its
+   inputs explicitly; if a task's inputs have not changed, it is not rebuilt and its earlier outputs
+   are reused.
 
-### Execution Engine — `source/confector/runner_core/`
-**Stateless** single-task execution orchestration (input resolution → build steps → artifact publishing). This is the core component deployable to serverless/FaaS.
-- `engine.d` — `TaskEngine`: stateless orchestrator for the full execution pipeline with cache support
-- `artifacts.d` — Artifact staging and checksum verification
-- `worker.d` — HTTP-based remote worker daemon
+### Motivating example
 
-### Server (Control Plane) — `source/confector/server/`
-Persistent Vibe.d web service with MongoDB persistence. **Goal:** a version of this should be deployable in a serverless context — see serverless design pillar above.
-- `app.d` — Application bootstrap (MongoDB, plugins, routing). Currently stateful; serverless target requires splitting orchestration into event-driven functions.
-- `config.d` — Server configuration structs
-- `controller/` — HTTP endpoints: `api_controller.d` (REST API), `dashboard_controller.d` (web UI), `admin_controller.d` (plugin management), `executor_controller.d`, `repositorycontroller.d`
-- `orchestrator/coordinator.d` — `BuildCoordinator`: central build orchestration, trigger handling, subgraph computation, in-flight deduplication. **Currently stateful** (in-memory registries, MongoDB persistence); for serverless deployment, this logic needs to be decomposed into stateless functions.
-- **`orchestrator/capacity_broker.d`** — Queue backlog monitoring and compute provisioning. No longer manages its own polling loop; the scheduler calls the `/api/v1/scheduler/capacity-evaluate` endpoint periodically.
-- `orchestrator/serverless_handler.d` — **Stateless** serverless/FaaS execution handler; entry point for serverless task execution via JSON-RPC
-- `storage/mongo_repository.d` — MongoDB implementation of `BuildStateRepository`
+A game project has *internal* builds (development tools enabled) and *external* builds (for end
+users). Day to day, only internal builds are needed. At release time, the team wants an external
+build of the **same commit** they have been testing — not merely the same branch.
 
-### Work Queue — `source/confector/queue/`
-Queue abstractions and implementations.
-- `queue.d` — `WorkQueue` interface and in-memory implementation
-- `mongo_queue.d` — MongoDB-backed persistent queue with visibility timeouts
+Conventional CI systems force a bad choice: build every variant up front (wasting time on builds
+nobody uses) or require a complete set of artifacts before a release can be cut. Confector should
+let the external build be produced on demand, from exactly the inputs the tested build used,
+rebuilding only what differs. The main mechanism for this is a clear task graph that can be
+targeted, and stopped, at any node.
 
-### Scheduler — `plugins/scheduler/`
-Plugin-based periodic job scheduling. The scheduler fires **HTTP POST requests** to registered URIs — not in-process delegate callbacks — making it fully compatible with serverless deployment where the scheduler and server may run in completely separate processes.
-- `plugin_api/scheduler.d` — `Scheduler` interface and `ScheduleEntry` model
-- `local/package.d` — `LocalSchedulerPlugin`: reference implementation using a dedicated thread that fires HTTP requests at cron-scheduled times
-- The scheduler is used by: capacity broker (1-minute interval), VCS polling (per-repository, 5-minute interval), and cron triggers (per-rule cron expression). VCS polling entries are registered dynamically when repositories are created or updated.
-
-### Configuration — `source/confector/config/`
-Type-safe hierarchical configuration with environment variable override support.
-- `package.d` — Struct-based config definitions with UDA annotations
-
-### Standalone Runner — `source/confector/runner_app/`
-CLI tool for single-task execution or HTTP worker daemon mode.
-- `main.d` — Entry point with `run` and `worker` subcommands
-
-### Plugins — `plugins/`
-Dynamic libraries compiled to `out/plugins/`. Categories:
-- **`definition/`** (server-side) — Step UI forms and validation (e.g., `git/`, `bash/`, `powershell/`)
-- **`step_executor/`** (runner-side) — Build step execution and input resolution (e.g., `git/`, `bash/`, `powershell/`)
-- **`worker/`** (server-side) — Compute provisioning (e.g., `local_process/`)
-- **`artifact/`** (runner-side) — Artifact storage backends (e.g., `local/`)
-- **`scheduler/`** (server-side) — Periodic job execution (e.g., `local/` — thread-based HTTP scheduler)
-
-### Other Key Directories
-- **`views/`** — 26 Diet-NG templates for the web UI (dashboard, projects, tasks, builds, etc.)
-- **`out/`** — Self-contained runtime artifact directory (executable, plugins, views, public assets)
-- **`deployments/`** — Deployment configs (Docker Compose, dev container)
-- **`dub.json`** — DUB package manifest defining sub-packages
-- **`reggaefile.d`** — Reggae build script coordinating compilation and asset sync
+When you are unsure whether a change serves the project, check it against this example.
 
 ---
 
-## Architectural Principles & Design Decisions
+## Goals
 
-### 1.1 Explicit Directed Acyclic Graph (DAG) Execution
-- **Decision**: Workflows are modeled strictly as directed acyclic graphs of discrete tasks rather than linear stages.
-- **Rationale**: Linear pipelines artificially constrain execution order and prevent fine-grained dependency modeling. An explicit DAG allows maximal parallelism, fan-out/fan-in patterns, and exact dependency isolation.
+- **Explicit inputs.** The task graph has a general notion of *inputs*. Source repositories at a
+  specific revision are the primary and most important kind of input, but not the only one.
+  *Why:* the whole caching model depends on inputs being declared. An input the system does not
+  know about is an input that can silently produce a stale cache hit.
+- **Good-faith caching, with an override.** Reusing a result is a best-effort judgment based on
+  declared inputs, not a proof. Builds can succeed or fail for reasons the system cannot see, so
+  users must be able to re-run a task, and re-running a task invalidates every task downstream of
+  it. *Why:* pragmatism. A cache that cannot be overridden turns every undetected input into a
+  support problem.
+- **Cheap to run.** An idle installation should cost close to nothing.
+- **Bring your own backend.** Confector can be deployed on AWS, Google Cloud, or other
+  infrastructure without this repository hosting an implementation for every provider. *Why:*
+  cheap hosting depends on using whatever services a team already has, and the core project cannot
+  maintain adapters for all of them.
+- **Open source.**
 
-### 1.2 Deterministic Content-Addressed Caching
-- **Decision**: Task execution is memoized using cryptographic input fingerprints computed deterministically upfront from task definitions and upstream task fingerprints (transitive input hashing) rather than dynamic runtime artifact file hashes.
-- **Rationale**: Eliminates redundant computation and decouples work definition from execution. Upfront transitive hashing ensures fingerprints are deterministic, statically resolvable during DAG scheduling before compute allocation, and invariant across all compute backends.
+## Non-goals
 
-### 1.3 Arbitrary Node-Level Triggers & Subgraph Slicing
-- **Decision**: Triggers (git events, webhooks, cron, manual dispatches) can target any arbitrary node in the DAG, not just root nodes.
-- **Rationale**: Allows targeted operations (such as running an isolated deployment or a specific test suite) by evaluating only the required subgraph. If upstream cached artifacts exist, ancestors do not re-run.
+Do not add features or abstractions in service of these:
 
-### 1.4 Serverless-First Design
-- **Decision**: The entire system is designed so that a version of the server can be deployed in a serverless/FaaS context. The execution core (`confector:core` / `confector:runner_core`) is stateless and embeddable as a library. The serverless handler (`serverless_handler.d`) provides a JSON-RPC entry point for stateless task execution.
-- **Rationale**: Serverless deployment enables elastic scaling from zero, pay-per-use cost models, and no persistent infrastructure overhead. The current persistent server (`confector:server`) is the reference implementation, but the goal is to decompose its orchestration logic (trigger matching, subgraph slicing, task coordination) into stateless, event-driven functions.
-- **Current status**: `TaskEngine` and `serverless_handler.d` are already stateless. `BuildCoordinator`, `CapacityBroker`, and `app.d` bootstrap are still stateful and represent the primary target for future serverless decomposition.
-- **Guideline for agents**: When making changes to the server module, always consider whether the change could prevent or complicate a future serverless deployment. Prefer passing state via abstractions (interfaces, parameters) over embedding it in class members or global state.
-
-### 1.5 Decoupled Queue-Based Worker Delegation
-- **Decision**: Compute tasks are dispatched via standard message queues (e.g., MongoDB Queue for local development, cloud message queues) to decoupled workers.
-- **Rationale**: Avoids maintaining stateful, proprietary agent daemons. Compute scales elastically from zero using ephemeral runners (serverless functions, Kubernetes Jobs/Pods, or container tasks) or traditional queue-polling workers.
-
-### 1.6 Modular Plugin Architecture
-- **Decision**: Execution environments, version control integrations, and runner backends are modeled as decoupled plugins managed by a centralized lifecycle registry.
-- **Rationale**: Isolates the core DAG scheduler from external toolchains and cloud providers, allowing new capabilities to be registered dynamically without altering core graph logic.
-
-### 1.7 Data-Oriented System Isolation (ECS-Inspired Model)
-- **Decision**: Task nodes are modeled as entity identities with attached, composable data components (inputs, execution specifications, outputs, and triggers), processed by stateless, decoupled systems.
-- **Rationale**: Prevents central domain model bloat when introducing exotic input types, heterogeneous storage layers, or custom execution targets. Eliminates rigid inheritance hierarchies in favor of data/logic separation, maximizing composability, modularity, and extensibility across plugins.
-
-### 1.8 Plugin-Defined Ordered Build Steps
-- **Decision**: Task execution consists of an arbitrary ordered list of plugin-defined build steps (such as the Git plugin's `clone_repository` step or the process runner's `process` step).
-- **Rationale**: Replaces rigid, monolithic script execution with composable, sequentially executed step systems. Each plugin exposes step handlers dynamically via `BuildStepSystem`, maximizing reusability and fine-grained error isolation.
-
-### 1.9 Scheduler Plugin — URI-Based Periodic Job Execution
-- **Decision**: Periodic tasks (capacity broker polling, VCS repository polling, cron trigger evaluation) use a plugin-based scheduler that fires HTTP POST requests to registered URIs, not in-process delegate callbacks.
-- **Rationale**: Separates WHAT to schedule (server concern) from HOW to schedule it (plugin concern). The scheduler knows nothing about server internals — it only knows URIs to call. This means the scheduler can run in a completely separate process (e.g., AWS Lambda triggered by CloudWatch Events) from the server, enabling serverless-compatible scheduling. The `LocalSchedulerPlugin` is a reference implementation using a dedicated thread; cloud-based plugins (e.g., AWS CloudWatch Events → HTTP endpoint) can be plugged in.
-- **Components that use the scheduler**: capacity broker (1-minute interval), VCS polling (per-repository, 5-minute interval, dynamically registered on repository create/update), cron triggers (per-rule cron expression).
-- **Key files**: `plugin_api/scheduler.d` (interface), `plugins/scheduler/local/package.d` (reference impl), `api_controller.d` (capacity-evaluate endpoint), `repositorycontroller.d` (per-repo poll endpoint and dynamic scheduler registration).
+- A hosted SaaS product.
+- Compatibility with Jenkins plugins or pipeline syntax.
+- Guaranteed hermetic or bit-for-bit reproducible builds. Caching is good faith, not proof.
+- Dependence on any particular database, queue, or cloud provider.
 
 ---
 
-## Developer & Agent Conventions
+## Design principles
 
-1. **Stateless Core Invariant**:
-   - `confector.core` and `confector.runner_core` modules must remain pure and stateless. External state and storage systems must be passed via abstractions (interfaces, parameters). Never introduce persistent state, global singletons with mutable state, or implicit I/O dependencies in these modules.
-2. **Serverless Deployability Check**:
-   - Before making architectural changes to the server module, ask: "Could this logic run as a stateless function?" If the answer should be yes, ensure state is passed explicitly rather than stored. The `BuildCoordinator` and `CapacityBroker` are known targets for future serverless decomposition.
-3. **Plugin Extensibility & Component-System Isolation**:
-   - New execution environments, input resolvers, or version control integrations should model data as passive components and logic as stateless systems, registering via `PluginRegistry`.
-4. **Explicit Error Diagnostics**:
-   - Prefer domain-specific exceptions (e.g., `DAGValidationException`, `FingerprintException`) with descriptive diagnostics (such as exact cycle paths in cyclic graphs).
-5. **No Silent Fallbacks — Fail Fast and Loudly**:
-   - Never add silent fallbacks or "reasonable" default behavior when configuration is missing, invalid, or ambiguous. Historically, agents have introduced fallbacks that hid serious errors (e.g., missing plugin context, wrong database connection strings, absent artifact directories).
-   - If a required configuration value, plugin context, or dependency is missing, throw an explicit exception with a clear error message immediately. Do not log a warning and continue.
-   - If a fallback is intentionally designed and obvious (e.g., a well-documented optional feature with a clear default), document it explicitly in the code and configuration schema. Otherwise, fail fast.
-   - Plugins must enforce non-null `PluginContext` in `initialize()` and throw if the host fails to provide configuration. Do not accept null contexts and degrade silently.
-6. **D Idioms & Safety**:
-   - Use standard D type qualifiers (`immutable`, `const`, `pure`, `@safe` / `@trusted` where appropriate).
-   - Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.
-7. **Build & Execution Workflow**:
-   - Build all targets (app, plugins, assets): `dub build`
-   - Build specific components: `dub build :server`, `dub build :plugins`, etc
-   - Run the server: `dub run :server`
-8. **Unit Testing**:
-   - Every core algorithm (DAG resolution, cycle detection, fingerprinting, trigger matching, plugin registration) must be accompanied by comprehensive unit tests (`dub test confector:core`).
+Each principle comes with the reason behind it. Use the reason to decide cases the principle does
+not spell out.
+
+### Separate *what to build* from *how to build it*
+
+Evaluating the graph — which tasks need to run, given their inputs and what is already cached — is
+a different concern from executing tasks. Keep them in separate components with a data boundary
+between them: evaluation produces data describing the work; execution consumes it.
+
+*Why:* conflating these two was the most damaging mistake in the project's history. It took a long
+time to separate graph evaluation from execution, and the build coordinator is still tangled as a
+result. If a change makes an executor decide what to build, or makes graph evaluation run or wait
+on work, stop and reconsider.
+
+### Separate data from behavior
+
+Prefer plain data structures processed by separate, focused components over objects that bundle
+state and behavior. Divide the design along systemic lines (in the spirit of ECS), not along class
+hierarchies.
+
+*Why:* the project owner is skeptical of object-oriented design. Plain data is easy to serialize,
+hash, store, and send across process boundaries — all of which Confector does constantly — and
+behavior kept separate from data is easier to test and replace.
+
+### Name things by role
+
+- Components that *act* are named for what they do: `GraphEvaluator`, `TaskDispatcher`.
+- Plain data types are nouns: `BuildPlan`, `TaskResult`.
+
+Avoid vague names like `Manager`, `Handler`, or `Helper`, and avoid naming a component for what it
+*is* rather than what it does. *Why:* a name that states the job makes it obvious when a component
+starts doing a second job. (Many existing names predate this rule; rename when you redesign a
+component, not in unrelated changes.)
+
+### Functional core, imperative shell
+
+Keep decision logic pure: given data in, return data out, with no I/O, persistence, clocks, or
+global state. Push side effects — databases, queues, network, file system, processes — to a thin
+outer layer that calls the pure core.
+
+*Why:* this is how Confector stays testable and how it reaches serverless deployment. Logic that
+receives its state explicitly can run in a long-lived server or in a short-lived function
+unchanged. This replaces an earlier, stricter "stateless core" rule that the code never actually
+followed.
+
+### Fail loudly
+
+Prefer obvious failures to silent degradation, within reason.
+
+- If required configuration, a plugin context, or a dependency is missing or invalid, throw an
+  exception with a clear message immediately. Do not log a warning and continue.
+- Do not invent defaults for required settings (for example, a default database connection
+  string). A wrong default that "works" hides the real problem.
+- Do not write empty `catch` blocks. Do not substitute sentinel values (such as `"unknown"`) for
+  data that failed to compute.
+- Prefer domain-specific exceptions with diagnostics that point at the cause (for example, the
+  exact cycle path in a cyclic graph).
+- An intentional optional feature with a sensible default is fine, but document the default where
+  it is defined.
+
+*Why:* earlier agents repeatedly added "reasonable" fallbacks that hid serious errors — missing
+plugin context, wrong database connection strings, absent artifact directories. Each one cost far
+more time to find than a crash would have.
+
+### YAGNI, except at boundaries
+
+Do not build speculative features. But design the interfaces *between* subsystems deliberately —
+"interface" in the conceptual sense of a contract, not inheritance.
+
+*Why:* internals are cheap to change; boundaries are not. A little care at a boundary (what data
+crosses it, who owns it, what can fail) saves a great deal of rework later.
 
 ---
 
-## Schemas & Specifications Reference
+## Invariants
 
-For specific JSON/YAML schemas, payload formats, and data contracts, refer to the documentation in [`docs/`](docs/):
-- **[Data Contracts & Schemas](docs/schemas.md)**: Task DAG YAML definitions, fingerprint hash formula, queue task messages, and artifact metadata.
-- **[Plugin Architecture Reference](docs/plugins.md)**: Plugin lifecycle, registry mechanics, and extension interfaces (`BuildStepSystem`, `RepositoryProvider`).
+Every change must preserve these. Some are not yet true of the current code; do not make them
+less true.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
-## Beads Issue Tracker
+1. **A task's fingerprint is a deterministic function of its declared inputs** and of its upstream
+   tasks' fingerprints. Changing any declared input changes the fingerprint. A repository input
+   contributes its *resolved revision* (commit), not just its URL or branch. *(Currently violated:
+   repository revisions do not reach the fingerprint.)*
+2. **Graph evaluation does not execute work, and execution does not decide what to build.**
+3. **Decision logic is pure; state is passed in explicitly.** No hidden global or mutable singleton
+   state in decision logic.
+4. **Re-running a task invalidates everything downstream of it.** *(Not yet implemented.)*
+5. **Required configuration is never defaulted silently.**
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+---
 
-### Quick Reference
+## Open questions
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
+These are **undecided**. Do not settle them implicitly by writing code that assumes an answer. If
+your task depends on one, stop and ask the project owner. When one is decided, update this file.
 
-### Rules
+- **What is a build?** Today a "build" conflates the *request* (trigger, target node, intent such
+  as force or re-run), the *plan* (resolved inputs, selected subgraph, fingerprints), and the
+  *execution results* (task outcomes, which are already shared between builds). These probably
+  need to be distinct concepts.
+- **Re-run semantics.** Leading idea: a re-run is itself an input (a "triggering intent") to the
+  re-run task, so its fingerprint and every downstream fingerprint change through normal
+  transitive hashing. Undecided: which result later builds with the same inputs should reuse.
+- **First-class releases.** Possibly unnecessary given node-level targeting; possibly cheap if a
+  release is just a named, pinned build plan.
+- **The input model.** How inputs are declared on a task, resolved to pinned values (branch to
+  commit, and so on), and fed into fingerprints.
+- **Plugin architecture.** Likely direction: formally separate *structural backends* (state store,
+  queue, artifact storage, scheduler, compute — exactly one each, chosen at deployment) from
+  *extensions* (build step types, version-control integrations — zero or more). Build steps,
+  including repository checkout, would become separate executables invoked by the runner.
+  Not yet designed in detail.
+- **Coordinator redesign.** The build coordinator mixes in-memory and persisted state; the likely
+  direction is an event-driven state machine over persisted state.
+- **Authentication and trust.** There is currently no authentication. Undecided: worker and user
+  auth, secret delivery, and keeping untrusted builds from writing to a shared cache.
+- **Pipeline definitions as code.** Tasks are currently defined in the web UI and stored in the
+  database; whether they should live in the repository is undecided.
+- **Build system.** Both `dub.json` and `reggaefile.d` define the build; one will be chosen.
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+---
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+## The current state of the code
 
-## Agent Context Profiles
+Be aware of these so you do not spread them:
 
-The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
+- **The build coordinator** (`source/confector/server/orchestrator/coordinator.d`) mixes graph
+  evaluation with dispatch, splits state between memory and the database, and contains silent
+  fallbacks. It is slated for redesign. Make minimal changes there.
+- **The data model** (`source/confector/plugin_api/model.d`) has accumulated aliases: several ways
+  to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
+  build step. **Do not add another alias.** If a representation is wrong, change it and update its
+  callers.
+- **There are no external consumers.** Do not add "backward compatibility" shims, re-export
+  modules, or deprecated fields. Change the code and its callers together.
+- **`PluginRegistry` is a global singleton** used from core logic. Do not add new dependencies on it;
+  pass what you need explicitly.
+- **In-memory test fakes do not always behave like the real backends.** Make fakes match the real
+  behavior, not the other way around.
 
-- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
-- **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
-- **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
+### Orientation
 
-## Session Completion
+- `source/confector/core/` — graph construction and evaluation, fingerprinting, trigger matching,
+  plugin registry.
+- `source/confector/plugin_api/` — data types and interfaces shared with plugins.
+- `source/confector/runner_core/` — executes a single task on a worker.
+- `source/confector/runner/` — the runner command-line program.
+- `source/confector/server/` — web server, API, dashboard, and build coordinator.
+- `source/confector/config/` — configuration types.
+- `plugins/` — plugins by category (step definitions and executors, workers, artifact storage,
+  state storage, queue, scheduler).
+- `views/`, `public/` — web UI templates and static assets.
 
-This protocol applies when ending a Beads implementation workflow. It is subordinate to explicit user, repository, and orchestrator instructions.
+Explore the code for anything more specific; file-level details change too often to list here.
 
-1. **File issues for remaining work** - Create beads for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **Handle git/sync by active profile**:
-   ```bash
-   # Conservative/minimal/default: report status and proposed commands; wait for approval.
-   git status
+---
 
-   # Team-maintainer opt-in only, unless current instructions forbid it:
-   git pull --rebase
-   bd dolt push
-   git push
-   git status
-   ```
-5. **Hand off** - Summarize changes, validation, issue status, and any blocked sync/commit/push step
+## How to work in this repository
 
-**Critical rules:**
-- Explicit user or orchestrator instructions override this Beads block.
-- Do not commit or push without clear authority from the active profile or the current user request.
-- If a required sync or push is blocked, stop and report the exact command and error.
-<!-- END BEADS INTEGRATION -->
+- **Ask when the intent is unclear.** If a request could be read more than one way, or touches an
+  open question, ask instead of guessing. An agent's guess written into code or documentation
+  tends to be mistaken later for a decision.
+- **Do not write your own opinions into this file or other design documentation.** Propose changes
+  to the project owner instead. This file should state the project's intent, not an agent's.
+- **Change the existing thing, do not add a parallel one.** Adding a new field, function, or module
+  alongside an old one that does nearly the same thing is how the data model got its aliases.
+- **Test the pure core.** Graph evaluation, fingerprinting, trigger matching, and similar decision
+  logic need unit tests. Because the logic is pure, tests should not need databases or servers.
+- **D conventions.** Use `immutable`, `const`, `pure`, and `@safe` / `@trusted` where they apply.
+  Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.
 
-<!-- BEGIN BEADS CODEX SETUP: generated by bd setup codex -->
-## Beads Issue Tracker
+## Build and test
 
-Use Beads (`bd`) for durable task tracking in repositories that include it. Use the `beads` skill at `.agents/skills/beads/SKILL.md` (project install) or `~/.agents/skills/beads/SKILL.md` (global install) for Beads workflow guidance, then use the `bd` CLI for issue operations.
+Subpackage names are prefixed with `confector-`. From the repository root:
 
-### Quick Reference
+- Run core unit tests: `dub test :confector-core`
+- Other subpackages follow the same pattern, for example `:confector-server` or
+  `:confector-runner-core`; check each subpackage's `dub.json` for its exact name.
 
-```bash
-bd ready                # Find available work
-bd show <id>            # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>           # Complete work
-bd prime                # Refresh Beads context
-```
-
-### Rules
-
-- Use `bd` for all task tracking; do not create markdown TODO lists.
-- Run `bd prime` when Beads context is missing or stale. Codex 0.129.0+ can load Beads context automatically through native hooks; use `/hooks` to inspect or toggle them.
-- Keep persistent project memory in Beads via `bd remember`; do not create ad hoc memory files.
-
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
-<!-- END BEADS CODEX SETUP -->
+A `reggaefile.d` also exists; see "Build system" under open questions.
