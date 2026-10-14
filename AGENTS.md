@@ -407,6 +407,31 @@ Decided October 2026 (design record: bead `confector-z7z.3`).
 - **Deferred:** a deployment builder for third-party backends (bead `confector-z7z.32`) and
   sandboxed WebAssembly extensions (bead `confector-z7z.33`).
 
+## Build steps
+
+Decided October 2026 (design record: bead `confector-z7z.6`).
+
+- **A step is a program.** The runner validates the step's configuration against its manifest's
+  schema, runs the program, and sends a JSON request on stdin.
+- **stdout and stderr are the log; structured events go to a file.** Events (progress,
+  annotations) are JSON lines appended to the file named by `CONFECTOR_EVENTS`. *Why:* any script
+  or existing tool is then a valid step without knowing the protocol.
+- **Exit code 0 is success.** A crashing step fails the task; only a lost runner counts as an
+  infrastructure failure.
+- **Stopping is graceful, then total.** On cancel or timeout the runner asks the step to stop,
+  waits a grace period, then kills the whole process tree — build tools spawn helpers that
+  outlive their parent.
+- **Workspaces start clean.** The runner stages the upstream outputs the task's inputs name,
+  runs the steps in order, and collects declared outputs. A task can opt into *named caches* —
+  directories that persist on a worker between runs of that task (for example Unity's `Library`).
+  Caches are outside the fingerprint.
+- **Steps inherit the worker's environment**, plus `CONFECTOR_*` variables and the task's own;
+  Confector's credentials are always stripped. Secrets arrive as environment variables or files
+  named by the task.
+- **Steps are versioned.** A task names a step and a version range; the exact version that ran is
+  recorded with the execution. Runners fetch step programs from the artifact store by checksum.
+- **Bash, PowerShell, and checkout are built in** and follow the same contract.
+
 ## Serverless constraints
 
 The control plane must be able to run as short-lived functions (for example AWS Lambda), which is
