@@ -530,7 +530,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
   Preferred shape: an input kind that pins to another project's chain, not chains that span
   projects.
-- **Build system.** Both `dub.json` and `reggaefile.d` define the build; one will be chosen.
 
 ---
 
@@ -593,4 +592,16 @@ Subpackage names are prefixed with `confector-`. From the repository root:
 - Other subpackages follow the same pattern, for example `:confector-server` or
   `:confector-runner-core`; check each subpackage's `dub.json` for its exact name.
 
-A `reggaefile.d` also exists; see "Build system" under open questions.
+**dub is the source of truth for the build.** Change `dub.json` files to change what is built;
+never make `reggaefile.d` the only place something is defined.
+
+**reggae is an optional, faster development build** over the same dub project (about twice as fast
+for incremental builds). From the repository root:
+
+```
+cd build && reggae -b ninja .. && ninja server
+```
+
+Known issue: the server executable lands under `build/.reggae/objs/server.objs/out/server/`
+rather than `build/out/server/` (bead `confector-z7z.44`). Release builds should use LDC (bead
+`confector-z7z.45`).
