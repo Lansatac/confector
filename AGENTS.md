@@ -363,6 +363,66 @@ handled by trust levels.
 - **Eventual goal:** configurable worker isolation for untrusted builds (separate worker pools or
   a fresh worker per execution), bead `confector-z7z.27`.
 
+## Backends and extensions
+
+Decided October 2026 (design record: bead `confector-z7z.3`).
+
+- **You pick and choose components when setting up the server.** Every backend is chosen by
+  deployment configuration at startup; switching one is a configuration change and a restart,
+  never a rebuild. *Why:* the owner prefers separate programs over "bring your own `main.d`" as
+  the way to make Confector composable.
+- **How a backend is provided depends on the backend:**
+  - The state store, queue, scheduler, and authenticator are **compiled in** — they are on the
+    hot path or security-critical. One binary contains every first-party implementation
+    (including an embedded single-node store, so a home build server needs no database server).
+  - The artifact store, log store, secret store, and compute are **extension kinds**. Common
+    implementations are built in using the same protocol — local and S3-compatible artifact
+    storage; build logs in the state store, S3, or CloudWatch; file secrets; local-process
+    compute. Anyone can add others — Azure Blob, Key Vault, a new cloud's machines — in any
+    language, without a rebuild.
+- **Nothing is loaded into the process at runtime.** No D shared libraries, no plugin registry.
+  Construct a typed set of backends at startup and pass it explicitly. *Why:* runtime library
+  loading in D is fragile, a global registry hides state from the core, and an endpoint that
+  loaded libraries on request was a remote-code-execution hole.
+- **Misconfiguration stops startup.** A missing or invalid backend is a startup error, not a
+  warning.
+- **Artifacts remember which store holds them,** so switching artifact stores keeps old artifacts
+  readable while the previous store stays configured; retiring it turns them into cache misses.
+- **Compute pools are admin data.** Pools (compute provider, capacity, labels, executor types)
+  are edited in the admin UI without a restart.
+- **Extensions are a manifest plus a program,** used where the set is open-ended: version control
+  providers, build steps, status reporters, and the three extension-kind backends above. The
+  manifest declares a JSON Schema for the extension's configuration, so the UI renders its forms
+  without running its code. Behavior is JSON in, JSON out, over one of three transports: run a
+  local program (stdin/stdout), call a URL, or a built-in implementation of the same protocol.
+  Extensions can be written in any language and added without a rebuild.
+- **Artifact bytes never pass through an extension.** An artifact-store extension only hands out
+  presigned URLs and deletes; runners transfer data directly.
+- **Build logs live in the log store, never line by line in the state store.** Runners write
+  directly where the store allows it, and the UI reads by cursor. Secrets are masked on the
+  runner, before log lines leave it.
+- **Installing an extension is running code:** admin-only, pinned by checksum. Running out of
+  process isolates crashes, not security.
+- **Git is built in;** supporting another git host's webhooks is a data file, not code.
+- **Deferred:** a deployment builder for third-party backends (bead `confector-z7z.32`) and
+  sandboxed WebAssembly extensions (bead `confector-z7z.33`).
+
+## Serverless constraints
+
+The control plane must be able to run as short-lived functions (for example AWS Lambda), which is
+how an idle installation costs close to nothing. Code that breaks these rules works on a single
+server and fails silently in a function.
+
+- **No background threads or timers in the server.** All work happens in response to a request
+  or a scheduler call; a function is frozen between requests. A scheduler backend may run its
+  own thread (the local one does), but it only makes HTTP calls like any other scheduler.
+- **No long-lived connections.** Live views in the UI poll.
+- **Keep startup cheap.** Building the backends from configuration happens on every cold start.
+- **Control-plane extensions should not assume a writable disk or installed language runtimes.**
+  In a function, prefer the URL transport; local programs must be self-contained.
+- **Runners never run as functions.** Builds outlast function time limits; runners live in
+  compute pools.
+
 ---
 
 ## Open questions
@@ -375,11 +435,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
   Preferred shape: an input kind that pins to another project's chain, not chains that span
   projects.
-- **Plugin architecture.** Likely direction: formally separate *structural backends* (state store,
-  queue, artifact storage, scheduler, compute — exactly one each, chosen at deployment) from
-  *extensions* (build step types, version-control integrations — zero or more). Build steps,
-  including repository checkout, would become separate executables invoked by the runner.
-  Not yet designed in detail.
 - **Pipeline definitions as code.** Tasks are currently defined in the web UI and stored in the
   database; whether they should live in the repository is undecided.
 - **Build system.** Both `dub.json` and `reggaefile.d` define the build; one will be chosen.
@@ -400,8 +455,9 @@ Be aware of these so you do not spread them:
   callers.
 - **There are no external consumers.** Do not add "backward compatibility" shims, re-export
   modules, or deprecated fields. Change the code and its callers together.
-- **`PluginRegistry` is a global singleton** used from core logic. Do not add new dependencies on it;
-  pass what you need explicitly.
+- **`PluginRegistry` is a global singleton** used from core logic, and plugins are still loaded as
+  shared libraries. Both are being removed (see "Backends and extensions"; bead
+  `confector-z7z.31`). Do not add new dependencies on them; pass what you need explicitly.
 - **In-memory test fakes do not always behave like the real backends.** Make fakes match the real
   behavior, not the other way around.
 
