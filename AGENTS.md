@@ -278,6 +278,33 @@ surprising given that meaning.
 - **Reuse means the latest success for a fingerprint.** Old and new generations never share a
   fingerprint, so this only matters for races.
 
+## Coordinating builds
+
+Decided October 2026 (design record: bead `confector-z7z.2`).
+
+- **Three components, split along what-versus-how.** An *input resolver* turns a request into a
+  chain (resolving inputs, finding or creating the chain). A pure *chain evaluator* takes a chain,
+  its requests, the rerun generations, and the executions for its fingerprints, and returns each
+  task's state plus the fingerprints that need an execution. An *execution dispatcher* claims each
+  needed fingerprint, records the execution, and enqueues it.
+- **All state is persisted; nothing lives only in memory.** At most one active execution per
+  fingerprint is enforced with compare-and-set in the store, not with locks. *Why:* multiple
+  instances and serverless deployment must work, and a restart must lose nothing.
+- **Level-triggered, not event-sourced.** Every input — a trigger, a completion, a cancel, a
+  rerun, an expired lease — only signals that something changed. The handler re-evaluates the
+  affected chains and dispatches whatever is missing. Every step is idempotent, so a crash between
+  saving state and enqueuing work is repaired by the next evaluation.
+- **The control plane owns fingerprints.** Work orders carry an execution id; a worker's
+  completion names that id, and the fingerprint comes from the control plane's own record.
+- **Infrastructure failures retry automatically; task failures do not.** A lost worker or expired
+  lease counts as an attempt, up to an admin-configured limit tracked on the execution. A task
+  that fails is retried only when a user asks.
+- **Expired leases are found by a sweep that runs only while work is active.** The sweep is
+  registered with the scheduler when executions are active and removed when none are, keeping an
+  idle installation free. Scheduler calls may be duplicated or missed, so every dispatch and
+  completion re-asserts whether the sweep should exist.
+- **Chain state is computed when read.** Add a cached summary only if it proves too slow.
+
 ---
 
 ## Open questions
@@ -298,8 +325,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   *extensions* (build step types, version-control integrations — zero or more). Build steps,
   including repository checkout, would become separate executables invoked by the runner.
   Not yet designed in detail.
-- **Coordinator redesign.** The build coordinator mixes in-memory and persisted state; the likely
-  direction is an event-driven state machine over persisted state.
 - **Authentication and trust.** There is currently no authentication. Undecided: worker and user
   auth, secret delivery, and keeping untrusted builds from writing to a shared cache.
 - **Pipeline definitions as code.** Tasks are currently defined in the web UI and stored in the
@@ -314,7 +339,8 @@ Be aware of these so you do not spread them:
 
 - **The build coordinator** (`source/confector/server/orchestrator/coordinator.d`) mixes graph
   evaluation with dispatch, splits state between memory and the database, and contains silent
-  fallbacks. It is slated for redesign. Make minimal changes there.
+  fallbacks. It is being replaced (see "Coordinating builds"; bead `confector-z7z.23`). Make
+  minimal changes there.
 - **The data model** (`source/confector/plugin_api/model.d`) has accumulated aliases: several ways
   to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
   build step. **Do not add another alias.** If a representation is wrong, change it and update its
