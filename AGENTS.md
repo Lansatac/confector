@@ -238,8 +238,9 @@ things; they are now distinct:
 How they fit together:
 
 - **A request joins or creates a chain.** Resolve the whole DAG and fingerprint it. If the project
-  already has a chain with the same snapshot, the request joins it; otherwise a new chain is
-  created. The request runs its targets and their upstream tasks, never downstream ones.
+  already has a chain with the same branch context and the same resolved inputs, the request
+  joins it; otherwise a new chain is created. The request runs its targets and their upstream
+  tasks, never downstream ones.
 - **Any task in a chain can be built later** against the chain's pinned inputs, without
   re-resolving. This is how an external build is made from exactly what was tested.
 - **Chain state is derived, never stored**, from the chain's requests and the executions for its
