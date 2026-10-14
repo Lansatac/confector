@@ -518,8 +518,15 @@ server and fails silently in a function.
 These are **undecided**. Do not settle them implicitly by writing code that assumes an answer. If
 your task depends on one, stop and ask the project owner. When one is decided, update this file.
 
-- **First-class releases.** Possibly unnecessary given node-level targeting; likely just a label
-  on a build chain.
+- **Releases and deployments.** Deferred, but do not close the door (bead `confector-z7z.40`).
+  Deploying is an ordinary task in the graph, so builds stay environment-free and a separate
+  task configures and ships them. The direction: a *release* is a record cut from a chain that
+  freezes the executions of chosen tasks and pins their artifacts, so later reruns never change
+  it; tasks can declare which environment they deploy to, giving a view of what was most recently
+  deployed where. Deploy tasks will need a flag to never reuse cached results (bead
+  `confector-z7z.42`).
+- **Retention.** Undesigned (bead `confector-z7z.43`): how long artifacts, logs, executions and
+  chains are kept. Pins (releases, manually pinned builds) must be part of it from the start.
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
   Preferred shape: an input kind that pins to another project's chain, not chains that span
   projects.
