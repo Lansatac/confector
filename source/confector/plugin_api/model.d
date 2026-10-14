@@ -636,129 +636,14 @@ struct WorkOrder
 {
     @optional @asName("build_id") string buildId;
     @optional @asName("task_id") string taskId;
+    /// The task definition to execute.
+    @optional @asName("task_node") TaskNode taskNode;
     @optional @asName("fingerprint") string fingerprint;
     @optional @asName("executor_type") string executorType;               // e.g., "local", "queue", "aws-ecs"
     @optional @asName("requirements") string[string] requirements;       // e.g., ["arch": "x86_64", "gpu": "true"]
     @optional @asName("payload") TaskExecutionPayload payload;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
     @optional @asName("created_at") string createdAt;
-}
-
-/**
- * Message queued for worker consumption wrapping a WorkOrder and tracking queue lease state.
- */
-struct TaskQueueMessage
-{
-    @optional @asName("id") string id;
-    @optional @asName("receipt_handle") string receiptHandle;
-    @optional @asName("work_order") WorkOrder workOrder;
-    @optional @asName("status") string status = "enqueued";              // "enqueued", "claimed", "completed", "failed"
-    @optional @asName("locked_by") string lockedBy;
-    @optional @asName("lock_expires_at") long lockExpiresAt = 0;
-    @optional @asName("retry_count") size_t retryCount = 0;
-    @optional @asName("attempt") int attempt = 1;
-    @optional @asName("task_node") TaskNode taskNode;
-    @optional @asName("max_attempts") size_t maxAttempts = 3;
-    @optional @asName("visible_after") long visibleAfterUnix = 0;
-    @optional @asName("error_reason") string errorReason;
-
-    // Helper constructor
-    this(string id, WorkOrder workOrder, string status = "enqueued", string lockedBy = null, long lockExpiresAt = 0, size_t retryCount = 0) pure nothrow @safe
-    {
-        this.id = id;
-        this.workOrder = workOrder;
-        this.status = status;
-        this.lockedBy = lockedBy;
-        this.lockExpiresAt = lockExpiresAt;
-        this.retryCount = retryCount;
-        this.attempt = cast(int)retryCount + 1;
-    }
-
-    // Convenience properties for backwards compatibility and ease of access
-    @ignore @property string messageId() const pure nothrow @safe
-    {
-        return id;
-    }
-
-    @ignore @property void messageId(string val) pure nothrow @safe
-    {
-        id = val;
-    }
-
-    @ignore @property string taskId() const pure nothrow @safe
-    {
-        return workOrder.taskId;
-    }
-
-    @ignore @property void taskId(string val) pure nothrow @safe
-    {
-        workOrder.taskId = val;
-    }
-
-    @ignore @property string buildId() const pure nothrow @safe
-    {
-        return workOrder.buildId;
-    }
-
-    @ignore @property void buildId(string val) pure nothrow @safe
-    {
-        workOrder.buildId = val;
-    }
-
-    @ignore @property string nodeFingerprint() const pure nothrow @safe
-    {
-        return workOrder.fingerprint;
-    }
-
-    @ignore @property void nodeFingerprint(string val) pure nothrow @safe
-    {
-        workOrder.fingerprint = val;
-    }
-
-    @ignore @property string executorType() const pure nothrow @safe
-    {
-        return workOrder.executorType;
-    }
-
-    @ignore @property void executorType(string val) pure nothrow @safe
-    {
-        workOrder.executorType = val;
-    }
-
-    @ignore @property size_t timeoutSeconds() const pure nothrow @safe
-    {
-        return workOrder.timeoutSeconds;
-    }
-
-    @ignore @property void timeoutSeconds(size_t val) pure nothrow @safe
-    {
-        workOrder.timeoutSeconds = val;
-    }
-
-    @ignore @property string createdAt() const pure nothrow @safe
-    {
-        return workOrder.createdAt;
-    }
-
-    @ignore @property void createdAt(string val) pure nothrow @safe
-    {
-        workOrder.createdAt = val;
-    }
-
-    @ignore @property ref TaskExecutionPayload executionPayload() return pure nothrow @safe
-    {
-        return workOrder.payload;
-    }
-
-    @ignore @property const(TaskExecutionPayload) executionPayload() const pure nothrow @safe
-    {
-        return workOrder.payload;
-    }
-
-    @ignore @property void executionPayload(TaskExecutionPayload val) pure nothrow @safe
-    {
-        workOrder.payload = val;
-    }
 }
 
 /**
@@ -977,60 +862,6 @@ interface BuildStateRepository
      * Lists recent change records for a repository.
      */
     VcsChangeRecord[] listRepositoryChanges(string repositoryUrl, size_t limit = 20);
-}
-
-/**
- * Generic Work Queue interface for decoupled task distribution.
- */
-interface WorkQueue
-{
-    /**
-     * Returns a short identifier for the backend type (e.g., "mongo", "memory").
-     */
-    @property string backendType() const;
-
-    /**
-     * Enqueues a task execution message.
-     */
-    void enqueue(TaskQueueMessage message);
-
-    /**
-     * Dequeues up to maxMessages ready for processing.
-     * Sets visibility timeout on returned messages.
-     * Optionally filters by supported executor types (e.g., ["local", "local_process", ""]).
-     */
-    TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30, const(string[]) supportedExecutorTypes = null);
-
-    /**
-     * Acknowledges successful processing of a message, removing it from the queue.
-     */
-    void ack(string receiptHandle);
-
-    /**
-     * Negatively acknowledges a message. If requeue is true and attempts < maxAttempts,
-     * the message is made visible again; otherwise it is moved to the dead-letter queue.
-     */
-    void nack(string receiptHandle, bool requeue = true, string errorReason = null);
-
-    /**
-     * Extends visibility timeout for an in-flight message while a worker is still processing.
-     */
-    void heartbeat(string receiptHandle, long extensionSeconds = 30);
-
-    /**
-     * Returns dead-lettered messages.
-     */
-    TaskQueueMessage[] getDeadLetterMessages();
-
-    /**
-     * Returns count of ready/pending messages.
-     */
-    ulong getPendingCount();
-
-    /**
-     * Returns pending / ready messages for inspection or queue monitoring.
-     */
-    TaskQueueMessage[] getPendingMessages(size_t limit = 50);
 }
 
 /// Re-export WorkerRecord from executor module so it's available via model

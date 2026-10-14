@@ -12,7 +12,7 @@ enum PluginCategory : string
     worker = "worker",              // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
     artifact = "artifact",          // Artifact Storage Plugins (content-addressed artifact backend)
     storage = "storage",            // State Storage Plugins (BuildStateRepository - builds, tasks, projects, etc.)
-    queue = "queue",                // Work Queue Plugins (WorkQueue - task message distribution)
+    queue = "queue",                // Dispatch Queue Plugins (DispatchQueue - delivery of work to workers)
     scheduler = "scheduler"         // Scheduler Plugins (periodic job execution)
 }
 
@@ -84,10 +84,10 @@ interface StateStoragePlugin : Plugin
 }
 
 /**
- * Interface for Work Queue Plugins.
- * Provides a backend for task message distribution (SQS, MongoDB queue, RabbitMQ, etc.).
+ * Interface for Dispatch Queue Plugins.
+ * Provides a DispatchQueue backend for delivering work to workers (SQS, MongoDB queue, etc.).
  */
-interface WorkQueuePlugin : Plugin
+interface DispatchQueuePlugin : Plugin
 {
 }
 

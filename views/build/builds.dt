@@ -3,39 +3,8 @@ extends layout
 block maincontent
   div.builds-container
     div.header-section
-      h1 Builds & Task Queue
-      p Track active task queues, discrete task execution stream, and parent build DAG runs.
-
-    div.section-title-bar(style="margin-top: 10px; margin-bottom: 15px;")
-      h2 Active Work Queue
-      div
-        span.badge.badge-primary #{queuedTasks.length} queued task units
-        a.btn.btn-sm.btn-outline(href="/tasks/", style="margin-left: 10px;") View Full Task Stream
-
-    - if (queuedTasks.length == 0)
-      div.empty-state(style="margin-bottom: 30px; padding: 20px;")
-        p Build queue is empty. No tasks currently waiting for workers.
-    - else
-      table.data-table(style="margin-bottom: 30px;")
-        thead
-          tr
-            th Message ID
-            th Task ID
-            th Parent Build
-            th Enqueued At
-            th Attempt
-            th Visibility Timeout
-        tbody
-          - foreach(msg; queuedTasks)
-            tr
-              td #{msg.messageId}
-              td
-                strong #{msg.taskId}
-              td
-                a.build-link(href="/builds/details?id=#{msg.buildId}") #{msg.buildId}
-              td #{msg.createdAt}
-              td #{msg.attempt} / #{msg.maxAttempts}
-              td #{msg.timeoutSeconds}s
+      h1 Builds
+      p Track build DAG runs and the task execution stream.
 
     - if (recentTasks.length > 0)
       div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")

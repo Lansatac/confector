@@ -9,7 +9,7 @@ public import confector.plugin_api.vcs;
 public import confector.plugin_api.scheduler;
 public import confector.config;
 public import confector.core.storage;
-public import confector.core.queue;
+public import confector.plugin_api.dispatch_queue;
 
 import vibe.core.log : logDebug, logInfo, logWarn, logError;
 import vibe.data.json : Json;
@@ -116,9 +116,7 @@ final class PluginRegistry
     private BuildStateRepository[] _stateRepositories;
     private BuildStateRepository[string] _stateRepositoriesByType;
     private string _defaultStateRepositoryType;
-    private WorkQueue[] _workQueues;
-    private WorkQueue[string] _workQueuesByType;
-    private string _defaultWorkQueueType;
+    private DispatchQueue[] _dispatchQueues;
     private VcsStateResolver[] _vcsResolvers;
     private Scheduler _scheduler;
     private PluginLogCallback _logCallback;
@@ -216,9 +214,9 @@ final class PluginRegistry
         {
             registerStateRepository(stateRepo);
         }
-        if (auto workQueue = cast(WorkQueue) plugin)
+        if (auto dispatchQueue = cast(DispatchQueue) plugin)
         {
-            registerWorkQueue(workQueue);
+            registerDispatchQueue(dispatchQueue);
         }
         if (auto vcsResolver = cast(VcsStateResolver) plugin)
         {
@@ -314,17 +312,12 @@ final class PluginRegistry
         }
     }
 
-    public void registerWorkQueue(WorkQueue queue)
+    public void registerDispatchQueue(DispatchQueue queue)
     {
         import std.algorithm : canFind;
-        if (!_workQueues.canFind(queue))
+        if (!_dispatchQueues.canFind(queue))
         {
-            _workQueues ~= queue;
-            _workQueuesByType[queue.backendType] = queue;
-            if (_defaultWorkQueueType.length == 0)
-            {
-                _defaultWorkQueueType = queue.backendType;
-            }
+            _dispatchQueues ~= queue;
         }
     }
 
@@ -440,27 +433,12 @@ final class PluginRegistry
                     }
                 }
             }
-            if (auto workQueue = cast(WorkQueue) plugin)
+            if (auto dispatchQueue = cast(DispatchQueue) plugin)
             {
-                for (size_t i = 0; i < _workQueues.length; )
+                for (size_t i = 0; i < _dispatchQueues.length; )
                 {
-                    if (_workQueues[i] is workQueue) _workQueues = _workQueues.remove(i);
+                    if (_dispatchQueues[i] is dispatchQueue) _dispatchQueues = _dispatchQueues.remove(i);
                     else i++;
-                }
-                if (auto it = workQueue.backendType in _workQueuesByType)
-                {
-                    if (*it is workQueue)
-                    {
-                        _workQueuesByType.remove(workQueue.backendType);
-                        if (_defaultWorkQueueType == workQueue.backendType && _workQueues.length > 0)
-                        {
-                            _defaultWorkQueueType = _workQueues[0].backendType;
-                        }
-                        else if (_workQueues.length == 0)
-                        {
-                            _defaultWorkQueueType = "";
-                        }
-                    }
                 }
             }
             if (auto vcsResolver = cast(VcsStateResolver) plugin)
@@ -592,23 +570,23 @@ final class PluginRegistry
         }
     }
 
-    public WorkQueue[] getWorkQueues()
+    /**
+     * Returns the registered dispatch queue, or null if no plugin provides one. Throws if more
+     * than one does: a deployment uses exactly one dispatch queue backend.
+     */
+    public DispatchQueue getDispatchQueue()
     {
-        return _workQueues;
-    }
+        import std.format : format;
 
-    public WorkQueue getWorkQueue(string backendType)
-    {
-        if (auto s = backendType in _workQueuesByType)
-            return *s;
-        return null;
-    }
-
-    public WorkQueue getDefaultWorkQueue()
-    {
-        if (_defaultWorkQueueType.length > 0)
-            return getWorkQueue(_defaultWorkQueueType);
-        return null;
+        if (_dispatchQueues.length > 1)
+        {
+            string[] names;
+            foreach (queue; _dispatchQueues)
+                names ~= typeid(cast(Object) queue).name;
+            throw new Exception(format("%s dispatch queue plugins are registered (%-(%s, %)); exactly one is supported",
+                _dispatchQueues.length, names));
+        }
+        return _dispatchQueues.length == 1 ? _dispatchQueues[0] : null;
     }
 
     public VcsStateResolver[] getVcsResolvers()
@@ -624,19 +602,6 @@ final class PluginRegistry
                 return resolver;
         }
         return null;
-    }
-
-    public string getDefaultWorkQueueType()
-    {
-        return _defaultWorkQueueType;
-    }
-
-    public void setDefaultWorkQueue(string backendType)
-    {
-        if (backendType in _workQueuesByType)
-        {
-            _defaultWorkQueueType = backendType;
-        }
     }
 
     public void registerScheduler(Scheduler scheduler)
@@ -710,9 +675,7 @@ final class PluginRegistry
         _stateRepositories.length = 0;
         _stateRepositoriesByType.clear();
         _defaultStateRepositoryType = "";
-        _workQueues.length = 0;
-        _workQueuesByType.clear();
-        _defaultWorkQueueType = "";
+        _dispatchQueues.length = 0;
     }
 }
 

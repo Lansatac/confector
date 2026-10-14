@@ -8,13 +8,13 @@ import confector.core.trigger;
 import confector.core.executor : CapacityBroker;
 import confector.runner_core.engine;
 import confector.orchestrator.coordinator;
-import confector.core.queue;
+import confector.plugin_api.dispatch_queue;
 
 import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator coordinator = null, BuildStateRepository stateRepo = null, CapacityBroker capacityBroker = null)
+URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordinator coordinator = null, BuildStateRepository stateRepo = null, CapacityBroker capacityBroker = null)
 {
     import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
@@ -55,126 +55,123 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
         }
     }
 
-    // Work Queue endpoints
+    // Dispatch queue endpoints, for workers that receive work through the control plane. The
+    // dispatch queue is internal delivery only; it is never listed or counted for display.
     if (queue !is null)
     {
-        postRoute("/queue/enqueue", (HTTPServerRequest req, HTTPServerResponse res) {
-            try
-            {
-                TaskQueueMessage msg = deserializeJson!TaskQueueMessage(req.json);
-                queue.enqueue(msg);
-                Json resp = Json.emptyObject;
-                resp["status"] = Json("enqueued");
-                resp["message_id"] = Json(msg.messageId);
-                res.writeJsonBody(resp);
-            }
-            catch (Exception e)
-            {
+        void writeQueueError(HTTPServerResponse res, Exception e)
+        {
+            // A lost lease is a conflict the worker must react to (stop or skip the work); a usage
+            // error is a malformed request; anything else is a server-side failure.
+            if (cast(LeaseLostException) e)
+                res.statusCode = HTTPStatus.conflict;
+            else if (cast(DispatchQueueUsageException) e)
                 res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
-            }
-        });
+            else
+                res.statusCode = HTTPStatus.internalServerError;
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            res.writeJsonBody(err);
+        }
 
-        postRoute("/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
+                import core.time : seconds;
+
                 auto pMax = "max_messages" in req.json;
                 auto pVis = "visibility_timeout" in req.json;
                 size_t maxMsgs = pMax !is null ? pMax.get!size_t : 1;
-                size_t visibility = pVis !is null ? pVis.get!size_t : 30;
-                auto msgs = queue.dequeue(maxMsgs, visibility);
-                res.writeJsonBody(msgs);
+                long visibility = pVis !is null ? pVis.get!long : 30;
+                auto received = queue.receive(defaultPoolQueue, maxMsgs, visibility.seconds);
+                Json leases = Json.emptyArray;
+                try
+                {
+                    foreach (lease; received)
+                    {
+                        WorkOrder order = deserializeJson!WorkOrder(lease.message);
+                        // Mark the task running, so capacity demand stops counting it.
+                        TaskStatus status;
+                        if (stateRepo !is null && stateRepo.getTaskStatus(order.buildId, order.taskId, status) && status == TaskStatus.queued)
+                        {
+                            stateRepo.setTaskStatus(order.buildId, order.taskId, TaskStatus.running);
+                        }
+                        Json item = Json.emptyObject;
+                        item["receipt"] = Json(lease.receipt);
+                        item["receive_count"] = Json(lease.receiveCount);
+                        item["work_order"] = lease.message;
+                        leases ~= item;
+                    }
+                }
+                catch (Exception e)
+                {
+                    // The worker will never see these leases; give them back rather than leave the
+                    // work invisible until the leases expire. Best effort: the original error is
+                    // what the caller needs.
+                    foreach (lease; received)
+                    {
+                        try
+                            queue.release(defaultPoolQueue, lease.receipt);
+                        catch (Exception releaseError)
+                            logError("[api] Failed to release receipt '%s' after a failed receive: %s", lease.receipt, releaseError.msg);
+                    }
+                    throw e;
+                }
+                res.writeJsonBody(leases);
             }
             catch (Exception e)
             {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
+                writeQueueError(res, e);
             }
         });
 
         postRoute("/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
-                string receiptHandle = req.json["receipt_handle"].get!string;
-                queue.ack(receiptHandle);
+                queue.ack(defaultPoolQueue, req.json["receipt"].get!string);
                 Json resp = Json.emptyObject;
                 resp["status"] = Json("acknowledged");
                 res.writeJsonBody(resp);
             }
             catch (Exception e)
             {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
+                writeQueueError(res, e);
             }
         });
 
-        postRoute("/queue/nack", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
-                string receiptHandle = req.json["receipt_handle"].get!string;
-                auto pReq = "requeue" in req.json;
-                auto pErr = "error_reason" in req.json;
-                bool requeue = pReq !is null ? pReq.get!bool : true;
-                string errorReason = pErr !is null ? pErr.get!string : "";
-                queue.nack(receiptHandle, requeue, errorReason);
+                import core.time : seconds;
+
+                auto pVis = "visibility_timeout" in req.json;
+                long visibility = pVis !is null ? pVis.get!long : 30;
+                queue.extend(defaultPoolQueue, req.json["receipt"].get!string, visibility.seconds);
                 Json resp = Json.emptyObject;
-                resp["status"] = Json("nacked");
+                resp["status"] = Json("extended");
                 res.writeJsonBody(resp);
             }
             catch (Exception e)
             {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
+                writeQueueError(res, e);
             }
         });
 
-        postRoute("/queue/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+        postRoute("/queue/release", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
-                string receiptHandle = req.json["receipt_handle"].get!string;
-                auto pExt = "extension_seconds" in req.json;
-                size_t extension = pExt !is null ? pExt.get!size_t : 30;
-                queue.heartbeat(receiptHandle, extension);
+                import core.time : seconds;
+
+                auto pDelay = "delay" in req.json;
+                long delay = pDelay !is null ? pDelay.get!long : 0;
+                queue.release(defaultPoolQueue, req.json["receipt"].get!string, delay.seconds);
                 Json resp = Json.emptyObject;
-                resp["status"] = Json("heartbeat_extended");
+                resp["status"] = Json("released");
                 res.writeJsonBody(resp);
             }
             catch (Exception e)
             {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
-            }
-        });
-
-        getRoute("/queue/stats", (HTTPServerRequest req, HTTPServerResponse res) {
-            Json stats = Json.emptyObject;
-            stats["pending_count"] = Json(queue.getPendingCount());
-            stats["dead_letter_count"] = Json(queue.getDeadLetterMessages().length);
-            res.writeJsonBody(stats);
-        });
-
-        getRoute("/queue/pending", (HTTPServerRequest req, HTTPServerResponse res) {
-            try
-            {
-                auto msgs = queue.getPendingMessages(50);
-                res.writeJsonBody(msgs);
-            }
-            catch (Exception e)
-            {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
+                writeQueueError(res, e);
             }
         });
     }
@@ -1376,7 +1373,8 @@ URLRouter apiRouter(TaskEngine engine, WorkQueue queue = null, BuildCoordinator 
 unittest
 {
     import confector.core.plugin;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository, InMemoryWorkQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
 
@@ -1400,7 +1398,7 @@ unittest
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
     auto engine = new TaskEngine(storage);
-    auto queue = new InMemoryWorkQueue();
+    auto queue = new InMemoryDispatchQueue();
 
     auto router = apiRouter(engine, queue);
     assert(router !is null);
@@ -1452,12 +1450,10 @@ unittest
 
     string bldId = coordinator.startBuild(proj, null, true);
     assert(bldId.length > 0);
-    assert(queue.getPendingCount() == 1);
-
-    auto pendingMsgs = queue.getPendingMessages(10);
-    assert(pendingMsgs.length == 1);
-    assert(pendingMsgs[0].taskId == "n1");
-    assert(pendingMsgs[0].buildId == bldId);
+    auto received = receiveWorkOrders(queue, 10);
+    assert(received.length == 1);
+    assert(received[0].workOrder.taskId == "n1");
+    assert(received[0].workOrder.buildId == bldId);
 
     // Simulate remote worker callback
     TaskExecutionResult workerRes;

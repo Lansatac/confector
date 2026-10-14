@@ -2,8 +2,6 @@ module confector.orchestrator.capacity_broker;
 
 import confector.core.model;
 import confector.core.executor;
-import confector.core.queue;
-import confector.orchestrator.coordinator;
 
 import core.sync.mutex : Mutex;
 import core.time : Duration, seconds, msecs;
@@ -13,23 +11,27 @@ import std.format : format;
 import vibe.core.log : logInfo, logError, logWarn, logDebug, logTrace;
 
 /**
- * Server-side capacity broker that inspects queue backlog / demand and delegates
+ * Server-side capacity broker that inspects outstanding work demand and delegates
  * compute provisioning to registered ComputeProvisioner plugins (such as LocalProcessProvisioner,
  * ECS provisioner, Kubernetes provisioner, etc.).
  */
 class DefaultCapacityBroker : CapacityBroker
 {
-    private WorkQueue m_workQueue;
-    private BuildCoordinator m_coordinator;
+    private QueueDemand[] delegate() m_demandSource;
     private ComputeProvisioner[] m_provisioners;
     private Mutex m_mutex;
 
-    // Allow one-shot local workers time to start and claim work before spawning
-    // another worker for the same still-visible queue backlog.
-    this(WorkQueue workQueue, BuildCoordinator coordinator = null)
+    /**
+     * demandSource returns the work waiting for a worker, one QueueDemand per work order or
+     * grouped. (The dispatch queue cannot be inspected, so demand comes from the coordinator.)
+     */
+    this(QueueDemand[] delegate() demandSource)
     {
-        this.m_workQueue = workQueue;
-        this.m_coordinator = coordinator;
+        if (demandSource is null)
+        {
+            throw new Exception("DefaultCapacityBroker requires a demand source");
+        }
+        this.m_demandSource = demandSource;
         this.m_mutex = new Mutex();
     }
 
@@ -84,49 +86,39 @@ class DefaultCapacityBroker : CapacityBroker
 
     void evaluateDemand()
     {
-        if (m_workQueue is null)
-        {
-            logError("[capacity_broker] evaluateDemand: work queue is null, skipping evaluation");
-            return;
-        }
-
-        // Inspect pending queue backlog
-        TaskQueueMessage[] pending = m_workQueue.getPendingMessages(100);
+        // Ask for demand before taking the broker's lock: the source may take its own lock, and
+        // the coordinator calls evaluateDemand while holding that one.
+        QueueDemand[] pending = m_demandSource();
         if (pending.length == 0)
         {
             return;
         }
 
-        logInfo("[capacity_broker] evaluateDemand: found %d pending queue message(s)", pending.length);
+        logInfo("[capacity_broker] evaluateDemand: found %d pending demand item(s)", pending.length);
 
-        // Group pending messages by (executorType, requirements) into QueueDemand items
+        // Group demand by (executorType, requirements)
         QueueDemand[string] demandMap;
-        foreach (msg; pending)
+        foreach (item; pending)
         {
-            string execType = msg.workOrder.executorType.length > 0 ? msg.workOrder.executorType : msg.executorType;
-            string reqKey = execType;
-            if (msg.workOrder.requirements !is null)
-            {
-                foreach (k, v; msg.workOrder.requirements)
-                {
-                    reqKey ~= ";" ~ k ~ "=" ~ v;
-                }
-            }
+            import std.algorithm.sorting : sort;
 
-            logInfo("[capacity_broker] evaluateDemand: pending msg '%s' (task '%s', build '%s', executorType='%s', reqKey='%s')",
-                msg.id, msg.workOrder.taskId, msg.workOrder.buildId, execType, reqKey);
+            string reqKey = item.executorType;
+            foreach (k; item.requirements.keys.sort)
+            {
+                reqKey ~= ";" ~ k ~ "=" ~ item.requirements[k];
+            }
+            const count = item.pendingWorkOrderCount > 0 ? item.pendingWorkOrderCount : 1;
+
+            logInfo("[capacity_broker] evaluateDemand: pending demand (executorType='%s', reqKey='%s', count=%d)",
+                item.executorType, reqKey, count);
 
             if (auto p = reqKey in demandMap)
             {
-                p.pendingWorkOrderCount++;
+                p.pendingWorkOrderCount += count;
             }
             else
             {
-                QueueDemand dem;
-                dem.executorType = execType;
-                dem.requirements = msg.workOrder.requirements.dup;
-                dem.pendingWorkOrderCount = 1;
-                demandMap[reqKey] = dem;
+                demandMap[reqKey] = QueueDemand(item.executorType, count, item.requirements.dup);
             }
         }
 
@@ -176,7 +168,10 @@ class DefaultCapacityBroker : CapacityBroker
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository, InMemoryWorkQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.plugin_api.dispatch_queue : DispatchQueue;
+    import confector.orchestrator.coordinator : BuildCoordinator, countReceivable, receiveWorkOrders, defaultPoolQueue;
 
     // Test Mock Provisioner
     class MockProvisioner : ComputeProvisioner
@@ -221,8 +216,14 @@ unittest
         }
     }
 
-    auto queue = new InMemoryWorkQueue();
-    auto broker = new DefaultCapacityBroker(queue);
+    // 2 local work orders, 1 gpu work order, 1 kubernetes work order
+    QueueDemand[] demand = [
+        QueueDemand("local", 1),
+        QueueDemand("local_process", 1),
+        QueueDemand("gpu", 1, ["gpu": "true"]),
+        QueueDemand("kubernetes", 1),
+    ];
+    auto broker = new DefaultCapacityBroker(() => demand);
 
     auto localProv = new MockProvisioner("local", 4);
     auto gpuProv = new MockProvisioner("gpu", 2);
@@ -233,30 +234,6 @@ unittest
     assert(broker.provisioners.length == 2);
     assert(broker.maxCapacity == 6);
     assert(broker.activeInstanceCount == 0);
-
-    // Enqueue 2 local tasks, 1 gpu task, 1 kubernetes task
-    TaskQueueMessage msg1;
-    msg1.id = "m1";
-    msg1.workOrder.executorType = "local";
-    queue.enqueue(msg1);
-
-    TaskQueueMessage msg2;
-    msg2.id = "m2";
-    msg2.workOrder.executorType = "local_process";
-    queue.enqueue(msg2);
-
-    TaskQueueMessage msgGpu;
-    msgGpu.id = "m3";
-    msgGpu.workOrder.executorType = "gpu";
-    msgGpu.workOrder.requirements = ["gpu": "true"];
-    queue.enqueue(msgGpu);
-
-    TaskQueueMessage msgK8s;
-    msgK8s.id = "m4";
-    msgK8s.workOrder.executorType = "kubernetes";
-    queue.enqueue(msgK8s);
-
-    assert(queue.getPendingCount() == 4);
 
     // Evaluate demand
     broker.evaluateDemand();
@@ -272,21 +249,21 @@ unittest
     // Total active across broker
     assert(broker.activeInstanceCount == 3);
 
-    // 2. End-to-end integration: BuildCoordinator + WorkQueue + DefaultCapacityBroker
+    // 2. End-to-end integration: BuildCoordinator + DispatchQueue + DefaultCapacityBroker
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
-    auto e2eQueue = new InMemoryWorkQueue();
+    auto e2eQueue = new InMemoryDispatchQueue();
     auto coord = new BuildCoordinator(storage, stateRepo, e2eQueue);
-    auto e2eBroker = new DefaultCapacityBroker(e2eQueue, coord);
+    auto e2eBroker = new DefaultCapacityBroker(() => coord.queuedDemand());
 
     // Provisioner that acts as an automated executor worker
     class AutoExecutingProvisioner : ComputeProvisioner
     {
-        private WorkQueue m_q;
+        private DispatchQueue m_q;
         private BuildCoordinator m_coord;
         private size_t m_active = 0;
 
-        this(WorkQueue q, BuildCoordinator c)
+        this(DispatchQueue q, BuildCoordinator c)
         {
             m_q = q;
             m_coord = c;
@@ -303,16 +280,16 @@ unittest
 
         void requestCapacity(in QueueDemand demand)
         {
-            auto msgs = m_q.dequeue(demand.pendingWorkOrderCount, 30, ["local", "local_process", ""]);
-            foreach (msg; msgs)
+            foreach (received; receiveWorkOrders(m_q, demand.pendingWorkOrderCount))
             {
+                auto order = received.workOrder;
                 TaskExecutionResult res;
-                res.taskId = msg.taskId;
-                res.buildId = msg.buildId;
+                res.taskId = order.taskId;
+                res.buildId = order.buildId;
                 res.status = TaskStatus.succeeded;
-                res.fingerprint = msg.nodeFingerprint.length > 0 ? msg.nodeFingerprint : "fp_" ~ msg.taskId;
-                m_coord.onTaskCompleted(msg.buildId, msg.taskId, res);
-                m_q.ack(msg.receiptHandle);
+                res.fingerprint = order.fingerprint.length > 0 ? order.fingerprint : "fp_" ~ order.taskId;
+                m_coord.onTaskCompleted(order.buildId, order.taskId, res);
+                m_q.ack(defaultPoolQueue, received.receipt);
             }
         }
     }
@@ -338,19 +315,19 @@ unittest
     assert(buildId.length > 0);
 
     // Initial demand: step1
-    assert(e2eQueue.getPendingCount() == 1);
+    assert(countReceivable(e2eQueue) == 1);
     e2eBroker.evaluateDemand();
 
     // After step1 completes, step2A and step2B are unblocked and enqueued
-    assert(e2eQueue.getPendingCount() == 2);
+    assert(countReceivable(e2eQueue) == 2);
     e2eBroker.evaluateDemand();
 
     // After step2A & step2B complete, step3 is unblocked and enqueued
-    assert(e2eQueue.getPendingCount() == 1);
+    assert(countReceivable(e2eQueue) == 1);
     e2eBroker.evaluateDemand();
 
     // All steps done
-    assert(e2eQueue.getPendingCount() == 0);
+    assert(countReceivable(e2eQueue) == 0);
     BuildRecord finalBuild;
     assert(stateRepo.getBuild(buildId, finalBuild));
     assert(finalBuild.status == "succeeded");

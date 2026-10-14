@@ -17,6 +17,10 @@
     }
   },
   "plugins": {
+    "mongo-queue": {
+      "connectionString": "mongodb://mongo:27017",
+      "dbName": "confector"
+    },
     "local-process": {
       "runnerBinary": "/code/build/out/runner/confector-runner",
       "serverUrl": "http://development:8080",

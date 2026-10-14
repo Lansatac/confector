@@ -9,7 +9,6 @@ import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
 import confector.runner_core.engine;
 import confector.orchestrator.coordinator;
-import confector.core.queue;
 
 import std.algorithm : filter, count, canFind;
 import std.datetime.systime : Clock;
@@ -77,7 +76,7 @@ string computeStubTaskChangeStatus(const TaskNode task, const TaskExecutionRecor
     return "pending_changes";
 }
 
-URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
+URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
 {
     if (registry is null)
     {
@@ -90,8 +89,6 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         auto projects = stateRepo !is null ? stateRepo.listProjects() : [];
         auto builds = stateRepo !is null ? stateRepo.listBuilds(10) : [];
         auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(10) : [];
-        ulong pendingTasks = queue !is null ? queue.getPendingCount() : 0;
-        ulong deadLetterCount = queue !is null ? queue.getDeadLetterMessages().length : 0;
 
         ulong totalBuilds = builds.length;
         ulong successfulBuilds = builds.filter!(b => b.status == "succeeded" || b.status == "cached").count;
@@ -159,7 +156,7 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
             dashboardProjects ~= pvm;
         }
 
-        res.render!("dashboard/home.dt", dashboardProjects, builds, recentTasks, pendingTasks, deadLetterCount, totalBuilds, successfulBuilds, failedBuilds, totalProjects, totalTasksAll, successfulTasksAll, failedTasksAll);
+        res.render!("dashboard/home.dt", dashboardProjects, builds, recentTasks, totalBuilds, successfulBuilds, failedBuilds, totalProjects, totalTasksAll, successfulTasksAll, failedTasksAll);
     });
 
     // Projects Management
@@ -726,13 +723,13 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         res.redirect("/projects/");
     });
 
-    // Tasks List & Active Work Queue (Task-Centric View)
+    // Tasks List (Task-Centric View). Queued tasks will be shown by the build queue view (bead
+    // confector-z7z.31.21); the dispatch queue is never read for display.
     router.get("/tasks/", (HTTPServerRequest req, HTTPServerResponse res) {
         string statusFilter = req.query.get("status", "");
         string projectFilter = req.query.get("project_id", "");
         auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(50, statusFilter, projectFilter) : [];
-        auto queuedTasks = queue !is null ? queue.getPendingMessages(50) : [];
-        res.render!("task/tasks.dt", recentTasks, queuedTasks, statusFilter, projectFilter);
+        res.render!("task/tasks.dt", recentTasks, statusFilter, projectFilter);
     });
 
     router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -895,12 +892,12 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
         res.render!("task/task-execution.dt", taskRecord, logs, build, taskNode, project);
     });
 
-    // Builds List & Active Work Queue
+    // Builds List. Queued tasks will be shown by the build queue view (bead confector-z7z.31.21);
+    // the dispatch queue is never read for display.
     router.get("/builds/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto builds = stateRepo !is null ? stateRepo.listBuilds(50) : [];
-        auto queuedTasks = queue !is null ? queue.getPendingMessages(50) : [];
         auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(25) : [];
-        res.render!("build/builds.dt", builds, queuedTasks, recentTasks);
+        res.render!("build/builds.dt", builds, recentTasks);
     });
 
     // Build Details & Task Graph Visualization
@@ -976,14 +973,13 @@ URLRouter dashboardRouter(TaskEngine engine, WorkQueue queue, BuildStateReposito
 
 unittest
 {
-    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage, InMemoryWorkQueue;
+    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage;
 
     auto stateRepo = new InMemoryBuildStateRepository();
-    auto queue = new InMemoryWorkQueue();
     auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
 
-    auto router = dashboardRouter(engine, queue, stateRepo);
+    auto router = dashboardRouter(engine, stateRepo);
     assert(router !is null);
 
     // Populate dummy build & trigger

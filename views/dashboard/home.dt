@@ -27,9 +27,6 @@ block maincontent
       div.stat-card
         div.stat-label Total Builds
         div.stat-value #{totalBuilds}
-      div.stat-card
-        div.stat-label Queue Pending
-        div.stat-value.text-info #{pendingTasks}
 
     div.section-title-bar
       div(style="display: flex; align-items: center; gap: 10px;")

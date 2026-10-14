@@ -3,38 +3,8 @@ extends layout
 block maincontent
   div.tasks-container
     div.header-section
-      h1 Task Queue & Execution Stream
-      p Real-time inspection of distributed DAG task execution units, cache status, and worker dispatch.
-
-    div.section-title-bar(style="margin-top: 10px; margin-bottom: 15px;")
-      h2 Active Work Queue
-      div
-        span.badge.badge-primary #{queuedTasks.length} queued
-
-    - if (queuedTasks.length == 0)
-      div.empty-state(style="margin-bottom: 30px; padding: 20px;")
-        p Task queue is empty. No tasks currently awaiting worker dispatch.
-    - else
-      table.data-table(style="margin-bottom: 30px;")
-        thead
-          tr
-            th Message ID
-            th Task ID
-            th Parent Build
-            th Enqueued At
-            th Attempt
-            th Visibility Timeout
-        tbody
-          - foreach(msg; queuedTasks)
-            tr
-              td #{msg.messageId}
-              td
-                strong #{msg.taskId}
-              td
-                a.build-link(href="/builds/details?id=#{msg.buildId}") #{msg.buildId}
-              td #{msg.createdAt}
-              td #{msg.attempt} / #{msg.maxAttempts}
-              td #{msg.timeoutSeconds}s
+      h1 Task Execution Stream
+      p Inspect task executions and their cache status.
 
     div.section-title-bar(style="margin-top: 20px; margin-bottom: 15px;")
       h2 Task Execution Stream

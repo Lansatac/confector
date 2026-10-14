@@ -5,7 +5,7 @@ import confector.core.model;
 import confector.core.storage : BuildStateRepository;
 import confector.core.plugin : PluginRegistry;
 import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance, CapacityBroker, ComputeProvisioner;
-import confector.core.queue : WorkQueue;
+import confector.orchestrator.coordinator : BuildCoordinator;
 
 import std.algorithm : filter, count;
 import std.array : array;
@@ -103,7 +103,7 @@ URLRouter executorRouter(
     BuildStateRepository stateRepo,
     PluginRegistry registry,
     CapacityBroker broker = null,
-    WorkQueue workQueue = null)
+    BuildCoordinator coordinator = null)
 {
     auto router = new URLRouter();
 
@@ -117,7 +117,9 @@ URLRouter executorRouter(
         size_t disabledCount = executors.length - enabledCount;
         size_t activeCapacity = broker !is null ? broker.activeInstanceCount : 0;
         size_t maxCapacity = broker !is null ? broker.maxCapacity : 0;
-        size_t queueDemandDepth = workQueue !is null ? workQueue.getPendingMessages(1000).length : 0;
+        // Work orders waiting for a worker, as the coordinator tracks them; the dispatch queue
+        // itself is never read for display.
+        size_t queueDemandDepth = coordinator !is null ? coordinator.queuedDemand().length : 0;
 
         res.render!("executor/executors.dt", executors, providers, provisioners, enabledCount, disabledCount, activeCapacity, maxCapacity, queueDemandDepth);
     });
@@ -127,7 +129,7 @@ URLRouter executorRouter(
         Json resp = Json.emptyObject;
         resp["active_capacity"] = Json(broker !is null ? broker.activeInstanceCount : 0);
         resp["max_capacity"] = Json(broker !is null ? broker.maxCapacity : 0);
-        resp["queue_demand_depth"] = Json(workQueue !is null ? workQueue.getPendingMessages(1000).length : 0);
+        resp["queue_demand_depth"] = Json(coordinator !is null ? coordinator.queuedDemand().length : 0);
 
         Json provArr = Json.emptyArray;
         if (broker !is null)
@@ -442,8 +444,9 @@ unittest
     assert(repo.deleteExecutor("exec-test-init"));
     assert(repo.listExecutors().length == 0);
 
-    // Test with CapacityBroker and WorkQueue
-    import confector.core.test_storage : InMemoryWorkQueue;
+    // Test with CapacityBroker and BuildCoordinator
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 
     class TestComputeProvisioner : ComputeProvisioner
@@ -455,12 +458,12 @@ unittest
         void requestCapacity(in QueueDemand demand) {}
     }
 
-    auto testQueue = new InMemoryWorkQueue();
-    auto testBroker = new DefaultCapacityBroker(testQueue);
+    auto testCoordinator = new BuildCoordinator(new InMemoryArtifactStorage(), repo, new InMemoryDispatchQueue());
+    auto testBroker = new DefaultCapacityBroker(() => testCoordinator.queuedDemand());
     auto testProv = new TestComputeProvisioner();
     testBroker.registerProvisioner(testProv);
 
-    auto routerWithBroker = executorRouter(repo, reg, testBroker, testQueue);
+    auto routerWithBroker = executorRouter(repo, reg, testBroker, testCoordinator);
     assert(routerWithBroker !is null);
     assert(testBroker.provisioners.length == 1);
     assert(testBroker.maxCapacity >= 1);

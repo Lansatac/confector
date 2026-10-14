@@ -7,3 +7,4 @@ public import confector.plugin_api.executor;
 public import confector.plugin_api.system;
 public import confector.plugin_api.vcs;
 public import confector.plugin_api.document_store;
+public import confector.plugin_api.dispatch_queue;

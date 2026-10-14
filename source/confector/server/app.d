@@ -21,7 +21,8 @@ import confector.core.plugin_loader : PluginLoader;
 import confector.core.storage : BuildStateRepository;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 import confector.storage.configured_storage : ConfiguredArtifactStorage;
-import confector.core.queue : WorkQueue;
+import confector.plugin_api.dispatch_queue : DispatchQueue;
+import confector.plugin_api.model : QueueDemand;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 import confector.orchestrator.coordinator : BuildCoordinator;
 import confector.runner_core.engine : TaskEngine;
@@ -168,7 +169,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
 /// Configures application URL routing.
 URLRouter createRouter(
     TaskEngine taskEngine,
-    WorkQueue workQueue,
+    DispatchQueue dispatchQueue,
     BuildCoordinator buildCoordinator,
     BuildStateRepository stateRepo,
     CapacityBroker capacityBroker = null,
@@ -190,27 +191,27 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, workQueue, buildCoordinator, stateRepo, capacityBroker);
+    auto api = apiRouter(taskEngine, dispatchQueue, buildCoordinator, stateRepo, capacityBroker);
     router.any("/api/v1/*", api);
     router.any("/api/*", api);
 
     // Dashboard, builds, projects, executors, and admin UI
-    router.any("/projects/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
+    router.any("/projects/*", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
     router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
 
-    router.any("/builds/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
+    router.any("/builds/*", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
     router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/builds/"); });
 
-    router.any("/tasks/*", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
+    router.any("/tasks/*", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
     router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/tasks/"); });
 
-    router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance, capacityBroker, workQueue));
+    router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance, capacityBroker, buildCoordinator));
     router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
 
     router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
     router.get("/admin", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/admin/plugins"); });
 
-    router.get("/", dashboardRouter(taskEngine, workQueue, stateRepo, null, buildCoordinator));
+    router.get("/", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
 
     router.any("/repositories/*", repositoryRouter(stateRepo, buildCoordinator, scheduler, serverPort));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
@@ -304,17 +305,17 @@ void main()
 
     // Use plugin-based storage and queue
     BuildStateRepository stateRepo = PluginRegistry.instance.getDefaultStateRepository();
-    WorkQueue workQueue = PluginRegistry.instance.getDefaultWorkQueue();
+    DispatchQueue dispatchQueue = PluginRegistry.instance.getDispatchQueue();
 
-    if (stateRepo is null || workQueue is null)
+    if (stateRepo is null || dispatchQueue is null)
     {
-        logError("Fatal: No state repository or work queue plugin registered.");
+        logError("Fatal: No state repository or dispatch queue plugin registered.");
         return;
     }
 
-    logInfo("Using plugin-based storage (%s) and queue (%s).",
+    logInfo("Using plugin-based storage (%s) and dispatch queue (%s).",
         PluginRegistry.instance.getDefaultStateRepositoryType(),
-        PluginRegistry.instance.getDefaultWorkQueueType());
+        typeid(cast(Object) dispatchQueue).name);
 
     // Validate that at least one artifact storage plugin is registered
     auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
@@ -329,8 +330,17 @@ void main()
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
     auto taskEngine = new TaskEngine(configuredStorage);
 
-    // Initialize capacity broker before coordinator so it can be passed through
-    auto capacityBroker = new DefaultCapacityBroker(workQueue);
+    // The broker and the coordinator refer to each other: the coordinator asks the broker for
+    // capacity, and the broker reads demand from the coordinator. Create the broker first and
+    // give it a demand source that fails loudly if asked before the coordinator exists.
+    BuildCoordinator buildCoordinator;
+    QueueDemand[] coordinatorDemand()
+    {
+        if (buildCoordinator is null)
+            throw new Exception("Capacity demand was requested before the build coordinator was created");
+        return buildCoordinator.queuedDemand();
+    }
+    auto capacityBroker = new DefaultCapacityBroker(&coordinatorDemand);
 
     // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
     foreach (plugin; PluginRegistry.instance.allPlugins())
@@ -368,7 +378,7 @@ void main()
         logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
-    auto buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, workQueue, capacityBroker);
+    buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, dispatchQueue, capacityBroker);
     logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Load scheduler plugin
@@ -376,7 +386,7 @@ void main()
 
     // Configure router and server settings
     auto router = createRouter(taskEngine,
-      workQueue,
+      dispatchQueue,
       buildCoordinator,
       stateRepo,
       capacityBroker,
@@ -470,18 +480,19 @@ void main()
 
 unittest
 {
-    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage, InMemoryWorkQueue;
+    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
 
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
     PluginRegistry.instance.setConfigRegistry(configRegistry);
 
     auto stateRepo = new InMemoryBuildStateRepository();
-    auto queue = new InMemoryWorkQueue();
+    auto queue = new InMemoryDispatchQueue();
     auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
-    auto broker = new DefaultCapacityBroker(queue, coordinator);
+    auto broker = new DefaultCapacityBroker(() => coordinator.queuedDemand());
 
     class TestProvisioner : ComputeProvisioner
     {

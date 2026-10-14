@@ -5,7 +5,7 @@ import confector.core.dag;
 import confector.core.storage;
 import confector.core.fingerprinter;
 import confector.core.executor : CapacityBroker;
-import confector.core.queue;
+import confector.plugin_api.dispatch_queue;
 
 import std.algorithm : canFind, filter;
 import std.array : array;
@@ -28,6 +28,8 @@ struct ActiveBuild
     bool force = false;
     string workspaceDir;
     bool[string] enqueuedTasks;
+    /// Compute demand of each task sent to the dispatch queue, by task id.
+    QueueDemand[string] queuedDemand;
 }
 
 /**
@@ -190,15 +192,21 @@ class InFlightTaskRegistry
 }
 
 /**
+ * The dispatch queue every work order is sent to. Until compute pools exist (bead
+ * confector-z7z.31.5), there is one pool and so one queue.
+ */
+enum defaultPoolQueue = "default";
+
+/**
  * Centralized Build Coordinator that orchestrates dynamic DAG progression,
- * evaluates task readiness, enqueues self-contained task work units to WorkQueue,
+ * evaluates task readiness, sends self-contained work orders to the dispatch queue,
  * and processes asynchronous task completions over network-safe boundaries.
  */
 class BuildCoordinator
 {
     private ArtifactStorage m_artifactStorage;
     private BuildStateRepository m_stateRepo;
-    private WorkQueue m_workQueue;
+    private DispatchQueue m_dispatchQueue;
     private CapacityBroker m_capacityBroker;
     private string m_callbackBaseUrl;
     private Mutex m_mutex;
@@ -208,14 +216,18 @@ class BuildCoordinator
     this(
         ArtifactStorage artifactStorage,
         BuildStateRepository stateRepo,
-        WorkQueue workQueue,
+        DispatchQueue dispatchQueue,
         CapacityBroker capacityBroker = null,
         string callbackBaseUrl = ""
     )
     {
         m_artifactStorage = artifactStorage;
         m_stateRepo = stateRepo;
-        m_workQueue = workQueue;
+        m_dispatchQueue = dispatchQueue;
+        if (m_dispatchQueue !is null)
+        {
+            m_dispatchQueue.ensureQueue(defaultPoolQueue);
+        }
         m_capacityBroker = capacityBroker;
         m_callbackBaseUrl = callbackBaseUrl;
         m_mutex = new Mutex();
@@ -224,14 +236,48 @@ class BuildCoordinator
 
     @property ArtifactStorage artifactStorage() { return m_artifactStorage; }
     @property BuildStateRepository stateRepository() { return m_stateRepo; }
-    @property WorkQueue workQueue() { return m_workQueue; }
+    @property DispatchQueue dispatchQueue() { return m_dispatchQueue; }
     @property InFlightTaskRegistry inFlightRegistry() { return m_inFlightRegistry; }
+
+    /**
+     * Returns the compute demand of the work orders sent to the dispatch queue whose tasks are
+     * still queued (not yet received by a worker): one QueueDemand per work order. A stopgap until
+     * demand is computed from queued executions in the state store (bead confector-z7z.31.21).
+     */
+    QueueDemand[] queuedDemand()
+    {
+        synchronized (m_mutex)
+        {
+            QueueDemand[] demand;
+            foreach (buildId, ref active; m_activeBuilds)
+            {
+                if (active.queuedDemand.length == 0)
+                {
+                    continue;
+                }
+                TaskStatus[string] statuses;
+                if (m_stateRepo !is null)
+                {
+                    statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
+                }
+                foreach (taskId, taskDemand; active.queuedDemand)
+                {
+                    if (statuses.get(taskId, TaskStatus.queued) == TaskStatus.queued)
+                    {
+                        demand ~= taskDemand;
+                    }
+                }
+            }
+            return demand;
+        }
+    }
+
     @property string callbackBaseUrl() const { return m_callbackBaseUrl; }
     @property void callbackBaseUrl(string url) { m_callbackBaseUrl = url; }
 
     /**
      * Initiates a new build execution for the given project and optional target task.
-     * Evaluates initial DAG roots and pushes ready tasks to WorkQueue.
+     * Evaluates initial DAG roots and sends ready tasks to the dispatch queue.
      * Returns the generated build ID.
      */
     string startBuild(
@@ -354,15 +400,27 @@ class BuildCoordinator
 
             // Acknowledge queue message if receipt handle provided
             string effectiveReceiptHandle = receiptHandle.length > 0 ? receiptHandle : result.receiptHandle;
-            if (effectiveReceiptHandle.length > 0 && m_workQueue !is null)
+            if (effectiveReceiptHandle.length > 0 && m_dispatchQueue !is null)
             {
                 try
                 {
-                    m_workQueue.ack(effectiveReceiptHandle);
+                    m_dispatchQueue.ack(defaultPoolQueue, effectiveReceiptHandle);
+                }
+                catch (LeaseLostException e)
+                {
+                    // Expected when the worker acknowledged the work order itself.
+                    logDebug("[coordinator] Queue acknowledgment note for receipt handle '%s': %s", effectiveReceiptHandle, e.msg);
+                }
+                catch (DispatchQueueUsageException e)
+                {
+                    // A malformed receipt is the caller's bug: reject the completion loudly.
+                    throw e;
                 }
                 catch (Exception e)
                 {
-                    logDebug("[coordinator] Queue acknowledgment note for receipt handle '%s': %s", effectiveReceiptHandle, e.msg);
+                    // The queue backend failed. Still record the completion; the message will be
+                    // redelivered and its handling must be idempotent.
+                    logError("[coordinator] Failed to acknowledge receipt handle '%s': %s", effectiveReceiptHandle, e.msg);
                 }
             }
 
@@ -635,7 +693,7 @@ class BuildCoordinator
                     continue;
                 }
 
-                // Check if already enqueued to WorkQueue
+                // Check if already sent to the dispatch queue
                 if (pActive.enqueuedTasks.get(tId, false))
                 {
                     continue;
@@ -749,7 +807,7 @@ class BuildCoordinator
                     }
                 }
 
-                // 4. In-Flight Coalescing & Enqueue to WorkQueue
+                // 4. In-Flight Coalescing & Send to the dispatch queue
                 bool shouldEnqueue = m_inFlightRegistry.registerOrSubscribe(fingerprint, buildId, tId);
                 pActive.enqueuedTasks[tId] = true;
 
@@ -916,6 +974,7 @@ class BuildCoordinator
                 WorkOrder workOrder;
                 workOrder.buildId = buildId;
                 workOrder.taskId = tId;
+                workOrder.taskNode = node;
                 workOrder.fingerprint = fingerprint;
                 workOrder.executorType = executorType;
                 workOrder.requirements = requirements;
@@ -923,33 +982,26 @@ class BuildCoordinator
                 workOrder.timeoutSeconds = node.timeoutSeconds;
                 workOrder.createdAt = Clock.currTime.toISOString();
 
-                TaskQueueMessage msg;
-                msg.id = "msg_" ~ randomUUID().toString();
-                msg.workOrder = workOrder;
-                msg.status = "enqueued";
-                msg.taskNode = node;
-                msg.timeoutSeconds = node.timeoutSeconds;
-                msg.maxAttempts = 3;
-                msg.visibleAfterUnix = Clock.currTime.toUnixTime();
-                msg.createdAt = workOrder.createdAt;
+                logInfo("[coordinator] Build '%s': Sending ready task '%s' to the dispatch queue (fingerprint: %s, executor: %s, timeout: %ds)", buildId, tId, fingerprint, executorType, node.timeoutSeconds);
 
-                logInfo("[coordinator] Build '%s': Enqueuing ready task '%s' to work queue (fingerprint: %s, executor: %s, timeout: %ds)", buildId, tId, fingerprint, executorType, node.timeoutSeconds);
-
-                if (m_workQueue !is null)
-                {
-                    m_workQueue.enqueue(msg);
-                }
-
-                // Trigger capacity evaluation so provisioners can respond immediately to new queue demand
-                if (m_capacityBroker !is null)
-                {
-                    m_capacityBroker.evaluateDemand();
-                }
-
-                // Mark task as queued — it will transition to running when a worker picks it up
+                // Mark the task queued and record its demand before sending: a worker may receive
+                // the work order (moving the task to running) as soon as it is sent, and the
+                // capacity evaluation below counts only queued tasks.
                 if (m_stateRepo !is null)
                 {
                     m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.queued);
+                }
+                pActive.queuedDemand[tId] = QueueDemand(executorType, 1, requirements);
+                if (m_dispatchQueue !is null)
+                {
+                    import vibe.data.json : serializeToJson;
+                    m_dispatchQueue.send(defaultPoolQueue, serializeToJson(workOrder));
+                }
+
+                // Trigger capacity evaluation so provisioners can respond immediately to new demand
+                if (m_capacityBroker !is null)
+                {
+                    m_capacityBroker.evaluateDemand();
                 }
             }
         }
@@ -1000,14 +1052,63 @@ class BuildCoordinator
     }
 }
 
+
+version (unittest)
+{
+    /// A work order received from the default pool queue, for tests.
+    struct ReceivedWorkOrder
+    {
+        WorkOrder workOrder;
+        string receipt;
+    }
+
+    /// Receives up to maxMessages work orders from the default pool queue, for tests.
+    ReceivedWorkOrder[] receiveWorkOrders(DispatchQueue queue, size_t maxMessages)
+    {
+        import core.time : hours;
+        import vibe.data.json : deserializeJson;
+
+        ReceivedWorkOrder[] received;
+        foreach (lease; queue.receive(defaultPoolQueue, maxMessages, 1.hours))
+        {
+            received ~= ReceivedWorkOrder(deserializeJson!WorkOrder(lease.message), lease.receipt);
+        }
+        return received;
+    }
+
+    /// Counts the receivable work orders on the default pool queue by receiving and then
+    /// releasing them all, for tests. (The dispatch queue offers no way to inspect it.)
+    size_t countReceivable(DispatchQueue queue)
+    {
+        import core.time : hours;
+
+        Lease[] leases;
+        while (true)
+        {
+            auto batch = queue.receive(defaultPoolQueue, maxReceiveBatch, 1.hours);
+            if (batch.length == 0)
+            {
+                break;
+            }
+            leases ~= batch;
+        }
+        foreach (lease; leases)
+        {
+            queue.release(defaultPoolQueue, lease.receipt);
+        }
+        return leases.length;
+    }
+}
+
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository, InMemoryWorkQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
 
     // Unit tests for BuildCoordinator
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
-    auto queue = new InMemoryWorkQueue();
+    auto queue = new InMemoryDispatchQueue();
     auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "http://127.0.0.1:8080");
 
     // 1. Single Task Graph
@@ -1022,12 +1123,12 @@ unittest
 
     string b1 = coordinator.startBuild(proj1);
     assert(b1.length > 0);
-    assert(queue.getPendingCount() == 1);
+    assert(countReceivable(queue) == 1);
 
-    auto dequeued = queue.dequeue(1);
+    auto dequeued = receiveWorkOrders(queue, 1);
     assert(dequeued.length == 1);
-    assert(dequeued[0].taskId == "lint");
-    assert(dequeued[0].buildId == b1);
+    assert(dequeued[0].workOrder.taskId == "lint");
+    assert(dequeued[0].workOrder.buildId == b1);
 
     TaskExecutionResult res1;
     res1.taskId = "lint";
@@ -1062,10 +1163,10 @@ unittest
     projLinear.tasks = [taskA, taskB, taskC];
 
     string bLinear = coordinator.startBuild(projLinear, null, true); // force execution
-    assert(queue.getPendingCount() == 1); // Only A is ready initially
+    assert(countReceivable(queue) == 1); // Only A is ready initially
 
-    auto deqA = queue.dequeue(1);
-    assert(deqA[0].taskId == "A");
+    auto deqA = receiveWorkOrders(queue, 1);
+    assert(deqA[0].workOrder.taskId == "A");
 
     TaskExecutionResult resA;
     resA.taskId = "A";
@@ -1073,9 +1174,9 @@ unittest
     resA.status = TaskStatus.succeeded;
     coordinator.onTaskCompleted(bLinear, "A", resA);
 
-    assert(queue.getPendingCount() == 1); // B is now unblocked
-    auto deqB = queue.dequeue(1);
-    assert(deqB[0].taskId == "B");
+    assert(countReceivable(queue) == 1); // B is now unblocked
+    auto deqB = receiveWorkOrders(queue, 1);
+    assert(deqB[0].workOrder.taskId == "B");
 
     TaskExecutionResult resB;
     resB.taskId = "B";
@@ -1083,9 +1184,9 @@ unittest
     resB.status = TaskStatus.succeeded;
     coordinator.onTaskCompleted(bLinear, "B", resB);
 
-    assert(queue.getPendingCount() == 1); // C is now unblocked
-    auto deqC = queue.dequeue(1);
-    assert(deqC[0].taskId == "C");
+    assert(countReceivable(queue) == 1); // C is now unblocked
+    auto deqC = receiveWorkOrders(queue, 1);
+    assert(deqC[0].workOrder.taskId == "C");
 
     TaskExecutionResult resC;
     resC.taskId = "C";
@@ -1119,10 +1220,10 @@ unittest
     projDiamond.tasks = [rootNode, branch1, branch2, mergeNode];
 
     string bDiamond = coordinator.startBuild(projDiamond, null, true);
-    assert(queue.getPendingCount() == 1); // Only root
+    assert(countReceivable(queue) == 1); // Only root
 
-    auto deqRoot = queue.dequeue(1);
-    assert(deqRoot[0].taskId == "root");
+    auto deqRoot = receiveWorkOrders(queue, 1);
+    assert(deqRoot[0].workOrder.taskId == "root");
 
     TaskExecutionResult resRoot;
     resRoot.taskId = "root";
@@ -1131,8 +1232,8 @@ unittest
     coordinator.onTaskCompleted(bDiamond, "root", resRoot);
 
     // Fan-out: both branch1 and branch2 should be enqueued simultaneously
-    assert(queue.getPendingCount() == 2);
-    auto deqBranches = queue.dequeue(2);
+    assert(countReceivable(queue) == 2);
+    auto deqBranches = receiveWorkOrders(queue, 2);
     assert(deqBranches.length == 2);
 
     // Complete branch1 only
@@ -1143,7 +1244,7 @@ unittest
     coordinator.onTaskCompleted(bDiamond, "branch1", resBr1);
 
     // Merge must NOT be enqueued yet because branch2 is still pending
-    assert(queue.getPendingCount() == 0);
+    assert(countReceivable(queue) == 0);
 
     // Complete branch2
     TaskExecutionResult resBr2;
@@ -1153,9 +1254,9 @@ unittest
     coordinator.onTaskCompleted(bDiamond, "branch2", resBr2);
 
     // Fan-in: merge is now enqueued
-    assert(queue.getPendingCount() == 1);
-    auto deqMerge = queue.dequeue(1);
-    assert(deqMerge[0].taskId == "merge");
+    assert(countReceivable(queue) == 1);
+    auto deqMerge = receiveWorkOrders(queue, 1);
+    assert(deqMerge[0].workOrder.taskId == "merge");
 
     TaskExecutionResult resMerge;
     resMerge.taskId = "merge";
@@ -1169,8 +1270,8 @@ unittest
 
     // 4. Failure Early Termination
     string bFail = coordinator.startBuild(projLinear, null, true);
-    auto deqFailA = queue.dequeue(1);
-    assert(deqFailA[0].taskId == "A");
+    auto deqFailA = receiveWorkOrders(queue, 1);
+    assert(deqFailA[0].workOrder.taskId == "A");
 
     TaskExecutionResult resFailA;
     resFailA.taskId = "A";
@@ -1180,7 +1281,7 @@ unittest
     coordinator.onTaskCompleted(bFail, "A", resFailA);
 
     // Downstream tasks B and C must not be enqueued
-    assert(queue.getPendingCount() == 0);
+    assert(countReceivable(queue) == 0);
 
     BuildRecord bFailRec;
     assert(stateRepo.getBuild(bFail, bFailRec));
@@ -1210,24 +1311,24 @@ unittest
 
         // Start Build 1 targeting entire pipeline (fetch -> process)
         string b1_coalesce = coord5.startBuild(projCoalesce, null, true);
-        assert(queue.getPendingCount() == 1); // "fetch" is enqueued for b1
+        assert(countReceivable(queue) == 1); // "fetch" is enqueued for b1
 
         // Start Build 2 targeting only "fetch" while "fetch" is still in-flight
         string b2_coalesce = coord5.startBuild(projCoalesce, "fetch", true);
         // Deduplication check: queue should STILL have pending count == 1, not 2!
-        assert(queue.getPendingCount() == 1);
+        assert(countReceivable(queue) == 1);
 
-        auto deqFetch = queue.dequeue(1);
+        auto deqFetch = receiveWorkOrders(queue, 1);
         assert(deqFetch.length == 1);
-        assert(deqFetch[0].taskId == "fetch");
+        assert(deqFetch[0].workOrder.taskId == "fetch");
 
         // Complete "fetch" task
         TaskExecutionResult resFetch;
         resFetch.taskId = "fetch";
-        resFetch.buildId = deqFetch[0].buildId;
+        resFetch.buildId = deqFetch[0].workOrder.buildId;
         resFetch.status = TaskStatus.succeeded;
-        resFetch.fingerprint = deqFetch[0].nodeFingerprint;
-        coord5.onTaskCompleted(deqFetch[0].buildId, "fetch", resFetch);
+        resFetch.fingerprint = deqFetch[0].workOrder.fingerprint;
+        coord5.onTaskCompleted(deqFetch[0].workOrder.buildId, "fetch", resFetch);
 
         // Build 2 (targeting only "fetch") should now be completed!
         BuildRecord b2Rec;
@@ -1235,17 +1336,17 @@ unittest
         assert(b2Rec.status == "succeeded");
         assert(b2Rec.executedTasks.canFind("fetch"));
 
-        // Build 1 should now have "process" unblocked and enqueued in WorkQueue
-        assert(queue.getPendingCount() == 1);
-        auto deqProc = queue.dequeue(1);
-        assert(deqProc[0].taskId == "process");
-        assert(deqProc[0].buildId == b1_coalesce);
+        // Build 1 should now have "process" unblocked and sent to the dispatch queue
+        assert(countReceivable(queue) == 1);
+        auto deqProc = receiveWorkOrders(queue, 1);
+        assert(deqProc[0].workOrder.taskId == "process");
+        assert(deqProc[0].workOrder.buildId == b1_coalesce);
 
         TaskExecutionResult resProc;
         resProc.taskId = "process";
         resProc.buildId = b1_coalesce;
         resProc.status = TaskStatus.succeeded;
-        resProc.fingerprint = deqProc[0].nodeFingerprint;
+        resProc.fingerprint = deqProc[0].workOrder.fingerprint;
         coord5.onTaskCompleted(b1_coalesce, "process", resProc);
 
         BuildRecord b1Rec_c;
@@ -1273,25 +1374,25 @@ unittest
 
         // First run: execute both tasks to populate cache
         string bFirst = coord6.startBuild(projCache, null, false);
-        assert(queue.getPendingCount() == 1);
+        assert(countReceivable(queue) == 1);
 
-        auto deqAlpha = queue.dequeue(1);
-        assert(deqAlpha[0].taskId == "alpha");
+        auto deqAlpha = receiveWorkOrders(queue, 1);
+        assert(deqAlpha[0].workOrder.taskId == "alpha");
         TaskExecutionResult resAlpha;
         resAlpha.taskId = "alpha";
         resAlpha.buildId = bFirst;
         resAlpha.status = TaskStatus.succeeded;
-        resAlpha.fingerprint = deqAlpha[0].nodeFingerprint;
+        resAlpha.fingerprint = deqAlpha[0].workOrder.fingerprint;
         coord6.onTaskCompleted(bFirst, "alpha", resAlpha);
 
-        assert(queue.getPendingCount() == 1);
-        auto deqBeta = queue.dequeue(1);
-        assert(deqBeta[0].taskId == "beta");
+        assert(countReceivable(queue) == 1);
+        auto deqBeta = receiveWorkOrders(queue, 1);
+        assert(deqBeta[0].workOrder.taskId == "beta");
         TaskExecutionResult resBeta;
         resBeta.taskId = "beta";
         resBeta.buildId = bFirst;
         resBeta.status = TaskStatus.succeeded;
-        resBeta.fingerprint = deqBeta[0].nodeFingerprint;
+        resBeta.fingerprint = deqBeta[0].workOrder.fingerprint;
         coord6.onTaskCompleted(bFirst, "beta", resBeta);
 
         BuildRecord bFirstRec;
@@ -1300,8 +1401,8 @@ unittest
 
         // Second run with identical inputs and force=false: full cache hit!
         string bCached = coord6.startBuild(projCache, null, false);
-        // Zero tasks should be placed in WorkQueue
-        assert(queue.getPendingCount() == 0);
+        // Zero tasks should be sent to the dispatch queue
+        assert(countReceivable(queue) == 0);
 
         BuildRecord bCachedRec;
         assert(stateRepo.getBuild(bCached, bCachedRec));
@@ -1329,8 +1430,8 @@ unittest
         string bCancel1 = coord7.startBuild(projCancel, null, true);
         string bCancel2 = coord7.startBuild(projCancel, null, true);
 
-        assert(queue.getPendingCount() == 1);
-        auto deqShared = queue.dequeue(1);
+        assert(countReceivable(queue) == 1);
+        auto deqShared = receiveWorkOrders(queue, 1);
 
         // Cancel build 1 while task is in flight
         coord7.cancelBuild(bCancel1);
@@ -1342,10 +1443,10 @@ unittest
         // Complete shared task
         TaskExecutionResult resShared;
         resShared.taskId = "shared_task";
-        resShared.buildId = deqShared[0].buildId;
+        resShared.buildId = deqShared[0].workOrder.buildId;
         resShared.status = TaskStatus.succeeded;
-        resShared.fingerprint = deqShared[0].nodeFingerprint;
-        coord7.onTaskCompleted(deqShared[0].buildId, "shared_task", resShared);
+        resShared.fingerprint = deqShared[0].workOrder.fingerprint;
+        coord7.onTaskCompleted(deqShared[0].workOrder.buildId, "shared_task", resShared);
 
         // Build 1 was NOT cancelled and should receive completion successfully
         BuildRecord bCancel2Rec;
@@ -1372,8 +1473,8 @@ unittest
 
         // Start a single build
         string bSolo = coord8.startBuild(projSolo, null, true);
-        assert(queue.getPendingCount() == 1);
-        auto deqSolo = queue.dequeue(1);
+        assert(countReceivable(queue) == 1);
+        auto deqSolo = receiveWorkOrders(queue, 1);
 
         // Cancel the only build while task is in flight
         coord8.cancelBuild(bSolo);
@@ -1385,10 +1486,10 @@ unittest
         // Worker reports completion for the task
         TaskExecutionResult resSolo;
         resSolo.taskId = "solo_task";
-        resSolo.buildId = deqSolo[0].buildId;
+        resSolo.buildId = deqSolo[0].workOrder.buildId;
         resSolo.status = TaskStatus.succeeded;
-        resSolo.fingerprint = deqSolo[0].nodeFingerprint;
-        coord8.onTaskCompleted(deqSolo[0].buildId, "solo_task", resSolo);
+        resSolo.fingerprint = deqSolo[0].workOrder.fingerprint;
+        coord8.onTaskCompleted(deqSolo[0].workOrder.buildId, "solo_task", resSolo);
 
         // Build must remain cancelled, not be overwritten to succeeded
         BuildRecord bSoloRecAfter;
@@ -1420,18 +1521,18 @@ unittest
         projWorkOrder.tasks = [gpuTask];
 
         string bWorkOrder = coord9.startBuild(projWorkOrder, null, true);
-        assert(queue.getPendingCount() == 1);
+        assert(countReceivable(queue) == 1);
 
-        auto deqGpu = queue.dequeue(1);
+        auto deqGpu = receiveWorkOrders(queue, 1);
         assert(deqGpu.length == 1);
-        assert(deqGpu[0].taskId == "train_model");
-        assert(deqGpu[0].buildId == bWorkOrder);
+        assert(deqGpu[0].workOrder.taskId == "train_model");
+        assert(deqGpu[0].workOrder.buildId == bWorkOrder);
 
         // Verify WorkOrder structure and metadata
         WorkOrder wo = deqGpu[0].workOrder;
         assert(wo.buildId == bWorkOrder);
         assert(wo.taskId == "train_model");
-        assert(wo.fingerprint == deqGpu[0].nodeFingerprint);
+        assert(wo.fingerprint == deqGpu[0].workOrder.fingerprint);
         assert(wo.executorType == "aws-ecs");
         assert(wo.requirements["gpu"] == "true");
         assert(wo.requirements["arch"] == "x86_64");
@@ -1469,12 +1570,12 @@ unittest
         projAck.tasks = [step1, step2];
 
         string bAck = coord10.startBuild(projAck, null, true);
-        assert(queue.getPendingCount() == 1);
+        assert(countReceivable(queue) == 1);
 
         // Dequeue step1 message - will receive a receiptHandle
-        auto deqStep1 = queue.dequeue(1);
+        auto deqStep1 = receiveWorkOrders(queue, 1);
         assert(deqStep1.length == 1);
-        string rHandle = deqStep1[0].receiptHandle;
+        string rHandle = deqStep1[0].receipt;
         assert(rHandle.length > 0);
 
         // Complete step1 providing receiptHandle directly in TaskExecutionResult
@@ -1482,27 +1583,27 @@ unittest
         resStep1.taskId = "step1";
         resStep1.buildId = bAck;
         resStep1.status = TaskStatus.succeeded;
-        resStep1.fingerprint = deqStep1[0].nodeFingerprint;
+        resStep1.fingerprint = deqStep1[0].workOrder.fingerprint;
         resStep1.receiptHandle = rHandle;
         coord10.onTaskCompleted(bAck, "step1", resStep1);
 
         // Downstream step2 is now ready in queue
-        assert(queue.getPendingCount() == 1);
+        assert(countReceivable(queue) == 1);
 
         // Explicit stepBuild invocation succeeds without errors
         coord10.stepBuild(bAck);
-        assert(queue.getPendingCount() == 1);
+        assert(countReceivable(queue) == 1);
 
-        auto deqStep2 = queue.dequeue(1);
-        assert(deqStep2[0].taskId == "step2");
+        auto deqStep2 = receiveWorkOrders(queue, 1);
+        assert(deqStep2[0].workOrder.taskId == "step2");
 
         // Complete step2 passing receiptHandle via parameter overload
         TaskExecutionResult resStep2;
         resStep2.taskId = "step2";
         resStep2.buildId = bAck;
         resStep2.status = TaskStatus.succeeded;
-        resStep2.fingerprint = deqStep2[0].nodeFingerprint;
-        coord10.onTaskCompleted(bAck, "step2", resStep2, deqStep2[0].receiptHandle);
+        resStep2.fingerprint = deqStep2[0].workOrder.fingerprint;
+        coord10.onTaskCompleted(bAck, "step2", resStep2, deqStep2[0].receipt);
 
         BuildRecord bAckRec;
         assert(stateRepo.getBuild(bAck, bAckRec));

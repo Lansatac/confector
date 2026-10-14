@@ -4,7 +4,7 @@ import confector.core.model;
 import confector.core.storage;
 import confector.core.plugin;
 import confector.core.plugin_loader;
-import confector.core.queue;
+import confector.plugin_api.dispatch_queue : Lease;
 import confector.runner_core.engine;
 import confector.runner_core.artifacts;
 import confector.runner_core.http_artifact_storage;
@@ -44,7 +44,7 @@ struct HttpWorkerConfig
 
 /**
  * HTTP client for worker-to-server control plane protocol.
- * Handles task dequeuing, heartbeat renewals, log streaming, and completion reporting.
+ * Handles receiving work orders, lease extensions, log streaming, and completion reporting.
  */
 class HttpWorkerClient
 {
@@ -175,74 +175,63 @@ class HttpWorkerClient
         }
     }
 
-    TaskQueueMessage[] dequeueTasks(size_t maxMessages = 1, size_t visibilityTimeout = 30)
+    /**
+     * Receives up to maxMessages work orders, leased for visibilityTimeout seconds. Each lease's
+     * message is a WorkOrder in JSON.
+     */
+    Lease[] receiveWork(size_t maxMessages = 1, size_t visibilityTimeout = 30)
     {
         Json req = Json.emptyObject;
         req["max_messages"] = Json(maxMessages);
         req["visibility_timeout"] = Json(visibilityTimeout);
         req["worker_id"] = Json(m_workerId);
 
-        Json res = sendJson("/queue/dequeue", "POST", req);
-        if (res.type == Json.Type.array)
+        Json res = sendJson("/queue/receive", "POST", req);
+        if (res.type != Json.Type.array)
         {
-            return deserializeJson!(TaskQueueMessage[])(res);
+            throw new Exception(format("Server returned %s from /queue/receive, not an array of leases", res.toString()));
         }
-        return [];
+        Lease[] leases;
+        foreach (item; res)
+        {
+            leases ~= Lease(item["receipt"].get!string, item["receive_count"].get!uint, item["work_order"]);
+        }
+        return leases;
     }
 
-    bool extendHeartbeat(string receiptHandle, size_t extensionSeconds = 30)
+    bool extendLease(string receipt, size_t visibilityTimeout = 30)
     {
-        if (receiptHandle.length == 0) return false;
+        if (receipt.length == 0) return false;
         try
         {
             Json req = Json.emptyObject;
-            req["receipt_handle"] = Json(receiptHandle);
-            req["extension_seconds"] = Json(extensionSeconds);
+            req["receipt"] = Json(receipt);
+            req["visibility_timeout"] = Json(visibilityTimeout);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/heartbeat", "POST", req);
+            sendJson("/queue/extend", "POST", req);
             return true;
         }
         catch (Exception e)
         {
-            logWarn("[HttpWorkerClient] Failed to extend heartbeat for receipt '%s': %s", receiptHandle, e.msg);
+            logWarn("[HttpWorkerClient] Failed to extend lease for receipt '%s': %s", receipt, e.msg);
             return false;
         }
     }
 
-    bool ackTask(string receiptHandle)
+    bool ackTask(string receipt)
     {
-        if (receiptHandle.length == 0) return false;
+        if (receipt.length == 0) return false;
         try
         {
             Json req = Json.emptyObject;
-            req["receipt_handle"] = Json(receiptHandle);
+            req["receipt"] = Json(receipt);
             req["worker_id"] = Json(m_workerId);
             sendJson("/queue/ack", "POST", req);
             return true;
         }
         catch (Exception e)
         {
-            logError("[HttpWorkerClient] Failed to acknowledge task receipt '%s': %s", receiptHandle, e.msg);
-            return false;
-        }
-    }
-
-    bool nackTask(string receiptHandle, bool requeue = true, string errorReason = "")
-    {
-        if (receiptHandle.length == 0) return false;
-        try
-        {
-            Json req = Json.emptyObject;
-            req["receipt_handle"] = Json(receiptHandle);
-            req["requeue"] = Json(requeue);
-            req["error_reason"] = Json(errorReason);
-            req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/nack", "POST", req);
-            return true;
-        }
-        catch (Exception e)
-        {
-            logError("[HttpWorkerClient] Failed to nack task receipt '%s': %s", receiptHandle, e.msg);
+            logError("[HttpWorkerClient] Failed to acknowledge task receipt '%s': %s", receipt, e.msg);
             return false;
         }
     }
@@ -302,7 +291,7 @@ class HttpWorkerClient
 }
 
 /**
- * Runner loop handling task dequeuing, execution via TaskEngine, heartbeat renewals,
+ * Runner loop handling work order receipt, execution via TaskEngine, lease extensions,
  * artifact packing/unpacking, and completion reporting over HTTP.
  */
 class HttpWorkerDaemon
@@ -376,8 +365,9 @@ class HttpWorkerDaemon
         m_engine = new TaskEngine(m_storage);
     }
 
-    TaskExecutionResult processOneMessage(in TaskQueueMessage msg)
+    TaskExecutionResult processOneMessage(in Lease lease)
     {
+        const WorkOrder msg = deserializeJson!WorkOrder(lease.message);
         string buildId = msg.buildId.length > 0 ? msg.buildId : "build_anon";
         string taskId = msg.taskId;
         string taskWsDir = buildPath(m_config.workspaceDir, buildId, taskId);
@@ -386,15 +376,15 @@ class HttpWorkerDaemon
             mkdirRecurse(taskWsDir);
         }
 
-        logInfo("[worker] Processing task '%s' for build '%s' (receipt: %s)", taskId, buildId, msg.receiptHandle);
+        logInfo("[worker] Processing task '%s' for build '%s' (receipt: %s)", taskId, buildId, lease.receipt);
 
         // Heartbeat periodic timer
         Thread heartbeatThread;
         bool heartbeatRunning = false;
-        if (msg.receiptHandle.length > 0 && m_config.heartbeatIntervalSeconds > 0)
+        if (lease.receipt.length > 0 && m_config.heartbeatIntervalSeconds > 0)
         {
             heartbeatRunning = true;
-            string handle = msg.receiptHandle;
+            string handle = lease.receipt;
             size_t intervalSec = m_config.heartbeatIntervalSeconds;
             size_t visTimeout = m_config.visibilityTimeoutSeconds;
             heartbeatThread = new Thread({
@@ -404,7 +394,7 @@ class HttpWorkerDaemon
                     if (!heartbeatRunning) break;
                     if (m_client !is null && handle.length > 0)
                     {
-                        m_client.extendHeartbeat(handle, visTimeout);
+                        m_client.extendLease(handle, visTimeout);
                     }
                 }
             });
@@ -430,18 +420,18 @@ class HttpWorkerDaemon
             taskNode.id = taskId;
         }
 
-        if (taskNode.environment.length == 0 && msg.executionPayload.environment.length > 0)
+        if (taskNode.environment.length == 0 && msg.payload.environment.length > 0)
         {
-            foreach (k, v; msg.executionPayload.environment)
+            foreach (k, v; msg.payload.environment)
             {
                 taskNode.environment[k] = v;
             }
         }
 
         // Map input_artifacts to taskNode upstream artifacts
-        if (msg.executionPayload.inputArtifacts.length > 0)
+        if (msg.payload.inputArtifacts.length > 0)
         {
-            foreach (inArt; msg.executionPayload.inputArtifacts)
+            foreach (inArt; msg.payload.inputArtifacts)
             {
                 UpstreamArtifactRef refArt;
                 refArt.taskId = inArt.taskId;
@@ -453,9 +443,9 @@ class HttpWorkerDaemon
         }
 
         // Map expectedOutputs to taskNode outputs
-        if (msg.executionPayload.expectedOutputs.length > 0)
+        if (msg.payload.expectedOutputs.length > 0)
         {
-            foreach (expOut; msg.executionPayload.expectedOutputs)
+            foreach (expOut; msg.payload.expectedOutputs)
             {
                 taskNode.outputs.artifacts ~= expOut;
             }
@@ -486,9 +476,9 @@ class HttpWorkerDaemon
             }
         }
 
-        string[string] upstreamHashes = msg.executionPayload.upstreamArtifactHashes.dup;
-        string[] allowedRepos = msg.executionPayload.allowedRepositories.dup;
-        string[string] repoMap = msg.executionPayload.repositoryMap.dup;
+        string[string] upstreamHashes = msg.payload.upstreamArtifactHashes.dup;
+        string[] allowedRepos = msg.payload.allowedRepositories.dup;
+        string[string] repoMap = msg.payload.repositoryMap.dup;
 
         TaskExecutionResult result;
         try
@@ -498,11 +488,11 @@ class HttpWorkerDaemon
                 taskNode,
                 taskWsDir,
                 upstreamHashes,
-                msg.executionPayload.force,
+                msg.payload.force,
                 &onLogLine,
                 allowedRepos,
                 repoMap,
-                msg.nodeFingerprint
+                msg.fingerprint
             );
         }
         catch (Exception e)
@@ -526,12 +516,12 @@ class HttpWorkerDaemon
         }
 
         // Report task completion over HTTP
-        m_client.reportCompletion(buildId, taskId, result, msg.executionPayload.callbackUrl);
+        m_client.reportCompletion(buildId, taskId, result, msg.payload.callbackUrl);
 
-        // Acknowledge task message from queue
-        if (msg.receiptHandle.length > 0)
+        // Acknowledge the work order
+        if (lease.receipt.length > 0)
         {
-            m_client.ackTask(msg.receiptHandle);
+            m_client.ackTask(lease.receipt);
         }
 
         m_tasksProcessed++;
@@ -550,7 +540,7 @@ class HttpWorkerDaemon
         {
             try
             {
-                auto messages = m_client.dequeueTasks(1, m_config.visibilityTimeoutSeconds);
+                auto messages = m_client.receiveWork(1, m_config.visibilityTimeoutSeconds);
                 if (messages.length == 0)
                 {
                     if (m_config.maxTasksToProcess > 0 && m_tasksProcessed >= m_config.maxTasksToProcess)
@@ -583,6 +573,19 @@ class HttpWorkerDaemon
         }
 
         logInfo("[worker] Worker '%s' stopped. Total tasks processed: %d", m_client.workerId, m_tasksProcessed);
+    }
+}
+
+version (unittest)
+{
+    /// The /queue/receive response holding one lease on a work order.
+    private Json testLeases(string receipt, WorkOrder order)
+    {
+        Json lease = Json.emptyObject;
+        lease["receipt"] = Json(receipt);
+        lease["receive_count"] = Json(1);
+        lease["work_order"] = serializeToJson(order);
+        return Json([lease]);
     }
 }
 
@@ -633,11 +636,11 @@ unittest
 
     // Test URL resolution & client headers
     auto client = new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1", "secret_tok_123");
-    assert(client.resolveEndpointUrl("/queue/dequeue") == "http://127.0.0.1:9099/api/v1/queue/dequeue");
-    assert(client.resolveEndpointUrl("/api/v1/queue/dequeue") == "http://127.0.0.1:9099/api/v1/queue/dequeue");
+    assert(client.resolveEndpointUrl("/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
+    assert(client.resolveEndpointUrl("/api/v1/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
 
     auto clientApiV1 = new HttpWorkerClient("http://127.0.0.1:9099/api/v1", "test_worker_1");
-    assert(clientApiV1.resolveEndpointUrl("/queue/dequeue") == "http://127.0.0.1:9099/api/v1/queue/dequeue");
+    assert(clientApiV1.resolveEndpointUrl("/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
 
     // Setup Mock HTTP Control Plane Server
     auto router = new URLRouter();
@@ -647,28 +650,27 @@ unittest
     bool completeCalled = false;
     bool ackCalled = false;
 
-    TaskQueueMessage mockMsg;
-    mockMsg.messageId = "msg_1";
-    mockMsg.receiptHandle = "receipt_xyz";
-    mockMsg.buildId = "build_test_1";
-    mockMsg.taskId = "task_test_1";
-    mockMsg.nodeFingerprint = "fp_mock_123";
-    mockMsg.taskNode.id = "task_test_1";
-    mockMsg.taskNode.steps = [BuildStep("step", "mock", null, "echo done")];
+    WorkOrder mockOrder;
+    mockOrder.buildId = "build_test_1";
+    mockOrder.taskId = "task_test_1";
+    mockOrder.fingerprint = "fp_mock_123";
+    mockOrder.taskNode.id = "task_test_1";
+    mockOrder.taskNode.steps = [BuildStep("step", "mock", null, "echo done")];
+    Json mockLeases = testLeases("receipt_xyz", mockOrder);
 
-    router.post("/api/v1/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCalled = true;
         if (dequeueCalled && !ackCalled)
         {
-            res.writeJsonBody([mockMsg]);
+            res.writeJsonBody(mockLeases);
         }
         else
         {
-            res.writeJsonBody(cast(TaskQueueMessage[])[]);
+            res.writeJsonBody(Json.emptyArray);
         }
     });
 
-    router.post("/api/v1/queue/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
         heartbeatCalled = true;
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
@@ -687,7 +689,7 @@ unittest
 
     router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
         ackCalled = true;
-        assert(req.json["receipt_handle"].get!string == "receipt_xyz");
+        assert(req.json["receipt"].get!string == "receipt_xyz");
         res.writeJsonBody(["status": "acknowledged"]);
     });
 
@@ -777,41 +779,39 @@ unittest
     string[] acknowledgedReceipts;
     string[] streamedLogs;
 
-    TaskQueueMessage msgStep1;
-    msgStep1.messageId = "msg_step_1";
-    msgStep1.receiptHandle = "receipt_step_1";
-    msgStep1.buildId = "build_multistep_1";
-    msgStep1.taskId = "task_step_1";
-    msgStep1.nodeFingerprint = "fp_step_1";
-    msgStep1.taskNode.id = "task_step_1";
-    msgStep1.taskNode.steps = [BuildStep("step1", "mock", null, "echo step 1 finished")];
+    WorkOrder orderStep1;
+    orderStep1.buildId = "build_multistep_1";
+    orderStep1.taskId = "task_step_1";
+    orderStep1.fingerprint = "fp_step_1";
+    orderStep1.taskNode.id = "task_step_1";
+    orderStep1.taskNode.steps = [BuildStep("step1", "mock", null, "echo step 1 finished")];
+    Json msgStep1 = testLeases("receipt_step_1", orderStep1);
 
-    TaskQueueMessage msgStep2;
-    msgStep2.messageId = "msg_step_2";
-    msgStep2.receiptHandle = "receipt_step_2";
-    msgStep2.buildId = "build_multistep_1";
-    msgStep2.taskId = "task_step_2";
-    msgStep2.nodeFingerprint = "fp_step_2";
-    msgStep2.taskNode.id = "task_step_2";
-    msgStep2.taskNode.steps = [BuildStep("step2", "mock", null, "echo step 2 finished")];
+    WorkOrder orderStep2;
+    orderStep2.buildId = "build_multistep_1";
+    orderStep2.taskId = "task_step_2";
+    orderStep2.fingerprint = "fp_step_2";
+    orderStep2.taskNode.id = "task_step_2";
+    orderStep2.taskNode.steps = [BuildStep("step2", "mock", null, "echo step 2 finished")];
+    Json msgStep2 = testLeases("receipt_step_2", orderStep2);
 
-    router.post("/api/v1/queue/dequeue", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCount++;
         if (completedTasks.length == 0)
         {
-            res.writeJsonBody([msgStep1]);
+            res.writeJsonBody(msgStep1);
         }
         else if (completedTasks.length == 1)
         {
-            res.writeJsonBody([msgStep2]);
+            res.writeJsonBody(msgStep2);
         }
         else
         {
-            res.writeJsonBody(cast(TaskQueueMessage[])[]);
+            res.writeJsonBody(Json.emptyArray);
         }
     });
 
-    router.post("/api/v1/queue/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
 
@@ -835,7 +835,7 @@ unittest
     });
 
     router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
-        acknowledgedReceipts ~= req.json["receipt_handle"].get!string;
+        acknowledgedReceipts ~= req.json["receipt"].get!string;
         res.writeJsonBody(["status": "acknowledged"]);
     });
 

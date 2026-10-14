@@ -1,14 +1,14 @@
 module confector.core.test_storage;
 
 /**
- * In-memory implementations of storage and queue interfaces for unit testing only.
- * Import this module conditionally in your unittest blocks:
+ * In-memory implementations of storage interfaces for unit testing only (the in-memory dispatch
+ * queue is confector.core.memory_dispatch_queue). Import this module conditionally in your
+ * unittest blocks:
  *
  *     unittest
  *     {
  *         import confector.core.test_storage;
  *         auto repo = new InMemoryBuildStateRepository();
- *         auto queue = new InMemoryWorkQueue();
  *         auto storage = new InMemoryArtifactStorage();
  *     }
  */
@@ -16,8 +16,6 @@ module confector.core.test_storage;
 import confector.plugin_api.model;
 import std.format : format;
 import std.json : JSONValue;
-import std.datetime.systime : Clock;
-import std.uuid : randomUUID;
 
 
 /**
@@ -547,248 +545,5 @@ class InMemoryBuildStateRepository : BuildStateRepository
             list = list[$ - limit .. $];
         }
         return list;
-    }
-}
-
-
-/**
- * In-memory implementation of WorkQueue for testing only.
- */
-class InMemoryWorkQueue : WorkQueue
-{
-    private struct QueueEntry
-    {
-        TaskQueueMessage message;
-        bool inFlight = false;
-        long visibleAfterUnix = 0;
-        string activeReceiptHandle;
-    }
-
-    private QueueEntry[] m_entries;
-    private TaskQueueMessage[] m_deadLetters;
-
-    private static long currentUnixTime()
-    {
-        return Clock.currTime.toUnixTime();
-    }
-
-    @property string backendType() const pure nothrow @safe
-    {
-        return "memory";
-    }
-
-    override void enqueue(TaskQueueMessage message)
-    {
-        if (message.messageId.length == 0)
-        {
-            message.messageId = "msg_" ~ randomUUID().toString();
-        }
-        if (message.createdAt.length == 0)
-        {
-            message.createdAt = Clock.currTime.toISOString();
-        }
-        if (message.maxAttempts <= 0)
-        {
-            message.maxAttempts = 3;
-        }
-
-        QueueEntry entry;
-        entry.message = message;
-        entry.inFlight = false;
-        entry.visibleAfterUnix = message.visibleAfterUnix > 0 ? message.visibleAfterUnix : currentUnixTime();
-        m_entries ~= entry;
-    }
-
-    private static bool matchesExecutor(const(TaskQueueMessage) msg, const(string[]) supportedExecutorTypes)
-    {
-        if (supportedExecutorTypes.length == 0)
-        {
-            return true;
-        }
-        string msgExec = msg.executorType;
-        foreach (t; supportedExecutorTypes)
-        {
-            if (t == msgExec || (t.length == 0 && msgExec.length == 0))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    override TaskQueueMessage[] dequeue(size_t maxMessages = 1, long visibilityTimeoutSeconds = 30, const(string[]) supportedExecutorTypes = null)
-    {
-        long now = currentUnixTime();
-        TaskQueueMessage[] result;
-
-        foreach (ref entry; m_entries)
-        {
-            if (result.length >= maxMessages)
-            {
-                break;
-            }
-
-            if (!matchesExecutor(entry.message, supportedExecutorTypes))
-            {
-                continue;
-            }
-
-            if (!entry.inFlight && entry.visibleAfterUnix <= now)
-            {
-                string handle = "rcpt_" ~ randomUUID().toString();
-                entry.inFlight = true;
-                entry.activeReceiptHandle = handle;
-                entry.visibleAfterUnix = now + visibilityTimeoutSeconds;
-
-                TaskQueueMessage msg = entry.message;
-                msg.receiptHandle = handle;
-                msg.visibleAfterUnix = entry.visibleAfterUnix;
-                result ~= msg;
-            }
-            else if (entry.inFlight && entry.visibleAfterUnix <= now)
-            {
-                // Visibility timeout expired without ACK -> retry attempt
-                entry.message.attempt++;
-                if (entry.message.attempt > entry.message.maxAttempts)
-                {
-                    // Move to dead letter
-                    entry.message.errorReason = "Visibility timeout expired and max attempts reached";
-                    m_deadLetters ~= entry.message;
-                    entry.inFlight = false;
-                    entry.visibleAfterUnix = long.max; // mark inactive
-                }
-                else
-                {
-                    string handle = "rcpt_" ~ randomUUID().toString();
-                    entry.activeReceiptHandle = handle;
-                    entry.visibleAfterUnix = now + visibilityTimeoutSeconds;
-
-                    TaskQueueMessage msg = entry.message;
-                    msg.receiptHandle = handle;
-                    msg.visibleAfterUnix = entry.visibleAfterUnix;
-                    result ~= msg;
-                }
-            }
-        }
-
-        // Cleanup dead letters from active entries
-        QueueEntry[] remaining;
-        foreach (entry; m_entries)
-        {
-            if (entry.visibleAfterUnix != long.max)
-            {
-                remaining ~= entry;
-            }
-        }
-        m_entries = remaining;
-
-        return result;
-    }
-
-    override void ack(string receiptHandle)
-    {
-        QueueEntry[] remaining;
-        bool found = false;
-
-        foreach (entry; m_entries)
-        {
-            if (entry.inFlight && entry.activeReceiptHandle == receiptHandle)
-            {
-                found = true;
-                continue; // removed from queue
-            }
-            remaining ~= entry;
-        }
-
-        if (!found)
-        {
-            throw new Exception(format("Message with receipt handle '%s' not found or already acknowledged", receiptHandle));
-        }
-
-        m_entries = remaining;
-    }
-
-    override void nack(string receiptHandle, bool requeue = true, string errorReason = null)
-    {
-        foreach (ref entry; m_entries)
-        {
-            if (entry.inFlight && entry.activeReceiptHandle == receiptHandle)
-            {
-                entry.message.errorReason = errorReason;
-                entry.inFlight = false;
-                entry.activeReceiptHandle = null;
-
-                if (!requeue || entry.message.attempt >= entry.message.maxAttempts)
-                {
-                    m_deadLetters ~= entry.message;
-                    entry.visibleAfterUnix = long.max; // mark for cleanup
-                }
-                else
-                {
-                    entry.message.attempt++;
-                    entry.visibleAfterUnix = currentUnixTime(); // make available immediately
-                }
-                break;
-            }
-        }
-
-        // Cleanup dead letters
-        QueueEntry[] remaining;
-        foreach (entry; m_entries)
-        {
-            if (entry.visibleAfterUnix != long.max)
-            {
-                remaining ~= entry;
-            }
-        }
-        m_entries = remaining;
-    }
-
-    override void heartbeat(string receiptHandle, long extensionSeconds = 30)
-    {
-        long now = currentUnixTime();
-        foreach (ref entry; m_entries)
-        {
-            if (entry.inFlight && entry.activeReceiptHandle == receiptHandle)
-            {
-                entry.visibleAfterUnix = now + extensionSeconds;
-                return;
-            }
-        }
-        throw new Exception(format("Cannot heartbeat; receipt handle '%s' not found or expired", receiptHandle));
-    }
-
-    override TaskQueueMessage[] getDeadLetterMessages()
-    {
-        return m_deadLetters.dup;
-    }
-
-    override ulong getPendingCount()
-    {
-        long now = currentUnixTime();
-        ulong count = 0;
-        foreach (entry; m_entries)
-        {
-            if (!entry.inFlight && entry.visibleAfterUnix <= now)
-            {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    override TaskQueueMessage[] getPendingMessages(size_t limit = 50)
-    {
-        long now = currentUnixTime();
-        TaskQueueMessage[] result;
-        foreach (ref entry; m_entries)
-        {
-            if (!entry.inFlight && entry.visibleAfterUnix <= now)
-            {
-                result ~= entry.message;
-                if (result.length >= limit) break;
-            }
-        }
-        return result;
     }
 }
