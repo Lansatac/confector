@@ -432,6 +432,24 @@ Decided October 2026 (design record: bead `confector-z7z.6`).
   recorded with the execution. Runners fetch step programs from the artifact store by checksum.
 - **Bash, PowerShell, and checkout are built in** and follow the same contract.
 
+## Version control providers
+
+Decided October 2026 (design record: bead `confector-z7z.7`).
+
+- **A provider does four things.** On the control plane: list a repository's refs, resolve a ref
+  selector to a pinned value, and parse webhooks. On the runner: check out a pinned value.
+  Verifying a webhook's signature is part of parsing it and cannot be skipped.
+- **Pinned values are opaque to the core** and hashed in canonical JSON (RFC 8785), so providers
+  cannot disagree on formatting.
+- **Webhooks first, polling as a fallback.** Polling is configured per repository, because it
+  costs money even when nothing changes.
+- **Git checkout fetches the exact commit.** If that commit no longer exists (for example after a
+  force-push), fail loudly; a rerun cannot help, because the chain pins that commit. Defaults:
+  full history, recursive submodules, Git LFS on.
+- **Checkout credentials stay inside checkout.** They are never written to the workspace or
+  passed to other steps. This is why untrusted builds may use them: it is the one exception to
+  "untrusted builds get no secrets".
+
 ## Serverless constraints
 
 The control plane must be able to run as short-lived functions (for example AWS Lambda), which is
