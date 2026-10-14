@@ -326,11 +326,42 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
   unchanged; code reviews and shelves in other systems map onto the same kind. Each project
   chooses whether to build a change request's head, its merge result, or both, as far as the
   provider supports.
-- **A chain carries the trust level of its request.** The rules — for example, that pull requests
-  from forks get no secrets and cannot write to the shared cache — belong to the open
-  "Authentication and trust" question.
+- **A chain carries the trust level of its request.** See "Authentication and trust".
 - **Deferred:** cancelling superseded builds when a newer push arrives, and reporting build status
   back to the hosting service.
+
+## Authentication and trust
+
+Decided October 2026 (design record: bead `confector-z7z.10`). The main threat today is
+unauthorized access to the server by anyone outside a closed team; untrusted contributors are
+handled by trust levels.
+
+- **Every endpoint is authenticated, and the server fails closed.** It refuses to start without
+  an authenticator configured; never add an unauthenticated route or a default credential.
+- **People sign in through someone else's identity provider.** Authentication is a backend: an
+  authenticator turns a request into an identity with roles, or nothing. First an authenticating
+  proxy (such as oauth2-proxy) that sets identity headers plus a shared secret; later, signed
+  proxy headers and a built-in OpenID Connect login. There are no built-in password accounts —
+  only a bootstrap admin token and API tokens. Group-to-role mapping is configuration, not
+  per-provider code.
+- **Roles are global for now:** admin, member, viewer.
+- **Workers hold one token per execution.** It is signed, short-lived, and carried in the work
+  order, and it allows only what that execution needs: reporting its own logs and completion,
+  uploading its own artifacts, downloading the artifacts its inputs name, and fetching its
+  secrets.
+- **Webhooks and scheduler callbacks are verified** — by the provider's signature, or by a secret
+  the scheduler sends.
+- **Secrets come from a secret store backend at run time.** Tasks declare secrets by name; the
+  runner fetches the values with its execution token. Values never appear in work orders, queue
+  messages, database records, or logs, and they are not inputs (not fingerprinted).
+- **Pull requests from forks are untrusted.** Following GitHub's model, untrusted builds wait for
+  a member's approval, get no secrets, may reuse trusted cache entries, and store their own
+  results in a scope tied to their change request that trusted builds never use. Pull requests
+  from branches in the repository itself are trusted.
+- **Plugins are never loaded at runtime from a request.** (A previous endpoint that did this was
+  removed.)
+- **Eventual goal:** configurable worker isolation for untrusted builds (separate worker pools or
+  a fresh worker per execution), bead `confector-z7z.27`.
 
 ---
 
@@ -349,8 +380,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   *extensions* (build step types, version-control integrations — zero or more). Build steps,
   including repository checkout, would become separate executables invoked by the runner.
   Not yet designed in detail.
-- **Authentication and trust.** There is currently no authentication. Undecided: worker and user
-  auth, secret delivery, and keeping untrusted builds from writing to a shared cache.
 - **Pipeline definitions as code.** Tasks are currently defined in the web UI and stored in the
   database; whether they should live in the repository is undecided.
 - **Build system.** Both `dub.json` and `reggaefile.d` define the build; one will be chosen.
