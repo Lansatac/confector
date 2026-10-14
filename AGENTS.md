@@ -407,6 +407,30 @@ Decided October 2026 (design record: bead `confector-z7z.3`).
 - **Deferred:** a deployment builder for third-party backends (bead `confector-z7z.32`) and
   sandboxed WebAssembly extensions (bead `confector-z7z.33`).
 
+## Backend interfaces
+
+Decided October 2026 (design record: bead `confector-z7z.4`).
+
+- **The state store is a small document store; domain logic lives in the core.** Backends offer
+  get, create, compare-and-set replace and remove, and index queries the core declares up front.
+  Chains, executions, branches and everything else are core code written once on top. Keep the
+  interface small so a new backend (DynamoDB, Postgres, SQLite) stays small.
+- **Correctness depends only on reads by id and compare-and-set on a single document.** Queries
+  are for finding things and may lag behind writes. There are no multi-document transactions;
+  the coordinator's next evaluation repairs anything left half-done.
+- **Documents stay under 256 KB.** Larger data belongs in the artifact or log store.
+- **The build queue and the dispatch queue are different things.** The *build queue* is what
+  users see — every queued or waiting task and why — and is computed from the state store. The
+  *dispatch queue* is internal delivery to workers, one per compute pool; it is never the source
+  of truth and never shown, and any lost message is re-sent from the state store.
+- **Dispatch just in time.** Work stays queued in the state store until a pool has idle capacity,
+  so users can reorder the build queue (move to top, priorities) up to the last moment.
+- **Workers never hold database credentials.** They receive work through the control plane, or
+  directly from a queue service (such as SQS) with access scoped to their pool, using a pool
+  credential.
+- **Every backend, including in-memory test fakes, must pass the conformance suite** for its
+  interface.
+
 ## Build steps
 
 Decided October 2026 (design record: bead `confector-z7z.6`).
