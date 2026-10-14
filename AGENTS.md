@@ -175,8 +175,7 @@ Decided October 2026 (design record: bead `confector-z7z.13`).
 - **Upstream task outputs are inputs.** Dependencies between tasks are declared as task-output
   inputs, and graph edges are derived from them. There is no separate dependency list.
 - **A repository input names a repository by id plus a ref selector.** Repositories are defined
-  globally or per project. What ref selectors exist, and how a triggering branch binds to them, is
-  part of the open "Branches" question.
+  globally or per project. Ref selectors are described under "Branches".
 - **Declared, then resolved, then hashed.** Resolution is its own step: it turns every declared
   input in the whole DAG into a pinned value (branch to commit, and so on) once, when a build
   chain is created, so every task in the chain sees the same revisions. Pinned values can come
@@ -305,6 +304,34 @@ Decided October 2026 (design record: bead `confector-z7z.2`).
   completion re-asserts whether the sweep should exist.
 - **Chain state is computed when read.** Add a cached summary only if it proves too slow.
 
+## Branches
+
+Decided October 2026 (design record: bead `confector-z7z.19`).
+
+- **Branches are tracked records**, independent of any one version-control system: repository,
+  ref name, kind (branch, tag, or change request), head revision, and whether the branch still
+  exists. Git branches, Plastic branches, and Perforce streams all map onto them. Webhooks and
+  polling keep them current; a deleted branch is hidden and stops triggering, but its history
+  stays.
+- **A branch spec chooses which branches are tracked** — include/exclude patterns such as
+  `+:*` and `-:experimental/*`. It is set on the repository and can be overridden per project.
+- **Builds carry a branch context.** A request records the branch that triggered it, and the
+  branch is part of a build chain's identity, so each branch has its own build history. Nothing is
+  built twice, because task executions are shared across chains.
+- **Repository inputs bind to branches through ref selectors:** a fixed ref (`main`); *follow the
+  trigger*, when the trigger came from this input's repository; or *same name with a fallback*,
+  for feature branches that span several repositories.
+- **Trigger rules filter on event kind** (push, tag, change request) **and branch patterns.**
+- **A pull request is a branch of kind *change request*,** so filters and selectors apply to it
+  unchanged; code reviews and shelves in other systems map onto the same kind. Each project
+  chooses whether to build a change request's head, its merge result, or both, as far as the
+  provider supports.
+- **A chain carries the trust level of its request.** The rules — for example, that pull requests
+  from forks get no secrets and cannot write to the shared cache — belong to the open
+  "Authentication and trust" question.
+- **Deferred:** cancelling superseded builds when a newer push arrives, and reporting build status
+  back to the hosting service.
+
 ---
 
 ## Open questions
@@ -312,9 +339,6 @@ Decided October 2026 (design record: bead `confector-z7z.2`).
 These are **undecided**. Do not settle them implicitly by writing code that assumes an answer. If
 your task depends on one, stop and ask the project owner. When one is decided, update this file.
 
-- **Branches.** Branches should be a first-class concept: branch filters on triggers, which
-  branches are visible, how a triggering branch binds to repository inputs, and pull request
-  builds. Not yet designed (bead `confector-z7z.19`).
 - **First-class releases.** Possibly unnecessary given node-level targeting; likely just a label
   on a build chain.
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
