@@ -150,8 +150,8 @@ crosses it, who owns it, what can fail) saves a great deal of rework later.
 Every change must preserve these. Some are not yet true of the current code; do not make them
 less true.
 
-1. **A task's fingerprint is a deterministic function of its identity and its resolved declared
-   inputs** — nothing else. Upstream task outputs are inputs, so upstream fingerprints feed in
+1. **A task's fingerprint is a deterministic function of its identity (project and task) and its
+   resolved declared inputs** — nothing else. Upstream task outputs are inputs, so upstream fingerprints feed in
    transitively. Changing any declared input changes the fingerprint. A repository input
    contributes its *pinned revision* (for git, the commit SHA), not its URL or branch. Build
    configuration (steps, parameters, environment) is not part of the fingerprint; see "The input
@@ -195,6 +195,30 @@ Decided October 2026 (design record: bead `confector-z7z.13`).
 - **Checkout is explicit.** Inputs are not materialized automatically. A checkout step takes an
   input *by name* — never a URL — and checks out exactly its pinned revision. Steps that fetch
   things outside the input mechanism are allowed but are outside the caching guarantee.
+
+## The caching contract
+
+Decided October 2026 (design record: bead `confector-z7z.1`).
+
+- **A cache hit means** an earlier execution of the same task — same project, same task, same
+  resolved declared inputs — *succeeded*, and its declared artifacts still exist.
+- **A cache hit does not promise** the same build configuration, worker toolchain or environment,
+  network-fetched content, or secrets, nor byte-identical output. Re-running a task is the
+  override.
+- **Projects never share cache entries.** Task identity in the fingerprint includes the project.
+- **The control plane computes cache keys.** Never trust a fingerprint reported by a worker.
+- **Results are append-only, looked up by fingerprint.** Never overwrite an earlier result.
+- **Only successes are reused.** Failures are recorded but are never cache hits; a re-run can cure
+  a failure caused by something outside the inputs, such as a build machine dying.
+- **Missing artifacts make a miss, not an error.** If retention removed a result's artifacts, the
+  task runs again. (A task that ran but did not produce an artifact a downstream input needs is
+  different: that fails loudly.)
+- **Each result records the full task definition it ran with**, so it can be inspected and the UI
+  can show when a result predates a configuration change.
+- **A build chain freezes** its set of tasks, their declared and resolved inputs, and their
+  fingerprints. It does **not** freeze build configuration, which is read when a task is
+  dispatched. A task deleted from the project after the chain was created fails loudly if asked to
+  build; a task added later is not part of the chain.
 
 ---
 
