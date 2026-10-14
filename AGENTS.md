@@ -220,6 +220,39 @@ Decided October 2026 (design record: bead `confector-z7z.1`).
   dispatched. A task deleted from the project after the chain was created fails loudly if asked to
   build; a task added later is not part of the chain.
 
+## What a build is
+
+Decided October 2026 (design record: bead `confector-z7z.14`). A "build" used to conflate three
+things; they are now distinct:
+
+- **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
+  its payload, optional pins. Immutable.
+- **Build chain** — a snapshot of the whole project DAG: every task's declared inputs, resolved
+  inputs, and fingerprint. Immutable once created. This is what the UI calls a *build*; it has a
+  canonical per-project number (#123) and, separately, user-editable labels.
+- **Task execution** — one run of one task at one fingerprint ("task run" in the UI).
+  Append-only and shared across chains; a cache hit is a chain using an execution another chain
+  produced.
+
+How they fit together:
+
+- **A request joins or creates a chain.** Resolve the whole DAG and fingerprint it. If the project
+  already has a chain with the same snapshot, the request joins it; otherwise a new chain is
+  created. The request runs its targets and their upstream tasks, never downstream ones.
+- **Any task in a chain can be built later** against the chain's pinned inputs, without
+  re-resolving. This is how an external build is made from exactly what was tested.
+- **Chain state is derived, never stored**, from the chain's requests and the executions for its
+  fingerprints.
+- **A configuration change does not trigger a rebuild** of a chain whose task already succeeded;
+  re-run the task to apply it.
+- **Retry and rerun are different.** *Retry* runs a failed or cancelled task again in the same
+  chain. *Rerun* forces a succeeded task to run again; it creates a new chain from that task
+  forward, whose parent is the original.
+- **Cancel means stop**, even when the execution is shared with other chains. Cancelling a task
+  also cancels the tasks downstream of it. Before acting, the UI shows everything that will be
+  cancelled — including other chains that share the execution — and offers to cancel upstream
+  tasks that are still running too.
+
 ---
 
 ## Open questions
@@ -227,21 +260,18 @@ Decided October 2026 (design record: bead `confector-z7z.1`).
 These are **undecided**. Do not settle them implicitly by writing code that assumes an answer. If
 your task depends on one, stop and ask the project owner. When one is decided, update this file.
 
-- **What is a build?** Today a "build" conflates the *request* (trigger, target node, intent such
-  as force or re-run), the *plan* (resolved inputs, selected subgraph, fingerprints), and the
-  *execution results* (task outcomes, which are already shared between builds). These probably
-  need to be distinct concepts. Leading direction: TeamCity-style *build chains*. Each request
-  evaluates the DAG and either joins an existing chain or creates a new one; a chain pins its
-  resolved inputs. A user can ask any not-yet-run task in a chain to build against those pinned
-  inputs, and a rebuild starts a new chain from that task forward.
 - **Branches.** Branches should be a first-class concept: branch filters on triggers, which
   branches are visible, how a triggering branch binds to repository inputs, and pull request
   builds. Not yet designed (bead `confector-z7z.19`).
 - **Re-run semantics.** Leading idea: a re-run is itself an input (a "triggering intent") to the
   re-run task, so its fingerprint and every downstream fingerprint change through normal
   transitive hashing. Undecided: which result later builds with the same inputs should reuse.
-- **First-class releases.** Possibly unnecessary given node-level targeting; possibly cheap if a
-  release is just a named, pinned build plan.
+  (Retry vs. rerun and cancellation are decided; see "What a build is".)
+- **First-class releases.** Possibly unnecessary given node-level targeting; likely just a label
+  on a build chain.
+- **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
+  Preferred shape: an input kind that pins to another project's chain, not chains that span
+  projects.
 - **Plugin architecture.** Likely direction: formally separate *structural backends* (state store,
   queue, artifact storage, scheduler, compute — exactly one each, chosen at deployment) from
   *extensions* (build step types, version-control integrations — zero or more). Build steps,
