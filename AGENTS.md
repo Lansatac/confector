@@ -407,6 +407,27 @@ Decided October 2026 (design record: bead `confector-z7z.3`).
 - **Deferred:** a deployment builder for third-party backends (bead `confector-z7z.32`) and
   sandboxed WebAssembly extensions (bead `confector-z7z.33`).
 
+## Pipeline definitions
+
+Decided October 2026 (design record: bead `confector-z7z.9`).
+
+- **A project's definition is one document** — tasks, inputs, steps, triggers, outputs — with one
+  schema, whether it is a YAML file or edited in the UI.
+- **Each project chooses where it lives:** a separate configuration repository (the default), the
+  code repository, or Confector itself. A separate repository is the default because editing the
+  pipeline then never invalidates builds, access can be limited to the people who own CI, and one
+  configuration can serve many code repositories. Code branches pair with configuration branches
+  through the *same name with a fallback* ref selector.
+- **Some things are never in a definition:** repository records and credentials, secrets, compute
+  pools, permissions, admin settings. Definitions refer to them by name.
+- **One rule for every storage location:** a chain freezes *structure* (tasks, inputs, edges)
+  from the definition as it was when the chain was created; *build configuration* (steps,
+  environment, outputs) is read from the current definition when a task is dispatched. Each
+  execution records the full definition it ran with and the commit it came from. So fixing a
+  configuration and rerunning works the same whether you edit in the UI or commit — and an
+  external build of an old, tested commit uses today's release configuration.
+- **An invalid definition fails loudly,** with file and line.
+
 ## Backend interfaces
 
 Decided October 2026 (design record: bead `confector-z7z.4`).
@@ -502,8 +523,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
   Preferred shape: an input kind that pins to another project's chain, not chains that span
   projects.
-- **Pipeline definitions as code.** Tasks are currently defined in the web UI and stored in the
-  database; whether they should live in the repository is undecided.
 - **Build system.** Both `dub.json` and `reggaefile.d` define the build; one will be chosen.
 
 ---
