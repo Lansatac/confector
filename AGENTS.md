@@ -407,6 +407,25 @@ Decided October 2026 (design record: bead `confector-z7z.3`).
 - **Deferred:** a deployment builder for third-party backends (bead `confector-z7z.32`) and
   sandboxed WebAssembly extensions (bead `confector-z7z.33`).
 
+## Retention
+
+Decided October 2026 (design record: bead `confector-z7z.43`).
+
+- **Retention is by reachability, not age.** Executions are shared across chains, so an old
+  execution may be what today's build reuses. Policy decides which *chains* are retained;
+  everything a retained chain uses is kept; anything else is deleted after it has been
+  unreferenced for a grace period.
+- **Always retained:** chains with work in progress (queued, running, or awaiting dispatch or
+  approval — tasks nobody requested do not count, since most chains never run every task), the
+  latest chain of each active branch, and pinned chains. Any signed-in user can pin a chain.
+- **Bytes go; records stay.** Artifacts and logs are deleted; chain and execution records are kept
+  forever by default (expiry is configurable) and show "artifacts expired". Building a task in an
+  old chain then rebuilds its upstream tasks from the same pinned inputs — the same inputs, not
+  necessarily the same bytes. Pin or release a chain to keep exact binaries.
+- **Retention runs as a daily, resumable, idempotent sweep** triggered by the scheduler, deleting
+  through the artifact and log stores. Never rely on storage lifecycle rules: they cannot know
+  what is pinned or still referenced.
+
 ## Pipeline definitions
 
 Decided October 2026 (design record: bead `confector-z7z.9`).
@@ -525,8 +544,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   it; tasks can declare which environment they deploy to, giving a view of what was most recently
   deployed where. Deploy tasks will need a flag to never reuse cached results (bead
   `confector-z7z.42`).
-- **Retention.** Undesigned (bead `confector-z7z.43`): how long artifacts, logs, executions and
-  chains are kept. Pins (releases, manually pinned builds) must be part of it from the start.
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
   Preferred shape: an input kind that pins to another project's chain, not chains that span
   projects.
