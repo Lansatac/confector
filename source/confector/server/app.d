@@ -16,6 +16,7 @@ import vibe.vibe;
 import confector.config;
 import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig;
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
+import confector.core.git_resolver : GitRepositoryResolver;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
 import confector.core.storage : BuildStateRepository;
@@ -378,7 +379,9 @@ void main()
         logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
-    buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, dispatchQueue, capacityBroker);
+    // Git is the only built-in version control provider, so every repository input resolves
+    // through it (bead confector-z7z.20.7).
+    buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, dispatchQueue, capacityBroker, "", new GitRepositoryResolver());
     logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Load scheduler plugin

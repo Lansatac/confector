@@ -138,11 +138,12 @@ private void putField(Out)(ref Out app, in string field) @safe
  * Pins the inputs that need no provider: a value input pins to its value and a task_output
  * input pins to the upstream task's fingerprint (taken from `upstreamFingerprints`, keyed
  * by task id). Repository inputs take their pinned value and display info from
- * `resolvedRepositories` (keyed by input name); until a resolver supplies one, a repository
- * input pins to an explicit `{"unresolved": {"repository": <id>, "ref": <selector>}}` marker built from its
- * declaration, so changing the repository or ref still changes the fingerprint.
+ * `resolvedRepositories` (keyed by input name); input resolution
+ * (confector.core.input_resolution) supplies them. A repository input is never fingerprinted
+ * from its declaration.
  *
- * Throws: Exception if a task_output input names an upstream task with no fingerprint.
+ * Throws: Exception if a task_output input names an upstream task with no fingerprint, or a
+ * repository input has no entry of kind repository in `resolvedRepositories`.
  */
 ResolvedInput[] pinInputs(
     in TaskNode task,
@@ -172,19 +173,14 @@ ResolvedInput[] pinInputs(
                 input.pinned = Json(*fp);
                 break;
             case InputKind.repository:
-                if (auto resolved = name in resolvedRepositories)
+                auto resolved = name in resolvedRepositories;
+                if (resolved is null || resolved.kind != InputKind.repository)
                 {
-                    input.pinned = resolved.pinned.clone;
-                    input.info = cast(string[string]) resolved.info.dup;
+                    throw new Exception(format("Task '%s' repository input '%s' (repository '%s' at ref '%s') has not been resolved",
+                        task.id, name, decl.spec.repository, decl.spec.refSelector));
                 }
-                else
-                {
-                    auto spec = Json.emptyObject;
-                    spec["repository"] = decl.spec.repository;
-                    spec["ref"] = decl.spec.refSelector;
-                    input.pinned = Json.emptyObject;
-                    input.pinned["unresolved"] = spec;
-                }
+                input.pinned = resolved.pinned.clone;
+                input.info = cast(string[string]) resolved.info.dup;
                 break;
         }
         result ~= input;
@@ -338,19 +334,24 @@ unittest
 
 unittest
 {
-    // An unresolved repository input still reflects its declaration
+    import std.algorithm.searching : canFind;
+
+    // An unresolved repository input is an error, never fingerprinted from its declaration
     TaskNode task;
     task.id = "compile";
     task.inputs["src"] = repositoryInput("game", "main");
-    const base = computeNodeFingerprint("p", task.id, pinInputs(task, null));
 
-    TaskNode otherRepo = task;
-    otherRepo.inputs["src"] = repositoryInput("engine", "main");
-    assert(computeNodeFingerprint("p", task.id, pinInputs(otherRepo, null)) != base);
+    bool threw = false;
+    try pinInputs(task, null);
+    catch (Exception ex) threw = ex.msg.canFind("'src'") && ex.msg.canFind("'game'");
+    assert(threw, "A repository input without a resolved pin must throw");
 
-    TaskNode otherRef = task;
-    otherRef.inputs["src"] = repositoryInput("game", "release");
-    assert(computeNodeFingerprint("p", task.id, pinInputs(otherRef, null)) != base);
+    // A pin of another kind under the input's name does not count
+    ResolvedInput[string] wrongKind = ["src": ResolvedInput("src", InputKind.value, Json("aaa111"))];
+    threw = false;
+    try pinInputs(task, null, wrongKind);
+    catch (Exception) threw = true;
+    assert(threw);
 }
 
 unittest

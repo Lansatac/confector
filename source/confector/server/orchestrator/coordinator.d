@@ -3,9 +3,11 @@ module confector.orchestrator.coordinator;
 import confector.core.model;
 import confector.core.dag;
 import confector.core.storage;
-import confector.core.fingerprinter;
+import confector.core.chain_resolver : resolveChain;
 import confector.core.executor : CapacityBroker;
+import confector.core.input_resolution : chainFingerprints, chainGraph;
 import confector.plugin_api.dispatch_queue;
+import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
 
 import std.algorithm : canFind, filter;
 import std.array : array;
@@ -22,8 +24,13 @@ import vibe.core.log : logInfo, logError, logWarn, logDebug;
 struct ActiveBuild
 {
     string buildId;
+    /// The project the build's configuration (steps, environment, outputs) is read from.
     ProjectRecord project;
+    /// The build's chain: its frozen tasks, the graph they form, and their fingerprints, which
+    /// are computed from the chain alone (never from the project).
+    ChainTask[] chain;
     TaskGraph graph;
+    string[string] fingerprints;
     string[] targetTaskIds;
     bool force = false;
     string workspaceDir;
@@ -212,15 +219,24 @@ class BuildCoordinator
     private Mutex m_mutex;
     private ActiveBuild[string] m_activeBuilds;
     private InFlightTaskRegistry m_inFlightRegistry;
+    private RepositoryResolver m_repositoryResolver;
 
+    /**
+     * `repositoryResolver` resolves every repository input when a build chain is created. Git
+     * is the only built-in provider, so one resolver serves every repository; when repositories
+     * record their provider, `selectResolver` picks by it. Without a resolver, creating a chain
+     * whose tasks declare repository inputs fails loudly.
+     */
     this(
         ArtifactStorage artifactStorage,
         BuildStateRepository stateRepo,
         DispatchQueue dispatchQueue,
         CapacityBroker capacityBroker = null,
-        string callbackBaseUrl = ""
+        string callbackBaseUrl = "",
+        RepositoryResolver repositoryResolver = null
     )
     {
+        m_repositoryResolver = repositoryResolver;
         m_artifactStorage = artifactStorage;
         m_stateRepo = stateRepo;
         m_dispatchQueue = dispatchQueue;
@@ -276,9 +292,13 @@ class BuildCoordinator
     @property void callbackBaseUrl(string url) { m_callbackBaseUrl = url; }
 
     /**
-     * Initiates a new build execution for the given project and optional target task.
-     * Evaluates initial DAG roots and sends ready tasks to the dispatch queue.
-     * Returns the generated build ID.
+     * Initiates a new build for the given project and optional target task: creates a build
+     * chain by resolving every input of the whole project DAG once, then evaluates the chain's
+     * initial roots and sends ready tasks to the dispatch queue. Returns the generated build ID,
+     * which also identifies the chain.
+     *
+     * Throws: InputResolutionException if any input cannot be resolved; nothing is recorded
+     * or dispatched then.
      */
     string startBuild(
         ProjectRecord project,
@@ -288,21 +308,17 @@ class BuildCoordinator
         string workspaceDir = null
     )
     {
+        // Resolve the whole DAG once; this is the only place a chain's inputs are resolved. It
+        // runs before the lock is taken: resolvers do network I/O, and a slow remote must not
+        // stall completions and evaluations of other builds. It needs only the repository
+        // lookup and the resolver, and records nothing, so a failure leaves no trace.
+        InputPin[InputDecl] noPins;
+        ChainTask[] chain = resolveChain(project.id, new TaskGraph(project), noPins,
+            &lookupRepository, &selectResolver);
+
         synchronized (m_mutex)
         {
             string buildId = "bld_" ~ randomUUID().toString()[0 .. 8];
-            TaskGraph graph = new TaskGraph(project);
-            graph.computeFingerprints(project.id);
-
-            string[] targetTaskIds;
-            if (targetTaskId.length > 0)
-            {
-                targetTaskIds = graph.resolveSubgraph(targetTaskId);
-            }
-            else
-            {
-                targetTaskIds = graph.topologicalSort();
-            }
 
             // Persist project if not already saved
             if (project.id.length > 0 && m_stateRepo !is null)
@@ -310,44 +326,186 @@ class BuildCoordinator
                 m_stateRepo.saveProject(project);
             }
 
-            // Create and persist initial BuildRecord
-            BuildRecord buildRecord;
-            buildRecord.buildId = buildId;
-            buildRecord.projectId = project.id;
-            buildRecord.projectName = project.name.length > 0 ? project.name : "default";
-            buildRecord.status = "queued";
-            buildRecord.triggerSource = triggerSource;
-            buildRecord.targetTaskId = targetTaskId;
-            buildRecord.workspaceDir = workspaceDir;
-            buildRecord.startedAt = Clock.currTime.toISOString();
-            buildRecord.executedTasks = [];
+            return startOnChainLocked(project, chain, buildId, buildId, targetTaskId, force, triggerSource, workspaceDir);
+        }
+    }
 
-            if (m_stateRepo !is null)
+    /**
+     * Builds `targetTaskId` (and its upstream tasks) of the existing chain that build
+     * `chainBuildId` belongs to, against the chain's frozen inputs: nothing is resolved again
+     * and the project's current inputs are ignored. Build configuration is read from the
+     * project as it is now. Returns the new build's ID.
+     *
+     * Throws: Exception if the build or its project does not exist, the build has no chain, or
+     * `targetTaskId` is not a task of the chain (it was added to the project later).
+     */
+    string buildInChain(
+        string chainBuildId,
+        string targetTaskId,
+        bool force = false,
+        string triggerSource = "manual",
+        string workspaceDir = null
+    )
+    {
+        synchronized (m_mutex)
+        {
+            if (m_stateRepo is null)
             {
-                foreach (tId; targetTaskIds)
-                {
-                    m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.pending);
-                }
-                m_stateRepo.recordBuild(buildRecord);
+                throw new Exception("Cannot build in an existing chain without a state repository");
+            }
+            BuildRecord origin;
+            if (!m_stateRepo.getBuild(chainBuildId, origin))
+            {
+                throw new Exception(format("Build '%s' does not exist", chainBuildId));
+            }
+            if (origin.chainTasks.length == 0 || origin.chainId.length == 0)
+            {
+                throw new Exception(format("Build '%s' has no build chain", chainBuildId));
+            }
+            ProjectRecord project;
+            if (!m_stateRepo.getProject(origin.projectId, project))
+            {
+                throw new Exception(format("Project '%s' of build '%s' does not exist", origin.projectId, chainBuildId));
             }
 
-            ActiveBuild active;
-            active.buildId = buildId;
-            active.project = project;
-            active.graph = graph;
-            active.targetTaskIds = targetTaskIds;
-            active.force = force;
-            active.workspaceDir = workspaceDir;
-
-            m_activeBuilds[buildId] = active;
-
-            logInfo("[coordinator] Starting build '%s' for project '%s' (target: %s, %d tasks in DAG)", buildId, project.name.length > 0 ? project.name : (project.id.length > 0 ? project.id : "default"), targetTaskId.length > 0 ? targetTaskId : "all", targetTaskIds.length);
-
-            // Evaluate initial root tasks & resolve cached nodes upfront
-            evaluateReadyTasksLocked(buildId);
-
-            return buildId;
+            string buildId = "bld_" ~ randomUUID().toString()[0 .. 8];
+            return startOnChainLocked(project, origin.chainTasks, origin.chainId, buildId, targetTaskId, force,
+                triggerSource, workspaceDir);
         }
+    }
+
+    /// Records build `buildId` on chain `chainId` and starts evaluating it. Must be called
+    /// with m_mutex held.
+    private string startOnChainLocked(
+        ProjectRecord project,
+        ChainTask[] chain,
+        string chainId,
+        string buildId,
+        string targetTaskId,
+        bool force,
+        string triggerSource,
+        string workspaceDir
+    )
+    {
+        TaskGraph graph = chainGraph(chain);
+        string[string] fingerprints = chainFingerprints(project.id, chain);
+
+        string[] targetTaskIds;
+        if (targetTaskId.length > 0)
+        {
+            if (!graph.allTaskIds().canFind(targetTaskId))
+            {
+                throw new Exception(format("Task '%s' is not part of build chain '%s'", targetTaskId, chainId));
+            }
+            targetTaskIds = graph.resolveSubgraph(targetTaskId);
+        }
+        else
+        {
+            targetTaskIds = graph.topologicalSort();
+        }
+
+        // Every task to run must still exist in the project, which supplies its configuration.
+        // Check before anything is recorded so a deleted task leaves no orphaned build.
+        foreach (tId; targetTaskIds)
+        {
+            if (!project.tasks.canFind!(t => t.id == tId))
+            {
+                throw new Exception(format("Task '%s' of build chain '%s' was deleted from project '%s' after the chain was created",
+                    tId, chainId, project.id));
+            }
+        }
+
+        // Create and persist initial BuildRecord
+        BuildRecord buildRecord;
+        buildRecord.buildId = buildId;
+        buildRecord.chainId = chainId;
+        buildRecord.chainTasks = chain;
+        buildRecord.projectId = project.id;
+        buildRecord.projectName = project.name.length > 0 ? project.name : "default";
+        buildRecord.status = "queued";
+        buildRecord.triggerSource = triggerSource;
+        buildRecord.targetTaskId = targetTaskId;
+        buildRecord.workspaceDir = workspaceDir;
+        buildRecord.startedAt = Clock.currTime.toISOString();
+        buildRecord.executedTasks = [];
+
+        if (m_stateRepo !is null)
+        {
+            foreach (tId; targetTaskIds)
+            {
+                m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.pending);
+            }
+            m_stateRepo.recordBuild(buildRecord);
+        }
+
+        ActiveBuild active;
+        active.buildId = buildId;
+        active.project = project;
+        active.chain = chain;
+        active.graph = graph;
+        active.fingerprints = fingerprints;
+        active.targetTaskIds = targetTaskIds;
+        active.force = force;
+        active.workspaceDir = workspaceDir;
+
+        m_activeBuilds[buildId] = active;
+
+        logInfo("[coordinator] Starting build '%s' on chain '%s' for project '%s' (target: %s, %d tasks in DAG)", buildId, chainId, project.name.length > 0 ? project.name : (project.id.length > 0 ? project.id : "default"), targetTaskId.length > 0 ? targetTaskId : "all", targetTaskIds.length);
+
+        // Evaluate initial root tasks & resolve cached nodes upfront
+        evaluateReadyTasksLocked(buildId);
+
+        return buildId;
+    }
+
+    /// Looks up a repository record for input resolution. Throws if it is not registered.
+    private RepositoryRecord lookupRepository(string repositoryId)
+    {
+        if (m_stateRepo is null)
+        {
+            throw new Exception("no state repository is configured to look repositories up in");
+        }
+        RepositoryRecord repository;
+        if (!m_stateRepo.getRepository(repositoryId, repository))
+        {
+            throw new Exception(format("repository '%s' is not registered", repositoryId));
+        }
+        return repository;
+    }
+
+    /// Chooses the resolver for a repository; see the constructor.
+    private RepositoryResolver selectResolver(in RepositoryRecord repository)
+    {
+        return m_repositoryResolver;
+    }
+
+    /// Returns task `taskId`'s fingerprint in `active`'s chain. Throws if it has none.
+    private static string chainFingerprint(ref ActiveBuild active, string taskId)
+    {
+        auto fingerprint = taskId in active.fingerprints;
+        if (fingerprint is null)
+        {
+            throw new Exception(format("Build '%s' has no fingerprint for task '%s'", active.buildId, taskId));
+        }
+        return *fingerprint;
+    }
+
+    /**
+     * Returns the task to dispatch: its build configuration as the build's project defines it,
+     * its inputs as the chain froze them. Throws if the task was deleted from the project after
+     * the chain was created.
+     */
+    private static TaskNode dispatchTask(ref ActiveBuild active, string taskId)
+    {
+        foreach (ref task; active.project.tasks)
+        {
+            if (task.id != taskId) continue;
+            TaskNode node = task;
+            node.inputs = active.graph.getTask(taskId).inputs;
+            return node;
+        }
+        throw new Exception(format("Task '%s' of build '%s' was deleted from project '%s' after its build chain was created",
+            taskId, active.buildId, active.project.id));
     }
 
     /**
@@ -430,11 +588,7 @@ class BuildCoordinator
                 }
                 if ((fingerprint.length == 0 || fingerprint == "unknown") && (buildId in m_activeBuilds))
                 {
-                    try
-                    {
-                        fingerprint = m_activeBuilds[buildId].graph.getFingerprint(taskId);
-                    }
-                    catch (Exception) {}
+                    fingerprint = m_activeBuilds[buildId].fingerprints.get(taskId, null);
                 }
 
                 // Retrieve all subscribed builds/tasks for this fingerprint
@@ -575,26 +729,34 @@ class BuildCoordinator
                     {
                         return;
                     }
-                    ProjectRecord proj;
-                    if (m_stateRepo.getProject(b.projectId, proj))
+                    // Structure and fingerprints come from the build's chain, never from the
+                    // project, which may have changed since; only configuration is read live.
+                    if (b.chainTasks.length == 0)
                     {
-                        ActiveBuild act;
-                        act.buildId = buildId;
-                        act.project = proj;
-                        act.graph = new TaskGraph(proj);
-                        act.graph.computeFingerprints(proj.id);
-                        if (b.targetTaskId.length > 0)
-                        {
-                            act.targetTaskIds = act.graph.resolveSubgraph(b.targetTaskId);
-                        }
-                        else
-                        {
-                            act.targetTaskIds = act.graph.topologicalSort();
-                        }
-                        act.workspaceDir = b.workspaceDir;
-                        m_activeBuilds[buildId] = act;
-                        pActive = buildId in m_activeBuilds;
+                        throw new Exception(format("Build '%s' has no build chain and cannot be resumed", buildId));
                     }
+                    ProjectRecord proj;
+                    if (!m_stateRepo.getProject(b.projectId, proj))
+                    {
+                        throw new Exception(format("Project '%s' of build '%s' does not exist", b.projectId, buildId));
+                    }
+                    ActiveBuild act;
+                    act.buildId = buildId;
+                    act.project = proj;
+                    act.chain = b.chainTasks;
+                    act.graph = chainGraph(b.chainTasks);
+                    act.fingerprints = chainFingerprints(b.projectId, b.chainTasks);
+                    if (b.targetTaskId.length > 0)
+                    {
+                        act.targetTaskIds = act.graph.resolveSubgraph(b.targetTaskId);
+                    }
+                    else
+                    {
+                        act.targetTaskIds = act.graph.topologicalSort();
+                    }
+                    act.workspaceDir = b.workspaceDir;
+                    m_activeBuilds[buildId] = act;
+                    pActive = buildId in m_activeBuilds;
                 }
             }
         }
@@ -713,21 +875,7 @@ class BuildCoordinator
                     }
 
                     // Collect upstream task fingerprints for content-addressed artifact lookup
-                    try
-                    {
-                        upstreamHashes[depId] = active.graph.getFingerprint(depId);
-                    }
-                    catch (Exception)
-                    {
-                        if (m_stateRepo !is null)
-                        {
-                            TaskExecutionRecord depRec;
-                            if (m_stateRepo.getTaskExecution(buildId, depId, depRec) && depRec.fingerprint.length > 0)
-                            {
-                                upstreamHashes[depId] = depRec.fingerprint;
-                            }
-                        }
-                    }
+                    upstreamHashes[depId] = chainFingerprint(active, depId);
                 }
 
                 if (!allDepsSatisfied)
@@ -735,18 +883,10 @@ class BuildCoordinator
                     continue;
                 }
 
-                TaskNode node = active.graph.getTask(tId);
+                TaskNode node = dispatchTask(active, tId);
 
-                // 3. Cache check using precomputed deterministic fingerprint
-                string fingerprint;
-                try
-                {
-                    fingerprint = active.graph.getFingerprint(tId);
-                }
-                catch (Exception)
-                {
-                    fingerprint = "unknown";
-                }
+                // 3. Cache check using the fingerprint computed from the build's chain
+                string fingerprint = chainFingerprint(active, tId);
 
                 if (!active.force && fingerprint.length > 0 && fingerprint != "unknown" && m_stateRepo !is null)
                 {
@@ -878,18 +1018,7 @@ class BuildCoordinator
                 foreach (decl; node.inputs.byValue)
                 {
                     if (decl.kind != InputKind.taskOutput || decl.spec.artifact.length == 0) continue;
-                    string upFp;
-                    try
-                    {
-                        upFp = active.graph.getFingerprint(decl.spec.task);
-                    }
-                    catch (Exception)
-                    {
-                        if (decl.spec.task in upstreamHashes)
-                        {
-                            upFp = upstreamHashes[decl.spec.task];
-                        }
-                    }
+                    string upFp = chainFingerprint(active, decl.spec.task);
 
                     InputArtifactRef inArt;
                     inArt.taskId = decl.spec.task;
@@ -1573,4 +1702,259 @@ unittest
         assert(stateRepo.getBuild(bAck, bAckRec));
         assert(bAckRec.status == "succeeded");
     }
+}
+
+version (unittest)
+{
+    import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
+
+    /// A repository resolver that answers with a settable "live" revision and counts its calls.
+    class FakeRepositoryResolver : RepositoryResolver
+    {
+        string liveSha = "aaa111";
+        bool fail;
+        size_t calls;
+
+        InputPin resolve(in RepositoryRecord repository, in InputDecl input)
+        {
+            import vibe.data.json : Json;
+
+            ++calls;
+            if (fail) throw new Exception("remote unreachable");
+            return InputPin(Json(liveSha), ["ref": input.spec.refSelector]);
+        }
+    }
+
+    /// Completes the one work order waiting on `queue` for `taskId` as succeeded, and returns it.
+    WorkOrder completeNext(BuildCoordinator coordinator, DispatchQueue queue, string taskId)
+    {
+        auto received = receiveWorkOrders(queue, 1);
+        assert(received.length == 1, "expected a work order for " ~ taskId);
+        auto wo = received[0].workOrder;
+        assert(wo.taskId == taskId, "expected " ~ taskId ~ ", got " ~ wo.taskId);
+        TaskExecutionResult res;
+        res.taskId = wo.taskId;
+        res.buildId = wo.buildId;
+        res.status = TaskStatus.succeeded;
+        res.fingerprint = wo.fingerprint;
+        coordinator.onTaskCompleted(wo.buildId, wo.taskId, res, received[0].receipt);
+        return wo;
+    }
+
+    /// A project with a shared source repository, a compile task and two variants of it.
+    ProjectRecord variantsProject()
+    {
+        TaskNode compile;
+        compile.id = "compile";
+        compile.inputs["src"] = repositoryInput("game", "main");
+        compile.steps = [BuildStep("Compile", "bash", null, "echo compile")];
+
+        TaskNode internal;
+        internal.id = "internal";
+        internal.inputs["bin"] = taskOutputInput("compile");
+        internal.inputs["src"] = repositoryInput("game", "main");
+        internal.inputs["flavor"] = valueInput("internal");
+        internal.steps = [BuildStep("Internal", "bash", null, "echo internal")];
+
+        TaskNode external;
+        external.id = "external";
+        external.inputs["bin"] = taskOutputInput("compile");
+        external.inputs["flavor"] = valueInput("external");
+        external.steps = [BuildStep("External", "bash", null, "echo external")];
+
+        ProjectRecord project;
+        project.id = "proj_variants";
+        project.tasks = [compile, internal, external];
+        return project;
+    }
+
+    RepositoryRecord gameRepository()
+    {
+        RepositoryRecord game;
+        game.name = "game";
+        game.address = "https://example.test/game.git";
+        return game;
+    }
+}
+
+unittest
+{
+    // A chain resolves the whole DAG once, stores resolved inputs for every task, and later
+    // requests on the chain reuse them without resolving again or reading the edited project
+    import confector.core.input_resolution : chainFingerprints;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import vibe.data.json : Json;
+
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto queue = new InMemoryDispatchQueue();
+    auto resolver = new FakeRepositoryResolver();
+    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue, null, "", resolver);
+
+    auto project = variantsProject();
+    string internalBuild = coordinator.startBuild(project, "internal");
+    assert(resolver.calls == 1, "game@main is declared three times but must be resolved once");
+
+    BuildRecord chainRecord;
+    assert(stateRepo.getBuild(internalBuild, chainRecord));
+    assert(chainRecord.chainId == internalBuild);
+    assert(chainRecord.chainTasks.length == 3, "Every task is in the chain, including the untargeted external build");
+    foreach (ref task; chainRecord.chainTasks)
+    {
+        foreach (ref input; task.resolvedInputs)
+        {
+            if (input.kind == InputKind.repository) assert(input.pinned == Json("aaa111"));
+        }
+    }
+    assert(chainRecord.chainTasks[1].id == "external" && chainRecord.chainTasks[1].resolvedInputs.length == 1);
+    auto expected = chainFingerprints(project.id, chainRecord.chainTasks);
+
+    assert(completeNext(coordinator, queue, "compile").fingerprint == expected["compile"]);
+    assert(completeNext(coordinator, queue, "internal").fingerprint == expected["internal"]);
+    assert(countReceivable(queue) == 0);
+
+    // The branch moves on and the project inputs are edited; the chain must not notice
+    resolver.liveSha = "bbb222";
+    ProjectRecord edited = project;
+    edited.tasks = project.tasks.dup;
+    edited.tasks[0].inputs = ["src": repositoryInput("game", "release")];
+    edited.tasks[2].inputs = ["bin": taskOutputInput("compile"), "flavor": valueInput("changed")];
+    edited.tasks[2].steps = [BuildStep("External", "bash", null, "echo external v2")];
+    stateRepo.saveProject(edited);
+
+    // Building the not-yet-run external task in the chain: no resolution, chain fingerprints,
+    // compile reused from cache, frozen inputs with the current configuration
+    string externalBuild = coordinator.buildInChain(internalBuild, "external");
+    assert(resolver.calls == 1, "Building a task of an existing chain must not resolve again");
+
+    BuildRecord externalRecord;
+    assert(stateRepo.getBuild(externalBuild, externalRecord));
+    assert(externalRecord.chainId == internalBuild);
+    assert(chainFingerprints(project.id, externalRecord.chainTasks) == expected);
+
+    TaskStatus compileStatus;
+    assert(stateRepo.getTaskStatus(externalBuild, "compile", compileStatus) && compileStatus == TaskStatus.cached);
+    auto external = completeNext(coordinator, queue, "external");
+    assert(external.fingerprint == expected["external"]);
+    assert(external.taskNode.inputs["flavor"] == valueInput("external"), "Inputs come from the chain");
+    assert(external.taskNode.steps[0].script == "echo external v2", "Configuration comes from the project");
+    assert(external.payload.upstreamArtifactHashes["compile"] == expected["compile"]);
+
+    BuildRecord externalDone;
+    assert(stateRepo.getBuild(externalBuild, externalDone) && externalDone.status == "succeeded");
+
+    // A task that is not in the chain cannot be built in it
+    bool threw = false;
+    try coordinator.buildInChain(internalBuild, "added_later");
+    catch (Exception ex) threw = ex.msg.canFind("not part of build chain");
+    assert(threw);
+
+    // A new chain from the edited project resolves again and pins the new revision
+    // (the edited project declares game at two refs, release and main: two resolutions)
+    string newBuild = coordinator.startBuild(edited, "compile", true);
+    assert(resolver.calls == 3);
+    BuildRecord newRecord;
+    assert(stateRepo.getBuild(newBuild, newRecord) && newRecord.chainId == newBuild);
+    assert(chainFingerprints(edited.id, newRecord.chainTasks)["compile"] != expected["compile"]);
+}
+
+unittest
+{
+    // A restarted coordinator resumes a build from its chain: no resolution and no fingerprints
+    // or structure from the project as edited meanwhile (bug confector-3qh)
+    import confector.core.input_resolution : chainFingerprints;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto storage = new InMemoryArtifactStorage();
+    auto queue = new InMemoryDispatchQueue();
+    auto project = variantsProject();
+
+    auto before = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    string buildId = before.startBuild(project, "internal", true);
+    BuildRecord record;
+    assert(stateRepo.getBuild(buildId, record));
+    auto expected = chainFingerprints(project.id, record.chainTasks);
+
+    auto compileOrder = receiveWorkOrders(queue, 1)[0];
+
+    ProjectRecord edited = project;
+    edited.tasks = project.tasks.dup;
+    edited.tasks[1].inputs = ["bin": taskOutputInput("compile"), "src": repositoryInput("game", "release"),
+        "flavor": valueInput("internal"), "extra": valueInput("x")];
+    stateRepo.saveProject(edited);
+
+    auto resolverAfter = new FakeRepositoryResolver();
+    resolverAfter.liveSha = "ccc333";
+    auto after = new BuildCoordinator(storage, stateRepo, queue, null, "", resolverAfter);
+    TaskExecutionResult done;
+    done.taskId = "compile";
+    done.buildId = buildId;
+    done.status = TaskStatus.succeeded;
+    done.fingerprint = compileOrder.workOrder.fingerprint;
+    after.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+
+    auto internal = completeNext(after, queue, "internal");
+    assert(resolverAfter.calls == 0, "Resuming a build must not resolve");
+    assert(internal.fingerprint == expected["internal"]);
+    assert("extra" !in internal.taskNode.inputs && internal.taskNode.inputs["src"] == repositoryInput("game", "main"));
+
+    // A task deleted from the project fails loudly when its chain asks to build it
+    ProjectRecord shrunk = project;
+    shrunk.tasks = project.tasks[0 .. 2].dup;
+    stateRepo.saveProject(shrunk);
+    const buildsBefore = stateRepo.listBuilds().length;
+    bool threw = false;
+    try after.buildInChain(buildId, "external");
+    catch (Exception ex) threw = ex.msg.canFind("deleted from project");
+    assert(threw);
+    assert(stateRepo.listBuilds().length == buildsBefore, "A rejected request must not record a build");
+    assert(countReceivable(queue) == 0, "A rejected request must not dispatch work");
+}
+
+unittest
+{
+    // A failed resolution fails chain creation loudly: nothing is recorded or dispatched
+    import confector.core.input_resolution : InputResolutionException;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto queue = new InMemoryDispatchQueue();
+    auto resolver = new FakeRepositoryResolver();
+    resolver.fail = true;
+    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue, null, "", resolver);
+
+    string failure(BuildCoordinator c, ProjectRecord p)
+    {
+        try c.startBuild(p);
+        catch (InputResolutionException ex) return ex.msg;
+        assert(false, "expected InputResolutionException");
+    }
+
+    auto msg = failure(coordinator, variantsProject());
+    assert(msg.canFind("'game'") && msg.canFind("'main'") && msg.canFind("remote unreachable"));
+    assert(resolver.calls == 1);
+
+    // An unregistered repository, or no resolver at all
+    resolver.fail = false;
+    auto unknown = variantsProject();
+    unknown.tasks[0].inputs = ["src": repositoryInput("tools", "main")];
+    assert(failure(coordinator, unknown).canFind("'tools'"));
+    auto noResolver = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue);
+    assert(failure(noResolver, variantsProject()).canFind("no repository resolver"));
+
+    // An empty ref selector: there is no default branch
+    auto noRef = variantsProject();
+    noRef.tasks[0].inputs = ["src": repositoryInput("game", "")];
+    const callsBefore = resolver.calls;
+    assert(failure(coordinator, noRef).canFind("no ref selector"));
+    assert(resolver.calls == callsBefore);
+
+    assert(stateRepo.listBuilds().length == 0, "A failed chain creation must not record a build");
+    assert(countReceivable(queue) == 0, "A failed chain creation must not dispatch work");
 }

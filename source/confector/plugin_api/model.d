@@ -531,11 +531,37 @@ struct GraphExecutionResult
 }
 
 /**
+ * One task as frozen in a build chain when the chain was created (design records: beads
+ * confector-z7z.1, confector-z7z.14 and confector-z7z.15): its declared inputs, which fix the
+ * graph's edges, and its resolved external inputs. Build configuration (steps, environment,
+ * outputs) is not frozen; it is read from the project when the task is dispatched.
+ * Fingerprints are not stored either; they are computed from the chain's tasks.
+ */
+struct ChainTask
+{
+    @asName("id") string id;
+    /// Declared inputs, keyed by input name, as they were when the chain was created.
+    @optional @asName("inputs") InputDecl[string] inputs;
+    /// Resolved repository and value inputs, sorted by name. Task output inputs are not
+    /// stored: they pin to upstream fingerprints, which are computed from the chain.
+    @optional @asName("resolved_inputs") ResolvedInput[] resolvedInputs;
+}
+
+/**
  * Persisted record of a build execution.
+ *
+ * Until the BuildRequest/BuildChain split (bead confector-z7z.23.1), a build record is both a
+ * request and the chain it runs on: `chainTasks` is the chain snapshot and `chainId` names the
+ * build that created it. A later request to build another task of the same chain is a new
+ * record carrying the same `chainId` and `chainTasks`, never a re-resolution.
  */
 struct BuildRecord
 {
     @optional @asName("build_id") string buildId;
+    /// The build that created this build's chain; equal to `buildId` for that build.
+    @optional @asName("chain_id") string chainId;
+    /// The chain snapshot: every task of the project DAG with its declared and resolved inputs.
+    @optional @asName("chain_tasks") ChainTask[] chainTasks;
     @optional @asName("project_id") string projectId;
     @optional @asName("project_name") string projectName = "default";
     @optional @asName("status") string status = "pending"; // pending, queued, running, succeeded, failed, cached, cancelled
