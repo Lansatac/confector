@@ -843,7 +843,7 @@ class BuildCoordinator
                         foreach (ancId; ancestors)
                         {
                             auto ancTask = active.graph.getTask(ancId);
-                            foreach (r; ancTask.inputs.repositories)
+                            foreach (r; repositoryIds(ancTask))
                             {
                                 if (!allowedRepos.canFind(r)) allowedRepos ~= r;
                                 if (r in repoMap && !allowedRepos.canFind(repoMap[r]))
@@ -851,36 +851,16 @@ class BuildCoordinator
                                     allowedRepos ~= repoMap[r];
                                 }
                             }
-                            if (ancTask.hasCustomComponent("git_source"))
-                            {
-                                import std.json : JSONType;
-                                auto comp = ancTask.getCustomComponent("git_source");
-                                if (comp.type == JSONType.object && "url" in comp)
-                                {
-                                    string u = comp["url"].str;
-                                    if (!allowedRepos.canFind(u)) allowedRepos ~= u;
-                                }
-                            }
                         }
                     }
                     catch (Exception) {}
                 }
-                foreach (r; node.inputs.repositories)
+                foreach (r; repositoryIds(node))
                 {
                     if (!allowedRepos.canFind(r)) allowedRepos ~= r;
                     if (r in repoMap && !allowedRepos.canFind(repoMap[r]))
                     {
                         allowedRepos ~= repoMap[r];
-                    }
-                }
-                if (node.hasCustomComponent("git_source"))
-                {
-                    import std.json : JSONType;
-                    auto comp = node.getCustomComponent("git_source");
-                    if (comp.type == JSONType.object && "url" in comp)
-                    {
-                        string u = comp["url"].str;
-                        if (!allowedRepos.canFind(u)) allowedRepos ~= u;
                     }
                 }
 
@@ -899,29 +879,28 @@ class BuildCoordinator
                     payload.callbackUrl = format("%s/api/v1/builds/%s/tasks/%s/complete", m_callbackBaseUrl, buildId, tId);
                 }
 
-                // Single authoritative upstream artifact list: (taskFingerprint, artifactId, destination)
-                foreach (artRef; node.inputs.upstreamArtifacts)
+                // Single authoritative upstream artifact list: (taskFingerprint, artifactId),
+                // from the task_output inputs that name an artifact. Artifacts unpack into the workspace root.
+                foreach (decl; node.inputs.byValue)
                 {
-                    string artId = artRef.effectiveArtifactId;
+                    if (decl.kind != InputKind.taskOutput || decl.spec.artifact.length == 0) continue;
                     string upFp;
                     try
                     {
-                        upFp = active.graph.getFingerprint(artRef.taskId);
+                        upFp = active.graph.getFingerprint(decl.spec.task);
                     }
                     catch (Exception)
                     {
-                        if (artRef.taskId in upstreamHashes)
+                        if (decl.spec.task in upstreamHashes)
                         {
-                            upFp = upstreamHashes[artRef.taskId];
+                            upFp = upstreamHashes[decl.spec.task];
                         }
                     }
 
                     InputArtifactRef inArt;
-                    inArt.taskId = artRef.taskId;
+                    inArt.taskId = decl.spec.task;
                     inArt.taskFingerprint = upFp;
-                    inArt.artifactId = artId;
-                    // Empty destination means unpack into workspace root
-                    inArt.destination = artRef.destination;
+                    inArt.artifactId = decl.spec.artifact;
                     payload.inputArtifacts ~= inArt;
                 }
 
@@ -1140,12 +1119,12 @@ unittest
 
     TaskNode taskB;
     taskB.id = "B";
-    taskB.dependsOn = ["A"];
+    taskB.inputs["A"] = taskOutputInput("A");
     taskB.steps = [BuildStep("B", "bash", null, "echo B")];
 
     TaskNode taskC;
     taskC.id = "C";
-    taskC.dependsOn = ["B"];
+    taskC.inputs["B"] = taskOutputInput("B");
     taskC.steps = [BuildStep("C", "bash", null, "echo C")];
 
     ProjectRecord projLinear;
@@ -1196,15 +1175,15 @@ unittest
 
     TaskNode branch1;
     branch1.id = "branch1";
-    branch1.dependsOn = ["root"];
+    branch1.inputs["root"] = taskOutputInput("root");
 
     TaskNode branch2;
     branch2.id = "branch2";
-    branch2.dependsOn = ["root"];
+    branch2.inputs["root"] = taskOutputInput("root");
 
     TaskNode mergeNode;
     mergeNode.id = "merge";
-    mergeNode.dependsOn = ["branch1", "branch2"];
+    mergeNode.inputs["branch1"] = taskOutputInput("branch1"); mergeNode.inputs["branch2"] = taskOutputInput("branch2");
 
     ProjectRecord projDiamond;
     projDiamond.id = "proj_diamond";
@@ -1293,7 +1272,7 @@ unittest
 
         TaskNode taskProc;
         taskProc.id = "process";
-        taskProc.dependsOn = ["fetch"];
+        taskProc.inputs["fetch"] = taskOutputInput("fetch");
         taskProc.steps = [BuildStep("Process", "bash", null, "echo processing")];
 
         ProjectRecord projCoalesce;
@@ -1356,7 +1335,7 @@ unittest
 
         TaskNode taskBeta;
         taskBeta.id = "beta";
-        taskBeta.dependsOn = ["alpha"];
+        taskBeta.inputs["alpha"] = taskOutputInput("alpha");
         taskBeta.steps = [BuildStep("Beta", "bash", null, "echo beta build")];
 
         ProjectRecord projCache;
@@ -1553,7 +1532,7 @@ unittest
 
         TaskNode step2;
         step2.id = "step2";
-        step2.dependsOn = ["step1"];
+        step2.inputs["step1"] = taskOutputInput("step1");
         step2.steps = [BuildStep("Step2", "bash", null, "echo step 2")];
 
         ProjectRecord projAck;

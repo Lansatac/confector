@@ -2,7 +2,7 @@ extends layout
 
 block maincontent
   - import vibe.data.json : serializeToJson;
-  - import confector.core.model : TriggerType, BuildStep;
+  - import confector.core.model : TriggerType, BuildStep, InputKind, repositoryIds;
   - import controller.dashboard_controller : StepProviderViewModel;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
@@ -10,7 +10,7 @@ block maincontent
   - string availableTasksJson = serializeToJson(availableTasksList).toString();
   - struct ProjectTaskOpt { string id; string name; string[] repositories; }
   - ProjectTaskOpt[] projectTasksList;
-  - foreach(t; project.tasks) { projectTasksList ~= ProjectTaskOpt(t.id, t.name, t.inputs.repositories); }
+  - foreach(t; project.tasks) { projectTasksList ~= ProjectTaskOpt(t.id, t.name, repositoryIds(t)); }
   - string projectTasksJson = serializeToJson(projectTasksList).toString();
   - struct RepoOpt { string name; string address; }
   - RepoOpt[] availableReposList;
@@ -57,9 +57,11 @@ block maincontent
           div.form-group
             label Task Dependencies (Other tasks in this project):
             div#dependencies-container.dependency-list
-              - foreach(dep; task.dependsOn)
+              - string[] plainUpstreamTasks;
+              - foreach(decl; task.inputs.byValue) { if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length == 0) plainUpstreamTasks ~= decl.spec.task; }
+              - foreach(dep; plainUpstreamTasks)
                 div.dependency-row(style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;")
-                  select.form-control(name="depends_on", style="flex: 1;")
+                  select.form-control(name="upstream_tasks", style="flex: 1;")
                     option(value="", disabled) -- Select a task --
                     - bool foundDep = false;
                     - foreach(t; project.tasks)
@@ -78,13 +80,13 @@ block maincontent
           div.form-group
             label Repository Dependencies:
             div#repo-dependencies-container.dependency-list
-              - foreach(repoDep; task.inputs.repositories)
+              - foreach(repoDep; repositoryIds(task))
                 div.dependency-row(style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;")
                   select.form-control(name="repositories", style="flex: 1;")
                     option(value="", disabled) -- Select a repository --
                     - bool foundRepo = false;
                     - foreach(r; repositories)
-                      - if (r.name == repoDep || r.address == repoDep)
+                      - if (r.name == repoDep)
                         - foundRepo = true;
                         option(value="#{r.name}", selected) #{r.name}#{r.address.length > 0 ? " (" ~ r.address ~ ")" : ""}
                       - else
@@ -98,7 +100,7 @@ block maincontent
           div.form-group
             label(for="upstream_artifacts") Required Upstream Artifacts (Format: taskId:artifactPath per line):
             - string upVal = "";
-            - foreach(i, up; task.inputs.upstreamArtifacts) { if (i > 0) upVal ~= "\n"; upVal ~= up.taskId ~ ":" ~ up.name; }
+            - foreach(decl; task.inputs.byValue) { if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length > 0) { if (upVal.length > 0) upVal ~= "\n"; upVal ~= decl.spec.task ~ ":" ~ decl.spec.artifact; } }
             textarea.form-control#upstream_artifacts(name="upstream_artifacts", rows="3", placeholder="build-release:confector.exe\ncompile:build/game.zip", style="font-family: monospace;") #{upVal}
 
         div#tab-steps.tab-pane
@@ -212,8 +214,8 @@ block maincontent
         }
       }
 
-      // 2. Repositories from upstream dependencies (selected in depends_on)
-      var depSelects = document.querySelectorAll('#dependencies-container select[name="depends_on"]');
+      // 2. Repositories from upstream dependencies (selected in upstream_tasks)
+      var depSelects = document.querySelectorAll('#dependencies-container select[name="upstream_tasks"]');
       var depTaskIds = [];
       for (var i = 0; i < depSelects.length; i++) {
         var dVal = depSelects[i].value;
@@ -644,7 +646,7 @@ block maincontent
       row.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
 
       var select = document.createElement('select');
-      select.name = 'depends_on';
+      select.name = 'upstream_tasks';
       select.className = 'form-control';
       select.style.flex = '1';
       select.onchange = function() { updateAllRepoDropdowns(); };

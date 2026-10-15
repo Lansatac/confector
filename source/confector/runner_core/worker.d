@@ -428,19 +428,6 @@ class HttpWorkerDaemon
             }
         }
 
-        // Map input_artifacts to taskNode upstream artifacts
-        if (msg.payload.inputArtifacts.length > 0)
-        {
-            foreach (inArt; msg.payload.inputArtifacts)
-            {
-                UpstreamArtifactRef refArt;
-                refArt.taskId = inArt.taskId;
-                refArt.artifactId = inArt.artifactId;
-                refArt.destination = inArt.destination;
-                refArt.sha256 = inArt.sha256;
-                taskNode.inputs.upstreamArtifacts ~= refArt;
-            }
-        }
 
         // Map expectedOutputs to taskNode outputs
         if (msg.payload.expectedOutputs.length > 0)
@@ -476,7 +463,13 @@ class HttpWorkerDaemon
             }
         }
 
+        // The task node's task_output inputs name the upstream artifacts to stage; input_artifacts
+        // carries the fingerprint of each upstream task they come from.
         string[string] upstreamHashes = msg.payload.upstreamArtifactHashes.dup;
+        foreach (inArt; msg.payload.inputArtifacts)
+        {
+            if (inArt.taskFingerprint.length > 0) upstreamHashes[inArt.taskId] = inArt.taskFingerprint;
+        }
         string[] allowedRepos = msg.payload.allowedRepositories.dup;
         string[string] repoMap = msg.payload.repositoryMap.dup;
 

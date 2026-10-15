@@ -51,24 +51,25 @@
     ctx.fill();
   }
 
-  function extractRepos(t) {
-    var raw = (t.inputs && (t.inputs.repositories || t.inputs.repos)) || t.repositories;
-    if (!raw) return [];
-    if (Array.isArray(raw)) return raw;
-    if (typeof raw === "string") {
-      return raw.split(",").map(function(s) { return s.trim(); }).filter(Boolean);
-    }
-    return [];
+  // Collects the distinct values of `field` in the specs of the task's inputs of `kind`.
+  function inputSpecValues(t, kind, field) {
+    var result = [];
+    var inputs = t.inputs || {};
+    Object.keys(inputs).forEach(function(name) {
+      var decl = inputs[name];
+      var value = decl && decl.kind === kind && decl.spec ? decl.spec[field] : null;
+      if (value && result.indexOf(value) === -1) result.push(value);
+    });
+    return result;
   }
 
+  function extractRepos(t) {
+    return inputSpecValues(t, "repository", "repository");
+  }
+
+  // Graph edges come from task_output inputs.
   function extractDeps(t) {
-    var raw = t.depends_on || t.dependsOn;
-    if (!raw) return [];
-    if (Array.isArray(raw)) return raw;
-    if (typeof raw === "string") {
-      return raw.split(",").map(function(s) { return s.trim(); }).filter(Boolean);
-    }
-    return [];
+    return inputSpecValues(t, "task_output", "task");
   }
 
   function renderGraph(canvasId, nodes, edges, selectedId, pendingCommits) {

@@ -89,10 +89,10 @@ block maincontent
                           - if (t.name != t.id)
                             code.text-muted(style="font-size: 11px;") #{t.id}
                         td
-                          - if (t.dependsOn.length == 0)
+                          - if (t.upstreamTasks.length == 0)
                             span.text-muted(style="font-size: 12px;") (root task)
                           - else
-                            - foreach(dep; t.dependsOn)
+                            - foreach(dep; t.upstreamTasks)
                               span.badge.badge-secondary(style="margin-right: 4px; font-size: 11px;") #{dep}
                         td
                           - if (t.changeStatus == "up_to_date")

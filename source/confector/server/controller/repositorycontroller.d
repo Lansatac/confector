@@ -9,7 +9,7 @@ import std.string : strip;
 import std.typecons : Tuple, tuple;
 import std.uri : encodeComponent;
 
-import confector.core.model : ProjectRecord, RepositoryRecord, projectUsesRepository;
+import confector.core.model : ProjectRecord, RepositoryRecord, projectUsesRepository, repositoryIds;
 import confector.core.storage : BuildStateRepository;
 import confector.orchestrator.coordinator : BuildCoordinator;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
@@ -348,7 +348,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
 
             foreach (t; p.tasks)
             {
-                if (t.inputs.repositories.canFind(repo.name) || (repo.address.length > 0 && t.inputs.repositories.canFind(repo.address)))
+                if (repositoryIds(t).canFind(repo.name))
                 {
                     matchingTasks ~= (t.name.length > 0 ? t.name : t.id);
                 }

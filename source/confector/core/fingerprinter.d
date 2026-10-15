@@ -138,65 +138,33 @@ string computeBuildStepsDigest(in TaskNode task) @trusted
 }
 
 /**
- * Computes deterministic SHA256 digest of task inputs (repositories, configs, upstream artifacts, parameters).
+ * Computes deterministic SHA256 digest of the task's declared inputs, in input-name order.
  */
 string computeTaskInputsDigest(in TaskNode task) pure nothrow @safe
 {
+    string[] names;
+    foreach (name; task.inputs.byKey) names ~= name;
+    names.sort();
+
     auto app = appender!string();
-
-    if (task.inputs.repositories.length > 0)
+    foreach (name; names)
     {
-        string[] repos = task.inputs.repositories.dup;
-        repos.sort();
-        foreach (r; repos)
-        {
-            app.put("REPO:");
-            app.put(r);
-            app.put("\n");
-        }
-    }
-
-    if (task.inputs.repositoryConfigs.length > 0)
-    {
-        foreach (rc; task.inputs.repositoryConfigs)
-        {
-            app.put("REPOCFG:url=");
-            app.put(rc.url);
-            app.put("|branch=");
-            app.put(rc.branch);
-            app.put("|dir=");
-            app.put(rc.targetDir);
-            app.put("\n");
-        }
-    }
-
-    if (task.inputs.upstreamArtifacts.length > 0)
-    {
-        foreach (art; task.inputs.upstreamArtifacts)
-        {
-            app.put("UPSTREAM_ART:task=");
-            app.put(art.taskId);
-            app.put("|art=");
-            app.put(art.effectiveArtifactId);
-            app.put("|dest=");
-            app.put(art.destination);
-            app.put("\n");
-        }
-    }
-
-    if (task.inputs.parameters.length > 0)
-    {
-        string[] pkeys;
-        foreach (k; task.inputs.parameters.byKey) pkeys ~= k;
-        pkeys.sort();
-        foreach (k; pkeys)
-        {
-            app.put("PARAM:");
-            app.put(k);
-            app.put("=");
-            app.put(task.inputs.parameters[k]);
-            app.put("\n");
-        }
+        const decl = task.inputs[name];
+        app.put("INPUT:");
+        app.put(name);
+        app.put("|kind=");
+        app.put(cast(string) decl.kind);
+        app.put("|repository=");
+        app.put(decl.spec.repository);
+        app.put("|ref=");
+        app.put(decl.spec.refSelector);
+        app.put("|value=");
+        app.put(decl.spec.value);
+        app.put("|task=");
+        app.put(decl.spec.task);
+        app.put("|artifact=");
+        app.put(decl.spec.artifact);
+        app.put("\n");
     }
 
     return sha256Hex(app.data);
@@ -283,25 +251,20 @@ struct Fingerprinter
         string[string] relevantFingerprints;
         if (upstreamFingerprints !is null)
         {
-            if (task.dependsOn.length > 0 || task.inputs.upstreamArtifacts.length > 0)
+            auto upstreamIds = upstreamTaskIds(task);
+            if (upstreamIds.length > 0)
             {
-                foreach (depId; task.dependsOn)
+                foreach (depId; upstreamIds)
                 {
                     if (auto p = depId in upstreamFingerprints)
                     {
                         relevantFingerprints[depId] = *p;
                     }
                 }
-                foreach (refArt; task.inputs.upstreamArtifacts)
+                foreach (decl; task.inputs.byValue)
                 {
-                    if (refArt.taskId.length > 0)
-                    {
-                        if (auto p = refArt.taskId in upstreamFingerprints)
-                        {
-                            relevantFingerprints[refArt.taskId] = *p;
-                        }
-                    }
-                    string artKey = format("%s:%s", refArt.taskId, refArt.effectiveArtifactId);
+                    if (decl.kind != InputKind.taskOutput) continue;
+                    string artKey = format("%s:%s", decl.spec.task, decl.spec.artifact);
                     if (auto p = artKey in upstreamFingerprints)
                     {
                         relevantFingerprints[artKey] = *p;
@@ -416,16 +379,18 @@ unittest
     string fpStepsMod = computeNodeFingerprint(taskStepsMod, artifacts1);
     assert(fpStepsMod != fpSteps, "Fingerprint must change when build step script changes");
 
-    // 7. Invalidation when upstream artifact declaration changes (destination or artifact_id)
+    // 7. Invalidation when a task output input declaration changes
     TaskNode taskUpstreamArt = task;
-    taskUpstreamArt.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports", "dest/lint")];
+    taskUpstreamArt.inputs = null;
+    taskUpstreamArt.inputs["lint"] = taskOutputInput("lint", "reports");
     string fpUpstreamArt = computeNodeFingerprint(taskUpstreamArt, artifacts1);
-    assert(fpUpstreamArt != fp1, "Fingerprint must change when upstream artifact declaration changes");
+    assert(fpUpstreamArt != fp1, "Fingerprint must change when a task output input is added");
 
     TaskNode taskUpstreamArtMod = taskUpstreamArt;
-    taskUpstreamArtMod.inputs.upstreamArtifacts = [UpstreamArtifactRef("lint", "reports", "dest/lint_other")];
+    taskUpstreamArtMod.inputs = null;
+    taskUpstreamArtMod.inputs["lint"] = taskOutputInput("lint", "summary");
     string fpUpstreamArtMod = computeNodeFingerprint(taskUpstreamArtMod, artifacts1);
-    assert(fpUpstreamArtMod != fpUpstreamArt, "Fingerprint must change when upstream artifact destination changes");
+    assert(fpUpstreamArtMod != fpUpstreamArt, "Fingerprint must change when a task output input's artifact changes");
 
     // 8. Invalidation when declared output artifacts change
     TaskNode taskOutputs = task;
@@ -438,11 +403,17 @@ unittest
     string fpOutputsMod = computeNodeFingerprint(taskOutputsMod, artifacts1);
     assert(fpOutputsMod != fpOutputs, "Fingerprint must change when declared output artifact pattern changes");
 
-    // 9. Invalidation when input parameters change
+    // 9. Invalidation when value inputs change
     TaskNode taskParams = task;
-    taskParams.inputs.parameters = ["target": "x86_64"];
+    taskParams.inputs = null;
+    taskParams.inputs["target"] = valueInput("x86_64");
     string fpParams = computeNodeFingerprint(taskParams, artifacts1);
-    assert(fpParams != fp1, "Fingerprint must change when input parameters change");
+    assert(fpParams != fp1, "Fingerprint must change when a value input is added");
+
+    TaskNode taskParamsMod = task;
+    taskParamsMod.inputs = null;
+    taskParamsMod.inputs["target"] = valueInput("arm64");
+    assert(computeNodeFingerprint(taskParamsMod, artifacts1) != fpParams, "Fingerprint must change when a value input changes");
 
     // 10. System contribution
     class CustomFingerprintSystem : FingerprintContributionSystem
@@ -468,7 +439,7 @@ unittest
         @property string systemName() const { return "vcs-revision"; }
         bool canContribute(in TaskNode t) const
         {
-            return (t.inputs.repositories.length > 0) || (t.inputs.repositoryConfigs.length > 0);
+            return repositoryIds(t).length > 0;
         }
         string contributeFingerprint(in TaskNode t, in FingerprintContributionContext ctx) const
         {
@@ -498,7 +469,7 @@ unittest
     // Task with repository input
     TaskNode repoTask;
     repoTask.id = "compile";
-    repoTask.inputs.repositories = ["https://github.com/example/repo.git"];
+    repoTask.inputs["src"] = repositoryInput("example-repo", "main");
     repoTask.steps = [BuildStep("Build", "bash", null, "make")];
 
     // First revision state

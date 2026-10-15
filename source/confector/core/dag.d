@@ -41,26 +41,20 @@ class TaskGraph
             m_dependents[task.id] = [];
         }
 
-        // Build dependency edges
+        // Build dependency edges. Edges come only from task_output inputs; walk the
+        // inputs in name order so errors and edge order are deterministic.
         foreach (task; tasks)
         {
-            string[] allDeps = task.dependsOn.dup;
-
-            // Also include upstream artifacts as dependencies
-            foreach (art; task.inputs.upstreamArtifacts)
+            foreach (inputName; task.inputs.keys.sort().release)
             {
-                if (art.taskId.length > 0 && !allDeps.canFind(art.taskId))
-                {
-                    allDeps ~= art.taskId;
-                }
-            }
+                auto decl = task.inputs[inputName];
+                if (decl.kind != InputKind.taskOutput) continue;
+                string depId = decl.spec.task;
 
-            foreach (depId; allDeps)
-            {
                 if (depId !in m_tasks)
                 {
                     throw new DAGValidationException(
-                        format("Task '%s' depends on non-existent task '%s'", task.id, depId),
+                        format("Task '%s' input '%s' names non-existent task '%s'", task.id, inputName, depId),
                         null,
                         [depId]
                     );
@@ -100,13 +94,6 @@ class TaskGraph
                 if (depId in m_fingerprints)
                 {
                     upstreamFps[depId] = m_fingerprints[depId];
-                }
-            }
-            foreach (art; node.inputs.upstreamArtifacts)
-            {
-                if (art.taskId in m_fingerprints)
-                {
-                    upstreamFps[art.taskId] = m_fingerprints[art.taskId];
                 }
             }
 
@@ -420,8 +407,8 @@ unittest
 {
     // 1. Test linear pipeline A -> B -> C
     TaskNode a; a.id = "A";
-    TaskNode b; b.id = "B"; b.dependsOn = ["A"];
-    TaskNode c; c.id = "C"; c.dependsOn = ["B"];
+    TaskNode b; b.id = "B"; b.inputs["a"] = taskOutputInput("A");
+    TaskNode c; c.id = "C"; c.inputs["b"] = taskOutputInput("B");
 
     auto graph = new TaskGraph([a, b, c]);
     auto sorted = graph.topologicalSort();
@@ -448,9 +435,9 @@ unittest
 {
     // 2. Test diamond pipeline A -> B -> D and A -> C -> D
     TaskNode a; a.id = "A";
-    TaskNode b; b.id = "B"; b.dependsOn = ["A"];
-    TaskNode c; c.id = "C"; c.dependsOn = ["A"];
-    TaskNode d; d.id = "D"; d.dependsOn = ["B", "C"];
+    TaskNode b; b.id = "B"; b.inputs["a"] = taskOutputInput("A");
+    TaskNode c; c.id = "C"; c.inputs["a"] = taskOutputInput("A");
+    TaskNode d; d.id = "D"; d.inputs["b"] = taskOutputInput("B"); d.inputs["c"] = taskOutputInput("C");
 
     auto graph = new TaskGraph([a, b, c, d]);
     auto sorted = graph.topologicalSort();
@@ -468,9 +455,9 @@ unittest
 unittest
 {
     // 3. Test cycle detection
-    TaskNode a; a.id = "A"; a.dependsOn = ["C"];
-    TaskNode b; b.id = "B"; b.dependsOn = ["A"];
-    TaskNode c; c.id = "C"; c.dependsOn = ["B"];
+    TaskNode a; a.id = "A"; a.inputs["c"] = taskOutputInput("C");
+    TaskNode b; b.id = "B"; b.inputs["a"] = taskOutputInput("A");
+    TaskNode c; c.id = "C"; c.inputs["b"] = taskOutputInput("B");
 
     bool caught = false;
     try
@@ -488,7 +475,7 @@ unittest
 unittest
 {
     // 4. Test self-cycle detection
-    TaskNode a; a.id = "A"; a.dependsOn = ["A"];
+    TaskNode a; a.id = "A"; a.inputs["a"] = taskOutputInput("A");
     bool caught = false;
     try
     {
@@ -522,7 +509,7 @@ unittest
 unittest
 {
     // 6. Test missing dependency detection
-    TaskNode a; a.id = "A"; a.dependsOn = ["non_existent"];
+    TaskNode a; a.id = "A"; a.inputs["missing"] = taskOutputInput("non_existent");
     bool caught = false;
     try
     {
@@ -532,6 +519,7 @@ unittest
     {
         caught = true;
         assert(ex.missingDependencies == ["non_existent"]);
+        assert(ex.msg.canFind("'A'") && ex.msg.canFind("'missing'") && ex.msg.canFind("'non_existent'"));
     }
     assert(caught, "Expected missing dependency to throw DAGValidationException");
 }
@@ -541,7 +529,7 @@ unittest
     // 7. Test upstream artifact dependency linkage
     TaskNode a; a.id = "A";
     TaskNode b; b.id = "B";
-    b.inputs.upstreamArtifacts = [UpstreamArtifactRef("A", "out/app")];
+    b.inputs["app"] = taskOutputInput("A", "out/app");
 
     auto graph = new TaskGraph([a, b]);
     assert(graph.getDependencies("B") == ["A"]);
@@ -553,9 +541,9 @@ unittest
 {
     // 8. Test disconnected independent subgraphs: (A -> B) and (C -> D)
     TaskNode a; a.id = "A";
-    TaskNode b; b.id = "B"; b.dependsOn = ["A"];
+    TaskNode b; b.id = "B"; b.inputs["a"] = taskOutputInput("A");
     TaskNode c; c.id = "C";
-    TaskNode d; d.id = "D"; d.dependsOn = ["C"];
+    TaskNode d; d.id = "D"; d.inputs["c"] = taskOutputInput("C");
 
     auto graph = new TaskGraph([a, b, c, d]);
     auto sorted = graph.topologicalSort();
@@ -575,8 +563,8 @@ unittest
     a.steps = [BuildStep("Build", "bash", null, "dub build")];
     a.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
 
-    TaskNode b; b.id = "test"; b.dependsOn = ["compile"];
-    b.inputs.upstreamArtifacts = [UpstreamArtifactRef("compile", "binaries", "dist")];
+    TaskNode b; b.id = "test";
+    b.inputs["binaries"] = taskOutputInput("compile", "binaries");
     b.steps = [BuildStep("Test", "bash", null, "dub test")];
 
     TaskNode c; c.id = "docs";
@@ -602,4 +590,39 @@ unittest
     assert(graphMod.getFingerprint("test") != graph1.getFingerprint("test"));
     // Unrelated task C (docs) fingerprint must remain unchanged
     assert(graphMod.getFingerprint("docs") == graph1.getFingerprint("docs"));
+}
+
+unittest
+{
+    // 11. Edges come only from task_output inputs; other input kinds add none
+    TaskNode a; a.id = "A";
+    TaskNode b; b.id = "B";
+    b.inputs["src"] = repositoryInput("A", "main"); // repository id coincides with a task id
+    b.inputs["v"] = valueInput("A");
+    auto graph = new TaskGraph([a, b]);
+    assert(graph.getDependencies("B").length == 0);
+    assert(graph.getDependents("A").length == 0);
+
+    // Two inputs naming the same upstream yield one edge
+    TaskNode c; c.id = "C";
+    c.inputs["x"] = taskOutputInput("A", "one");
+    c.inputs["y"] = taskOutputInput("A", "two");
+    auto g2 = new TaskGraph([a, c]);
+    assert(g2.getDependencies("C") == ["A"]);
+}
+
+unittest
+{
+    // 12. Missing-task error names the node and the input
+    TaskNode a; a.id = "A";
+    TaskNode b; b.id = "B"; b.inputs["lib"] = taskOutputInput("ghost");
+    try
+    {
+        new TaskGraph([a, b]);
+        assert(false, "expected DAGValidationException");
+    }
+    catch (DAGValidationException ex)
+    {
+        assert(ex.msg.canFind("'B'") && ex.msg.canFind("'lib'") && ex.msg.canFind("'ghost'"));
+    }
 }

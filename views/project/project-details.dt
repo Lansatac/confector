@@ -79,22 +79,27 @@ block maincontent
               td
                 a(href="/tasks/details?project_id=#{project.id}&task_id=#{t.id}", style="font-weight: 600; text-decoration: none; color: inherit;") #{t.name.length > 0 ? t.name : t.id}
               td
-                - if (t.dependsOn.length > 0)
+                - import confector.core.model : upstreamTaskIds, repositoryIds, InputKind;
+                - auto upstreamTasks = upstreamTaskIds(t);
+                - if (upstreamTasks.length > 0)
                   div(style="display: flex; flex-wrap: wrap; gap: 4px;")
-                    - foreach(dep; t.dependsOn)
+                    - foreach(dep; upstreamTasks)
                       span.badge.badge-secondary #{dep}
                 - else
                   span(style="color: #6c757d; font-size: 0.85em;") Root node (None)
               td
                 div(style="font-size: 0.85em;")
-                  - if (t.inputs.repositories.length > 0)
+                  - size_t repoCount = repositoryIds(t).length;
+                  - size_t upstreamArtifactCount = 0;
+                  - foreach(decl; t.inputs.byValue) { if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length > 0) upstreamArtifactCount++; }
+                  - if (repoCount > 0)
                     div
                       strong Repos: 
-                      span #{t.inputs.repositories.length} repo(s)
-                  - if (t.inputs.upstreamArtifacts.length > 0)
+                      span #{repoCount} repo(s)
+                  - if (upstreamArtifactCount > 0)
                     div
                       strong Upstream: 
-                      span #{t.inputs.upstreamArtifacts.length} artifact(s)
+                      span #{upstreamArtifactCount} artifact(s)
                   - if (t.outputs.artifacts.length > 0)
                     div
                       strong Outputs: 

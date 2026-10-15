@@ -41,29 +41,48 @@ block maincontent
           tr
             th(style="width: 140px;") Upstream Tasks
             td
-              - if (taskNode.dependsOn.length > 0)
+              - import confector.core.model : upstreamTaskIds, repositoryIds, InputKind;
+              - auto upstreamTasks = upstreamTaskIds(taskNode);
+              - if (upstreamTasks.length > 0)
                 div(style="display: flex; flex-wrap: wrap; gap: 6px;")
-                  - foreach(dep; taskNode.dependsOn)
+                  - foreach(dep; upstreamTasks)
                     a.badge.badge-secondary(href="/tasks/details?project_id=#{project.id}&task_id=#{dep}", style="text-decoration: none;") #{dep}
               - else
                 span.text-muted Root task (No dependencies)
           tr
             th Repositories
             td
-              - if (taskNode.inputs.repositories.length > 0)
+              - if (repositoryIds(taskNode).length > 0)
                 div(style="display: flex; flex-wrap: wrap; gap: 6px;")
-                  - foreach(repo; taskNode.inputs.repositories)
-                    span.badge.badge-info #{repo}
+                  - foreach(inputName, decl; taskNode.inputs)
+                    - if (decl.kind == InputKind.repository)
+                      span.badge.badge-info #{inputName}: #{decl.spec.repository} @ #{decl.spec.refSelector}
               - else
                 span.text-muted None
           tr
             th Upstream Artifacts
             td
-              - if (taskNode.inputs.upstreamArtifacts.length > 0)
+              - bool hasUpstreamArtifacts = false;
+              - foreach(decl; taskNode.inputs.byValue) { if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length > 0) hasUpstreamArtifacts = true; }
+              - if (hasUpstreamArtifacts)
                 div(style="display: flex; flex-direction: column; gap: 4px;")
-                  - foreach(up; taskNode.inputs.upstreamArtifacts)
-                    div
-                      code #{up.taskId}:#{up.name}
+                  - foreach(inputName, decl; taskNode.inputs)
+                    - if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length > 0)
+                      div
+                        code #{decl.spec.task}:#{decl.spec.artifact}
+              - else
+                span.text-muted None
+          tr
+            th Values
+            td
+              - bool hasValues = false;
+              - foreach(decl; taskNode.inputs.byValue) { if (decl.kind == InputKind.value) hasValues = true; }
+              - if (hasValues)
+                div(style="display: flex; flex-direction: column; gap: 4px;")
+                  - foreach(inputName, decl; taskNode.inputs)
+                    - if (decl.kind == InputKind.value)
+                      div
+                        code #{inputName}=#{decl.spec.value}
               - else
                 span.text-muted None
 

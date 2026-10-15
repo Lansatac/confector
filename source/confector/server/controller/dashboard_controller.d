@@ -29,7 +29,7 @@ struct DashboardTaskViewModel
 {
     string id;
     string name;
-    string[] dependsOn;
+    string[] upstreamTasks;
     string lastStatus;          // "succeeded", "cached", "failed", "running", "never_run"
     string changeStatus;        // "up_to_date", "pending_changes", "never_run" (stubbed)
     string lastFingerprint;
@@ -76,6 +76,173 @@ string computeStubTaskChangeStatus(const TaskNode task, const TaskExecutionRecor
     return "pending_changes";
 }
 
+/**
+ * Thrown when the task editor's input fields cannot be mapped onto declared inputs,
+ * for example when two different inputs would get the same name.
+ */
+class TaskInputFormException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * Maps the task editor's input fields onto the task's declared inputs.
+ *
+ * The editor lists repositories (by id), upstream artifacts ("taskId:artifactId" lines)
+ * and upstream tasks without artifacts. Each listed item keeps every existing input that
+ * declares the same thing (same repository; same task and artifact) under its existing
+ * name, so ref selectors and input names survive a save. Items without an existing input
+ * get a generated name with a per-kind prefix (`repo:<id>`, `task:<id>`,
+ * `artifact:<task>:<artifact>`), so generated names never collide across kinds. Value
+ * inputs are not editable in the form and are kept as they are.
+ *
+ * Throws: TaskInputFormException if two different inputs would share a name.
+ */
+InputDecl[string] mapTaskEditorInputs(
+    string taskId,
+    in InputDecl[string] existing,
+    in string[] repositoryValues,
+    string upstreamArtifactsText,
+    in string[] upstreamTaskValues
+) @safe
+{
+    import std.algorithm.searching : findSplit;
+    import std.algorithm.sorting : sort;
+
+    string[] existingNames;
+    foreach (name; existing.byKey) existingNames ~= name;
+    existingNames.sort();
+
+    static string describe(in InputDecl decl) pure @safe
+    {
+        final switch (decl.kind)
+        {
+            case InputKind.repository: return format("repository '%s'", decl.spec.repository);
+            case InputKind.value: return format("value '%s'", decl.spec.value);
+            case InputKind.taskOutput:
+                return decl.spec.artifact.length > 0
+                    ? format("artifact '%s' of task '%s'", decl.spec.artifact, decl.spec.task)
+                    : format("task '%s'", decl.spec.task);
+        }
+    }
+
+    static bool sameTarget(in InputDecl a, in InputDecl b) pure nothrow @safe
+    {
+        if (a.kind != b.kind) return false;
+        final switch (a.kind)
+        {
+            case InputKind.repository: return a.spec.repository == b.spec.repository;
+            case InputKind.value: return a.spec.value == b.spec.value;
+            case InputKind.taskOutput: return a.spec.task == b.spec.task && a.spec.artifact == b.spec.artifact;
+        }
+    }
+
+    InputDecl[string] result;
+
+    void declare(string name, InputDecl decl)
+    {
+        if (auto p = name in result)
+        {
+            if (*p == decl) return;
+            throw new TaskInputFormException(format(
+                "task '%s' would declare input '%s' twice, as %s and as %s; rename one of them",
+                taskId, name, describe(*p), describe(decl)));
+        }
+        result[name] = decl;
+    }
+
+    void declareFromForm(string generatedName, InputDecl decl)
+    {
+        bool kept = false;
+        foreach (name; existingNames)
+        {
+            if (sameTarget(existing[name], decl))
+            {
+                declare(name, existing[name]);
+                kept = true;
+            }
+        }
+        if (!kept) declare(generatedName, decl);
+    }
+
+    foreach (name; existingNames)
+    {
+        if (existing[name].kind == InputKind.value) declare(name, existing[name]);
+    }
+
+    foreach (rVal; repositoryValues)
+    {
+        foreach (r; rVal.split(","))
+        {
+            string repoId = r.strip();
+            if (repoId.length == 0) continue;
+            declareFromForm("repo:" ~ repoId, repositoryInput(repoId, ""));
+        }
+    }
+
+    foreach (line; upstreamArtifactsText.split("\n"))
+    {
+        string s = line.strip();
+        if (s.length == 0) continue;
+        auto parts = s.findSplit(":");
+        string upTask = parts[0].strip();
+        string upArtifact = parts[1].length > 0 ? parts[2].strip() : upTask;
+        declareFromForm("artifact:" ~ upTask ~ ":" ~ upArtifact, taskOutputInput(upTask, upArtifact));
+    }
+
+    foreach (dVal; upstreamTaskValues)
+    {
+        foreach (d; dVal.split(","))
+        {
+            string upTask = d.strip();
+            if (upTask.length == 0 || upTask == taskId) continue;
+            declareFromForm("task:" ~ upTask, taskOutputInput(upTask));
+        }
+    }
+
+    return result;
+}
+
+unittest
+{
+    import std.exception : assertThrown;
+
+    // Round trip: names, ref selectors and value inputs survive a save of the rendered form.
+    InputDecl[string] existing = [
+        "src": repositoryInput("game", "main"),
+        "lib": repositoryInput("game", "release"),
+        "flavor": valueInput("external"),
+        "eng": taskOutputInput("build-engine", "engine.zip"),
+        "setup": taskOutputInput("setup"),
+        "engine-order": taskOutputInput("build-engine"),
+    ];
+    auto roundTrip = mapTaskEditorInputs("package", existing,
+        ["game"], "build-engine:engine.zip", ["setup", "build-engine"]);
+    assert(roundTrip == existing);
+
+    // Items removed from the form are dropped; value inputs stay.
+    auto removed = mapTaskEditorInputs("package", existing, [], "", []);
+    assert(removed == ["flavor": valueInput("external")]);
+
+    // New items get per-kind names: repository `engine` and upstream task `engine` do not collide.
+    auto fresh = mapTaskEditorInputs("package", null,
+        ["engine, tools"], "engine:engine.zip\nlib:out:dir/a.zip", ["engine", "package"]);
+    assert(fresh == [
+        "repo:engine": repositoryInput("engine", ""),
+        "repo:tools": repositoryInput("tools", ""),
+        "task:engine": taskOutputInput("engine"),
+        "artifact:engine:engine.zip": taskOutputInput("engine", "engine.zip"),
+        "artifact:lib:out:dir/a.zip": taskOutputInput("lib", "out:dir/a.zip"),
+    ]);
+
+    // A genuine collision (an existing value input holding a generated name) is a form error.
+    InputDecl[string] clashing = ["task:engine": valueInput("x")];
+    assertThrown!TaskInputFormException(mapTaskEditorInputs("package", clashing, [], "", ["engine"]));
+}
+
 URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
 {
     if (registry is null)
@@ -112,7 +279,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
                 DashboardTaskViewModel tvm;
                 tvm.id = task.id;
                 tvm.name = task.name.length > 0 ? task.name : task.id;
-                tvm.dependsOn = task.dependsOn;
+                tvm.upstreamTasks = upstreamTaskIds(task);
 
                 TaskExecutionRecord latestExec;
                 if (stateRepo !is null)
@@ -222,7 +389,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             bool[string] seenRepos;
             foreach (task; project.tasks)
             {
-                foreach (repo; task.inputs.repositories)
+                foreach (repo; repositoryIds(task))
                 {
                     string trimmed = repo.strip;
                     if (trimmed.length > 0 && !(trimmed in seenRepos))
@@ -505,54 +672,19 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             }
             task.steps = steps;
 
-            // Dependencies
-            string[] deps;
-            foreach (dVal; req.form.getAll("depends_on"))
+            // Inputs
+            TaskNode existingTask;
+            foreach (t; project.tasks)
             {
-                foreach (d; dVal.split(","))
-                {
-                    string s = d.strip();
-                    if (s.length > 0 && s != task.id && !deps.canFind(s))
-                    {
-                        deps ~= s;
-                    }
-                }
+                if (t.id == task.id) existingTask = t;
             }
-            task.dependsOn = deps;
-
-            // Repository dependencies
-            string[] repos;
-            foreach (rVal; req.form.getAll("repositories"))
-            {
-                foreach (r; rVal.split(","))
-                {
-                    string s = r.strip();
-                    if (s.length > 0 && !repos.canFind(s))
-                    {
-                        repos ~= s;
-                    }
-                }
-            }
-            task.inputs.repositories = repos;
-
-            // Upstream artifacts
-            string upStr = req.form.get("upstream_artifacts", "");
-            UpstreamArtifactRef[] upstreamRefs;
-            foreach (line; upStr.split("\n"))
-            {
-                string s = line.strip();
-                if (s.length == 0) continue;
-                auto parts = s.split(":");
-                if (parts.length >= 2)
-                {
-                    upstreamRefs ~= UpstreamArtifactRef(parts[0].strip(), parts[1].strip());
-                }
-                else
-                {
-                    upstreamRefs ~= UpstreamArtifactRef(parts[0].strip(), parts[0].strip());
-                }
-            }
-            task.inputs.upstreamArtifacts = upstreamRefs;
+            task.inputs = mapTaskEditorInputs(
+                task.id,
+                existingTask.inputs,
+                req.form.getAll("repositories"),
+                req.form.get("upstream_artifacts", ""),
+                req.form.getAll("upstream_tasks")
+            );
 
             // Output artifacts
             string outStr = req.form.get("output_artifacts", "");
@@ -653,6 +785,11 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             {
                 stateRepo.saveProject(project);
             }
+        }
+        catch (TaskInputFormException e)
+        {
+            res.writeBody("Invalid task inputs: " ~ e.msg, HTTPStatus.badRequest, "text/plain; charset=UTF-8");
+            return;
         }
         catch (Exception e)
         {
@@ -1004,11 +1141,11 @@ unittest
     TaskNode tNode1;
     tNode1.id = "test_node_1";
     tNode1.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 1")];
-    tNode1.inputs.repositories = ["repo_main"];
+    tNode1.inputs["repo_main"] = repositoryInput("repo_main", "main");
     tNode1.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
     TaskNode tNode2;
     tNode2.id = "test_node_2";
-    tNode2.dependsOn = ["test_node_1"];
+    tNode2.inputs["test_node_1"] = taskOutputInput("test_node_1");
     tNode2.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 2")];
     tNode2.triggers = [TriggerRule(TriggerType.webhook, null, null, "/api/v1/deploy")];
     p.tasks = [tNode1, tNode2];
@@ -1025,7 +1162,7 @@ unittest
     assert(stateRepo.getProject("proj_dash_1", fetchedProj));
     assert(fetchedProj.tasks.length == 2);
     assert(fetchedProj.tasks[0].id == "test_node_1");
-    assert(fetchedProj.tasks[0].inputs.repositories == ["repo_main"]);
+    assert(fetchedProj.tasks[0].inputs == ["repo_main": repositoryInput("repo_main", "main")]);
     assert(fetchedProj.tasks[0].triggers.length == 1);
     assert(fetchedProj.tasks[0].triggers[0].type == TriggerType.gitPush);
     assert(fetchedProj.tasks[0].triggers[0].branches == ["main", "feature/*"]);
@@ -1126,7 +1263,7 @@ unittest
             DashboardTaskViewModel tvm;
             tvm.id = task.id;
             tvm.name = task.name.length > 0 ? task.name : task.id;
-            tvm.dependsOn = task.dependsOn;
+            tvm.upstreamTasks = upstreamTaskIds(task);
 
             TaskExecutionRecord latestExec;
             auto execs = stateRepo.listTaskExecutionsForTask(proj.id, task.id, 1);
@@ -1190,7 +1327,7 @@ unittest
     assert(foundDetailTask);
     assert(detailTask.id == "test_node_2");
     assert(detailTask.steps.length == 1);
-    assert(detailTask.dependsOn == ["test_node_1"]);
+    assert(upstreamTaskIds(detailTask) == ["test_node_1"]);
 
     auto node2History = stateRepo.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
     assert(node2History.length == 1);

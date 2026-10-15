@@ -69,54 +69,94 @@ struct TriggerEvent
 }
 
 /**
- * Upstream artifact reference consumed as input by a dependent task.
+ * Kinds of declared task input. See AGENTS.md, "The input model".
  */
-struct UpstreamArtifactRef
+enum InputKind : string
 {
-    @asName("task_id") string taskId;
-    @optional @asName("artifact_id") string artifactId;
-    @optional @asName("destination") string destination;
-    @optional string name;
-    @optional string path;
-    @optional string sha256;
-
-    this(string taskId, string artifactId, string destination = "", string sha256 = null) pure nothrow @safe
-    {
-        this.taskId = taskId;
-        this.artifactId = artifactId;
-        this.destination = destination;
-        this.name = artifactId;
-        this.path = artifactId;
-        this.sha256 = sha256;
-    }
-
-    @property string effectiveArtifactId() const pure nothrow @safe
-    {
-        if (artifactId.length > 0) return artifactId;
-        if (name.length > 0) return name;
-        return path;
-    }
+    /// A source repository at a ref; resolved to the provider's pinned value (git: commit SHA).
+    repository = "repository",
+    /// A literal value; its pinned value is the value itself.
+    value = "value",
+    /// The outputs of an upstream task; its pinned value is that task's fingerprint.
+    /// Graph edges are derived from these inputs.
+    taskOutput = "task_output"
 }
 
 /**
- * Specific repository configuration for VCS inputs.
+ * Kind-specific part of an input declaration. Only the fields belonging to the
+ * input's kind are set:
+ *
+ * - `repository`: `repository` (repository id) and `ref` (ref selector string,
+ *   interpreted by the provider's resolver).
+ * - `value`: `value`.
+ * - `task_output`: `task` (upstream task id) and `artifact` (id of one of that task's
+ *   declared output artifacts, staged into the workspace before the task runs).
+ *   An empty `artifact` depends on the upstream task without staging any of its outputs.
  */
-struct RepositoryInput
+struct InputSpec
 {
-    @optional string url;
-    @optional string branch;
-    @optional @asName("target_dir") string targetDir;
+    @optional string repository;
+    @optional @asName("ref") string refSelector;
+    @optional string value;
+    @optional string task;
+    @optional string artifact;
 }
 
 /**
- * Inputs required for a task execution.
+ * A declared task input: a kind plus a kind-specific spec. Declared on
+ * `TaskNode.inputs`, a map keyed by the input's name; steps refer to inputs by
+ * that name.
  */
-struct TaskInputs
+struct InputDecl
 {
-    @optional string[] repositories;
-    @optional @asName("repository_configs") RepositoryInput[] repositoryConfigs;
-    @optional @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
-    @optional string[string] parameters;
+    InputKind kind;
+    @optional InputSpec spec;
+}
+
+/// Declares a repository input: repository `repositoryId` at the ref selected by `refSelector`.
+InputDecl repositoryInput(string repositoryId, string refSelector) pure nothrow @safe
+{
+    InputDecl decl;
+    decl.kind = InputKind.repository;
+    decl.spec.repository = repositoryId;
+    decl.spec.refSelector = refSelector;
+    return decl;
+}
+
+/// Declares a value input.
+InputDecl valueInput(string value) pure nothrow @safe
+{
+    InputDecl decl;
+    decl.kind = InputKind.value;
+    decl.spec.value = value;
+    return decl;
+}
+
+/// Declares a task output input: artifact `artifact` of upstream task `task`
+/// (or no artifact, when `artifact` is empty).
+InputDecl taskOutputInput(string task, string artifact = null) pure nothrow @safe
+{
+    InputDecl decl;
+    decl.kind = InputKind.taskOutput;
+    decl.spec.task = task;
+    decl.spec.artifact = artifact;
+    return decl;
+}
+
+/**
+ * A declared input resolved to a pinned value, as frozen in a build chain.
+ */
+struct ResolvedInput
+{
+    /// The input's name, as declared on the task.
+    string name;
+    InputKind kind;
+    /// Canonical pinned value; hashed into the fingerprint. Opaque to the core:
+    /// each provider defines its own (git: the commit SHA). For a value input it is
+    /// the value; for a task output input, the upstream task's fingerprint.
+    Json pinned;
+    /// Display-only details (branch, URL, commit subject, ...). Never hashed.
+    @optional string[string] info;
 }
 
 /**
@@ -159,26 +199,6 @@ struct OutputArtifactDecl
 }
 
 /**
- * Repository input component data.
- */
-struct RepositoryInputComponent
-{
-    @optional string[] repositories;
-    @optional string address;
-    @optional @asName("target_directory") string targetDirectory;
-    @optional string branch;
-    @optional string tag;
-}
-
-/**
- * Upstream artifact input component data.
- */
-struct UpstreamArtifactInputComponent
-{
-    @optional @asName("upstream_artifacts") UpstreamArtifactRef[] upstreamArtifacts;
-}
-
-/**
  * Represents an individual plugin-defined build step within a TaskNode.
  */
 struct BuildStep
@@ -216,15 +236,6 @@ struct BuildStep
 }
 
 /**
- * Parameter input component data.
- */
-struct ParameterInputComponent
-{
-    @optional string[string] parameters;
-}
-
-
-/**
  * Artifact output component data.
  */
 struct ArtifactOutputComponent
@@ -256,8 +267,8 @@ struct TaskNode
 {
     string id;
     @optional string name;
-    @optional @asName("depends_on") string[] dependsOn;
-    @optional TaskInputs inputs;
+    /// Declared inputs keyed by input name. Upstream dependencies are task_output inputs.
+    @optional InputDecl[string] inputs;
     @optional TaskOutputs outputs;
     @optional @asName("steps") BuildStep[] steps;
     @optional TriggerRule[] triggers;
@@ -293,20 +304,48 @@ struct TaskNode
         components[componentName] = data.toString();
     }
 
-    RepositoryInputComponent getRepositoryInputComponent() const pure nothrow @safe
-    {
-        return RepositoryInputComponent(inputs.repositories.dup);
-    }
-
-    UpstreamArtifactInputComponent getUpstreamArtifactInputComponent() const pure nothrow @safe
-    {
-        return UpstreamArtifactInputComponent(inputs.upstreamArtifacts.dup);
-    }
-
     ArtifactOutputComponent getArtifactOutputComponent() const pure nothrow @safe
     {
         return ArtifactOutputComponent(outputs.artifacts.dup);
     }
+}
+
+/**
+ * Returns the ids of the upstream tasks named by the task's task_output inputs,
+ * sorted and without duplicates.
+ */
+string[] upstreamTaskIds(in TaskNode task) pure nothrow @safe
+{
+    import std.algorithm.sorting : sort;
+    import std.algorithm.iteration : uniq;
+    import std.array : array;
+
+    string[] ids;
+    foreach (decl; task.inputs.byValue)
+    {
+        if (decl.kind == InputKind.taskOutput) ids ~= decl.spec.task;
+    }
+    ids.sort();
+    return ids.uniq.array;
+}
+
+/**
+ * Returns the repository ids named by the task's repository inputs, sorted and
+ * without duplicates.
+ */
+string[] repositoryIds(in TaskNode task) pure nothrow @safe
+{
+    import std.algorithm.sorting : sort;
+    import std.algorithm.iteration : uniq;
+    import std.array : array;
+
+    string[] ids;
+    foreach (decl; task.inputs.byValue)
+    {
+        if (decl.kind == InputKind.repository) ids ~= decl.spec.repository;
+    }
+    ids.sort();
+    return ids.uniq.array;
 }
 
 /**
@@ -583,18 +622,17 @@ struct ProjectRecord
 }
 
 /**
- * Returns true if any task of the project declares the repository as an input,
- * by repository name or by address.
+ * Returns true if any task of the project declares a repository input naming the
+ * repository by its id (the repository record's name).
  */
 bool projectUsesRepository(const ref ProjectRecord project, const ref RepositoryRecord repo) pure nothrow @safe
 {
+    import std.algorithm.searching : canFind;
+
+    if (repo.name.length == 0) return false;
     foreach (ref t; project.tasks)
     {
-        foreach (r; t.inputs.repositories)
-        {
-            if ((repo.name.length > 0 && r == repo.name) || (repo.address.length > 0 && r == repo.address))
-                return true;
-        }
+        if (repositoryIds(t).canFind(repo.name)) return true;
     }
     return false;
 }
@@ -886,10 +924,33 @@ unittest
 {
     TaskNode node;
     node.id = "test-node";
-    node.inputs.repositories = ["repo1"];
-    assert(node.getRepositoryInputComponent().repositories == ["repo1"]);
+    node.inputs["src"] = repositoryInput("repo1", "main");
+    node.inputs["lib"] = repositoryInput("repo1", "release");
+    node.inputs["engine"] = taskOutputInput("build-engine", "engine.zip");
+    node.inputs["order"] = taskOutputInput("setup");
+    node.inputs["flavor"] = valueInput("external");
+    assert(repositoryIds(node) == ["repo1"]);
+    assert(upstreamTaskIds(node) == ["build-engine", "setup"]);
 
     node.setCustomComponent("test", JSONValue("val"));
     assert(node.hasCustomComponent("test"));
     assert(node.getCustomComponent("test").str == "val");
+}
+
+unittest
+{
+    // Inputs round-trip through JSON as a map keyed by name, with snake_case kinds.
+    TaskNode node;
+    node.id = "package";
+    node.inputs["src"] = repositoryInput("game", "main");
+    node.inputs["engine"] = taskOutputInput("build-engine", "engine.zip");
+    node.inputs["flavor"] = valueInput("external");
+
+    auto json = serializeToJson(node);
+    assert(json["inputs"]["src"]["kind"].get!string == "repository");
+    assert(json["inputs"]["src"]["spec"]["ref"].get!string == "main");
+    assert(json["inputs"]["engine"]["kind"].get!string == "task_output");
+
+    auto back = deserializeJson!TaskNode(json);
+    assert(back.inputs == node.inputs);
 }

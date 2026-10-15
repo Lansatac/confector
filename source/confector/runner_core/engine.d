@@ -10,9 +10,7 @@ import confector.runner_core.logging;
 import confector.runner_core.artifacts;
 
 import std.file : exists, isFile;
-import std.path : buildPath, isAbsolute;
 import std.format : format;
-import std.json : JSONType;
 import std.algorithm.searching : canFind;
 import std.datetime.stopwatch : StopWatch, AutoStart;
 import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
@@ -97,10 +95,14 @@ class TaskEngine
         inputCtx.effectiveWorkingDir = effectiveWorkingDir;
         inputCtx.artifactStorage = m_artifactStorage;
         inputCtx.logCallback = logCallback;
-        foreach (k, v; task.inputs.parameters)
+        // Value inputs are exposed to resolvers and steps as task parameters, keyed by input name
+        string[string] valueInputs;
+        foreach (name, decl; task.inputs)
         {
-            inputCtx.parameters[k] = v;
+            if (decl.kind == InputKind.value) valueInputs[name] = decl.spec.value;
         }
+        inputCtx.parameters = valueInputs.dup;
+        foreach (k, v; repositoryMap) inputCtx.repositoryMap[k] = v;
 
         foreach (resolver; PluginRegistry.instance.getInputResolvers())
         {
@@ -110,8 +112,14 @@ class TaskEngine
             }
         }
 
-        // 3. Retrieve upstream artifacts into workspace (only when engine owns artifact I/O)
-        if (manageArtifacts && task.inputs.upstreamArtifacts.length > 0)
+        // 3. Retrieve upstream artifacts named by task_output inputs into the workspace root
+        //    (only when engine owns artifact I/O)
+        const(InputDecl)[] artifactInputs;
+        foreach (decl; task.inputs.byValue)
+        {
+            if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length > 0) artifactInputs ~= decl;
+        }
+        if (manageArtifacts && artifactInputs.length > 0)
         {
             if (m_artifactStorage is null)
             {
@@ -122,17 +130,16 @@ class TaskEngine
                 return result;
             }
 
-            foreach (refArt; task.inputs.upstreamArtifacts)
+            foreach (decl; artifactInputs)
             {
-                string artId = refArt.effectiveArtifactId;
-                string targetLocal = refArt.destination.length > 0
-                    ? buildPath(effectiveWorkingDir, refArt.destination)
-                    : effectiveWorkingDir;
+                string upTaskId = decl.spec.task;
+                string artId = decl.spec.artifact;
+                string targetLocal = effectiveWorkingDir;
 
                 string upFp;
-                if (upstreamFingerprints !is null && refArt.taskId in upstreamFingerprints)
+                if (upstreamFingerprints !is null && upTaskId in upstreamFingerprints)
                 {
-                    upFp = upstreamFingerprints[refArt.taskId];
+                    upFp = upstreamFingerprints[upTaskId];
                 }
 
                 if (upFp.length == 0 || !m_artifactStorage.artifactExists(upFp, artId))
@@ -140,20 +147,20 @@ class TaskEngine
                     result.status = TaskStatus.failed;
                     result.errorMessage = format(
                         "Upstream artifact '%s' from task '%s' (fingerprint '%s') not found in artifact storage",
-                        artId, refArt.taskId, upFp
+                        artId, upTaskId, upFp
                     );
                     sw.stop();
                     result.durationMs = sw.peek.total!"msecs";
                     return result;
                 }
 
-                bool staged = ArtifactStager.stageUpstreamArtifact(m_artifactStorage, upFp, artId, targetLocal, refArt.sha256);
+                bool staged = ArtifactStager.stageUpstreamArtifact(m_artifactStorage, upFp, artId, targetLocal);
                 if (!staged)
                 {
                     result.status = TaskStatus.failed;
                     result.errorMessage = format(
                         "Failed to extract upstream artifact '%s' from task '%s' into '%s' (checksum mismatch or corrupt archive)",
-                        artId, refArt.taskId, targetLocal
+                        artId, upTaskId, targetLocal
                     );
                     sw.stop();
                     result.durationMs = sw.peek.total!"msecs";
@@ -162,7 +169,7 @@ class TaskEngine
 
                 if (logCallback !is null)
                 {
-                    logCallback(format("[confector] Staged upstream artifact '%s' (from task '%s') into '%s'", artId, refArt.taskId, targetLocal));
+                    logCallback(format("[confector] Staged upstream artifact '%s' (from task '%s') into '%s'", artId, upTaskId, targetLocal));
                 }
             }
         }
@@ -181,7 +188,7 @@ class TaskEngine
         stepCtx.workspaceDir = workspaceDir;
         stepCtx.workingDirectory = effectiveWorkingDir;
         stepCtx.environment = task.environment.dup;
-        stepCtx.taskParameters = task.inputs.parameters.dup;
+        stepCtx.taskParameters = valueInputs.dup;
         stepCtx.artifactStorage = m_artifactStorage;
         stepCtx.logCallback = combinedLogger;
 
@@ -207,21 +214,12 @@ class TaskEngine
                 }
             }
         }
-        foreach (r; task.inputs.repositories)
+        foreach (r; repositoryIds(task))
         {
             if (!effectiveAllowedRepos.canFind(r)) effectiveAllowedRepos ~= r;
             if (r in effectiveRepoMap && !effectiveAllowedRepos.canFind(effectiveRepoMap[r]))
             {
                 effectiveAllowedRepos ~= effectiveRepoMap[r];
-            }
-        }
-        if (task.hasCustomComponent("git_source"))
-        {
-            auto comp = task.getCustomComponent("git_source");
-            if (comp.type == JSONType.object && "url" in comp)
-            {
-                string u = comp["url"].str;
-                if (!effectiveAllowedRepos.canFind(u)) effectiveAllowedRepos ~= u;
             }
         }
         stepCtx.allowedRepositories = effectiveAllowedRepos;

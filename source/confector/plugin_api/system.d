@@ -16,6 +16,8 @@ struct InputResolutionContext
     ArtifactStorage artifactStorage;
     LogDelegate logCallback;
     string[string] parameters;
+    /// Repository id -> repository address, for resolving repository inputs.
+    string[string] repositoryMap;
 }
 
 /**
@@ -40,6 +42,8 @@ struct FingerprintContributionContext
     string[string] parameters;
     /// Optional map of repository URL -> resolved VCS state, allowing plugins to contribute revision hashes.
     @optional VcsRepositoryState[string] vcsRepositoryStates;
+    /// Optional map of repository id -> repository address, for resolving repository inputs.
+    @optional string[string] repositoryMap;
 }
 
 /**

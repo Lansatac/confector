@@ -1237,16 +1237,17 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                             string[] candidates;
                             foreach (t; proj.tasks)
                             {
-                                if (t.id == rule.targetTaskId) candidates = t.inputs.repositories ~ candidates;
-                                else candidates ~= t.inputs.repositories;
+                                if (t.id == rule.targetTaskId) candidates = repositoryIds(t) ~ candidates;
+                                else candidates ~= repositoryIds(t);
                             }
                             foreach (cand; candidates)
                             {
+                                // Candidates are repository ids; only registered repositories have an address.
                                 RepositoryRecord repoRec;
-                                string addr = stateRepo.getRepository(cand, repoRec) ? repoRec.address : cand;
-                                if (addr.length > 0 && PluginRegistry.instance.findVcsResolver(addr) !is null)
+                                if (!stateRepo.getRepository(cand, repoRec)) continue;
+                                if (repoRec.address.length > 0 && PluginRegistry.instance.findVcsResolver(repoRec.address) !is null)
                                 {
-                                    targetRepoUrl = addr;
+                                    targetRepoUrl = repoRec.address;
                                     break;
                                 }
                             }

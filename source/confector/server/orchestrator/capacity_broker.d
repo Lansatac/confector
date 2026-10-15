@@ -300,11 +300,11 @@ unittest
     // Build DAG: Step1 -> (Step2A, Step2B) -> Step3
     TaskNode step1; step1.id = "step1";
     step1.steps = [BuildStep("Step1", "bash", null, "echo step 1")];
-    TaskNode step2A; step2A.id = "step2A"; step2A.dependsOn = ["step1"];
+    TaskNode step2A; step2A.id = "step2A"; step2A.inputs["step1"] = taskOutputInput("step1");
     step2A.steps = [BuildStep("Step2A", "bash", null, "echo step 2A")];
-    TaskNode step2B; step2B.id = "step2B"; step2B.dependsOn = ["step1"];
+    TaskNode step2B; step2B.id = "step2B"; step2B.inputs["step1"] = taskOutputInput("step1");
     step2B.steps = [BuildStep("Step2B", "bash", null, "echo step 2B")];
-    TaskNode step3; step3.id = "step3"; step3.dependsOn = ["step2A", "step2B"];
+    TaskNode step3; step3.id = "step3"; step3.inputs["step2A"] = taskOutputInput("step2A"); step3.inputs["step2B"] = taskOutputInput("step2B");
     step3.steps = [BuildStep("Step3", "bash", null, "echo step 3")] ;
 
     ProjectRecord dagProj;

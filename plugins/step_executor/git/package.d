@@ -187,50 +187,27 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
         {
             return false;
         }
-        if (task.inputs.repositories.length > 0)
-        {
-            foreach (repo; task.inputs.repositories)
-            {
-                if (canHandle(repo)) return true;
-            }
-        }
-        if (task.hasCustomComponent("git_source"))
-        {
-            return true;
-        }
-        return false;
+        // Repository inputs name repositories by id; whether an id is a git repository is
+        // only known once it is mapped to an address in resolveInputs.
+        return repositoryIds(task).length > 0;
     }
 
     void resolveInputs(in TaskNode task, ref InputResolutionContext context)
     {
-        foreach (repo; task.inputs.repositories)
+        foreach (repoId; repositoryIds(task))
         {
+            auto addressPtr = repoId in context.repositoryMap;
+            if (addressPtr is null)
+            {
+                throw new Exception(format("Task '%s' has a repository input naming unknown repository '%s'", task.id, repoId));
+            }
+            string repo = *addressPtr;
             if (canHandle(repo))
             {
                 string targetDir = buildPath(context.effectiveWorkingDir, baseName(repo));
                 if (isWithinDirectory(targetDir, context.effectiveWorkingDir))
                 {
                     cloneRepository(repo, targetDir, context.logCallback);
-                }
-                else if (context.logCallback !is null)
-                {
-                    context.logCallback(format("[git] Security Error: Clone target '%s' escapes effective working directory '%s'", targetDir, context.effectiveWorkingDir));
-                }
-            }
-        }
-
-        if (task.hasCustomComponent("git_source"))
-        {
-            auto comp = task.getCustomComponent("git_source");
-            if (comp.type == JSONType.object && "url" in comp)
-            {
-                string url = comp["url"].str;
-                string targetDir = "target_dir" in comp
-                    ? (isAbsolute(comp["target_dir"].str) ? comp["target_dir"].str : buildPath(context.effectiveWorkingDir, comp["target_dir"].str))
-                    : buildPath(context.effectiveWorkingDir, baseName(url));
-                if (isWithinDirectory(targetDir, context.effectiveWorkingDir))
-                {
-                    cloneRepository(url, targetDir, context.logCallback);
                 }
                 else if (context.logCallback !is null)
                 {
@@ -816,8 +793,7 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
     bool canContribute(in TaskNode task) const
     {
         // Contribute if the task has repository inputs or git-related build steps
-        if (task.inputs.repositories.length > 0) return true;
-        if (task.hasCustomComponent("git_source")) return true;
+        if (repositoryIds(task).length > 0) return true;
         foreach (step; task.steps)
         {
             if (canExecuteStep(step)) return true;
@@ -834,19 +810,13 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
         // Collect all repository URLs from the task
         string[] repoUrls;
 
-        // From repository inputs
-        foreach (repo; task.inputs.repositories)
+        // From repository inputs, by repository id. Ids without an address in the context
+        // cannot be resolved here and contribute nothing.
+        foreach (repoId; repositoryIds(task))
         {
-            if (canHandle(repo)) repoUrls ~= repo;
-        }
-
-        // From git_source component
-        if (task.hasCustomComponent("git_source"))
-        {
-            auto comp = task.getCustomComponent("git_source");
-            if (comp.type == JSONType.object && "url" in comp)
+            if (auto address = repoId in context.repositoryMap)
             {
-                repoUrls ~= comp["url"].str;
+                if (canHandle(*address)) repoUrls ~= *address;
             }
         }
 
@@ -1133,18 +1103,7 @@ unittest
     {
         TaskNode task;
         task.id = "build";
-        task.inputs.repositories = ["https://github.com/example/repo.git"];
-        assert(plugin.canContribute(task));
-    }
-
-    // Test canContribute with git_source component
-    {
-        TaskNode task;
-        task.id = "build";
-        task.setCustomComponent("git_source", JSONValue([
-            "url": JSONValue("https://github.com/example/repo.git"),
-            "branch": JSONValue("main")
-        ]));
+        task.inputs["src"] = repositoryInput("example-repo", "main");
         assert(plugin.canContribute(task));
     }
 
@@ -1168,9 +1127,10 @@ unittest
     {
         TaskNode task;
         task.id = "build";
-        task.inputs.repositories = ["https://github.com/example/repo.git"];
+        task.inputs["src"] = repositoryInput("example-repo", "main");
 
         FingerprintContributionContext ctx;
+        ctx.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
         ctx.vcsRepositoryStates = [
             "https://github.com/example/repo.git": VcsRepositoryState(
                 "https://github.com/example/repo.git",
@@ -1190,9 +1150,10 @@ unittest
     {
         TaskNode task;
         task.id = "build";
-        task.inputs.repositories = ["https://github.com/example/repo.git"];
+        task.inputs["src"] = repositoryInput("example-repo", "main");
 
         FingerprintContributionContext ctx1;
+        ctx1.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
         ctx1.vcsRepositoryStates = [
             "https://github.com/example/repo.git": VcsRepositoryState(
                 "https://github.com/example/repo.git",
@@ -1203,6 +1164,7 @@ unittest
         ];
 
         FingerprintContributionContext ctx2;
+        ctx2.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
         ctx2.vcsRepositoryStates = [
             "https://github.com/example/repo.git": VcsRepositoryState(
                 "https://github.com/example/repo.git",
@@ -1221,12 +1183,23 @@ unittest
     {
         TaskNode task;
         task.id = "build";
-        task.inputs.repositories = ["https://github.com/example/repo.git"];
+        task.inputs["src"] = repositoryInput("example-repo", "main");
 
         FingerprintContributionContext ctx;
+        ctx.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
 
         auto contribution = plugin.contributeFingerprint(task, ctx);
         assert(contribution.canFind("unknown|"));
+    }
+
+    // Test contributeFingerprint ignores repository ids it cannot map to an address
+    {
+        TaskNode task;
+        task.id = "build";
+        task.inputs["src"] = repositoryInput("example-repo", "main");
+
+        FingerprintContributionContext ctx;
+        assert(plugin.contributeFingerprint(task, ctx).length == 0);
     }
 
     // Test contributeFingerprint returns empty for non-git task
