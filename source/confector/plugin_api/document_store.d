@@ -17,7 +17,7 @@ module confector.plugin_api.document_store;
  */
 
 import std.typecons : Nullable;
-import vibe.data.json : Json;
+import vibe.data.json : Json, parseJsonString;
 
 /// Largest document a store accepts, in bytes, measured as compact JSON (Json.toString()) by
 /// validateDocument. Larger data belongs in the artifact or log store.
@@ -37,8 +37,9 @@ enum size_t maxKeyBytes = 1024;
  *
  * Indexes are sparse: a document without the partition key field (or, when the index has one,
  * the sort key field) is not in the index. Writes reject key fields that are not strings, but a
- * document stored before its collection gained an index may hold one; such a document is also
- * not in the index.
+ * backend may hold a document written before its collection was first declared (for example
+ * data loaded into the database directly) whose key field is not a valid string; such a
+ * document is also not in the index.
  */
 struct IndexSpec
 {
@@ -63,6 +64,14 @@ struct CollectionSpec
  *
  * Content field names are not reserved: a backend that stores the id and version alongside the
  * content must keep them from colliding with content fields.
+ *
+ * Content reads back as parseJsonString(content.toString()), whatever was written: the form
+ * returned by create, replace, get and query is the JSON text parsed again. So a float that
+ * prints as an integer (2.0) or a small BigInt reads back as an integer, and callers that
+ * compare what they wrote with what they read must normalize the same way. Floats go through
+ * the JSON text, so they may lose precision beyond about 16 significant digits, and a float
+ * whose text does not parse back as a double (double.max) is rejected on write. Every backend
+ * returns this form from every operation, so the result does not depend on which one it is.
  */
 struct Document
 {
@@ -114,7 +123,11 @@ interface DocumentStore
      * Declares collections and their indexes, creating them in the backend if needed, and
      * returns once they can be queried. Called by the core at startup before any other operation.
      * Declaring a collection again with an identical spec is a no-op; with a different spec it
-     * throws DocumentStoreUsageException.
+     * throws DocumentStoreUsageException. A backend that persists data remembers each collection's
+     * spec in the database, so this holds across restarts and between processes sharing the
+     * database: the first declaration fixes a collection's indexes, and changing them is a
+     * migration that declare does not perform. On the first declaration over a collection that
+     * already holds documents, the backend indexes them before returning.
      */
     void declare(const(CollectionSpec)[] collections);
 
@@ -219,7 +232,8 @@ void checkRedeclaration(const CollectionSpec existing, const CollectionSpec inco
 
     if (existing != incoming)
         throw new DocumentStoreUsageException(format(
-            "Collection '%s' is already declared as %s; cannot redeclare it as %s", existing.name, existing, incoming));
+            "Collection '%s' is already declared as %s; cannot redeclare it as %s. Changing a collection's indexes is a migration, which declare does not perform",
+            existing.name, existing, incoming));
 }
 
 /// Returns the named index of a collection, or throws DocumentStoreUsageException.
@@ -236,10 +250,33 @@ IndexSpec findIndex(const CollectionSpec spec, string indexName) @safe pure
 /**
  * Checks a document about to be written: an id of 1 to maxKeyBytes bytes, content that is a
  * JSON object, a non-empty string of at most maxKeyBytes in every indexed field that is present,
- * and a size within maxDocumentBytes. Returns the size. Throws DocumentStoreUsageException or
+ * no NaN, infinity or negative zero anywhere in the content, compact JSON text that parses back
+ * (see validateDocumentText), and a size within maxDocumentBytes. Returns the size. Throws DocumentStoreUsageException or
  * DocumentTooLargeException.
  */
 size_t validateDocument(const CollectionSpec spec, string id, Json content) @safe
+{
+    return validateDocumentText(spec, id, content).text.length;
+}
+
+/// A document that passed validateDocumentText: its compact JSON text, which is what a backend
+/// that stores text stores, and the content parsed back from that text, which is what the
+/// document reads back as. Both are made before anything is written, so a backend never has to
+/// parse after a write.
+struct ValidatedContent
+{
+    string text;
+    /// A fresh value that shares nothing with the caller's content or with other copies.
+    Json content;
+}
+
+/**
+ * Like validateDocument, but returns the compact JSON text the size was measured on and the
+ * content parsed back from it, so a backend does not serialize the content twice. Also throws
+ * DocumentStoreUsageException if the text cannot be parsed back (a float vibe writes as a
+ * number that does not parse as a double, such as double.max).
+ */
+ValidatedContent validateDocumentText(const CollectionSpec spec, string id, Json content) @safe
 {
     import std.format : format;
 
@@ -268,12 +305,21 @@ size_t validateDocument(const CollectionSpec spec, string id, Json content) @saf
                     field, id, spec.name, index.name, length, maxKeyBytes));
         }
     }
-    const sizeBytes = content.toString().length;
+    rejectUnstorableNumbers(spec, id, content, "");
+    const text = content.toString();
+    const sizeBytes = text.length;
     if (sizeBytes > maxDocumentBytes)
         throw new DocumentTooLargeException(format(
             "Document '%s' in collection '%s' is %s bytes; the limit is %s. Store large data in the artifact or log store.",
             id, spec.name, sizeBytes, maxDocumentBytes), spec.name, id, sizeBytes);
-    return sizeBytes;
+    Json parsed;
+    try
+        parsed = parseJsonString(text);
+    catch (Exception e)
+        throw new DocumentStoreUsageException(format(
+            "Document '%s' in collection '%s' cannot be read back from its JSON text (%s); a number in it is probably too large for a double",
+            id, spec.name, e.msg));
+    return ValidatedContent(text, parsed);
 }
 
 /**
@@ -322,5 +368,46 @@ private string jsonTypeName(Json.Type type) @safe pure nothrow
         case Json.Type.string: return "a string";
         case Json.Type.array: return "an array";
         case Json.Type.object: return "an object";
+    }
+}
+
+/**
+ * Throws DocumentStoreUsageException for a NaN, an infinity or a negative zero anywhere in the
+ * content, nested values included. JSON has no NaN or infinity: vibe's Json.toString writes
+ * NaN as null (silently changing the value) and infinity as `inf` (not JSON, so the stored
+ * document could never be read back). Negative zero is written as -0 and read back as the
+ * integer 0, so its sign would be lost; it is rejected rather than normalized so that a
+ * document a store accepts keeps its sign. (A stored document reads back as the parsed JSON
+ * text, see Document; this only keeps that form from changing a number's meaning.)
+ */
+private void rejectUnstorableNumbers(const CollectionSpec spec, string id, Json value, string path) @safe
+{
+    import std.format : format;
+    import std.math : isFinite, signbit;
+
+    final switch (value.type)
+    {
+        case Json.Type.float_:
+            const number = value.get!double;
+            if (!isFinite(number) || (number == 0 && signbit(number)))
+                throw new DocumentStoreUsageException(format(
+                    "Document '%s' in collection '%s' holds %s at '%s'; JSON cannot represent NaN, infinity or negative zero",
+                    id, spec.name, number, path.length == 0 ? "$" : path));
+            break;
+        case Json.Type.array:
+            foreach (i, element; value.get!(Json[]))
+                rejectUnstorableNumbers(spec, id, element, format("%s[%s]", path, i));
+            break;
+        case Json.Type.object:
+            foreach (key, element; value.get!(Json[string]))
+                rejectUnstorableNumbers(spec, id, element, path ~ "." ~ key);
+            break;
+        case Json.Type.undefined:
+        case Json.Type.null_:
+        case Json.Type.bool_:
+        case Json.Type.int_:
+        case Json.Type.bigInt:
+        case Json.Type.string:
+            break;
     }
 }

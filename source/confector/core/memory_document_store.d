@@ -11,40 +11,73 @@ import vibe.data.json : Json, parseJsonString;
  * real backend need not be.
  *
  * Stored and returned contents are deep copies, so callers cannot change stored documents
- * except through the interface.
+ * except through the interface. Content is stored as the JSON text parsed again, as the
+ * contract requires. Instances made by restart() share their data and lock on it.
  */
 class InMemoryDocumentStore : DocumentStore
 {
-    private CollectionSpec[string] m_specs;
-    private Document[string][string] m_documents; // collection -> id -> document
+    /// What a restart keeps: the declared specs and the documents, like a real backend's
+    /// database. Which collections this instance has declared since it was created is not kept.
+    private static final class Backing
+    {
+        CollectionSpec[string] specs;
+        Document[string][string] documents; // collection -> id -> document
+    }
+
+    private Backing m_backing;
+    private CollectionSpec[string] m_specs; // declared through this instance
+
+    this()
+    {
+        m_backing = new Backing;
+    }
+
+    private this(Backing backing)
+    {
+        m_backing = backing;
+    }
+
+    /**
+     * A new store over the same documents and declared specs, as if the process had restarted
+     * against the same database: nothing is declared through it yet, so callers must declare
+     * before using it. The original store stays usable.
+     */
+    InMemoryDocumentStore restart()
+    {
+        return new InMemoryDocumentStore(m_backing);
+    }
 
     override void declare(const(CollectionSpec)[] collections)
     {
-        synchronized (this)
+        synchronized (m_backing)
         {
             // Validate everything before changing anything, so a bad declaration leaves no trace.
             CollectionSpec[string] added;
             foreach (spec; collections)
             {
                 validateCollectionSpec(spec);
-                if (auto existing = spec.name in m_specs)
+                if (auto existing = spec.name in m_backing.specs)
                     checkRedeclaration(*existing, spec);
                 else if (auto pending = spec.name in added)
                     checkRedeclaration(*pending, spec);
                 else
                     added[spec.name] = CollectionSpec(spec.name, spec.indexes.dup);
             }
-            foreach (name, spec; added)
-                m_specs[name] = spec;
+            foreach (spec; collections)
+            {
+                if (spec.name !in m_backing.specs)
+                    m_backing.specs[spec.name] = added[spec.name];
+                m_specs[spec.name] = m_backing.specs[spec.name];
+            }
         }
     }
 
     override Nullable!Document get(string collection, string id)
     {
-        synchronized (this)
+        synchronized (m_backing)
         {
             specFor(collection);
-            if (auto documents = collection in m_documents)
+            if (auto documents = collection in m_backing.documents)
                 if (auto document = id in *documents)
                     return nullable(copyOf(*document));
             return Nullable!Document.init;
@@ -53,37 +86,38 @@ class InMemoryDocumentStore : DocumentStore
 
     override Document create(string collection, string id, Json content)
     {
-        synchronized (this)
+        synchronized (m_backing)
         {
-            validateDocument(specFor(collection), id, content);
-            if (auto documents = collection in m_documents)
+            auto validated = validateDocumentText(specFor(collection), id, content);
+            if (auto documents = collection in m_backing.documents)
                 if (id in *documents)
                     throw new DocumentConflictException(format("Document '%s' already exists in collection '%s'", id, collection), collection, id);
-            auto document = Document(id, 1, content.clone());
-            m_documents[collection][id] = document;
+            // Stored in the form every backend returns: the JSON text parsed again.
+            auto document = Document(id, 1, validated.content);
+            m_backing.documents[collection][id] = document;
             return copyOf(document);
         }
     }
 
     override Document replace(string collection, string id, Json content, ulong expectedVersion)
     {
-        synchronized (this)
+        synchronized (m_backing)
         {
-            validateDocument(specFor(collection), id, content);
+            auto validated = validateDocumentText(specFor(collection), id, content);
             auto current = expectVersion(collection, id, expectedVersion, "replace");
-            auto document = Document(id, current.version_ + 1, content.clone());
-            m_documents[collection][id] = document;
+            auto document = Document(id, current.version_ + 1, validated.content);
+            m_backing.documents[collection][id] = document;
             return copyOf(document);
         }
     }
 
     override void remove(string collection, string id, ulong expectedVersion)
     {
-        synchronized (this)
+        synchronized (m_backing)
         {
             specFor(collection);
             expectVersion(collection, id, expectedVersion, "remove");
-            m_documents[collection].remove(id);
+            m_backing.documents[collection].remove(id);
         }
     }
 
@@ -91,12 +125,12 @@ class InMemoryDocumentStore : DocumentStore
     {
         import std.algorithm.sorting : sort;
 
-        synchronized (this)
+        synchronized (m_backing)
         {
             const index = validateIndexQuery(specFor(collection), lookup);
 
             Entry[] entries;
-            if (auto documents = collection in m_documents)
+            if (auto documents = collection in m_backing.documents)
             {
                 foreach (ref document; *documents)
                 {
@@ -198,7 +232,7 @@ class InMemoryDocumentStore : DocumentStore
 
     private Document expectVersion(string collection, string id, ulong expectedVersion, string operation)
     {
-        if (auto documents = collection in m_documents)
+        if (auto documents = collection in m_backing.documents)
         {
             if (auto document = id in *documents)
             {

@@ -6,9 +6,12 @@ module confector.core.conformance.document_store;
  *
  * Run it from a backend's tests:
  *
- *     checkDocumentStore(() => new MyDocumentStore(freshTestDatabase()));
+ *     checkDocumentStore(() => new MyDocumentStore(freshTestDatabase()), (previous) => reopen(previous));
  *
- * The factory is called once per check and must return an empty store each time.
+ * The factory is called once per check and must return an empty store each time. The restart
+ * function takes a store the factory returned and returns a new store over the same data, as a
+ * process restart would: documents and declared collections are kept, but nothing is declared
+ * through the new store until the test declares it. The original store stays usable.
  *
  * Query checks read their own writes immediately. A backend whose queries may lag in production
  * (such as DynamoDB global secondary indexes) must run the suite in a configuration where they
@@ -31,18 +34,28 @@ class DocumentStoreConformanceException : Exception
 
 /// Runs every check against stores from makeStore. Throws DocumentStoreConformanceException on
 /// the first failure.
-void checkDocumentStore(DocumentStore delegate() makeStore)
+void checkDocumentStore(DocumentStore delegate() makeStore, DocumentStore delegate(DocumentStore) restart)
 {
     foreach (check; checks)
-    {
-        auto store = makeStore();
-        store.declare(collections);
-        try
-            check.run(store);
-        catch (Exception e)
-            throw new DocumentStoreConformanceException(format("DocumentStore conformance check '%s' failed: %s%s",
-                check.name, cast(DocumentStoreConformanceException) e ? "" : typeid(e).name ~ ": ", e.msg), e.file, e.line);
-    }
+        runCheck(check.name, () { check.run(makeStoreAndDeclare(makeStore)); });
+    foreach (check; restartChecks)
+        runCheck(check.name, () { auto store = makeStoreAndDeclare(makeStore); check.run(store, restart); });
+}
+
+private DocumentStore makeStoreAndDeclare(DocumentStore delegate() makeStore)
+{
+    auto store = makeStore();
+    store.declare(collections);
+    return store;
+}
+
+private void runCheck(string name, void delegate() run)
+{
+    try
+        run();
+    catch (Exception e)
+        throw new DocumentStoreConformanceException(format("DocumentStore conformance check '%s' failed: %s%s",
+            name, cast(DocumentStoreConformanceException) e ? "" : typeid(e).name ~ ": ", e.msg), e.file, e.line);
 }
 
 private:
@@ -51,6 +64,12 @@ struct Check
 {
     string name;
     void function(DocumentStore) run;
+}
+
+struct RestartCheck
+{
+    string name;
+    void function(DocumentStore, DocumentStore delegate(DocumentStore)) run;
 }
 
 immutable Check[] checks = [
@@ -69,6 +88,13 @@ immutable Check[] checks = [
     Check("query paging across writes", &queryPagingAcrossWrites),
     Check("query index without sort key", &queryIndexWithoutSortKey),
     Check("queries follow writes", &queriesFollowWrites),
+    Check("numbers JSON cannot represent", &unrepresentableNumbers),
+    Check("content reads back as parsed JSON text", &contentIsNormalized),
+    Check("floats that do not parse back", &floatsThatDoNotParseBack),
+];
+
+immutable RestartCheck[] restartChecks = [
+    RestartCheck("declarations survive a restart", &declarationsSurviveRestart),
 ];
 
 enum things = "things";
@@ -480,6 +506,149 @@ void queriesFollowWrites(DocumentStore store)
     expect(store.query(things, query).documents.length == 0, "query still finds a removed document");
 }
 
+void unrepresentableNumbers(DocumentStore store)
+{
+    foreach (name, bad; ["NaN": double.nan, "infinity": double.infinity, "negative infinity": -double.infinity, "negative zero": -0.0])
+    {
+        auto top = thing("ann", "1");
+        top["number"] = bad;
+        expectThrows!DocumentStoreUsageException(() { store.create(things, "a", top); }, "create with " ~ name ~ " at the top level");
+        auto nested = thing("ann", "1");
+        nested["deep"] = Json(["list": Json([Json(1), Json(["x": Json(bad)])])]);
+        expectThrows!DocumentStoreUsageException(() { store.create(things, "a", nested); }, "create with " ~ name ~ " nested in arrays and objects");
+        expect(store.get(things, "a").isNull, "a rejected create stored the document");
+
+        store.create(things, "b", thing("ann", "1"));
+        expectThrows!DocumentStoreUsageException(() { store.replace(things, "b", top, 1); }, "replace with " ~ name);
+        expect(store.get(things, "b").get.version_ == 1, "a rejected replace changed the document");
+        store.remove(things, "b", 1);
+    }
+
+    auto fine = thing("ann", "1");
+    fine["number"] = 1.5;
+    store.create(things, "c", fine);
+    expect(store.get(things, "c").get.content == fine, "finite floats did not round-trip");
+}
+
+/// Equal values of the same JSON types, all the way down (Json's own == is lenient between numbers).
+bool sameJson(Json a, Json b)
+{
+    if (a.type != b.type)
+        return false;
+    switch (a.type)
+    {
+        case Json.Type.array:
+            if (a.length != b.length)
+                return false;
+            foreach (i; 0 .. a.length)
+                if (!sameJson(a[i], b[i]))
+                    return false;
+            return true;
+        case Json.Type.object:
+            if (a.length != b.length)
+                return false;
+            foreach (string key, value; a)
+            {
+                auto other = key in b;
+                if (other is null || !sameJson(value, *other))
+                    return false;
+            }
+            return true;
+        default:
+            return a == b;
+    }
+}
+
+void contentIsNormalized(DocumentStore store)
+{
+    import std.bigint : BigInt;
+    import vibe.data.json : parseJsonString;
+
+    Json make(string owner, string created)
+    {
+        auto content = thing(owner, created);
+        content["float"] = 2.0;
+        content["big"] = Json(BigInt(5));
+        content["nested"] = Json(["list": Json([Json(2.0), Json(BigInt(5)), Json(["deep": Json(3.0)])])]);
+        return content;
+    }
+
+    void expectNormalized(Json written, Json actual, string where)
+    {
+        auto expected = parseJsonString(written.toString());
+        expect(sameJson(expected, actual), format("%s returned %s (%s), not the parsed JSON text %s", where, actual, actual.toString(), expected));
+    }
+
+    auto content = make("ann", "1");
+    expectNormalized(content, store.create(things, "a", content).content, "create");
+    expectNormalized(content, store.get(things, "a").get.content, "get after create");
+    IndexQuery query = { index: byOwner, partitionKey: "ann", limit: 10 };
+    expectNormalized(content, store.query(things, query).documents[0].content, "query after create");
+
+    auto replacement = make("ann", "2");
+    expectNormalized(replacement, store.replace(things, "a", replacement, 1).content, "replace");
+    expectNormalized(replacement, store.get(things, "a").get.content, "get after replace");
+    expectNormalized(replacement, store.query(things, query).documents[0].content, "query after replace");
+}
+
+void floatsThatDoNotParseBack(DocumentStore store)
+{
+    foreach (name, big; ["double.max": double.max, "negative double.max": -double.max])
+    {
+        auto top = thing("ann", "1");
+        top["number"] = big;
+        auto nested = thing("ann", "1");
+        nested["deep"] = Json(["list": Json([Json(1), Json(["x": Json(big)])])]);
+        foreach (content; [top, nested])
+        {
+            expectThrows!DocumentStoreUsageException(() { store.create(things, "a", content); }, "create with " ~ name);
+            expect(store.get(things, "a").isNull, "a rejected create stored the document");
+        }
+
+        auto original = thing("ann", "1");
+        store.create(things, "b", original);
+        foreach (content; [top, nested])
+            expectThrows!DocumentStoreUsageException(() { store.replace(things, "b", content, 1); }, "replace with " ~ name);
+        auto kept = store.get(things, "b");
+        expect(!kept.isNull && kept.get.version_ == 1 && kept.get.content == original, "a rejected replace changed the document or made it unreadable");
+        IndexQuery query = { index: byOwner, partitionKey: "ann", limit: 10 };
+        expect(queryAll(store, query).ids == ["b"], "a query after a rejected replace did not return the unchanged document");
+        store.remove(things, "b", 1);
+    }
+}
+
+void declarationsSurviveRestart(DocumentStore store, DocumentStore delegate(DocumentStore) restart)
+{
+    store.create(things, "a", thing("ann", "1", "red"));
+    store.create(others, "o", Json.emptyObject);
+
+    auto second = restart(store);
+    expectThrows!DocumentStoreUsageException(() { second.get(things, "a"); }, "use of a collection before declaring it after a restart");
+
+    // The specs are remembered across the restart, so a different spec is refused even though this
+    // instance has not seen the collection, and queries cannot silently use a stale index.
+    expectThrows!DocumentStoreUsageException(() {
+        second.declare([CollectionSpec(things, [IndexSpec(byOwner, "creator", "created"), IndexSpec(byColor, "color")])]);
+    }, "redeclaring an index with a different partition key after a restart");
+    expectThrows!DocumentStoreUsageException(() {
+        second.declare([CollectionSpec(things, [IndexSpec(byOwner, "owner", "created")])]);
+    }, "redeclaring a collection without one of its indexes after a restart");
+    expectThrows!DocumentStoreUsageException(() { second.get(things, "a"); }, "use of a collection whose declaration was rejected");
+
+    second.declare(collections);
+    expect(second.get(things, "a").get.content["owner"].get!string == "ann", "a document did not survive a restart");
+    IndexQuery query = { index: byOwner, partitionKey: "ann", limit: 10 };
+    expect(queryAll(second, query).ids == ["a"], "an index query after a restart did not find the document");
+    query.index = byColor;
+    query.partitionKey = "red";
+    expect(queryAll(second, query).ids == ["a"], "a query on the other index after a restart did not find the document");
+
+    // Both instances see each other's writes through the shared data.
+    second.replace(things, "a", thing("bob", "2"), 1);
+    expect(store.get(things, "a").get.version_ == 2, "a write through a restarted store is not visible to the original");
+    expectThrows!DocumentConflictException(() { store.replace(things, "a", thing("cy", "3"), 1); }, "a stale replace through the original store");
+}
+
 bool canFindId(const string[] ids, string id)
 {
     foreach (candidate; ids)
@@ -492,5 +661,7 @@ unittest
 {
     import confector.core.memory_document_store : InMemoryDocumentStore;
 
-    checkDocumentStore(() => new InMemoryDocumentStore());
+    checkDocumentStore(
+        () => cast(DocumentStore) new InMemoryDocumentStore(),
+        (previous) => cast(DocumentStore) (cast(InMemoryDocumentStore) previous).restart());
 }
