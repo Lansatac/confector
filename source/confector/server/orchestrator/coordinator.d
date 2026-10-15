@@ -5,7 +5,7 @@ import confector.core.dag;
 import confector.core.storage;
 import confector.core.chain_resolver : resolveChain;
 import confector.core.executor : CapacityBroker;
-import confector.core.input_resolution : chainFingerprints, chainGraph;
+import confector.core.input_resolution : GraphResolution, chainGraph, chainResolution;
 import confector.plugin_api.dispatch_queue;
 import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
 
@@ -26,11 +26,15 @@ struct ActiveBuild
     string buildId;
     /// The project the build's configuration (steps, environment, outputs) is read from.
     ProjectRecord project;
-    /// The build's chain: its frozen tasks, the graph they form, and their fingerprints, which
-    /// are computed from the chain alone (never from the project).
+    /// The build's chain: its frozen tasks, the graph they form, and every task's resolved inputs
+    /// and fingerprint, which are computed from the chain alone (never from the project).
     ChainTask[] chain;
     TaskGraph graph;
-    string[string] fingerprints;
+    GraphResolution resolution;
+    /// Address of each repository input of every task the build runs (task id -> input name ->
+    /// address), looked up once when the build starts so dispatch does not depend on live
+    /// repository records.
+    string[string][string] repositoryAddresses;
     string[] targetTaskIds;
     bool force = false;
     string workspaceDir;
@@ -388,7 +392,7 @@ class BuildCoordinator
     )
     {
         TaskGraph graph = chainGraph(chain);
-        string[string] fingerprints = chainFingerprints(project.id, chain);
+        GraphResolution resolution = chainResolution(project.id, chain);
 
         string[] targetTaskIds;
         if (targetTaskId.length > 0)
@@ -414,6 +418,11 @@ class BuildCoordinator
                     tId, chainId, project.id));
             }
         }
+
+        // Every repository input of every task to run must have an address to check out from.
+        // Look them up now, before anything is recorded, so a missing repository fails the
+        // request instead of stranding a recorded build mid-dispatch.
+        string[string][string] addresses = chainRepositoryAddresses(graph, targetTaskIds);
 
         // Create and persist initial BuildRecord
         BuildRecord buildRecord;
@@ -443,7 +452,8 @@ class BuildCoordinator
         active.project = project;
         active.chain = chain;
         active.graph = graph;
-        active.fingerprints = fingerprints;
+        active.resolution = resolution;
+        active.repositoryAddresses = addresses;
         active.targetTaskIds = targetTaskIds;
         active.force = force;
         active.workspaceDir = workspaceDir;
@@ -482,12 +492,80 @@ class BuildCoordinator
     /// Returns task `taskId`'s fingerprint in `active`'s chain. Throws if it has none.
     private static string chainFingerprint(ref ActiveBuild active, string taskId)
     {
-        auto fingerprint = taskId in active.fingerprints;
+        auto fingerprint = taskId in active.resolution.fingerprints;
         if (fingerprint is null)
         {
             throw new Exception(format("Build '%s' has no fingerprint for task '%s'", active.buildId, taskId));
         }
         return *fingerprint;
+    }
+
+    /**
+     * Records task `taskId` of `active` as failed because it could not be dispatched, and
+     * forgets that it was sent: its in-flight registration (`registeredFingerprint`, empty if
+     * it was not registered yet) and queued demand. Must be called with m_mutex held.
+     */
+    private void failDispatch(ref ActiveBuild active, string taskId, string registeredFingerprint, string error)
+    {
+        string message = format("Task '%s' could not be dispatched: %s", taskId, error);
+        logError("[coordinator] Build '%s': %s", active.buildId, message);
+        if (registeredFingerprint.length > 0)
+        {
+            m_inFlightRegistry.completeTask(registeredFingerprint);
+        }
+        active.enqueuedTasks.remove(taskId);
+        active.queuedDemand.remove(taskId);
+
+        TaskExecutionRecord rec;
+        rec.buildId = active.buildId;
+        rec.taskId = taskId;
+        rec.projectId = active.project.id;
+        rec.status = cast(string) TaskStatus.failed;
+        rec.errorMessage = message;
+        rec.exitCode = 1;
+        rec.finishedAt = Clock.currTime.toISOString();
+        m_stateRepo.recordTaskExecution(rec);
+        m_stateRepo.setTaskStatus(active.buildId, taskId, TaskStatus.failed, message);
+    }
+
+    /// Returns task `taskId`'s resolved inputs in `active`'s chain, sorted by name. Throws if
+    /// it has none (every task of a chain has an entry, empty when it declares no inputs).
+    private static ResolvedInput[] chainInputs(ref ActiveBuild active, string taskId)
+    {
+        auto inputs = taskId in active.resolution.inputs;
+        if (inputs is null)
+        {
+            throw new Exception(format("Build '%s' has no resolved inputs for task '%s'", active.buildId, taskId));
+        }
+        return (*inputs).dup;
+    }
+
+    /**
+     * Returns the address of the repository each repository input of each of `taskIds` names
+     * (task id -> input name -> address; tasks without repository inputs have no entry), read
+     * from the repository records now: an address says how to fetch, not what, so it is
+     * configuration rather than part of the chain. Inputs come from the chain's `graph`.
+     *
+     * Throws: Exception if a repository is not registered or has no address.
+     */
+    private string[string][string] chainRepositoryAddresses(TaskGraph graph, in string[] taskIds)
+    {
+        string[string][string] addresses;
+        foreach (tId; taskIds)
+        {
+            foreach (name, decl; graph.getTask(tId).inputs)
+            {
+                if (decl.kind != InputKind.repository) continue;
+                RepositoryRecord repository = lookupRepository(decl.spec.repository);
+                if (repository.address.length == 0)
+                {
+                    throw new Exception(format("Task '%s' input '%s': repository '%s' has no address to check out from",
+                        tId, name, decl.spec.repository));
+                }
+                addresses[tId][name] = repository.address;
+            }
+        }
+        return addresses;
     }
 
     /**
@@ -588,7 +666,7 @@ class BuildCoordinator
                 }
                 if ((fingerprint.length == 0 || fingerprint == "unknown") && (buildId in m_activeBuilds))
                 {
-                    fingerprint = m_activeBuilds[buildId].fingerprints.get(taskId, null);
+                    fingerprint = m_activeBuilds[buildId].resolution.fingerprints.get(taskId, null);
                 }
 
                 // Retrieve all subscribed builds/tasks for this fingerprint
@@ -745,7 +823,7 @@ class BuildCoordinator
                     act.project = proj;
                     act.chain = b.chainTasks;
                     act.graph = chainGraph(b.chainTasks);
-                    act.fingerprints = chainFingerprints(b.projectId, b.chainTasks);
+                    act.resolution = chainResolution(b.projectId, b.chainTasks);
                     if (b.targetTaskId.length > 0)
                     {
                         act.targetTaskIds = act.graph.resolveSubgraph(b.targetTaskId);
@@ -755,6 +833,21 @@ class BuildCoordinator
                         act.targetTaskIds = act.graph.topologicalSort();
                     }
                     act.workspaceDir = b.workspaceDir;
+                    try
+                    {
+                        act.repositoryAddresses = chainRepositoryAddresses(act.graph, act.targetTaskIds);
+                    }
+                    catch (Exception e)
+                    {
+                        // Nothing of this build can be dispatched any more: fail it rather
+                        // than leave it running forever.
+                        logError("[coordinator] Build '%s' cannot be resumed: %s", buildId, e.msg);
+                        b.status = "failed";
+                        b.errorMessage = e.msg;
+                        b.finishedAt = Clock.currTime.toISOString();
+                        m_stateRepo.recordBuild(b);
+                        return;
+                    }
                     m_activeBuilds[buildId] = act;
                     pActive = buildId in m_activeBuilds;
                 }
@@ -831,6 +924,7 @@ class BuildCoordinator
 
         // 2. Identify ready tasks and evaluate cache or enqueue
         bool stateChanged = false;
+        bool dispatchFailed = false;
         do
         {
             stateChanged = false;
@@ -858,7 +952,6 @@ class BuildCoordinator
                 // Check if all upstream dependencies in targetTaskIds are satisfied
                 string[] deps = active.graph.getDependencies(tId);
                 bool allDepsSatisfied = true;
-                string[string] upstreamHashes;
 
                 foreach (depId; deps)
                 {
@@ -873,9 +966,6 @@ class BuildCoordinator
                         allDepsSatisfied = false;
                         break;
                     }
-
-                    // Collect upstream task fingerprints for content-addressed artifact lookup
-                    upstreamHashes[depId] = chainFingerprint(active, depId);
                 }
 
                 if (!allDepsSatisfied)
@@ -883,212 +973,170 @@ class BuildCoordinator
                     continue;
                 }
 
-                TaskNode node = dispatchTask(active, tId);
-
-                // 3. Cache check using the fingerprint computed from the build's chain
-                string fingerprint = chainFingerprint(active, tId);
-
-                if (!active.force && fingerprint.length > 0 && fingerprint != "unknown" && m_stateRepo !is null)
+                string registeredFingerprint;
+                try
                 {
-                    ArtifactMetadata[] cachedArtifacts;
-                    if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedArtifacts))
+                    TaskNode node = dispatchTask(active, tId);
+
+                    // 3. Cache check using the fingerprint computed from the build's chain
+                    string fingerprint = chainFingerprint(active, tId);
+
+                    if (!active.force && fingerprint.length > 0 && fingerprint != "unknown" && m_stateRepo !is null)
                     {
-                        // Verify artifacts exist in stream storage by (taskFingerprint, artifactId)
-                        bool allValid = true;
-                        foreach (meta; cachedArtifacts)
+                        ArtifactMetadata[] cachedArtifacts;
+                        if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedArtifacts))
                         {
-                            if (m_artifactStorage !is null)
+                            // Verify artifacts exist in stream storage by (taskFingerprint, artifactId)
+                            bool allValid = true;
+                            foreach (meta; cachedArtifacts)
                             {
-                                string effectiveFp = meta.taskFingerprint.length > 0 ? meta.taskFingerprint : fingerprint;
-                                string effectiveArtId = meta.artifactId.length > 0 ? meta.artifactId : meta.filePath;
-                                if (!m_artifactStorage.artifactExists(effectiveFp, effectiveArtId))
+                                if (m_artifactStorage !is null)
                                 {
-                                    allValid = false;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (allValid)
-                        {
-                            logInfo("[coordinator] Build '%s': Task '%s' resolved from cache (fingerprint: %s)", buildId, tId, fingerprint);
-
-                            // Resolve immediately as cached
-                            TaskExecutionRecord cacheRec;
-                            cacheRec.buildId = buildId;
-                            cacheRec.taskId = tId;
-                            cacheRec.status = "cached";
-                            cacheRec.fingerprint = fingerprint;
-                            cacheRec.producedArtifacts = cachedArtifacts;
-                            cacheRec.finishedAt = Clock.currTime.toISOString();
-
-                            m_stateRepo.recordTaskExecution(cacheRec);
-                            m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cached);
-
-                            BuildRecord b;
-                            if (m_stateRepo.getBuild(buildId, b))
-                            {
-                                if (!b.executedTasks.canFind(tId))
-                                {
-                                    b.executedTasks ~= tId;
-                                    m_stateRepo.recordBuild(b);
+                                    string effectiveFp = meta.taskFingerprint.length > 0 ? meta.taskFingerprint : fingerprint;
+                                    string effectiveArtId = meta.artifactId.length > 0 ? meta.artifactId : meta.filePath;
+                                    if (!m_artifactStorage.artifactExists(effectiveFp, effectiveArtId))
+                                    {
+                                        allValid = false;
+                                        break;
+                                    }
                                 }
                             }
 
-                            stateChanged = true;
-                            continue;
+                            if (allValid)
+                            {
+                                logInfo("[coordinator] Build '%s': Task '%s' resolved from cache (fingerprint: %s)", buildId, tId, fingerprint);
+
+                                // Resolve immediately as cached
+                                TaskExecutionRecord cacheRec;
+                                cacheRec.buildId = buildId;
+                                cacheRec.taskId = tId;
+                                cacheRec.status = "cached";
+                                cacheRec.fingerprint = fingerprint;
+                                cacheRec.producedArtifacts = cachedArtifacts;
+                                cacheRec.finishedAt = Clock.currTime.toISOString();
+
+                                m_stateRepo.recordTaskExecution(cacheRec);
+                                m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cached);
+
+                                BuildRecord b;
+                                if (m_stateRepo.getBuild(buildId, b))
+                                {
+                                    if (!b.executedTasks.canFind(tId))
+                                    {
+                                        b.executedTasks ~= tId;
+                                        m_stateRepo.recordBuild(b);
+                                    }
+                                }
+
+                                stateChanged = true;
+                                continue;
+                            }
                         }
                     }
+
+                    // The work order carries the task's resolved inputs from the chain (task outputs
+                    // pinned to upstream fingerprints, which address the artifacts to stage) and where
+                    // to fetch each repository input from (looked up when the build started);
+                    // nothing else names a repository.
+                    ResolvedInput[] inputs = chainInputs(active, tId);
+                    string[string] addresses = active.repositoryAddresses.get(tId, null);
+
+                    // 4. In-Flight Coalescing & Send to the dispatch queue
+                    bool shouldEnqueue = m_inFlightRegistry.registerOrSubscribe(fingerprint, buildId, tId);
+                    pActive.enqueuedTasks[tId] = true;
+
+                    if (!shouldEnqueue)
+                    {
+                        logInfo("[coordinator] Build '%s': Task '%s' coalesced with in-flight execution (fingerprint: %s)", buildId, tId, fingerprint);
+                        continue;
+                    }
+                    registeredFingerprint = fingerprint;
+
+                    TaskExecutionPayload payload;
+                    payload.inputs = inputs;
+                    payload.repositoryAddresses = addresses;
+                    payload.environment = node.environment;
+                    payload.workspaceDir = active.workspaceDir;
+                    payload.force = active.force;
+                    payload.expectedOutputs = node.outputs.artifacts.dup;
+
+                    if (m_callbackBaseUrl.length > 0)
+                    {
+                        payload.callbackUrl = format("%s/api/v1/builds/%s/tasks/%s/complete", m_callbackBaseUrl, buildId, tId);
+                    }
+
+                    // Resolve executorType and requirements tags from TaskNode components or definitions
+                    string executorType = "local";
+                    string[string] requirements;
+
+                    if (node.hasCustomComponent("executor"))
+                    {
+                        auto comp = node.getCustomComponent("executor");
+                        if (comp.type == JSONType.string) executorType = comp.str;
+                        else if (comp.type == JSONType.object && "type" in comp) executorType = comp["type"].str;
+                    }
+                    else if (node.hasCustomComponent("executor_type"))
+                    {
+                        auto comp = node.getCustomComponent("executor_type");
+                        if (comp.type == JSONType.string) executorType = comp.str;
+                    }
+                    else if (node.components !is null && "executor_type" in node.components)
+                    {
+                        executorType = node.components["executor_type"];
+                    }
+                    else if (node.components !is null && "executor" in node.components)
+                    {
+                        executorType = node.components["executor"];
+                    }
+
+                    if (node.hasCustomComponent("requirements"))
+                    {
+                        auto comp = node.getCustomComponent("requirements");
+                        if (comp.type == JSONType.object)
+                        {
+                            foreach (k, v; comp.object)
+                            {
+                                if (v.type == JSONType.string) requirements[k] = v.str;
+                                else requirements[k] = v.toString();
+                            }
+                        }
+                    }
+
+                    WorkOrder workOrder;
+                    workOrder.buildId = buildId;
+                    workOrder.taskId = tId;
+                    workOrder.taskNode = node;
+                    workOrder.fingerprint = fingerprint;
+                    workOrder.executorType = executorType;
+                    workOrder.requirements = requirements;
+                    workOrder.payload = payload;
+                    workOrder.timeoutSeconds = node.timeoutSeconds;
+                    workOrder.createdAt = Clock.currTime.toISOString();
+
+                    logInfo("[coordinator] Build '%s': Sending ready task '%s' to the dispatch queue (fingerprint: %s, executor: %s, timeout: %ds)", buildId, tId, fingerprint, executorType, node.timeoutSeconds);
+
+                    // Mark the task queued and record its demand before sending: a worker may receive
+                    // the work order (moving the task to running) as soon as it is sent, and the
+                    // capacity evaluation below counts only queued tasks.
+                    if (m_stateRepo !is null)
+                    {
+                        m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.queued);
+                    }
+                    pActive.queuedDemand[tId] = QueueDemand(executorType, 1, requirements);
+                    if (m_dispatchQueue !is null)
+                    {
+                        import vibe.data.json : serializeToJson;
+                        m_dispatchQueue.send(defaultPoolQueue, serializeToJson(workOrder));
+                    }
                 }
-
-                // 4. In-Flight Coalescing & Send to the dispatch queue
-                bool shouldEnqueue = m_inFlightRegistry.registerOrSubscribe(fingerprint, buildId, tId);
-                pActive.enqueuedTasks[tId] = true;
-
-                if (!shouldEnqueue)
+                catch (Exception e)
                 {
-                    logInfo("[coordinator] Build '%s': Task '%s' coalesced with in-flight execution (fingerprint: %s)", buildId, tId, fingerprint);
+                    // A task that cannot be dispatched fails, so the build fails rather than
+                    // waiting forever for a work order that was never sent.
+                    if (m_stateRepo is null) throw e;
+                    failDispatch(*pActive, tId, registeredFingerprint, e.msg);
+                    dispatchFailed = true;
                     continue;
-                }
-
-                string[] allowedRepos;
-                string[string] repoMap;
-
-                if (m_stateRepo !is null)
-                {
-                    try
-                    {
-                        foreach (repoRec; m_stateRepo.listRepositories())
-                        {
-                            if (repoRec.name.length > 0 && repoRec.address.length > 0)
-                            {
-                                repoMap[repoRec.name] = repoRec.address;
-                            }
-                        }
-                    }
-                    catch (Exception) {}
-                }
-
-                if (active.graph !is null)
-                {
-                    try
-                    {
-                        auto ancestors = active.graph.resolveSubgraph(tId);
-                        foreach (ancId; ancestors)
-                        {
-                            auto ancTask = active.graph.getTask(ancId);
-                            foreach (r; repositoryIds(ancTask))
-                            {
-                                if (!allowedRepos.canFind(r)) allowedRepos ~= r;
-                                if (r in repoMap && !allowedRepos.canFind(repoMap[r]))
-                                {
-                                    allowedRepos ~= repoMap[r];
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception) {}
-                }
-                foreach (r; repositoryIds(node))
-                {
-                    if (!allowedRepos.canFind(r)) allowedRepos ~= r;
-                    if (r in repoMap && !allowedRepos.canFind(repoMap[r]))
-                    {
-                        allowedRepos ~= repoMap[r];
-                    }
-                }
-
-                TaskExecutionPayload payload;
-                payload.allowedRepositories = allowedRepos;
-                payload.repositoryMap = repoMap;
-                payload.environment = node.environment;
-                payload.workspaceDir = active.workspaceDir;
-                payload.force = active.force;
-                payload.expectedOutputs = node.outputs.artifacts.dup;
-                payload.upstreamArtifactHashes = upstreamHashes;
-                payload.nodeFingerprint = fingerprint;
-
-                if (m_callbackBaseUrl.length > 0)
-                {
-                    payload.callbackUrl = format("%s/api/v1/builds/%s/tasks/%s/complete", m_callbackBaseUrl, buildId, tId);
-                }
-
-                // Single authoritative upstream artifact list: (taskFingerprint, artifactId),
-                // from the task_output inputs that name an artifact. Artifacts unpack into the workspace root.
-                foreach (decl; node.inputs.byValue)
-                {
-                    if (decl.kind != InputKind.taskOutput || decl.spec.artifact.length == 0) continue;
-                    string upFp = chainFingerprint(active, decl.spec.task);
-
-                    InputArtifactRef inArt;
-                    inArt.taskId = decl.spec.task;
-                    inArt.taskFingerprint = upFp;
-                    inArt.artifactId = decl.spec.artifact;
-                    payload.inputArtifacts ~= inArt;
-                }
-
-                // Resolve executorType and requirements tags from TaskNode components or definitions
-                string executorType = "local";
-                string[string] requirements;
-
-                if (node.hasCustomComponent("executor"))
-                {
-                    auto comp = node.getCustomComponent("executor");
-                    if (comp.type == JSONType.string) executorType = comp.str;
-                    else if (comp.type == JSONType.object && "type" in comp) executorType = comp["type"].str;
-                }
-                else if (node.hasCustomComponent("executor_type"))
-                {
-                    auto comp = node.getCustomComponent("executor_type");
-                    if (comp.type == JSONType.string) executorType = comp.str;
-                }
-                else if (node.components !is null && "executor_type" in node.components)
-                {
-                    executorType = node.components["executor_type"];
-                }
-                else if (node.components !is null && "executor" in node.components)
-                {
-                    executorType = node.components["executor"];
-                }
-
-                if (node.hasCustomComponent("requirements"))
-                {
-                    auto comp = node.getCustomComponent("requirements");
-                    if (comp.type == JSONType.object)
-                    {
-                        foreach (k, v; comp.object)
-                        {
-                            if (v.type == JSONType.string) requirements[k] = v.str;
-                            else requirements[k] = v.toString();
-                        }
-                    }
-                }
-
-                WorkOrder workOrder;
-                workOrder.buildId = buildId;
-                workOrder.taskId = tId;
-                workOrder.taskNode = node;
-                workOrder.fingerprint = fingerprint;
-                workOrder.executorType = executorType;
-                workOrder.requirements = requirements;
-                workOrder.payload = payload;
-                workOrder.timeoutSeconds = node.timeoutSeconds;
-                workOrder.createdAt = Clock.currTime.toISOString();
-
-                logInfo("[coordinator] Build '%s': Sending ready task '%s' to the dispatch queue (fingerprint: %s, executor: %s, timeout: %ds)", buildId, tId, fingerprint, executorType, node.timeoutSeconds);
-
-                // Mark the task queued and record its demand before sending: a worker may receive
-                // the work order (moving the task to running) as soon as it is sent, and the
-                // capacity evaluation below counts only queued tasks.
-                if (m_stateRepo !is null)
-                {
-                    m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.queued);
-                }
-                pActive.queuedDemand[tId] = QueueDemand(executorType, 1, requirements);
-                if (m_dispatchQueue !is null)
-                {
-                    import vibe.data.json : serializeToJson;
-                    m_dispatchQueue.send(defaultPoolQueue, serializeToJson(workOrder));
                 }
 
                 // Trigger capacity evaluation so provisioners can respond immediately to new demand
@@ -1099,6 +1147,13 @@ class BuildCoordinator
             }
         }
         while (stateChanged);
+
+        if (dispatchFailed)
+        {
+            // Re-evaluate: the failed task fails the build and cancels what is left
+            evaluateReadyTasksLocked(buildId);
+            return;
+        }
 
         // 5. Check if all target tasks are finished
         if (m_stateRepo !is null)
@@ -1781,7 +1836,7 @@ unittest
 {
     // A chain resolves the whole DAG once, stores resolved inputs for every task, and later
     // requests on the chain reuse them without resolving again or reading the edited project
-    import confector.core.input_resolution : chainFingerprints;
+    import confector.core.input_resolution : chainResolution;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
     import vibe.data.json : Json;
@@ -1808,11 +1863,23 @@ unittest
         }
     }
     assert(chainRecord.chainTasks[1].id == "external" && chainRecord.chainTasks[1].resolvedInputs.length == 1);
-    auto expected = chainFingerprints(project.id, chainRecord.chainTasks);
+    auto expected = chainResolution(project.id, chainRecord.chainTasks).fingerprints;
 
-    assert(completeNext(coordinator, queue, "compile").fingerprint == expected["compile"]);
-    assert(completeNext(coordinator, queue, "internal").fingerprint == expected["internal"]);
+    auto compileOrder = completeNext(coordinator, queue, "compile");
+    assert(compileOrder.fingerprint == expected["compile"]);
+    auto internalOrder = completeNext(coordinator, queue, "internal");
+    assert(internalOrder.fingerprint == expected["internal"]);
     assert(countReceivable(queue) == 0);
+
+    // A work order carries exactly the task's resolved inputs from the chain, and the address of
+    // each repository input by input name; nothing else names a repository
+    assert(compileOrder.payload.inputs == [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])]);
+    assert(compileOrder.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
+    assert(internalOrder.payload.inputs == chainResolution(project.id, chainRecord.chainTasks).inputs["internal"]);
+    assert(internalOrder.payload.inputs.length == 3 && internalOrder.payload.inputs[0].name == "bin"
+        && internalOrder.payload.inputs[0].kind == InputKind.taskOutput
+        && internalOrder.payload.inputs[0].pinned == Json(expected["compile"]));
+    assert(internalOrder.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
 
     // The branch moves on and the project inputs are edited; the chain must not notice
     resolver.liveSha = "bbb222";
@@ -1831,7 +1898,7 @@ unittest
     BuildRecord externalRecord;
     assert(stateRepo.getBuild(externalBuild, externalRecord));
     assert(externalRecord.chainId == internalBuild);
-    assert(chainFingerprints(project.id, externalRecord.chainTasks) == expected);
+    assert(chainResolution(project.id, externalRecord.chainTasks).fingerprints == expected);
 
     TaskStatus compileStatus;
     assert(stateRepo.getTaskStatus(externalBuild, "compile", compileStatus) && compileStatus == TaskStatus.cached);
@@ -1839,7 +1906,11 @@ unittest
     assert(external.fingerprint == expected["external"]);
     assert(external.taskNode.inputs["flavor"] == valueInput("external"), "Inputs come from the chain");
     assert(external.taskNode.steps[0].script == "echo external v2", "Configuration comes from the project");
-    assert(external.payload.upstreamArtifactHashes["compile"] == expected["compile"]);
+    assert(external.payload.inputs == [
+        ResolvedInput("bin", InputKind.taskOutput, Json(expected["compile"])),
+        ResolvedInput("flavor", InputKind.value, Json("external")),
+    ], "Task outputs pin to the upstream fingerprint, which addresses the artifacts to stage");
+    assert(external.payload.repositoryAddresses.length == 0);
 
     BuildRecord externalDone;
     assert(stateRepo.getBuild(externalBuild, externalDone) && externalDone.status == "succeeded");
@@ -1856,14 +1927,14 @@ unittest
     assert(resolver.calls == 3);
     BuildRecord newRecord;
     assert(stateRepo.getBuild(newBuild, newRecord) && newRecord.chainId == newBuild);
-    assert(chainFingerprints(edited.id, newRecord.chainTasks)["compile"] != expected["compile"]);
+    assert(chainResolution(edited.id, newRecord.chainTasks).fingerprints["compile"] != expected["compile"]);
 }
 
 unittest
 {
     // A restarted coordinator resumes a build from its chain: no resolution and no fingerprints
     // or structure from the project as edited meanwhile (bug confector-3qh)
-    import confector.core.input_resolution : chainFingerprints;
+    import confector.core.input_resolution : chainResolution;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
 
@@ -1877,7 +1948,7 @@ unittest
     string buildId = before.startBuild(project, "internal", true);
     BuildRecord record;
     assert(stateRepo.getBuild(buildId, record));
-    auto expected = chainFingerprints(project.id, record.chainTasks);
+    auto expected = chainResolution(project.id, record.chainTasks).fingerprints;
 
     auto compileOrder = receiveWorkOrders(queue, 1)[0];
 
@@ -1957,4 +2028,67 @@ unittest
 
     assert(stateRepo.listBuilds().length == 0, "A failed chain creation must not record a build");
     assert(countReceivable(queue) == 0, "A failed chain creation must not dispatch work");
+}
+
+unittest
+{
+    // A repository input whose repository has no address cannot be dispatched: there would be
+    // nothing to check it out from
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto stateRepo = new InMemoryBuildStateRepository();
+    RepositoryRecord noAddress = gameRepository();
+    noAddress.address = "";
+    stateRepo.saveRepository(noAddress);
+    auto queue = new InMemoryDispatchQueue();
+    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue, null, "", new FakeRepositoryResolver());
+
+    bool threw = false;
+    try coordinator.startBuild(variantsProject(), "compile");
+    catch (Exception ex) threw = ex.msg.canFind("'src'") && ex.msg.canFind("no address");
+    assert(threw);
+    assert(countReceivable(queue) == 0);
+    assert(stateRepo.listBuilds().length == 0, "The request must fail before a build is recorded");
+    assert(coordinator.m_activeBuilds.length == 0, "No active build may remain");
+}
+
+unittest
+{
+    // A task that cannot be dispatched mid-build fails, and so does its build, instead of the
+    // build waiting forever: here a restarted coordinator resumes a build whose next task was
+    // deleted from the project meanwhile
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto storage = new InMemoryArtifactStorage();
+    auto queue = new InMemoryDispatchQueue();
+    auto project = variantsProject();
+
+    auto before = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    string buildId = before.startBuild(project, "internal", true);
+    auto compileOrder = receiveWorkOrders(queue, 1)[0];
+
+    ProjectRecord shrunk = project;
+    shrunk.tasks = [project.tasks[0], project.tasks[2]];
+    stateRepo.saveProject(shrunk);
+
+    auto after = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    TaskExecutionResult done;
+    done.taskId = "compile";
+    done.buildId = buildId;
+    done.status = TaskStatus.succeeded;
+    done.fingerprint = compileOrder.workOrder.fingerprint;
+    after.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+
+    TaskStatus internalStatus;
+    assert(stateRepo.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.failed);
+    TaskExecutionRecord internalRec;
+    assert(stateRepo.getTaskExecution(buildId, "internal", internalRec) && internalRec.errorMessage.canFind("deleted from project"));
+    BuildRecord record;
+    assert(stateRepo.getBuild(buildId, record) && record.status == "failed");
+    assert(after.m_activeBuilds.length == 0 && after.inFlightRegistry.inFlightCount() == 0);
+    assert(countReceivable(queue) == 0);
 }

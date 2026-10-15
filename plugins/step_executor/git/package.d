@@ -6,17 +6,20 @@ import std.stdio;
 import std.file;
 import std.path : buildPath, baseName, isAbsolute, buildNormalizedPath, absolutePath, relativePath, dirSeparator;
 import std.algorithm.searching : canFind, startsWith, endsWith;
+import std.algorithm.sorting : sort;
 import std.array : split;
+import std.conv : to;
 import std.string : strip, toLower, indexOf;
 import std.json : JSONValue, JSONType;
 
 import confector.plugin_api.model;
 import confector.plugin_api.plugin;
 import confector.plugin_api.vcs;
-import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult;
+import confector.plugin_api.system : BuildStepSystem, StepExecutionContext, StepExecutionResult;
 import confector.plugin_api.executor : LogDelegate;
 import std.json : parseJSON;
 import std.datetime : Clock;
+import vibe.data.json : Json;
 
 private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
 {
@@ -39,85 +42,101 @@ private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
     return true;
 }
 
-private string normalizeRepoUrl(string url) pure @safe
+/**
+ * Parameters of the checkout step. A checkout step names a declared repository input by its
+ * name (`input`) and checks out exactly that input's pinned commit; it never takes a URL, a
+ * repository or a ref. Options:
+ *
+ * - `target_dir`: directory to check out into, relative to the step's working directory
+ *   (default: the working directory itself); must stay inside the workspace.
+ * - `depth`: fetch depth, a positive integer (default: full history).
+ * - `submodules`: `true` or `false` (default: `true`, recursive).
+ *
+ * The git program is always `git` from the runner's PATH; a task cannot choose it.
+ */
+private immutable string[] checkoutParameters = ["input", "target_dir", "depth", "submodules"];
+
+/// The null device, used as git's global configuration so no user-level configuration applies.
+version (Windows) private enum nullDevice = "NUL";
+else private enum nullDevice = "/dev/null";
+
+/**
+ * Returns the environment checkout runs git with: `inherited` (the runner's own environment
+ * with the task's and step's on top) without any variable that changes how git behaves, plus
+ * Confector's own settings.
+ *
+ * Every `GIT_*` variable is dropped (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_*, GIT_SSH*, GIT_TRACE*,
+ * GIT_EXEC_PATH, GIT_ASKPASS, ...), as are `SSH_ASKPASS` and `XDG_CONFIG_HOME`. Then:
+ * system and global configuration are disabled, nothing may prompt, ssh runs in batch mode,
+ * and repository discovery stops at `checkoutDir`'s parent, so only the fresh repository in
+ * `checkoutDir` is ever used.
+ */
+string[string] checkoutEnvironment(in string[string] inherited, string checkoutDir) @safe
 {
-    import std.string : toLower, strip;
-    import std.algorithm.searching : endsWith;
-    string u = url.strip().toLower();
-    while (u.endsWith("/")) u = u[0 .. $ - 1];
-    if (u.endsWith(".git")) u = u[0 .. $ - 4];
-    return u;
+    import std.path : dirName;
+    import std.uni : toUpper;
+
+    string[string] env;
+    foreach (key, value; inherited)
+    {
+        const upper = key.toUpper;
+        if (upper.startsWith("GIT_") || upper == "SSH_ASKPASS" || upper == "XDG_CONFIG_HOME") continue;
+        env[key] = value;
+    }
+    env["GIT_CONFIG_NOSYSTEM"] = "1";
+    env["GIT_CONFIG_GLOBAL"] = nullDevice;
+    env["GIT_TERMINAL_PROMPT"] = "0";
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes";
+    env["GIT_CEILING_DIRECTORIES"] = dirName(buildNormalizedPath(absolutePath(checkoutDir)));
+    return env;
 }
 
-private bool isRepoMatch(string candidate, string target, in string[string] repoMap = null) pure @safe
+/// Configuration every checkout git command runs with, overriding anything that could hand
+/// credentials to a helper or run code: no credential helpers, no fsmonitor, no `ext::` remotes.
+private immutable string[] hermeticGitOptions = [
+    "-c", "credential.helper=",
+    "-c", "core.fsmonitor=false",
+    "-c", "protocol.ext.allow=never",
+    "-c", "advice.detachedHead=false",
+];
+
+unittest
 {
-    if (candidate == target) return true;
-    if (repoMap !is null)
+    auto env = checkoutEnvironment([
+        "PATH": "/usr/bin", "GIT_DIR": "/elsewhere", "git_work_tree": "/x", "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "url.x.insteadOf", "GIT_TRACE_CURL": "1", "GIT_SSH": "evil", "GIT_EXEC_PATH": "/evil",
+        "SSH_ASKPASS": "evil", "XDG_CONFIG_HOME": "/evil", "GIT_TERMINAL_PROMPT": "1",
+    ], "/ws/src");
+    assert(env["PATH"] == "/usr/bin");
+    foreach (dropped; ["GIT_DIR", "git_work_tree", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_TRACE_CURL", "GIT_SSH",
+        "GIT_EXEC_PATH", "SSH_ASKPASS", "XDG_CONFIG_HOME"])
     {
-        if (auto p = candidate in repoMap)
-        {
-            if (*p == target || isRepoMatch(*p, target)) return true;
-        }
-        if (auto p = target in repoMap)
-        {
-            if (candidate == *p || isRepoMatch(candidate, *p)) return true;
-        }
+        assert(dropped !in env, dropped);
     }
-    string nCandidate = normalizeRepoUrl(candidate);
-    string nTarget = normalizeRepoUrl(target);
-    if (nCandidate.length > 0 && nCandidate == nTarget) return true;
-
-    // Check if one is SSH format and other is HTTPS format for same repo
-    // e.g. git@github.com:org/repo and https://github.com/org/repo
-    import std.algorithm.searching : startsWith;
-    import std.string : indexOf;
-
-    string getHostAndPath(string url)
-    {
-        string norm = normalizeRepoUrl(url);
-        if (norm.startsWith("https://")) norm = norm[8 .. $];
-        else if (norm.startsWith("http://")) norm = norm[7 .. $];
-        else if (norm.startsWith("ssh://git@"))
-        {
-            norm = norm[10 .. $];
-            auto colonIdx = norm.indexOf(':');
-            if (colonIdx != -1) norm = norm[0 .. colonIdx] ~ "/" ~ norm[colonIdx + 1 .. $];
-        }
-        else if (norm.startsWith("git@"))
-        {
-            norm = norm[4 .. $];
-            auto colonIdx = norm.indexOf(':');
-            if (colonIdx != -1) norm = norm[0 .. colonIdx] ~ "/" ~ norm[colonIdx + 1 .. $];
-        }
-        return norm;
-    }
-
-    auto hCandidate = getHostAndPath(candidate);
-    auto hTarget = getHostAndPath(target);
-    if (hCandidate.length > 0 && hCandidate == hTarget)
-    {
-        return true;
-    }
-
-    return false;
+    assert(env["GIT_TERMINAL_PROMPT"] == "0" && env["GIT_CONFIG_NOSYSTEM"] == "1" && env["GIT_CONFIG_GLOBAL"] == nullDevice);
 }
 
 /**
- * Git repository provider, input resolution, and build step execution plugin.
- * Encapsulates Git-specific cloning, command operations, and input staging.
+ * Git version control plugin: the built-in checkout step, plus webhook parsing and remote
+ * state queries for the control plane.
+ *
+ * The checkout step checks out a repository input by name at its pinned commit SHA. The
+ * repository's address comes from the work order and is used only here: it is passed to git on
+ * the command line, never written to `.git/config` or anywhere else in the workspace, and
+ * redacted from everything logged.
  */
-class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSystem, BuildStepSystem, VcsStateResolver
+class GitRunnerPlugin : StepExecutionPlugin, BuildStepSystem, VcsStateResolver
 {
     private PluginContext m_context;
 
     @property string name() const { return "git-runner"; }
     @property string versionString() const { return "1.0.0"; }
-    @property string description() const { return "Git version control execution, input resolution, and build step runner plugin"; }
+    @property string description() const { return "Git checkout step and repository state plugin"; }
     @property PluginCategory category() const { return PluginCategory.step_executor; }
 
     ConfigDefinition[] configDefinitions() const { return null; }
     @property string providerType() const { return "git"; }
-    @property string systemName() const { return "git-input-resolver"; }
+    @property string systemName() const { return "git-checkout"; }
 
     void initialize(PluginContext context = null)
     {
@@ -146,77 +165,6 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
             || repositoryAddress.endsWith(".git");
     }
 
-    void cloneRepository(string address, string targetDirectory, LogDelegate logCallback = null)
-    {
-        mkdirRecurse(targetDirectory);
-
-        if (m_context !is null)
-        {
-            m_context.info(format("Executing git clone via GitRunnerPlugin for %s into %s", address, targetDirectory));
-        }
-
-        auto pipe = pipeShell(format("git clone %s .", address),
-            Redirect.stdout | Redirect.stderrToStdout,
-            null,
-            Config.retainStderr,
-            targetDirectory);
-
-        scope(exit) wait(pipe.pid);
-
-        foreach (line; pipe.stdout.byLineCopy)
-        {
-            if (m_context !is null)
-            {
-                m_context.debug_(line);
-            }
-            if (logCallback !is null)
-            {
-                logCallback(line);
-            }
-        }
-        if (m_context !is null)
-        {
-            m_context.info("Git clone completed successfully via GitRunnerPlugin");
-        }
-    }
-
-    bool canResolve(in TaskNode task) const
-    {
-        // When task has explicit build steps, bypass InputResolver pass so step execution manages checkout
-        if (task.steps.length > 0)
-        {
-            return false;
-        }
-        // Repository inputs name repositories by id; whether an id is a git repository is
-        // only known once it is mapped to an address in resolveInputs.
-        return repositoryIds(task).length > 0;
-    }
-
-    void resolveInputs(in TaskNode task, ref InputResolutionContext context)
-    {
-        foreach (repoId; repositoryIds(task))
-        {
-            auto addressPtr = repoId in context.repositoryMap;
-            if (addressPtr is null)
-            {
-                throw new Exception(format("Task '%s' has a repository input naming unknown repository '%s'", task.id, repoId));
-            }
-            string repo = *addressPtr;
-            if (canHandle(repo))
-            {
-                string targetDir = buildPath(context.effectiveWorkingDir, baseName(repo));
-                if (isWithinDirectory(targetDir, context.effectiveWorkingDir))
-                {
-                    cloneRepository(repo, targetDir, context.logCallback);
-                }
-                else if (context.logCallback !is null)
-                {
-                    context.logCallback(format("[git] Security Error: Clone target '%s' escapes effective working directory '%s'", targetDir, context.effectiveWorkingDir));
-                }
-            }
-        }
-    }
-
     bool canExecuteStep(in BuildStep step) const
     {
         return step.type == "clone_repository"
@@ -226,222 +174,217 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
             || step.type == "git";
     }
 
+    /**
+     * Checks out the repository input the step names at its pinned commit. Fails, without
+     * running git, if the step names no input, names an input the task does not declare or
+     * that is not a repository input, carries any parameter other than those in
+     * `checkoutParameters`, or the input's pinned value is not a full commit SHA.
+     */
     StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
     {
         StepExecutionResult res;
-        string repoParam = "";
-        string branchParam = "";
-        string targetDirParam = "";
-        string commitParam = "";
-        string depthParam = "";
-        bool submodules = true;
 
-        if ("repository" in step.parameters) repoParam = step.parameters["repository"];
-        else if ("url" in step.parameters) repoParam = step.parameters["url"];
-        else if ("address" in step.parameters) repoParam = step.parameters["address"];
-        else if ("repo" in step.parameters) repoParam = step.parameters["repo"];
-
-        if ("branch" in step.parameters) branchParam = step.parameters["branch"];
-        else if ("ref" in step.parameters) branchParam = step.parameters["ref"];
-        else if ("tag" in step.parameters) branchParam = step.parameters["tag"];
-
-        if ("target_dir" in step.parameters) targetDirParam = step.parameters["target_dir"];
-        else if ("targetDirectory" in step.parameters) targetDirParam = step.parameters["targetDirectory"];
-        else if ("target" in step.parameters) targetDirParam = step.parameters["target"];
-
-        if ("commit" in step.parameters) commitParam = step.parameters["commit"];
-        else if ("sha" in step.parameters) commitParam = step.parameters["sha"];
-
-        if ("depth" in step.parameters) depthParam = step.parameters["depth"];
-        if ("submodules" in step.parameters)
-        {
-            string sVal = step.parameters["submodules"];
-            submodules = (sVal != "false" && sVal != "0" && sVal != "no");
-        }
-
-        if (repoParam.length == 0 && step.command.length > 0)
-        {
-            repoParam = step.command;
-        }
-
-        if (repoParam.length == 0)
+        StepExecutionResult fail(string message)
         {
             res.success = false;
-            res.exitCode = 1;
-            res.errorMessage = "No repository address specified for git clone step";
-            return res;
-        }
-
-        // Repository authorization check
-        if (context.allowedRepositories.length > 0)
-        {
-            bool isAllowed = false;
-            foreach (allowed; context.allowedRepositories)
-            {
-                if (isRepoMatch(repoParam, allowed, context.repositoryMap))
-                {
-                    isAllowed = true;
-                    break;
-                }
-            }
-
-            if (!isAllowed)
-            {
-                res.success = false;
-                res.exitCode = 403;
-                res.errorMessage = format("Repository '%s' is not in the project's allowed repositories whitelist", repoParam);
-                if (context.logCallback !is null)
-                {
-                    context.logCallback(format("[git] Security Error: %s", res.errorMessage));
-                }
-                return res;
-            }
-        }
-
-        string cloneTargetDir;
-        if (targetDirParam.length > 0)
-        {
-            cloneTargetDir = isAbsolute(targetDirParam) ? targetDirParam : buildPath(context.workingDirectory, targetDirParam);
-        }
-        else
-        {
-            cloneTargetDir = context.workingDirectory;
-        }
-
-        // Enforce workspace jail boundary security
-        if (!isWithinDirectory(cloneTargetDir, context.workspaceDir))
-        {
-            res.success = false;
-            res.exitCode = 1;
-            res.errorMessage = format("Security Error: Target directory '%s' escapes workspace boundary '%s'", cloneTargetDir, context.workspaceDir);
+            res.exitCode = res.exitCode != 0 ? res.exitCode : 1;
+            res.errorMessage = message;
             if (context.logCallback !is null)
             {
-                context.logCallback(res.errorMessage);
+                context.logCallback(format("[git] Error: %s", message));
             }
             return res;
         }
 
-        if (!exists(cloneTargetDir))
+        string[] keys = step.parameters.keys;
+        keys.sort();
+        foreach (key; keys)
         {
-            mkdirRecurse(cloneTargetDir);
+            if (!checkoutParameters.canFind(key))
+            {
+                return fail(format("Checkout step parameter '%s' is not supported. A checkout step names a declared repository input with 'input' and checks out its pinned commit; supported parameters: %-(%s, %)",
+                    key, checkoutParameters));
+            }
+        }
+        if (step.command.length > 0 || step.script.length > 0)
+        {
+            return fail("A checkout step takes no command or script; name a declared repository input with the 'input' parameter");
         }
 
-        string effectiveRepoUrl = repoParam;
-        if (context.repositoryMap !is null)
+        string inputName = step.parameters.get("input", "");
+        if (inputName.length == 0)
         {
-            int maxHops = 10;
-            while (maxHops-- > 0 && (effectiveRepoUrl in context.repositoryMap))
+            return fail("Checkout step has no 'input' parameter naming the repository input to check out");
+        }
+        auto input = inputName in context.inputs;
+        if (input is null)
+        {
+            return fail(format("Checkout step names input '%s', which task '%s' does not declare", inputName, context.taskId));
+        }
+        if (input.kind != InputKind.repository)
+        {
+            return fail(format("Checkout step names input '%s', which is a %s input, not a repository input",
+                inputName, cast(string) input.kind));
+        }
+        if (input.pinned.type != Json.Type.string || !isFullSha(input.pinned.get!string))
+        {
+            return fail(format("Repository input '%s' is not pinned to a git commit SHA", inputName));
+        }
+        string sha = input.pinned.get!string.toLower;
+
+        auto addressPtr = inputName in context.repositoryAddresses;
+        if (addressPtr is null || addressPtr.length == 0)
+        {
+            return fail(format("The work order gives no repository address for input '%s'", inputName));
+        }
+        string address = *addressPtr;
+        if (address.startsWith("-"))
+        {
+            return fail(format("The repository address of input '%s' must not start with '-'", inputName));
+        }
+
+        string targetDirParam = step.parameters.get("target_dir", "");
+        string checkoutDir = targetDirParam.length == 0
+            ? context.workingDirectory
+            : (isAbsolute(targetDirParam) ? targetDirParam : buildPath(context.workingDirectory, targetDirParam));
+        if (!isWithinDirectory(checkoutDir, context.workspaceDir))
+        {
+            return fail(format("Target directory '%s' escapes workspace boundary '%s'", checkoutDir, context.workspaceDir));
+        }
+
+        string depth = step.parameters.get("depth", "");
+        if (depth.length > 0)
+        {
+            uint parsed;
+            try parsed = depth.to!uint;
+            catch (Exception) parsed = 0;
+            if (parsed == 0)
             {
-                effectiveRepoUrl = context.repositoryMap[effectiveRepoUrl];
+                return fail(format("Checkout step 'depth' must be a positive integer, not '%s'", depth));
             }
         }
 
-        string gitExecutable = "git";
-        if ("executable" in step.parameters && step.parameters["executable"].length > 0)
+        bool submodules = true;
+        if (auto p = "submodules" in step.parameters)
         {
-            gitExecutable = step.parameters["executable"];
+            if (*p == "true") submodules = true;
+            else if (*p == "false") submodules = false;
+            else return fail(format("Checkout step 'submodules' must be 'true' or 'false', not '%s'", *p));
         }
 
-        string[] cloneArgs = [gitExecutable, "clone"];
-        if (depthParam.length > 0)
+        // Checkout must start from a fresh repository: an existing .git (from an upstream
+        // artifact or an earlier step) could carry configuration that redirects the fetch or
+        // captures credentials.
+        if (exists(buildPath(checkoutDir, ".git")))
         {
-            cloneArgs ~= ["--depth", depthParam];
+            return fail(format("Checkout directory '%s' already contains .git; check input '%s' out into a fresh directory (set target_dir)",
+                checkoutDir, inputName));
         }
-        if (branchParam.length > 0 && commitParam.length == 0)
+
+        if (!exists(checkoutDir))
         {
-            cloneArgs ~= ["--branch", branchParam];
+            mkdirRecurse(checkoutDir);
         }
-        if (submodules)
-        {
-            cloneArgs ~= "--recurse-submodules";
-        }
-        cloneArgs ~= effectiveRepoUrl;
-        cloneArgs ~= ".";
+
+        string[string] inherited = environment.toAA();
+        foreach (k, v; context.environment) inherited[k] = v;
+        foreach (k, v; step.environment) inherited[k] = v;
+        string[string] gitEnv = checkoutEnvironment(inherited, checkoutDir);
 
         if (context.logCallback !is null)
         {
-            string logMsg = format("[git] Cloning repository '%s'", repoParam);
-            if (branchParam.length > 0) logMsg ~= format(" (branch: %s)", branchParam);
-            if (targetDirParam.length > 0) logMsg ~= format(" into '%s'", targetDirParam);
-            context.logCallback(logMsg);
+            context.logCallback(format("[git] Checking out input '%s' at commit %s", inputName, sha));
         }
 
         try
         {
-            string[string] stepEnv;
-            foreach (k, v; context.environment) stepEnv[k] = v;
-            foreach (k, v; step.environment) stepEnv[k] = v;
-
-            auto pipe = pipeProcess(cloneArgs,
-                Redirect.stdout | Redirect.stderrToStdout,
-                stepEnv.length > 0 ? stepEnv : null,
-                Config.retainStderr,
-                cloneTargetDir);
-
-            foreach (line; pipe.stdout.byLineCopy)
+            int run(string[] args)
             {
-                res.outputLines ~= line;
+                return runGit(["git"] ~ hermeticGitOptions ~ args, checkoutDir, gitEnv, res, context.logCallback);
+            }
+
+            // No templates: the fresh repository has no hooks
+            int code = run(["init", "--quiet", "--template="]);
+            if (code != 0)
+            {
+                res.exitCode = code;
+                return fail(format("git init failed with exit code %d", code));
+            }
+
+            // Fetch exactly the pinned commit, straight from the address: no remote is
+            // configured, so the address never lands in .git/config.
+            string[] fetchSha = ["fetch", "--no-tags", "--quiet"];
+            if (depth.length > 0) fetchSha ~= "--depth=" ~ depth;
+            fetchSha ~= ["--", address, sha];
+            if (run(fetchSha) != 0)
+            {
+                // The server refuses to serve an unadvertised commit: fetch its branches and
+                // tags, then require the commit to be among what they reach.
                 if (context.logCallback !is null)
                 {
-                    context.logCallback(line);
+                    context.logCallback("[git] The repository did not serve the commit directly; fetching its branches and tags");
+                }
+                code = run(["fetch", "--no-tags", "--quiet", "--", address,
+                    "+refs/heads/*:refs/confector/heads/*", "+refs/tags/*:refs/confector/tags/*"]);
+                if (code != 0)
+                {
+                    res.exitCode = code;
+                    return fail(format("git fetch for input '%s' failed with exit code %d", inputName, code));
+                }
+                if (run(["cat-file", "-e", sha ~ "^{commit}"]) != 0)
+                {
+                    res.exitCode = 1;
+                    return fail(format("Commit %s of input '%s' no longer exists in its repository (force-pushed?). The build chain pins that commit, so a rerun cannot help; start a new build",
+                        sha, inputName));
                 }
             }
 
-            res.exitCode = wait(pipe.pid);
-            res.success = (res.exitCode == 0);
-
-            if (!res.success)
+            code = run(["checkout", "--quiet", "--detach", sha, "--"]);
+            if (code != 0)
             {
-                res.errorMessage = format("Git clone failed with exit code %d", res.exitCode);
-                return res;
+                res.exitCode = code;
+                return fail(format("git checkout of commit %s failed with exit code %d", sha, code));
             }
 
-            // If a specific commit SHA was requested, checkout that commit explicitly
-            if (commitParam.length > 0)
+            if (submodules)
             {
-                if (context.logCallback !is null)
+                code = run(["submodule", "update", "--init", "--recursive"]);
+                if (code != 0)
                 {
-                    context.logCallback(format("[git] Checking out commit '%s'", commitParam));
-                }
-
-                string[] checkoutArgs = [gitExecutable, "checkout", commitParam];
-                auto coPipe = pipeProcess(checkoutArgs,
-                    Redirect.stdout | Redirect.stderrToStdout,
-                    stepEnv.length > 0 ? stepEnv : null,
-                    Config.retainStderr,
-                    cloneTargetDir);
-
-                foreach (line; coPipe.stdout.byLineCopy)
-                {
-                    res.outputLines ~= line;
-                    if (context.logCallback !is null)
-                    {
-                        context.logCallback(line);
-                    }
-                }
-
-                int coExit = wait(coPipe.pid);
-                if (coExit != 0)
-                {
-                    res.success = false;
-                    res.exitCode = coExit;
-                    res.errorMessage = format("Git checkout commit '%s' failed with exit code %d", commitParam, coExit);
-                    return res;
+                    res.exitCode = code;
+                    return fail(format("git submodule update failed with exit code %d", code));
                 }
             }
         }
         catch (Exception e)
         {
             res.exitCode = -1;
-            res.success = false;
-            res.errorMessage = e.msg;
-            if (context.logCallback !is null)
-            {
-                context.logCallback(format("[git] Execution error: %s", e.msg));
-            }
+            return fail(format("Could not run git: %s", redactUserInfo(e.msg)));
         }
 
+        res.success = true;
+        res.exitCode = 0;
         return res;
+    }
+
+    /// Runs one git command in `dir` with standard input closed, appending its output, with any
+    /// credentials in URLs redacted, to `res` and the log. Returns its exit code.
+    private static int runGit(string[] args, string dir, string[string] env, ref StepExecutionResult res, LogDelegate log)
+    {
+        // newEnv: git sees exactly nv, never the runner's unfiltered environment
+        auto pipe = pipeProcess(args, Redirect.stdin | Redirect.stdout | Redirect.stderrToStdout, env,
+            Config.newEnv, dir);
+        pipe.stdin.close();
+        foreach (line; pipe.stdout.byLineCopy)
+        {
+            string shown = redactUserInfo(line);
+            res.outputLines ~= shown;
+            if (log !is null)
+            {
+                log(shown);
+            }
+        }
+        return wait(pipe.pid);
     }
 
     // ===================== VcsStateResolver implementation =====================
@@ -797,6 +740,57 @@ extern(C) export Plugin confector_create_plugin()
     return new GitRunnerPlugin();
 }
 
+version (unittest)
+{
+    private enum testSha = "1111111111111111111111111111111111111111";
+
+    /// A step context for a task declaring repository input `src`, value input `flavor` and
+    /// task_output input `bin`, with `src` pinned to `sha` at `address`.
+    private StepExecutionContext checkoutContext(string workspace, string sha = testSha, string address = "https://example.test/game.git")
+    {
+        StepExecutionContext ctx;
+        ctx.taskId = "compile";
+        ctx.workspaceDir = workspace;
+        ctx.workingDirectory = workspace;
+        ctx.inputs["src"] = ResolvedInput("src", InputKind.repository, Json(sha));
+        ctx.inputs["flavor"] = ResolvedInput("flavor", InputKind.value, Json("internal"));
+        ctx.inputs["bin"] = ResolvedInput("bin", InputKind.taskOutput, Json("fp_upstream"));
+        ctx.repositoryAddresses["src"] = address;
+        return ctx;
+    }
+
+    private BuildStep checkoutStep(string[string] parameters)
+    {
+        BuildStep step;
+        step.type = "clone_repository";
+        step.parameters = parameters;
+        return step;
+    }
+
+    /// Removes a directory tree that may contain git's read-only object files.
+    private void removeTree(string dir)
+    {
+        version (Windows)
+        {
+            enum uint readOnly = 0x1; // FILE_ATTRIBUTE_READONLY
+            foreach (DirEntry entry; dirEntries(dir, SpanMode.depth, false))
+            {
+                if (entry.isFile && (entry.attributes & readOnly)) setAttributes(entry.name, entry.attributes & ~readOnly);
+            }
+        }
+        rmdirRecurse(dir);
+    }
+
+    /// Runs git in `dir`, asserting success, and returns its trimmed output.
+    private string gitIn(string dir, string[] args)
+    {
+        auto r = execute(["git", "-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"] ~ args,
+            null, Config.none, size_t.max, dir);
+        assert(r.status == 0, format("git %s failed: %s", args, r.output));
+        return r.output.strip;
+    }
+}
+
 unittest
 {
     auto plugin = new GitRunnerPlugin();
@@ -804,56 +798,142 @@ unittest
     assert(plugin.name == "git-runner");
     assert(plugin.category == PluginCategory.step_executor);
     assert(plugin.providerType == "git");
-    assert(plugin.systemName == "git-input-resolver");
+    assert(plugin.systemName == "git-checkout");
 
     assert(plugin.canHandle("https://github.com/dlang/dmd.git"));
     assert(plugin.canHandle("git@github.com:dlang/druntime.git"));
     assert(!plugin.canHandle("svn://svn.example.com/repo"));
 
-    BuildStep bStep;
-    bStep.type = "clone_repository";
-    bStep.parameters["repository"] = "https://github.com/dlang/dub.git";
-    assert(plugin.canExecuteStep(bStep));
-
-    BuildStep gitStep;
-    gitStep.type = "git";
-    assert(plugin.canExecuteStep(gitStep));
-
+    assert(plugin.canExecuteStep(checkoutStep(["input": "src"])));
     BuildStep bashStep;
     bashStep.type = "bash";
     assert(!plugin.canExecuteStep(bashStep));
+}
 
-    // Security whitelist check test
-    StepExecutionContext sCtx;
-    sCtx.workspaceDir = ".";
-    sCtx.workingDirectory = ".";
-    sCtx.allowedRepositories = ["https://github.com/allowed/repo.git"];
+unittest
+{
+    // A checkout step can only name a declared repository input; anything else fails before
+    // git runs (none of these cases needs git)
+    auto plugin = new GitRunnerPlugin();
+    plugin.initialize(new NullPluginContext("git-runner"));
 
-    BuildStep unauthStep;
-    unauthStep.type = "clone_repository";
-    unauthStep.parameters["repository"] = "https://github.com/unauthorized/repo.git";
+    bool failsWith(StepExecutionContext ctx, BuildStep step, string expected)
+    {
+        auto res = plugin.executeStep(step, ctx);
+        return !res.success && res.exitCode != 0 && res.errorMessage.canFind(expected);
+    }
 
-    auto unauthRes = plugin.executeStep(unauthStep, sCtx);
-    assert(!unauthRes.success);
-    assert(unauthRes.exitCode == 403);
+    auto ctx = checkoutContext(".");
 
-    // Repository map alias resolution check
-    StepExecutionContext mapCtx;
-    mapCtx.workspaceDir = ".";
-    mapCtx.workingDirectory = ".";
-    mapCtx.allowedRepositories = ["https://github.com/allowed/repo.git"];
-    mapCtx.repositoryMap = ["confector": "https://github.com/allowed/repo.git"];
+    assert(failsWith(ctx, checkoutStep(null), "no 'input' parameter"));
+    assert(failsWith(ctx, checkoutStep(["input": "tools"]), "'tools', which task 'compile' does not declare"));
+    assert(failsWith(ctx, checkoutStep(["input": "flavor"]), "value input, not a repository input"));
+    assert(failsWith(ctx, checkoutStep(["input": "bin"]), "task_output input, not a repository input"));
 
-    BuildStep aliasStep;
-    aliasStep.type = "clone_repository";
-    aliasStep.parameters["repository"] = "confector";
-    // Target invalid directory to avoid running actual git clone during unit test while testing pre-clone resolution
-    aliasStep.parameters["target_dir"] = "../escape";
+    // No URL, repository, address, ref or commit parameter: only the input's pinned commit
+    foreach (param; ["repository", "url", "address", "repo", "branch", "ref", "commit", "sha", "executable"])
+    {
+        assert(failsWith(ctx, checkoutStep(["input": "src", param: "https://example.test/other.git"]),
+            format("parameter '%s' is not supported", param)), param);
+    }
+    BuildStep withCommand = checkoutStep(["input": "src"]);
+    withCommand.command = "https://example.test/other.git";
+    assert(failsWith(ctx, withCommand, "takes no command"));
 
-    auto aliasRes = plugin.executeStep(aliasStep, mapCtx);
-    // Should pass whitelist auth check (not 403) and fail on boundary escape (code 1)
-    assert(aliasRes.exitCode != 403);
-    assert(!aliasRes.success);
+    // The pinned value must be a full commit SHA, and the work order must say where to fetch it
+    assert(failsWith(checkoutContext(".", "main"), checkoutStep(["input": "src"]), "not pinned to a git commit SHA"));
+    auto noAddress = checkoutContext(".");
+    noAddress.repositoryAddresses = null;
+    assert(failsWith(noAddress, checkoutStep(["input": "src"]), "no repository address for input 'src'"));
+    assert(failsWith(checkoutContext(".", testSha, "--upload-pack=evil"), checkoutStep(["input": "src"]), "must not start with '-'"));
+
+    // Options are validated, and the checkout stays inside the workspace
+    assert(failsWith(ctx, checkoutStep(["input": "src", "target_dir": "../escape"]), "escapes workspace"));
+    assert(failsWith(ctx, checkoutStep(["input": "src", "depth": "0"]), "positive integer"));
+    assert(failsWith(ctx, checkoutStep(["input": "src", "submodules": "maybe"]), "'true' or 'false'"));
+}
+
+unittest
+{
+    // Checkout by input name against a local repository: exactly the pinned commit, not the
+    // branch tip, and the address is not written into the workspace
+    import std.uuid : randomUUID;
+
+    try
+    {
+        if (execute(["git", "--version"]).status != 0) return;
+    }
+    catch (Exception) return;
+
+    string root = buildPath(tempDir(), "cfx" ~ randomUUID().toString()[0 .. 6]);
+    string origin = buildPath(root, "o");
+    string workspace = buildPath(root, "w");
+    mkdirRecurse(origin);
+    mkdirRecurse(workspace);
+    scope(exit) if (exists(root)) removeTree(root);
+
+    gitIn(origin, ["init", "--quiet"]);
+    std.file.write(buildPath(origin, "version.txt"), "one");
+    gitIn(origin, ["add", "version.txt"]);
+    gitIn(origin, ["commit", "--quiet", "-m", "one"]);
+    string first = gitIn(origin, ["rev-parse", "HEAD"]);
+    std.file.write(buildPath(origin, "version.txt"), "two");
+    gitIn(origin, ["commit", "--quiet", "-am", "two"]);
+    string tip = gitIn(origin, ["rev-parse", "HEAD"]);
+    assert(first != tip);
+
+    auto plugin = new GitRunnerPlugin();
+    plugin.initialize(new NullPluginContext("git-runner"));
+
+    string[] logged;
+    auto ctx = checkoutContext(workspace, first, origin);
+    ctx.logCallback = (string line) { logged ~= line; };
+    auto res = plugin.executeStep(checkoutStep(["input": "src", "target_dir": "src"]), ctx);
+    assert(res.success, res.errorMessage);
+
+    string checkout = buildPath(workspace, "src");
+    assert(readText(buildPath(checkout, "version.txt")) == "one", "The pinned commit is checked out, not the branch tip");
+    assert(gitIn(checkout, ["rev-parse", "HEAD"]) == first);
+    assert(!readText(buildPath(checkout, ".git", "config")).canFind(baseName(root)),
+        "The repository address must not be written into the workspace");
+
+    import std.array : replace;
+
+    // A pre-existing .git (here one whose config would redirect the fetch) is refused, not reused
+    string planted = buildPath(workspace, "planted");
+    mkdirRecurse(buildPath(planted, ".git"));
+    std.file.write(buildPath(planted, ".git", "config"), "[url \"" ~ buildPath(root, "nowhere").replace("\\", "/") ~ "\"]\n\tinsteadOf = " ~ origin.replace("\\", "\\\\") ~ "\n");
+    auto plantedCtx = checkoutContext(workspace, first, origin);
+    auto plantedRes = plugin.executeStep(checkoutStep(["input": "src", "target_dir": "planted"]), plantedCtx);
+    assert(!plantedRes.success && plantedRes.errorMessage.canFind("already contains .git"), plantedRes.errorMessage);
+
+    // The task's environment cannot change how git runs: a redirecting GIT_CONFIG_*, a foreign
+    // GIT_DIR, a global config file and tracing are all ignored
+    string elsewhere = buildPath(root, "e");
+    mkdirRecurse(elsewhere);
+    string globalConfig = buildPath(root, "gc");
+    std.file.write(globalConfig, "[url \"" ~ buildPath(root, "nowhere").replace("\\", "/") ~ "\"]\n\tinsteadOf = " ~ origin.replace("\\", "\\\\") ~ "\n");
+    auto hostile = checkoutContext(workspace, first, origin);
+    hostile.environment = [
+        "GIT_DIR": buildPath(elsewhere, ".git"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "url." ~ buildPath(root, "nowhere").replace("\\", "/") ~ ".insteadOf",
+        "GIT_CONFIG_VALUE_0": origin,
+        "GIT_CONFIG_GLOBAL": globalConfig,
+        "GIT_TRACE": "1",
+        "GIT_TRACE_CURL": "1",
+    ];
+    auto hostileRes = plugin.executeStep(checkoutStep(["input": "src", "target_dir": "h"]), hostile);
+    assert(hostileRes.success, hostileRes.errorMessage);
+    assert(gitIn(buildPath(workspace, "h"), ["rev-parse", "HEAD"]) == first);
+    assert(!exists(buildPath(elsewhere, ".git")), "GIT_DIR from the task must not be honoured");
+    foreach (line; hostileRes.outputLines) assert(!line.canFind("trace"), "GIT_TRACE from the task must not be honoured: " ~ line);
+
+    // A pinned commit the repository does not have fails loudly, naming the input
+    auto missing = checkoutContext(workspace, "0123456789abcdef0123456789abcdef01234567", origin);
+    auto missingRes = plugin.executeStep(checkoutStep(["input": "src", "target_dir": "gone"]), missing);
+    assert(!missingRes.success);
+    assert(missingRes.errorMessage.canFind("no longer exists") && missingRes.errorMessage.canFind("'src'"), missingRes.errorMessage);
 }
 
 unittest

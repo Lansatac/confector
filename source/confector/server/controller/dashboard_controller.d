@@ -604,10 +604,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
                 auto stepCommands = req.form.getAll("step_command");
                 auto stepWorkDirs = req.form.getAll("step_working_dir");
                 auto stepWorkDirs2 = req.form.getAll("step_workingDirectory");
-                auto stepRepoUrls = req.form.getAll("step_repo_url");
-                auto stepRepoUrls2 = req.form.getAll("step_param_repository");
-                auto stepBranches = req.form.getAll("step_repo_branch");
-                auto stepBranches2 = req.form.getAll("step_param_branch");
+                auto stepInputs = req.form.getAll("step_param_input");
                 auto stepTargetDirs = req.form.getAll("step_repo_target");
                 auto stepTargetDirs2 = req.form.getAll("step_param_target_dir");
                 auto stepExecutables = req.form.getAll("step_param_executable");
@@ -630,22 +627,10 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
                     if (i < stepWorkDirs.length && stepWorkDirs[i].strip().length > 0) step.workingDirectory = stepWorkDirs[i].strip();
                     else if (i < stepWorkDirs2.length && stepWorkDirs2[i].strip().length > 0) step.workingDirectory = stepWorkDirs2[i].strip();
 
-                    if (i < stepRepoUrls.length && stepRepoUrls[i].strip().length > 0)
+                    // A checkout step names a declared repository input; it takes no URL or ref
+                    if (i < stepInputs.length && stepInputs[i].strip().length > 0)
                     {
-                        step.parameters["repository"] = stepRepoUrls[i].strip();
-                    }
-                    else if (i < stepRepoUrls2.length && stepRepoUrls2[i].strip().length > 0)
-                    {
-                        step.parameters["repository"] = stepRepoUrls2[i].strip();
-                    }
-
-                    if (i < stepBranches.length && stepBranches[i].strip().length > 0)
-                    {
-                        step.parameters["branch"] = stepBranches[i].strip();
-                    }
-                    else if (i < stepBranches2.length && stepBranches2[i].strip().length > 0)
-                    {
-                        step.parameters["branch"] = stepBranches2[i].strip();
+                        step.parameters["input"] = stepInputs[i].strip();
                     }
 
                     if (i < stepTargetDirs.length && stepTargetDirs[i].strip().length > 0)

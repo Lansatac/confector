@@ -17,11 +17,13 @@ struct ServerlessTaskRequest
     @asName("build_id") string buildId;
     TaskNode task;
     @asName("workspace_dir") string workspaceDir;
-    @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
+    /// The task's fingerprint, computed by the control plane; required.
+    string fingerprint;
+    /// The task's resolved inputs, as a work order carries them.
+    @optional ResolvedInput[] inputs;
+    /// Address of each repository input, keyed by input name, as a work order carries them.
+    @optional @asName("repository_addresses") string[string] repositoryAddresses;
     bool force = false;
-    @optional @asName("allowed_repositories") string[] allowedRepositories;
-    @optional @asName("repository_map") string[string] repositoryMap;
-    @optional @asName("project_id") string projectId;
 }
 
 /**
@@ -84,14 +86,10 @@ ServerlessTaskResponse executeServerlessTask(
         request.buildId,
         request.task,
         request.workspaceDir,
-        request.upstreamArtifactHashes,
-        request.force,
-        null,
-        request.allowedRepositories,
-        request.repositoryMap,
-        null,
-        true,
-        request.projectId
+        request.fingerprint,
+        request.inputs,
+        request.repositoryAddresses,
+        request.force
     );
 
     ServerlessTaskResponse response;
@@ -187,6 +185,7 @@ unittest
     ServerlessTaskRequest req;
     req.buildId = "srv_bld_1";
     req.workspaceDir = testDir;
+    req.fingerprint = "fp_echo";
 
     TaskNode node;
     node.id = "echo_step";
@@ -199,6 +198,15 @@ unittest
     assert(response.taskId == "echo_step");
     assert(response.status == TaskStatus.succeeded);
     assert(response.exitCode == 0);
+    assert(response.fingerprint == "fp_echo");
+
+    // A request without the control plane's fingerprint is refused
+    ServerlessTaskRequest noFingerprint = req;
+    noFingerprint.fingerprint = null;
+    bool threw = false;
+    try executeServerlessTask(noFingerprint);
+    catch (Exception ex) threw = true;
+    assert(threw);
 
     // Test JSON RPC execution
     string jsonReq = format(

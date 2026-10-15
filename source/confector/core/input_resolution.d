@@ -18,7 +18,7 @@ module confector.core.input_resolution;
  * the same ref sees one pinned value. Pins are keyed the same way; build keys with
  * `repositoryInput(repositoryId, refSelector)`.
  *
- * A build chain stores the result as `freezeChain` returns it; `chainFingerprints` computes
+ * A build chain stores the result as `freezeChain` returns it; `chainResolution` computes
  * fingerprints from a chain alone, so building any task of an existing chain never resolves
  * again. The shell that calls a resolver is confector.core.chain_resolver.
  */
@@ -226,7 +226,7 @@ private GraphResolution fingerprintGraph(
  * Freezes `graph` and its `resolution` into a build chain's tasks (design records: beads
  * confector-z7z.1 and confector-z7z.15): every task of the graph, sorted by id, with its
  * declared inputs and its resolved repository and value inputs. Task output inputs and
- * fingerprints are not frozen; `chainFingerprints` recomputes them from the chain.
+ * fingerprints are not frozen; `chainResolution` recomputes them from the chain.
  *
  * Throws: InputResolutionException if `resolution` lacks a task of `graph`.
  */
@@ -275,15 +275,16 @@ TaskGraph chainGraph(in ChainTask[] chain)
 }
 
 /**
- * Computes every task's fingerprint from `chain` alone: the frozen repository pins, value
- * inputs and graph structure, with task_output inputs pinned to upstream fingerprints. Never
- * reads the project or resolves anything, so every request on a chain sees the same
- * fingerprints. (Rerun generations, bead confector-z7z.15, will be a second argument.)
+ * Computes every task's resolved inputs and fingerprint from `chain` alone: the frozen
+ * repository pins, value inputs and graph structure, with task_output inputs pinned to upstream
+ * fingerprints. Never reads the project or resolves anything, so every request on a chain sees
+ * the same inputs and fingerprints; a task's resolved inputs are what its work order carries.
+ * (Rerun generations, bead confector-z7z.15, will be a second argument.)
  *
  * Throws: InputResolutionException if a frozen resolved input does not match the task's
  * declared inputs; Exception if a frozen repository input has no resolved pin.
  */
-string[string] chainFingerprints(string projectId, in ChainTask[] chain) @trusted
+GraphResolution chainResolution(string projectId, in ChainTask[] chain) @trusted
 {
     auto graph = chainGraph(chain);
 
@@ -313,7 +314,7 @@ string[string] chainFingerprints(string projectId, in ChainTask[] chain) @truste
         }
         repositoryPinsByTask[frozen.id] = repositoryPins;
     }
-    return fingerprintGraph(projectId, graph, repositoryPinsByTask).fingerprints;
+    return fingerprintGraph(projectId, graph, repositoryPinsByTask);
 }
 
 /// Re-keys `pins` by repositoryInputKey. Throws if a key is not a repository input, or if two
@@ -615,14 +616,18 @@ unittest
     assert(chain[1].inputs.length == 0 && chain[1].resolvedInputs.length == 0);
     assert(chain[2].inputs.length == 1 && chain[2].resolvedInputs.length == 0, "Task outputs are not frozen");
 
-    assert(chainFingerprints("p", chain) == resolution.fingerprints);
-    assert(chainFingerprints("q", chain)["lint"] != resolution.fingerprints["lint"], "The project is part of every fingerprint");
+    assert(chainResolution("p", chain).fingerprints == resolution.fingerprints);
+    // A task's resolved inputs, task outputs included, come back exactly as resolved: they
+    // are what the task's work order carries
+    assert(chainResolution("p", chain).inputs == resolution.inputs);
+    assert(chainResolution("p", chain).inputs["test"] == [ResolvedInput("bin", InputKind.taskOutput, Json(resolution.fingerprints["compile"]))]);
+    assert(chainResolution("q", chain).fingerprints["lint"] != resolution.fingerprints["lint"], "The project is part of every fingerprint");
 
     // The chain does not alias the project's tasks: editing them later changes nothing
     compile.inputs["src"] = repositoryInput("game", "release");
     compile.inputs["extra"] = valueInput("x");
     assert(chain[0].inputs.length == 2 && chain[0].inputs["src"] == repositoryInput("game", "main"));
-    assert(chainFingerprints("p", chain) == resolution.fingerprints);
+    assert(chainResolution("p", chain).fingerprints == resolution.fingerprints);
 
     // Survives a serialization round trip, as when stored in and loaded from the state store
     import vibe.data.json : deserializeJson, serializeToJson;
@@ -633,12 +638,12 @@ unittest
     auto loaded = deserializeJson!BuildRecord(serializeToJson(record).toString());
     assert(loaded.chainId == "b1" && loaded.chainTasks.length == 3);
     assert(loaded.chainTasks[0].inputs["src"] == repositoryInput("game", "main"));
-    assert(chainFingerprints("p", loaded.chainTasks) == resolution.fingerprints);
+    assert(chainResolution("p", loaded.chainTasks).fingerprints == resolution.fingerprints);
 }
 
 unittest
 {
-    // chainFingerprints reads only the chain: a new revision or a missing pin is visible only
+    // chainResolution reads only the chain: a new revision or a missing pin is visible only
     // through the frozen values, and a chain inconsistent with its declarations fails loudly
     TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game", "main");
     a.inputs["v"] = valueInput("x");
@@ -646,28 +651,28 @@ unittest
     auto graph = new TaskGraph([a, b]);
     InputPin[InputDecl] none;
     auto chain = freezeChain(graph, resolveGraphInputs("p", graph, none, [repositoryInput("game", "main"): pinOf("aaa111")]));
-    const base = chainFingerprints("p", chain);
+    const base = chainResolution("p", chain).fingerprints;
 
     auto newer = freezeChain(graph, resolveGraphInputs("p", graph, none, [repositoryInput("game", "main"): pinOf("bbb222")]));
-    assert(chainFingerprints("p", newer)["a"] != base["a"] && chainFingerprints("p", newer)["b"] != base["b"]);
+    assert(chainResolution("p", newer).fingerprints["a"] != base["a"] && chainResolution("p", newer).fingerprints["b"] != base["b"]);
 
     ChainTask[] dropped = [ChainTask(chain[0].id, chain[0].inputs, [chain[0].resolvedInputs[1]]), chain[1]];
     bool threw = false;
-    try chainFingerprints("p", dropped);
+    try chainResolution("p", dropped);
     catch (Exception ex) threw = ex.msg.canFind("'src'");
     assert(threw, "A frozen repository input without a pin must throw");
 
     ChainTask[] wrongValue = [ChainTask(chain[0].id, chain[0].inputs,
         [chain[0].resolvedInputs[0], ResolvedInput("v", InputKind.value, Json("y"))]), chain[1]];
     threw = false;
-    try chainFingerprints("p", wrongValue);
+    try chainResolution("p", wrongValue);
     catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "v";
     assert(threw);
 
     ChainTask[] undeclared = [ChainTask(chain[0].id, chain[0].inputs,
         chain[0].resolvedInputs ~ ResolvedInput("ghost", InputKind.value, Json("z"))), chain[1]];
     threw = false;
-    try chainFingerprints("p", undeclared);
+    try chainResolution("p", undeclared);
     catch (InputResolutionException ex) threw = ex.inputName == "ghost";
     assert(threw);
 }

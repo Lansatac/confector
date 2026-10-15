@@ -21,6 +21,7 @@ module confector.core.git_resolver;
 
 import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
 import confector.plugin_api.model : InputDecl, InputKind, RepositoryRecord;
+import confector.plugin_api.vcs : isFullSha, redactUserInfo;
 
 import vibe.data.json : Json;
 
@@ -54,17 +55,6 @@ class GitResolutionException : Exception
  * against the end of the ref name), and returns its standard output. Throws if git fails.
  */
 alias LsRemote = string delegate(string address, string[] patterns);
-
-/// True if `s` is a complete git object id: 40 (SHA-1) or 64 (SHA-256) hex digits.
-bool isFullSha(string s) pure nothrow @safe @nogc
-{
-    if (s.length != 40 && s.length != 64) return false;
-    foreach (immutable char c; s)
-    {
-        if (!isHexDigit(c)) return false;
-    }
-    return true;
-}
 
 /**
  * Parses `git ls-remote` output (`<sha>\t<ref>` per line). Lines of any other shape are
@@ -144,50 +134,6 @@ GitRef selectGitRef(string selector, const GitRef[] refs) pure @safe
             "Git ref selector '%s' is ambiguous; it matches %-(%s, %). Use a fully qualified ref", selector, names));
     }
     return found[0];
-}
-
-/**
- * Replaces the userinfo of every URL in `text` (`https://user:token@host/...` becomes
- * `https://***@host/...`), so credentials embedded in a repository address never reach an
- * exception message or a log. Pure.
- */
-string redactUserInfo(string text) pure @safe
-{
-    import std.ascii : isWhite;
-
-    auto app = appender!string();
-    size_t i = 0;
-    while (i < text.length)
-    {
-        const sep = text[i .. $].indexOf("://");
-        if (sep < 0)
-        {
-            app.put(text[i .. $]);
-            break;
-        }
-        const authorityStart = i + sep + 3;
-        app.put(text[i .. authorityStart]);
-
-        // The authority runs to the next '/', whitespace or end; its userinfo ends at its last '@'.
-        size_t end = authorityStart;
-        ptrdiff_t at = -1;
-        while (end < text.length && text[end] != '/' && !isWhite(text[end]))
-        {
-            if (text[end] == '@') at = end;
-            ++end;
-        }
-        if (at >= 0)
-        {
-            app.put("***");
-            app.put(text[at .. end]);
-        }
-        else
-        {
-            app.put(text[authorityStart .. end]);
-        }
-        i = end;
-    }
-    return app.data;
 }
 
 /// How long `git ls-remote` may run before it is killed. A remote that does not answer within
@@ -396,18 +342,6 @@ unittest // resolver: branch, tag, patterns passed to git, info
     assert(pin.info["ref"] == "refs/heads/main");
     assert(seen[0] == "https://example.test/r.git" && seen.canFind("refs/heads/main"));
     assert(resolver.resolve(repo(), repositoryInputFor("v1")).pinned == Json(sha1c));
-}
-
-unittest // credentials in URLs are redacted
-{
-    assert(redactUserInfo("https://user:t0ken@example.test/r.git") == "https://***@example.test/r.git");
-    assert(redactUserInfo("git ls-remote https://x-access-token:abc@github.com/o/r failed: fatal: https://tok@github.com/o/r not found")
-        == "git ls-remote https://***@github.com/o/r failed: fatal: https://***@github.com/o/r not found");
-    assert(redactUserInfo("ssh://git@host:22/r.git") == "ssh://***@host:22/r.git");
-    assert(redactUserInfo("https://u:p@ss@host/r") == "https://***@host/r", "Userinfo ends at the last '@'");
-    assert(redactUserInfo("https://example.test/a@b") == "https://example.test/a@b", "An '@' in the path is not userinfo");
-    assert(redactUserInfo("git@host:org/r.git") == "git@host:org/r.git");
-    assert(redactUserInfo("") == "" && redactUserInfo("no url here") == "no url here");
 }
 
 unittest // a failing remote's address is redacted in the error, and nothing prompts

@@ -38,7 +38,7 @@ void printUsage()
     writeln("  -v, --version   Display version information");
     writeln();
     writeln("Run options:");
-    writeln("  --payload=<path|json|->  JSON payload string, file path, or '-' for stdin");
+    writeln("  --payload=<path|json|->  Work order JSON (task_node, fingerprint, payload): string, file path, or '-' for stdin");
     writeln("  --workspace=<dir>        Workspace directory path (required)");
     writeln("  --storage-dir=<dir>      Artifact storage directory (required)");
     writeln("  --plugins-dir=<dir>      Directory to load dynamic step plugins from (default: plugins)");
@@ -67,7 +67,7 @@ int handleRun(string[] args)
 
     auto helpInfo = getopt(
         args,
-        "payload", "Task payload JSON file path, JSON string, or '-' for stdin", &payloadArg,
+        "payload", "Work order JSON file path, JSON string, or '-' for stdin", &payloadArg,
         "workspace", "Workspace directory path", &workspaceDir,
         "storage-dir", "Artifact storage directory (required for offline mode)", &storageDir,
         "server-url", "Confector server URL for HTTP artifact storage", &serverUrl,
@@ -144,30 +144,21 @@ int handleRun(string[] args)
         return 1;
     }
 
-    TaskNode task;
-    string buildId = "single_run";
-    string projectId;
-    string[string] upstreamFingerprints;
-    bool force = false;
-    string[] allowedRepositories;
-    string[string] repositoryMap;
-
-    if (parsed.type == Json.Type.object && "task" in parsed)
+    // The payload is a work order, exactly as the control plane dispatches it: the task, its
+    // fingerprint and its resolved inputs.
+    WorkOrder order;
+    try
     {
-        task = deserializeJson!TaskNode(parsed["task"]);
-        if ("build_id" in parsed) buildId = parsed["build_id"].get!string;
-        if ("project_id" in parsed) projectId = parsed["project_id"].get!string;
-        if ("workspace_dir" in parsed && workspaceDir == ".") workspaceDir = parsed["workspace_dir"].get!string;
-        if ("storage_base_dir" in parsed) storageDir = parsed["storage_base_dir"].get!string;
-        if ("upstream_artifact_hashes" in parsed) upstreamFingerprints = deserializeJson!(string[string])(parsed["upstream_artifact_hashes"]);
-        if ("force" in parsed) force = parsed["force"].get!bool;
-        if ("allowed_repositories" in parsed) allowedRepositories = deserializeJson!(string[])(parsed["allowed_repositories"]);
-        if ("repository_map" in parsed) repositoryMap = deserializeJson!(string[string])(parsed["repository_map"]);
+        order = deserializeJson!WorkOrder(parsed);
     }
-    else
+    catch (Exception e)
     {
-        task = deserializeJson!TaskNode(parsed);
+        stderr.writefln("Error: payload is not a work order: %s", e.msg);
+        return 1;
     }
+    TaskNode task = order.taskNode;
+    if (task.id.length == 0) task.id = order.taskId;
+    string buildId = order.buildId.length > 0 ? order.buildId : "single_run";
 
     if (!exists(workspaceDir))
     {
@@ -204,21 +195,27 @@ int handleRun(string[] args)
     }
     auto engine = new TaskEngine(storage);
 
-    auto result = engine.executeTask(
-        buildId,
-        task,
-        workspaceDir,
-        upstreamFingerprints,
-        force,
-        (line) {
-            stderr.writeln(line);
-        },
-        allowedRepositories,
-        repositoryMap,
-        null,
-        true,
-        projectId
-    );
+    TaskExecutionResult result;
+    try
+    {
+        result = engine.executeTask(
+            buildId,
+            task,
+            workspaceDir,
+            order.fingerprint,
+            order.payload.inputs,
+            order.payload.repositoryAddresses,
+            order.payload.force,
+            (line) {
+                stderr.writeln(line);
+            }
+        );
+    }
+    catch (Exception e)
+    {
+        stderr.writefln("Error: %s", e.msg);
+        return 1;
+    }
 
     writeln(serializeToJsonString(result));
     return result.status == TaskStatus.succeeded ? 0 : (result.exitCode != 0 ? result.exitCode : 1);

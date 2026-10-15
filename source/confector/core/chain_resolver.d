@@ -9,7 +9,7 @@ module confector.core.chain_resolver;
  * between them, through injected seams, so tests run without a network or a store.
  *
  * Resolution happens only here, when a chain is created. Building any task of an existing
- * chain uses the chain's frozen tasks (`chainFingerprints`) and never calls a resolver.
+ * chain uses the chain's frozen tasks (`chainResolution`) and never calls a resolver.
  */
 
 import confector.core.dag : TaskGraph;

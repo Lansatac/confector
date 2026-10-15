@@ -674,37 +674,26 @@ struct ExecutionPlan
 }
 
 /**
- * Authoritative upstream artifact reference for worker staging.
- * Addressed by (taskFingerprint, artifactId) with optional unpack destination.
- */
-struct InputArtifactRef
-{
-    @asName("task_id") string taskId;
-    @optional @asName("task_fingerprint") string taskFingerprint;
-    @optional @asName("artifact_id") string artifactId;
-    @optional @asName("storage_uri") string storageUri;
-    @optional @asName("destination") string destination;
-    @optional @asName("sha256") string sha256;
-}
-
-
-/**
  * Self-contained execution payload for worker tasks.
+ *
+ * Inputs reach the runner only as the work order's task declares them (`WorkOrder.taskNode.inputs`)
+ * and as `inputs` pins them; nothing else names a repository or revision.
  */
 struct TaskExecutionPayload
 {
-    @optional @asName("commit_sha") string commitSha;
-    @optional @asName("allowed_repositories") string[] allowedRepositories;
-    @optional @asName("repository_map") string[string] repositoryMap;
+    /// The task's resolved inputs, one per declared input, sorted by name, as the build chain
+    /// pins them: a repository input's provider pinned value (git: the commit SHA), a value
+    /// input's value, and a task_output input's upstream task fingerprint, which addresses the
+    /// upstream artifacts its declaration names.
+    @optional @asName("inputs") ResolvedInput[] inputs;
+    /// Address to fetch each repository input from, keyed by input name: exactly the task's
+    /// repository inputs. How to fetch, not what; never hashed. Used only by the built-in
+    /// checkout step.
+    @optional @asName("repository_addresses") string[string] repositoryAddresses;
     @optional string[string] environment;
-    /// Single authoritative list of upstream artifacts to unpack before execution.
-    @optional @asName("input_artifacts") InputArtifactRef[] inputArtifacts;
-    /// Map of upstream taskId -> task fingerprint (content-addressed).
-    @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
     @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
     @optional @asName("workspace_dir") string workspaceDir;
     @optional @asName("callback_url") string callbackUrl;
-    @optional @asName("node_fingerprint") string nodeFingerprint;
     @optional @asName("force") bool force = false;
 }
 
@@ -717,6 +706,8 @@ struct WorkOrder
     @optional @asName("task_id") string taskId;
     /// The task definition to execute.
     @optional @asName("task_node") TaskNode taskNode;
+    /// The task's fingerprint, computed by the control plane from the build chain. The runner
+    /// stores outputs under it and never computes its own; a work order without one fails.
     @optional @asName("fingerprint") string fingerprint;
     @optional @asName("executor_type") string executorType;               // e.g., "local", "queue", "aws-ecs"
     @optional @asName("requirements") string[string] requirements;       // e.g., ["arch": "x86_64", "gpu": "true"]

@@ -155,9 +155,8 @@ less true.
    transitively. Changing any declared input changes the fingerprint. A repository input
    contributes its *pinned revision* (for git, the commit SHA), not its URL or branch. Build
    configuration (steps, parameters, environment) is not part of the fingerprint; see "The input
-   model". *(Partly implemented: repository revisions reach the fingerprint and build
-   configuration does not, but checkout does not yet use the pinned revision; bead
-   `confector-z7z.20.8`.)*
+   model". *(Implemented: repository revisions reach the fingerprint, build configuration
+   does not, and the checkout step checks out the pinned revision; bead `confector-z7z.20.8`.)*
 2. **Graph evaluation does not execute work, and execution does not decide what to build.**
 3. **Decision logic is pure; state is passed in explicitly.** No hidden global or mutable singleton
    state in decision logic.

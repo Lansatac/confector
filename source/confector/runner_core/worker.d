@@ -463,16 +463,10 @@ class HttpWorkerDaemon
             }
         }
 
-        // The task node's task_output inputs name the upstream artifacts to stage; input_artifacts
-        // carries the fingerprint of each upstream task they come from.
-        string[string] upstreamHashes = msg.payload.upstreamArtifactHashes.dup;
-        foreach (inArt; msg.payload.inputArtifacts)
-        {
-            if (inArt.taskFingerprint.length > 0) upstreamHashes[inArt.taskId] = inArt.taskFingerprint;
-        }
-        string[] allowedRepos = msg.payload.allowedRepositories.dup;
-        string[string] repoMap = msg.payload.repositoryMap.dup;
-
+        // The work order's resolved inputs drive everything input-related: task_output inputs
+        // name the upstream artifacts to stage (from the upstream fingerprint they pin), and the
+        // checkout step checks repository inputs out by name. The fingerprint is the work
+        // order's; the worker never computes one.
         TaskExecutionResult result;
         try
         {
@@ -480,12 +474,11 @@ class HttpWorkerDaemon
                 buildId,
                 taskNode,
                 taskWsDir,
-                upstreamHashes,
+                msg.fingerprint,
+                msg.payload.inputs,
+                msg.payload.repositoryAddresses,
                 msg.payload.force,
-                &onLogLine,
-                allowedRepos,
-                repoMap,
-                msg.fingerprint
+                &onLogLine
             );
         }
         catch (Exception e)

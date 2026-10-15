@@ -8,7 +8,7 @@ public import confector.plugin_api.logging;
 enum PluginCategory : string
 {
     definition = "definition",     // Step Definition Plugins (BuildStepProvider, UI templates, validation schemas)
-    step_executor = "step_executor", // Step Execution Plugins (BuildStepSystem, InputResolverSystem)
+    step_executor = "step_executor", // Step Execution Plugins (BuildStepSystem)
     worker = "worker",              // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
     artifact = "artifact",          // Artifact Storage Plugins (content-addressed artifact backend)
     storage = "storage",            // State Storage Plugins (BuildStateRepository - builds, tasks, projects, etc.)

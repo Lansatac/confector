@@ -104,7 +104,6 @@ final class PluginRegistry
 {
     private static PluginRegistry _instance;
     private Plugin[string] _plugins;
-    private InputResolverSystem[] _inputResolvers;
     private ArtifactPublishingSystem[] _artifactPublishers;
     private BuildStepSystem[] _stepSystems;
     private BuildStepProvider[] _stepProviders;
@@ -181,10 +180,6 @@ final class PluginRegistry
         logDebug("[plugin_registry] initialize() returned for '%s'", plugin.name);
 
         // Automatically register implemented system interfaces
-        if (auto resolver = cast(InputResolverSystem) plugin)
-        {
-            registerInputResolver(resolver);
-        }
         if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
         {
             registerArtifactPublisher(pubSystem);
@@ -222,15 +217,6 @@ final class PluginRegistry
             registerScheduler(sched);
         }
         logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
-    }
-
-    public void registerInputResolver(InputResolverSystem system)
-    {
-        import std.algorithm : canFind;
-        if (!_inputResolvers.canFind(system))
-        {
-            _inputResolvers ~= system;
-        }
     }
 
     public void registerArtifactPublisher(ArtifactPublishingSystem system)
@@ -325,14 +311,6 @@ final class PluginRegistry
             plugin.shutdown();
 
             import std.algorithm.mutation : remove;
-            if (auto resolver = cast(InputResolverSystem) plugin)
-            {
-                for (size_t i = 0; i < _inputResolvers.length; )
-                {
-                    if (_inputResolvers[i] is resolver) _inputResolvers = _inputResolvers.remove(i);
-                    else i++;
-                }
-            }
             if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
             {
                 for (size_t i = 0; i < _artifactPublishers.length; )
@@ -428,11 +406,6 @@ final class PluginRegistry
                 }
             }
         }
-    }
-
-    public InputResolverSystem[] getInputResolvers()
-    {
-        return _inputResolvers;
     }
 
     public ArtifactPublishingSystem[] getArtifactPublishers()
@@ -636,7 +609,6 @@ final class PluginRegistry
             plugin.shutdown();
         }
         _plugins.clear();
-        _inputResolvers.length = 0;
         _artifactPublishers.length = 0;
         _stepSystems.length = 0;
         _stepProviders.length = 0;
@@ -684,7 +656,7 @@ unittest
     assert(mock.shutdownCalled);
     assert(registry.getPlugin("mock-plugin") is null);
 
-    class IntegratedPlugin : Plugin, InputResolverSystem, BuildStepSystem, BuildStepProvider
+    class IntegratedPlugin : Plugin, BuildStepSystem, BuildStepProvider
     {
         @property string name() const { return "integrated-plugin"; }
         @property string versionString() const { return "1.0.0"; }
@@ -698,9 +670,6 @@ unittest
 
         void initialize(PluginContext context = null) {}
         void shutdown() {}
-
-        bool canResolve(in TaskNode task) const { return task.id == "task-resolved"; }
-        void resolveInputs(in TaskNode task, ref InputResolutionContext context) {}
 
         bool canExecuteStep(in BuildStep step) const { return step.type == "test-step"; }
         StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
@@ -718,7 +687,6 @@ unittest
     auto integrated = new IntegratedPlugin();
     registry.registerPlugin(integrated);
 
-    assert(registry.getInputResolvers().length == 1);
     assert(registry.getStepSystems().length == 1);
     assert(registry.getStepProviders().length == 1);
     assert(registry.getStepProvider("test-step") is integrated);
@@ -730,7 +698,6 @@ unittest
 
     // Test unregistering
     registry.unregisterPlugin("integrated-plugin");
-    assert(registry.getInputResolvers().length == 0);
     assert(registry.getStepSystems().length == 0);
     assert(registry.getStepProviders().length == 0);
     assert(registry.getStepProvider("test-step") is null);

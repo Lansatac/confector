@@ -183,10 +183,14 @@ class LocalProcessInstance : ComputeInstance
             "steps": JSONValue([stepObj])
         ]);
 
+        // confector-runner `run` takes a work order. An ExecutionRequest carries no fingerprint,
+        // which only the control plane computes and the runner requires, so the runner refuses
+        // this order until ExecutionRequest is given one.
         JSONValue payloadObj = JSONValue([
             "build_id": JSONValue(buildId),
-            "workspace_dir": JSONValue(effectiveWorkDir),
-            "task": taskObj
+            "task_id": JSONValue(taskId),
+            "task_node": taskObj,
+            "payload": JSONValue(["workspace_dir": JSONValue(effectiveWorkDir)])
         ]);
 
         string tempPayloadPath = buildPath(tempDir(), format("payload_%s.json", randomUUID().toString()));

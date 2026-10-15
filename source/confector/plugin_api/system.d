@@ -6,32 +6,6 @@ import std.json : JSONValue, JSONType;
 import vibe.data.serialization : optional;
 
 /**
- * Context payload provided to input resolution systems during workflow preparation.
- */
-struct InputResolutionContext
-{
-    string buildId;
-    string workspaceDir;
-    string effectiveWorkingDir;
-    ArtifactStorage artifactStorage;
-    LogDelegate logCallback;
-    string[string] parameters;
-    /// Repository id -> repository address, for resolving repository inputs.
-    string[string] repositoryMap;
-}
-
-/**
- * Stateless system interface for resolving input components attached to task nodes
- * (e.g., Git clones, remote tarballs, S3 datasets, upstream artifacts).
- */
-interface InputResolverSystem
-{
-    @property string systemName() const;
-    bool canResolve(in TaskNode task) const;
-    void resolveInputs(in TaskNode task, ref InputResolutionContext context);
-}
-
-/**
  * Context payload provided to a build step system during step execution.
  */
 struct StepExecutionContext
@@ -44,8 +18,13 @@ struct StepExecutionContext
     ArtifactStorage artifactStorage;
     LogDelegate logCallback;
     string[string] taskParameters;
-    string[] allowedRepositories;
-    string[string] repositoryMap;
+    /// The task's resolved inputs, keyed by input name, exactly as the work order pinned them.
+    /// Inputs are not materialized automatically: a step that needs one (the built-in checkout
+    /// step) looks it up by name.
+    ResolvedInput[string] inputs;
+    /// Address of the repository each repository input names, keyed by input name. Used only
+    /// by the built-in checkout step.
+    string[string] repositoryAddresses;
 }
 
 /**
