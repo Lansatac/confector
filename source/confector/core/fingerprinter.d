@@ -137,9 +137,9 @@ private void putField(Out)(ref Out app, in string field) @safe
 /**
  * Pins the inputs that need no provider: a value input pins to its value and a task_output
  * input pins to the upstream task's fingerprint (taken from `upstreamFingerprints`, keyed
- * by task id). Repository inputs take their pinned value from `resolvedRepositories`
- * (keyed by input name); until a resolver supplies one, a repository input pins to an
- * explicit `{"unresolved": {"repository": <id>, "ref": <selector>}}` marker built from its
+ * by task id). Repository inputs take their pinned value and display info from
+ * `resolvedRepositories` (keyed by input name); until a resolver supplies one, a repository
+ * input pins to an explicit `{"unresolved": {"repository": <id>, "ref": <selector>}}` marker built from its
  * declaration, so changing the repository or ref still changes the fingerprint.
  *
  * Throws: Exception if a task_output input names an upstream task with no fingerprint.
@@ -172,7 +172,11 @@ ResolvedInput[] pinInputs(
                 input.pinned = Json(*fp);
                 break;
             case InputKind.repository:
-                if (auto resolved = name in resolvedRepositories) input.pinned = resolved.pinned;
+                if (auto resolved = name in resolvedRepositories)
+                {
+                    input.pinned = resolved.pinned.clone;
+                    input.info = cast(string[string]) resolved.info.dup;
+                }
                 else
                 {
                     auto spec = Json.emptyObject;
