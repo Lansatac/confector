@@ -6,6 +6,8 @@ import std.array : array;
 import std.format : format;
 import std.string : join;
 
+import vibe.data.json : Json;
+
 /**
  * Directed Acyclic Graph (DAG) manager for task dependency resolution,
  * cycle detection, topological sorting, and subgraph slicing.
@@ -26,7 +28,8 @@ class TaskGraph
     }
 
     /**
-     * Constructs a TaskGraph from a list of TaskNode elements.
+     * Constructs a TaskGraph from a list of TaskNode elements. Fingerprints are not
+     * computed until `computeFingerprints` is called with the owning project's id.
      */
     this(in TaskNode[] tasks)
     {
@@ -72,15 +75,19 @@ class TaskGraph
         }
 
         validate();
-        computeFingerprints();
     }
 
     /**
      * Precomputes deterministic node fingerprints in topological execution order.
+     *
+     * `projectId` is part of every task's fingerprint identity. Value inputs pin to their value and task_output inputs to the upstream task's
+     * fingerprint. Repository inputs take their pinned value from `resolvedRepositories`
+     * (task id -> input name -> resolved input); until input resolution supplies those,
+     * an unresolved repository input pins to a marker built from its declaration.
      */
-    void computeFingerprints(string workspaceDir = "")
+    void computeFingerprints(string projectId, in ResolvedInput[string][string] resolvedRepositories = null)
     {
-        import confector.core.fingerprinter : Fingerprinter;
+        import confector.core.fingerprinter : computeNodeFingerprint, pinInputs;
 
         m_fingerprints.clear();
         auto order = topologicalSort();
@@ -97,8 +104,8 @@ class TaskGraph
                 }
             }
 
-            string fp = Fingerprinter.computeNodeFingerprint(node, workspaceDir, upstreamFps);
-            m_fingerprints[taskId] = fp;
+            const(ResolvedInput[string]) repositoryPins = resolvedRepositories.get(taskId, null);
+            m_fingerprints[taskId] = computeNodeFingerprint(projectId, taskId, pinInputs(node, upstreamFps, repositoryPins));
         }
     }
 
@@ -572,6 +579,8 @@ unittest
 
     auto graph1 = new TaskGraph([a, b, c]);
     auto graph2 = new TaskGraph([a, b, c]);
+    graph1.computeFingerprints("p");
+    graph2.computeFingerprints("p");
 
     // All fingerprints must be computed upfront and match identically across evaluations
     assert(graph1.getFingerprint("compile") == graph2.getFingerprint("compile"));
@@ -580,16 +589,41 @@ unittest
     assert(graph1.getFingerprint("compile").length == 64);
     assert(graph1.getFingerprint("test").length == 64);
 
-    // 10. Modifying upstream task changes downstream fingerprint
+    // 10. Modifying an upstream input changes downstream fingerprints
     TaskNode aMod = a;
-    aMod.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
+    aMod.inputs["flavor"] = valueInput("release");
     auto graphMod = new TaskGraph([aMod, b, c]);
+    graphMod.computeFingerprints("p");
 
     // compile and test fingerprints must change
     assert(graphMod.getFingerprint("compile") != graph1.getFingerprint("compile"));
     assert(graphMod.getFingerprint("test") != graph1.getFingerprint("test"));
     // Unrelated task C (docs) fingerprint must remain unchanged
     assert(graphMod.getFingerprint("docs") == graph1.getFingerprint("docs"));
+
+    // Build configuration is not an input: changing steps leaves fingerprints unchanged
+    TaskNode aSteps = a;
+    aSteps.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
+    auto graphSteps = new TaskGraph([aSteps, b, c]);
+    graphSteps.computeFingerprints("p");
+    assert(graphSteps.getFingerprint("compile") == graph1.getFingerprint("compile"));
+    assert(graphSteps.getFingerprint("test") == graph1.getFingerprint("test"));
+
+    // Resolved repository pins reach the fingerprint
+    TaskNode d; d.id = "d"; d.inputs["src"] = repositoryInput("game", "main");
+    ResolvedInput[string][string] pinsA = ["d": ["src": ResolvedInput("src", InputKind.repository, Json("aaa111"))]];
+    ResolvedInput[string][string] pinsB = ["d": ["src": ResolvedInput("src", InputKind.repository, Json("bbb222"))]];
+    auto gd = new TaskGraph([d]);
+    gd.computeFingerprints("p", pinsA);
+    const fpA = gd.getFingerprint("d");
+    gd.computeFingerprints("p", pinsB);
+    assert(gd.getFingerprint("d") != fpA);
+
+    // The project is part of a task's identity
+    gd.computeFingerprints("q", pinsB);
+    const fpQ = gd.getFingerprint("d");
+    gd.computeFingerprints("p", pinsB);
+    assert(gd.getFingerprint("d") != fpQ);
 }
 
 unittest

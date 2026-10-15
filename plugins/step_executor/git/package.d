@@ -13,7 +13,7 @@ import std.json : JSONValue, JSONType;
 import confector.plugin_api.model;
 import confector.plugin_api.plugin;
 import confector.plugin_api.vcs;
-import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult, FingerprintContributionSystem, FingerprintContributionContext;
+import confector.plugin_api.system : InputResolverSystem, InputResolutionContext, BuildStepSystem, StepExecutionContext, StepExecutionResult;
 import confector.plugin_api.executor : LogDelegate;
 import std.json : parseJSON;
 import std.datetime : Clock;
@@ -106,7 +106,7 @@ private bool isRepoMatch(string candidate, string target, in string[string] repo
  * Git repository provider, input resolution, and build step execution plugin.
  * Encapsulates Git-specific cloning, command operations, and input staging.
  */
-class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSystem, BuildStepSystem, VcsStateResolver, FingerprintContributionSystem
+class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSystem, BuildStepSystem, VcsStateResolver
 {
     private PluginContext m_context;
 
@@ -787,104 +787,6 @@ class GitRunnerPlugin : StepExecutionPlugin, RepositoryProvider, InputResolverSy
             return false;
         }
     }
-
-    // ===================== FingerprintContributionSystem implementation =====================
-
-    bool canContribute(in TaskNode task) const
-    {
-        // Contribute if the task has repository inputs or git-related build steps
-        if (repositoryIds(task).length > 0) return true;
-        foreach (step; task.steps)
-        {
-            if (canExecuteStep(step)) return true;
-        }
-        return false;
-    }
-
-    string contributeFingerprint(in TaskNode task, in FingerprintContributionContext context) const
-    {
-        import std.array : appender;
-
-        auto ap = appender!string();
-
-        // Collect all repository URLs from the task
-        string[] repoUrls;
-
-        // From repository inputs, by repository id. Ids without an address in the context
-        // cannot be resolved here and contribute nothing.
-        foreach (repoId; repositoryIds(task))
-        {
-            if (auto address = repoId in context.repositoryMap)
-            {
-                if (canHandle(*address)) repoUrls ~= *address;
-            }
-        }
-
-        // From build steps
-        foreach (step; task.steps)
-        {
-            if (canExecuteStep(step))
-            {
-                string repoParam;
-                foreach (key; ["repository", "url", "address", "repo"])
-                {
-                    if (key in step.parameters)
-                    {
-                        repoParam = step.parameters[key];
-                        break;
-                    }
-                }
-                if (repoParam.length > 0 && canHandle(repoParam))
-                {
-                    repoUrls ~= repoParam;
-                }
-            }
-        }
-
-        if (repoUrls.length == 0) return "";
-
-        // Sort for determinism
-        import std.algorithm.sorting : sort;
-        repoUrls.sort();
-
-        foreach (repoUrl; repoUrls)
-        {
-            ap.put("repo:");
-            ap.put(normalizeRepoUrl(repoUrl));
-            ap.put(':');
-
-            // Try to get the resolved VCS state from context
-            if (context.vcsRepositoryStates !is null)
-            {
-                bool found = false;
-                foreach (key, state; context.vcsRepositoryStates)
-                {
-                    if (isRepoMatch(key, repoUrl))
-                    {
-                        ap.put(state.revision);
-                        ap.put('|');
-                        ap.put(state.targetRef);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                {
-                    // No resolved state available; use empty revision marker
-                    ap.put("unknown|");
-                }
-            }
-            else
-            {
-                // No VCS state map provided; use empty revision marker
-                ap.put("unknown|");
-            }
-
-            ap.put('\n');
-        }
-
-        return ap.data;
-    }
 }
 
 /**
@@ -1090,146 +992,5 @@ unittest
         VcsRepositoryState state;
         // Should return false because revision is empty (deleted ref)
         assert(!plugin.parseWebhookPayload(githubHeaders, payload, state));
-    }
-}
-
-unittest
-{
-    // Test FingerprintContributionSystem interface methods
-    auto plugin = new GitRunnerPlugin();
-    plugin.initialize(new NullPluginContext("git-runner"));
-
-    // Test canContribute with repository inputs
-    {
-        TaskNode task;
-        task.id = "build";
-        task.inputs["src"] = repositoryInput("example-repo", "main");
-        assert(plugin.canContribute(task));
-    }
-
-    // Test canContribute with git build step
-    {
-        TaskNode task;
-        task.id = "build";
-        task.steps = [BuildStep("Clone", "clone_repository", ["repository": "https://github.com/example/repo.git"])];
-        assert(plugin.canContribute(task));
-    }
-
-    // Test canContribute returns false for non-git task
-    {
-        TaskNode task;
-        task.id = "build";
-        task.steps = [BuildStep("Build", "bash", null, "dub build")];
-        assert(!plugin.canContribute(task));
-    }
-
-    // Test contributeFingerprint with repository inputs and VCS state
-    {
-        TaskNode task;
-        task.id = "build";
-        task.inputs["src"] = repositoryInput("example-repo", "main");
-
-        FingerprintContributionContext ctx;
-        ctx.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
-        ctx.vcsRepositoryStates = [
-            "https://github.com/example/repo.git": VcsRepositoryState(
-                "https://github.com/example/repo.git",
-                "git",
-                "main",
-                "abc123def456"
-            )
-        ];
-
-        auto contribution = plugin.contributeFingerprint(task, ctx);
-        assert(contribution.length > 0);
-        assert(contribution.canFind("abc123def456"));
-        assert(contribution.canFind("main"));
-    }
-
-    // Test contributeFingerprint with different revisions produces different output
-    {
-        TaskNode task;
-        task.id = "build";
-        task.inputs["src"] = repositoryInput("example-repo", "main");
-
-        FingerprintContributionContext ctx1;
-        ctx1.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
-        ctx1.vcsRepositoryStates = [
-            "https://github.com/example/repo.git": VcsRepositoryState(
-                "https://github.com/example/repo.git",
-                "git",
-                "main",
-                "abc123def456"
-            )
-        ];
-
-        FingerprintContributionContext ctx2;
-        ctx2.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
-        ctx2.vcsRepositoryStates = [
-            "https://github.com/example/repo.git": VcsRepositoryState(
-                "https://github.com/example/repo.git",
-                "git",
-                "main",
-                "789xyz000000"
-            )
-        ];
-
-        auto contrib1 = plugin.contributeFingerprint(task, ctx1);
-        auto contrib2 = plugin.contributeFingerprint(task, ctx2);
-        assert(contrib1 != contrib2, "Different revisions should produce different fingerprint contributions");
-    }
-
-    // Test contributeFingerprint with no VCS state
-    {
-        TaskNode task;
-        task.id = "build";
-        task.inputs["src"] = repositoryInput("example-repo", "main");
-
-        FingerprintContributionContext ctx;
-        ctx.repositoryMap = ["example-repo": "https://github.com/example/repo.git"];
-
-        auto contribution = plugin.contributeFingerprint(task, ctx);
-        assert(contribution.canFind("unknown|"));
-    }
-
-    // Test contributeFingerprint ignores repository ids it cannot map to an address
-    {
-        TaskNode task;
-        task.id = "build";
-        task.inputs["src"] = repositoryInput("example-repo", "main");
-
-        FingerprintContributionContext ctx;
-        assert(plugin.contributeFingerprint(task, ctx).length == 0);
-    }
-
-    // Test contributeFingerprint returns empty for non-git task
-    {
-        TaskNode task;
-        task.id = "build";
-        task.steps = [BuildStep("Build", "bash", null, "dub build")];
-
-        FingerprintContributionContext ctx;
-        auto contribution = plugin.contributeFingerprint(task, ctx);
-        assert(contribution.length == 0);
-    }
-
-    // Test contributeFingerprint with build step repository
-    {
-        TaskNode task;
-        task.id = "build";
-        task.steps = [BuildStep("Clone", "git:clone", ["url": "https://github.com/example/repo.git"])];
-
-        FingerprintContributionContext ctx;
-        ctx.vcsRepositoryStates = [
-            "https://github.com/example/repo.git": VcsRepositoryState(
-                "https://github.com/example/repo.git",
-                "git",
-                "main",
-                "deadbeef1234"
-            )
-        ];
-
-        auto contribution = plugin.contributeFingerprint(task, ctx);
-        assert(contribution.canFind("deadbeef1234"));
     }
 }

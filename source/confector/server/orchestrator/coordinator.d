@@ -292,10 +292,7 @@ class BuildCoordinator
         {
             string buildId = "bld_" ~ randomUUID().toString()[0 .. 8];
             TaskGraph graph = new TaskGraph(project);
-            if (workspaceDir.length > 0)
-            {
-                graph.computeFingerprints(workspaceDir);
-            }
+            graph.computeFingerprints(project.id);
 
             string[] targetTaskIds;
             if (targetTaskId.length > 0)
@@ -585,10 +582,7 @@ class BuildCoordinator
                         act.buildId = buildId;
                         act.project = proj;
                         act.graph = new TaskGraph(proj);
-                        if (b.workspaceDir.length > 0)
-                        {
-                            act.graph.computeFingerprints(b.workspaceDir);
-                        }
+                        act.graph.computeFingerprints(proj.id);
                         if (b.targetTaskId.length > 0)
                         {
                             act.targetTaskIds = act.graph.resolveSubgraph(b.targetTaskId);

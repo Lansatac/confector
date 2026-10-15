@@ -44,6 +44,8 @@ class TaskEngine
      *   repositoryMap = Mapping of logical repo names to physical URLs.
      *   precomputedFingerprint = When non-empty, used as authoritative node fingerprint.
      *   manageArtifacts = When true, engine stages upstream artifacts and packs outputs.
+     *   projectId = Owning project, part of the fingerprint identity; required when no
+     *               precomputed fingerprint is given.
      */
     TaskExecutionResult executeTask(
         string buildId,
@@ -55,7 +57,8 @@ class TaskEngine
         in string[] allowedRepositories = null,
         in string[string] repositoryMap = null,
         string precomputedFingerprint = null,
-        bool manageArtifacts = true
+        bool manageArtifacts = true,
+        string projectId = null
     )
     {
         auto sw = StopWatch(AutoStart.yes);
@@ -76,7 +79,7 @@ class TaskEngine
         {
             try
             {
-                fingerprint = Fingerprinter.computeNodeFingerprint(task, workspaceDir, upstreamFingerprints);
+                fingerprint = computeNodeFingerprint(projectId, task.id, pinInputs(task, upstreamFingerprints));
             }
             catch (Exception e)
             {
@@ -385,7 +388,8 @@ unittest
     }
     node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 
-    auto res1 = engine.executeTask("build_1", node1, testDir);
+    auto res1 = engine.executeTask("build_1", node1, testDir, null, false, null, null, null, null, true, "proj_1");
+    assert(res1.fingerprint.length == 64);
     assert(res1.status == TaskStatus.succeeded);
     assert(res1.producedArtifacts.length == 1);
     assert(storage.artifactExists(res1.fingerprint, "output.txt"));

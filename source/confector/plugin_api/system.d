@@ -32,33 +32,6 @@ interface InputResolverSystem
 }
 
 /**
- * Context payload provided to fingerprint contribution systems.
- */
-struct FingerprintContributionContext
-{
-    string workspaceDir;
-    string[string] upstreamArtifactHashes;
-    @optional string[string] upstreamFingerprints;
-    string[string] parameters;
-    /// Optional map of repository URL -> resolved VCS state, allowing plugins to contribute revision hashes.
-    @optional VcsRepositoryState[string] vcsRepositoryStates;
-    /// Optional map of repository id -> repository address, for resolving repository inputs.
-    @optional string[string] repositoryMap;
-}
-
-/**
- * Stateless system interface for calculating cryptographic fingerprint contributions
- * from specific components attached to a task node.
- */
-interface FingerprintContributionSystem
-{
-    @property string systemName() const;
-    bool canContribute(in TaskNode task) const;
-    string contributeFingerprint(in TaskNode task, in FingerprintContributionContext context) const;
-}
-
-
-/**
  * Context payload provided to a build step system during step execution.
  */
 struct StepExecutionContext

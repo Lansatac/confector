@@ -21,6 +21,7 @@ struct ServerlessTaskRequest
     bool force = false;
     @optional @asName("allowed_repositories") string[] allowedRepositories;
     @optional @asName("repository_map") string[string] repositoryMap;
+    @optional @asName("project_id") string projectId;
 }
 
 /**
@@ -87,7 +88,10 @@ ServerlessTaskResponse executeServerlessTask(
         request.force,
         null,
         request.allowedRepositories,
-        request.repositoryMap
+        request.repositoryMap,
+        null,
+        true,
+        request.projectId
     );
 
     ServerlessTaskResponse response;

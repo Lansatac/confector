@@ -105,7 +105,6 @@ final class PluginRegistry
     private static PluginRegistry _instance;
     private Plugin[string] _plugins;
     private InputResolverSystem[] _inputResolvers;
-    private FingerprintContributionSystem[] _fingerprintContributors;
     private ArtifactPublishingSystem[] _artifactPublishers;
     private BuildStepSystem[] _stepSystems;
     private BuildStepProvider[] _stepProviders;
@@ -186,10 +185,6 @@ final class PluginRegistry
         {
             registerInputResolver(resolver);
         }
-        if (auto contributor = cast(FingerprintContributionSystem) plugin)
-        {
-            registerFingerprintContributor(contributor);
-        }
         if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
         {
             registerArtifactPublisher(pubSystem);
@@ -235,15 +230,6 @@ final class PluginRegistry
         if (!_inputResolvers.canFind(system))
         {
             _inputResolvers ~= system;
-        }
-    }
-
-    public void registerFingerprintContributor(FingerprintContributionSystem system)
-    {
-        import std.algorithm : canFind;
-        if (!_fingerprintContributors.canFind(system))
-        {
-            _fingerprintContributors ~= system;
         }
     }
 
@@ -347,14 +333,6 @@ final class PluginRegistry
                     else i++;
                 }
             }
-            if (auto contributor = cast(FingerprintContributionSystem) plugin)
-            {
-                for (size_t i = 0; i < _fingerprintContributors.length; )
-                {
-                    if (_fingerprintContributors[i] is contributor) _fingerprintContributors = _fingerprintContributors.remove(i);
-                    else i++;
-                }
-            }
             if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
             {
                 for (size_t i = 0; i < _artifactPublishers.length; )
@@ -455,11 +433,6 @@ final class PluginRegistry
     public InputResolverSystem[] getInputResolvers()
     {
         return _inputResolvers;
-    }
-
-    public FingerprintContributionSystem[] getFingerprintContributors()
-    {
-        return _fingerprintContributors;
     }
 
     public ArtifactPublishingSystem[] getArtifactPublishers()
@@ -664,7 +637,6 @@ final class PluginRegistry
         }
         _plugins.clear();
         _inputResolvers.length = 0;
-        _fingerprintContributors.length = 0;
         _artifactPublishers.length = 0;
         _stepSystems.length = 0;
         _stepProviders.length = 0;

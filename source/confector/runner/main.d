@@ -146,6 +146,7 @@ int handleRun(string[] args)
 
     TaskNode task;
     string buildId = "single_run";
+    string projectId;
     string[string] upstreamFingerprints;
     bool force = false;
     string[] allowedRepositories;
@@ -155,6 +156,7 @@ int handleRun(string[] args)
     {
         task = deserializeJson!TaskNode(parsed["task"]);
         if ("build_id" in parsed) buildId = parsed["build_id"].get!string;
+        if ("project_id" in parsed) projectId = parsed["project_id"].get!string;
         if ("workspace_dir" in parsed && workspaceDir == ".") workspaceDir = parsed["workspace_dir"].get!string;
         if ("storage_base_dir" in parsed) storageDir = parsed["storage_base_dir"].get!string;
         if ("upstream_artifact_hashes" in parsed) upstreamFingerprints = deserializeJson!(string[string])(parsed["upstream_artifact_hashes"]);
@@ -212,7 +214,10 @@ int handleRun(string[] args)
             stderr.writeln(line);
         },
         allowedRepositories,
-        repositoryMap
+        repositoryMap,
+        null,
+        true,
+        projectId
     );
 
     writeln(serializeToJsonString(result));
