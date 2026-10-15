@@ -5,7 +5,8 @@ import confector.core.dag;
 import confector.core.storage;
 import confector.core.chain_resolver : resolveChain;
 import confector.core.executor : CapacityBroker;
-import confector.core.input_resolution : GraphResolution, chainGraph, chainResolution;
+import confector.core.input_resolution : GraphResolution, RerunGenerations, chainGraph;
+import confector.core.rerun_generations : readChainResolution;
 import confector.plugin_api.dispatch_queue;
 import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
 
@@ -17,6 +18,22 @@ import std.json : JSONValue, JSONType;
 import std.uuid : randomUUID;
 import core.sync.mutex : Mutex;
 import vibe.core.log : logInfo, logError, logWarn, logDebug;
+
+/**
+ * Evaluates `chain`'s resolved inputs and fingerprints with every task at rerun generation 0.
+ * This coordinator has no rerun generation store: no rerun can be requested yet (the rerun
+ * action is bead confector-z7z.20.14), and it is being replaced by the ChainEvaluator (bead
+ * confector-z7z.23.2), which reads generations through RerunGenerationStore. Whoever adds the
+ * rerun action must replace this before reruns can take effect here.
+ */
+private GraphResolution chainResolutionBeforeReruns(string projectId, in ChainTask[] chain)
+{
+    return readChainResolution(projectId, chain, (in string[] bases) {
+        RerunGenerations generations;
+        foreach (base; bases) generations[base] = 0;
+        return generations;
+    });
+}
 
 /**
  * Metadata tracked for an active or recorded build graph execution.
@@ -317,7 +334,7 @@ class BuildCoordinator
         // stall completions and evaluations of other builds. It needs only the repository
         // lookup and the resolver, and records nothing, so a failure leaves no trace.
         InputPin[InputDecl] noPins;
-        ChainTask[] chain = resolveChain(project.id, new TaskGraph(project), noPins,
+        ChainTask[] chain = resolveChain(new TaskGraph(project), noPins,
             &lookupRepository, &selectResolver);
 
         synchronized (m_mutex)
@@ -392,7 +409,7 @@ class BuildCoordinator
     )
     {
         TaskGraph graph = chainGraph(chain);
-        GraphResolution resolution = chainResolution(project.id, chain);
+        GraphResolution resolution = chainResolutionBeforeReruns(project.id, chain);
 
         string[] targetTaskIds;
         if (targetTaskId.length > 0)
@@ -849,7 +866,7 @@ class BuildCoordinator
                     act.project = proj;
                     act.chain = b.chainTasks;
                     act.graph = chainGraph(b.chainTasks);
-                    act.resolution = chainResolution(b.projectId, b.chainTasks);
+                    act.resolution = chainResolutionBeforeReruns(b.projectId, b.chainTasks);
                     if (b.targetTaskId.length > 0)
                     {
                         act.targetTaskIds = act.graph.resolveSubgraph(b.targetTaskId);
@@ -1865,7 +1882,6 @@ unittest
 {
     // A chain resolves the whole DAG once, stores resolved inputs for every task, and later
     // requests on the chain reuse them without resolving again or reading the edited project
-    import confector.core.input_resolution : chainResolution;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
     import vibe.data.json : Json;
@@ -1892,7 +1908,7 @@ unittest
         }
     }
     assert(chainRecord.chainTasks[1].id == "external" && chainRecord.chainTasks[1].resolvedInputs.length == 1);
-    auto expected = chainResolution(project.id, chainRecord.chainTasks).fingerprints;
+    auto expected = chainResolutionBeforeReruns(project.id, chainRecord.chainTasks).fingerprints;
 
     auto compileOrder = completeNext(coordinator, queue, "compile");
     assert(compileOrder.fingerprint == expected["compile"]);
@@ -1904,7 +1920,7 @@ unittest
     // each repository input by input name; nothing else names a repository
     assert(compileOrder.payload.inputs == [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])]);
     assert(compileOrder.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
-    assert(internalOrder.payload.inputs == chainResolution(project.id, chainRecord.chainTasks).inputs["internal"]);
+    assert(internalOrder.payload.inputs == chainResolutionBeforeReruns(project.id, chainRecord.chainTasks).inputs["internal"]);
     assert(internalOrder.payload.inputs.length == 3 && internalOrder.payload.inputs[0].name == "bin"
         && internalOrder.payload.inputs[0].kind == InputKind.taskOutput
         && internalOrder.payload.inputs[0].pinned == Json(expected["compile"]));
@@ -1927,7 +1943,7 @@ unittest
     BuildRecord externalRecord;
     assert(stateRepo.getBuild(externalBuild, externalRecord));
     assert(externalRecord.chainId == internalBuild);
-    assert(chainResolution(project.id, externalRecord.chainTasks).fingerprints == expected);
+    assert(chainResolutionBeforeReruns(project.id, externalRecord.chainTasks).fingerprints == expected);
 
     TaskStatus compileStatus;
     assert(stateRepo.getTaskStatus(externalBuild, "compile", compileStatus) && compileStatus == TaskStatus.cached);
@@ -1956,14 +1972,13 @@ unittest
     assert(resolver.calls == 3);
     BuildRecord newRecord;
     assert(stateRepo.getBuild(newBuild, newRecord) && newRecord.chainId == newBuild);
-    assert(chainResolution(edited.id, newRecord.chainTasks).fingerprints["compile"] != expected["compile"]);
+    assert(chainResolutionBeforeReruns(edited.id, newRecord.chainTasks).fingerprints["compile"] != expected["compile"]);
 }
 
 unittest
 {
     // A restarted coordinator resumes a build from its chain: no resolution and no fingerprints
     // or structure from the project as edited meanwhile (bug confector-3qh)
-    import confector.core.input_resolution : chainResolution;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
 
@@ -1977,7 +1992,7 @@ unittest
     string buildId = before.startBuild(project, "internal", true);
     BuildRecord record;
     assert(stateRepo.getBuild(buildId, record));
-    auto expected = chainResolution(project.id, record.chainTasks).fingerprints;
+    auto expected = chainResolutionBeforeReruns(project.id, record.chainTasks).fingerprints;
 
     auto compileOrder = receiveWorkOrders(queue, 1)[0];
 

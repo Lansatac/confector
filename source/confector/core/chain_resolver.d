@@ -35,7 +35,9 @@ alias RepositoryLookup = RepositoryRecord delegate(string repositoryId);
 alias ResolverSelector = RepositoryResolver delegate(in RepositoryRecord repository);
 
 /**
- * Resolves every input of every task in `graph` and freezes the result into a chain's tasks.
+ * Resolves every external input of every task in `graph` and freezes the result into a chain's
+ * tasks. Fingerprints are not computed here; they depend on rerun generations, which are read
+ * when the chain is evaluated (confector.core.rerun_generations).
  *
  * Repository inputs pinned by `knownPins` (trigger payload, user pins) are taken as given; each
  * other distinct repository input is looked up with `lookup` and resolved once with the
@@ -47,7 +49,6 @@ alias ResolverSelector = RepositoryResolver delegate(in RepositoryRecord reposit
  * chain.
  */
 ChainTask[] resolveChain(
-    string projectId,
     const TaskGraph graph,
     in InputPin[InputDecl] knownPins,
     RepositoryLookup lookup,
@@ -81,7 +82,7 @@ ChainTask[] resolveChain(
         resolved[key] = pin;
     }
 
-    return freezeChain(graph, resolveGraphInputs(projectId, graph, knownPins, resolved));
+    return freezeChain(graph, resolveGraphInputs(graph, knownPins, resolved));
 }
 
 version (unittest)
@@ -133,7 +134,7 @@ unittest
     auto resolver = new CountingResolver();
     resolver.shaByRef = ["game@main": "aaa111", "engine@stable": "eee555"];
     InputPin[InputDecl] none;
-    auto chain = resolveChain("p", graph, none, (id) => knownRepository(id), always(resolver));
+    auto chain = resolveChain(graph, none, (id) => knownRepository(id), always(resolver));
 
     assert(resolver.calls == 2, "game@main and engine@stable must each be resolved exactly once");
     assert(chain.length == 3);
@@ -148,7 +149,7 @@ unittest
 
     // Pre-supplied pins are not resolved again
     InputPin[InputDecl] known = [repositoryInput("game", "main"): InputPin(Json("from-trigger"))];
-    auto pinned = resolveChain("p", graph, known, (id) => knownRepository(id), always(resolver));
+    auto pinned = resolveChain(graph, known, (id) => knownRepository(id), always(resolver));
     assert(resolver.calls == 3, "Only engine@stable may be resolved");
     assert(pinned[1].resolvedInputs[0].pinned == Json("from-trigger"));
 }
@@ -163,7 +164,7 @@ unittest
 
     string failure(RepositoryLookup lookup, ResolverSelector select)
     {
-        try resolveChain("p", graph, none, lookup, select);
+        try resolveChain(graph, none, lookup, select);
         catch (InputResolutionException ex) return ex.msg;
         assert(false, "expected InputResolutionException");
     }
@@ -181,7 +182,7 @@ unittest
     // The repository is not registered
     TaskNode b; b.id = "b"; b.inputs["src"] = repositoryInput("tools", "main");
     bool threw = false;
-    try resolveChain("p", new TaskGraph([b]), none, (id) => knownRepository(id), always(resolver));
+    try resolveChain(new TaskGraph([b]), none, (id) => knownRepository(id), always(resolver));
     catch (InputResolutionException ex) threw = ex.msg.canFind("'tools'") && ex.msg.canFind("not registered");
     assert(threw);
 
@@ -192,7 +193,7 @@ unittest
     }
     auto nullResolver = new NullResolver();
     threw = false;
-    try resolveChain("p", graph, none, (id) => knownRepository(id), always(nullResolver));
+    try resolveChain(graph, none, (id) => knownRepository(id), always(nullResolver));
     catch (InputResolutionException ex) threw = ex.taskId == "a";
     assert(threw);
 
@@ -200,7 +201,7 @@ unittest
     TaskNode c; c.id = "c"; c.inputs["src"] = repositoryInput("game", "");
     auto counting = new CountingResolver();
     threw = false;
-    try resolveChain("p", new TaskGraph([c]), none, (id) => knownRepository(id), always(counting));
+    try resolveChain(new TaskGraph([c]), none, (id) => knownRepository(id), always(counting));
     catch (InputResolutionException ex) threw = ex.taskId == "c" && ex.msg.canFind("no ref selector");
     assert(threw && counting.calls == 0);
 }

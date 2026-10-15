@@ -2,9 +2,9 @@ module confector.core.input_resolution;
 
 /**
  * Pure whole-DAG input resolution (design record: bead confector-z7z.13; AGENTS.md, "The input
- * model"). Turns every declared input of every task in a graph into a ResolvedInput and
- * fingerprints every task, so a chain created from the result pins the same revisions for
- * every task, including tasks nobody has asked to build yet.
+ * model"). Turns every declared external input (repository and value) of every task in a graph
+ * into a ResolvedInput, so a chain created from the result pins the same revisions for every
+ * task, including tasks nobody has asked to build yet.
  *
  * Resolution runs in two steps around the shell's I/O:
  *
@@ -19,12 +19,14 @@ module confector.core.input_resolution;
  * `repositoryInput(repositoryId, refSelector)`.
  *
  * A build chain stores the result as `freezeChain` returns it; `chainResolution` computes
- * fingerprints from a chain alone, so building any task of an existing chain never resolves
- * again. The shell that calls a resolver is confector.core.chain_resolver.
+ * fingerprints from a chain and the current rerun generations (bead confector-z7z.15), so
+ * building any task of an existing chain never resolves again. The shell that calls a resolver
+ * is confector.core.chain_resolver; the one that reads rerun generations is
+ * confector.core.rerun_generations.
  */
 
 import confector.core.dag : TaskGraph;
-import confector.core.fingerprinter : computeNodeFingerprint, pinInputs;
+import confector.core.fingerprinter : computeBaseFingerprint, computeFingerprint, pinInputs;
 import confector.core.model;
 import confector.plugin_api.input_resolver : InputPin;
 
@@ -52,16 +54,28 @@ class InputResolutionException : Exception
 }
 
 /**
- * Every task's resolved inputs and fingerprint, for the whole graph.
+ * Every task's resolved inputs, base fingerprint and fingerprint, for the whole graph.
  */
 struct GraphResolution
 {
     /// Resolved inputs keyed by task id, each task's sorted by input name. Every task in the
     /// graph has an entry, empty when it declares no inputs.
     ResolvedInput[][string] inputs;
+    /// Base fingerprint (the fingerprint without the rerun generation) keyed by task id, for
+    /// every task in the graph. Rerun generations are keyed by it.
+    string[string] bases;
     /// Fingerprint keyed by task id, for every task in the graph.
     string[string] fingerprints;
 }
+
+/**
+ * The current rerun generation of each base fingerprint (design record: bead confector-z7z.15),
+ * keyed by base. A base that was never rerun is at generation 0 and must still be present: a
+ * missing base means its generation has not been read, never that it is 0. The shell reads
+ * generations from the store (confector.core.rerun_generations); the pure core only receives
+ * them.
+ */
+alias RerunGenerations = ulong[string];
 
 /**
  * Returns the key that identifies a repository input: its declaration reduced to the kind,
@@ -113,24 +127,24 @@ InputDecl[] unpinnedRepositoryInputs(const TaskGraph graph, in InputPin[InputDec
 }
 
 /**
- * Resolves every declared input of every task in `graph` and fingerprints every task, in
- * topological order:
+ * Resolves the external inputs of every task in `graph`, keyed by task id, each task's sorted
+ * by input name:
  *
  * - a value input pins to its value;
  * - a repository input pins to `knownPins[key]` if present, otherwise to
  *   `resolvedPins[key]`, where `key` is `repositoryInputKey` of its declaration. A
  *   pre-supplied pin always takes precedence; a resolver result for the same key is ignored.
- *   Pins for repository inputs the graph does not declare are ignored;
- * - a task_output input pins to the upstream task's fingerprint.
+ *   Pins for repository inputs the graph does not declare are ignored.
  *
- * Fingerprints come from `computeNodeFingerprint` with `projectId`. Pure: performs no I/O.
+ * Task output inputs are not resolved here: they pin to upstream fingerprints, which depend on
+ * rerun generations, so they are pinned only when a chain is evaluated (`chainResolution`).
+ * Every task of the graph has an entry. Pure: performs no I/O.
  *
  * Throws: InputResolutionException if a repository input has no pin in either map, if a pin
  * used is undefined or null, if a key of either map is not a repository input, or if a
  * repository input names no repository or has an empty ref selector.
  */
-GraphResolution resolveGraphInputs(
-    string projectId,
+ResolvedInput[][string] resolveGraphInputs(
     const TaskGraph graph,
     in InputPin[InputDecl] knownPins,
     in InputPin[InputDecl] resolvedPins
@@ -139,14 +153,20 @@ GraphResolution resolveGraphInputs(
     const known = normalizePins(knownPins, "pre-supplied");
     const resolved = normalizePins(resolvedPins, "resolver");
 
-    ResolvedInput[string][string] repositoryPinsByTask;
+    ResolvedInput[][string] result;
     foreach (taskId; graph.allTaskIds())
     {
         const task = graph.getTask(taskId);
 
-        ResolvedInput[string] repositoryPins;
-        foreach (name, decl; task.inputs)
+        ResolvedInput[] external;
+        foreach (name; task.inputs.keys.sort().release)
         {
+            const decl = task.inputs[name];
+            if (decl.kind == InputKind.value)
+            {
+                external ~= ResolvedInput(name, InputKind.value, Json(decl.spec.value));
+                continue;
+            }
             if (decl.kind != InputKind.repository) continue;
             requireRepositorySpec(taskId, name, decl);
             const key = repositoryInputKey(decl);
@@ -171,11 +191,11 @@ GraphResolution resolveGraphInputs(
                     taskId, name, decl.spec.repository, decl.spec.refSelector, source), taskId, name);
             }
 
-            repositoryPins[name] = ResolvedInput(name, InputKind.repository, pin.pinned.clone, cast(string[string]) pin.info.dup);
+            external ~= ResolvedInput(name, InputKind.repository, pin.pinned.clone, cast(string[string]) pin.info.dup);
         }
-        repositoryPinsByTask[taskId] = repositoryPins;
+        result[taskId] = external;
     }
-    return fingerprintGraph(projectId, graph, repositoryPinsByTask);
+    return result;
 }
 
 /**
@@ -200,42 +220,21 @@ void requireRepositorySpec(string taskId, string name, in InputDecl decl) pure @
 }
 
 /**
- * Pins every task's inputs and fingerprints it, in topological order, given each task's
- * resolved repository inputs (task id -> input name -> resolved input). The one place whole
- * graphs are fingerprinted, for a fresh resolution and for an existing chain alike.
- */
-private GraphResolution fingerprintGraph(
-    string projectId,
-    const TaskGraph graph,
-    in ResolvedInput[string][string] repositoryPinsByTask
-) @trusted
-{
-    GraphResolution result;
-    foreach (taskId; graph.topologicalSort())
-    {
-        const(ResolvedInput[string]) repositoryPins = repositoryPinsByTask.get(taskId, null);
-        // Topological order guarantees every upstream fingerprint is already present.
-        auto inputs = pinInputs(graph.getTask(taskId), result.fingerprints, repositoryPins);
-        result.inputs[taskId] = inputs;
-        result.fingerprints[taskId] = computeNodeFingerprint(projectId, taskId, inputs);
-    }
-    return result;
-}
-
-/**
- * Freezes `graph` and its `resolution` into a build chain's tasks (design records: beads
- * confector-z7z.1 and confector-z7z.15): every task of the graph, sorted by id, with its
- * declared inputs and its resolved repository and value inputs. Task output inputs and
- * fingerprints are not frozen; `chainResolution` recomputes them from the chain.
+ * Freezes `graph` and its resolved external inputs (`resolveGraphInputs`) into a build chain's
+ * tasks (design records: beads confector-z7z.1 and confector-z7z.15): every task of the graph,
+ * sorted by id, with its declared inputs and its resolved repository and value inputs. Task
+ * output inputs and fingerprints are never frozen; `chainResolution` computes them from the
+ * chain and the current rerun generations.
  *
- * Throws: InputResolutionException if `resolution` lacks a task of `graph`.
+ * Throws: InputResolutionException if `externalInputs` lacks a task of `graph` or holds a
+ * task output input.
  */
-ChainTask[] freezeChain(const TaskGraph graph, in GraphResolution resolution) @trusted
+ChainTask[] freezeChain(const TaskGraph graph, in ResolvedInput[][string] externalInputs) @trusted
 {
     ChainTask[] chain;
     foreach (taskId; graph.allTaskIds())
     {
-        auto resolved = taskId in resolution.inputs;
+        auto resolved = taskId in externalInputs;
         if (resolved is null)
         {
             throw new InputResolutionException(format("Task '%s' has not been resolved", taskId), taskId);
@@ -246,7 +245,12 @@ ChainTask[] freezeChain(const TaskGraph graph, in GraphResolution resolution) @t
         foreach (name, decl; graph.getTask(taskId).inputs) frozen.inputs[name] = decl;
         foreach (ref input; *resolved)
         {
-            if (input.kind == InputKind.taskOutput) continue;
+            if (input.kind == InputKind.taskOutput)
+            {
+                throw new InputResolutionException(format(
+                    "Task '%s' input '%s' is a task output, which a chain never freezes", taskId, input.name),
+                    taskId, input.name);
+            }
             frozen.resolvedInputs ~= ResolvedInput(input.name, input.kind, input.pinned.clone, cast(string[string]) input.info.dup);
         }
         chain ~= frozen;
@@ -275,16 +279,62 @@ TaskGraph chainGraph(in ChainTask[] chain)
 }
 
 /**
- * Computes every task's resolved inputs and fingerprint from `chain` alone: the frozen
- * repository pins, value inputs and graph structure, with task_output inputs pinned to upstream
+ * Computes every task's resolved inputs, base fingerprint and fingerprint from `chain` and the
+ * current rerun `generations` (design record: bead confector-z7z.15): the frozen repository
+ * pins, value inputs and graph structure, with task_output inputs pinned to upstream
  * fingerprints. Never reads the project or resolves anything, so every request on a chain sees
- * the same inputs and fingerprints; a task's resolved inputs are what its work order carries.
- * (Rerun generations, bead confector-z7z.15, will be a second argument.)
+ * the same inputs; a task's resolved inputs are what its work order carries. Generations are
+ * shared, live state, not part of the chain, so bumping a task's generation changes its
+ * fingerprint and every downstream one in every chain that shares the task's base.
+ *
+ * `generations` must hold every base of the chain. Bases depend on upstream fingerprints, so
+ * they become known a level at a time: the shell reads `unreadRerunBases` until none are left
+ * (confector.core.rerun_generations.readChainResolution).
  *
  * Throws: InputResolutionException if a frozen resolved input does not match the task's
- * declared inputs; Exception if a frozen repository input has no resolved pin.
+ * declared inputs, or a task's base is missing from `generations`; Exception if a frozen
+ * repository input has no resolved pin.
  */
-GraphResolution chainResolution(string projectId, in ChainTask[] chain) @trusted
+GraphResolution chainResolution(string projectId, in ChainTask[] chain, in RerunGenerations generations) @trusted
+{
+    string[string] unread;
+    auto result = evaluateChain(projectId, chain, generations, unread);
+    if (unread.length > 0)
+    {
+        const taskId = unread.keys.sort()[0];
+        throw new InputResolutionException(format(
+            "The rerun generation of task '%s' (base fingerprint %s) has not been read", taskId, unread[taskId]), taskId);
+    }
+    return result;
+}
+
+/**
+ * Returns the bases of `chain` that `generations` lacks but that can be computed from it,
+ * sorted and without duplicates; empty once `generations` covers the whole chain. Reading these
+ * and calling again settles at least one more level of the graph each round. Pure.
+ *
+ * Throws: as `chainResolution`, except for missing generations.
+ */
+string[] unreadRerunBases(string projectId, in ChainTask[] chain, in RerunGenerations generations) @trusted
+{
+    string[string] unread;
+    evaluateChain(projectId, chain, generations, unread);
+
+    bool[string] distinct;
+    foreach (base; unread.byValue) distinct[base] = true;
+    return distinct.keys.sort().release;
+}
+
+/// Pins and fingerprints, in topological order, every task of `chain` whose own and upstream
+/// generations are all in `generations`. A task whose base has no generation is added to
+/// `unread` (task id -> base) and has inputs and a base but no fingerprint; tasks downstream of
+/// it are skipped.
+private GraphResolution evaluateChain(
+    string projectId,
+    in ChainTask[] chain,
+    in RerunGenerations generations,
+    ref string[string] unread
+) @trusted
 {
     auto graph = chainGraph(chain);
 
@@ -314,7 +364,35 @@ GraphResolution chainResolution(string projectId, in ChainTask[] chain) @trusted
         }
         repositoryPinsByTask[frozen.id] = repositoryPins;
     }
-    return fingerprintGraph(projectId, graph, repositoryPinsByTask);
+
+    GraphResolution result;
+    foreach (taskId; graph.topologicalSort())
+    {
+        const task = graph.getTask(taskId);
+        // Topological order puts every upstream task first; one without a fingerprint is
+        // waiting for its generation to be read, and so is this task.
+        bool upstreamPending = false;
+        foreach (decl; task.inputs.byValue)
+        {
+            if (decl.kind == InputKind.taskOutput && decl.spec.task !in result.fingerprints) upstreamPending = true;
+        }
+        if (upstreamPending) continue;
+
+        const(ResolvedInput[string]) repositoryPins = repositoryPinsByTask.get(taskId, null);
+        auto inputs = pinInputs(task, result.fingerprints, repositoryPins);
+        const base = computeBaseFingerprint(projectId, taskId, inputs);
+        result.inputs[taskId] = inputs;
+        result.bases[taskId] = base;
+
+        auto generation = base in generations;
+        if (generation is null)
+        {
+            unread[taskId] = base;
+            continue;
+        }
+        result.fingerprints[taskId] = computeFingerprint(base, *generation);
+    }
+    return result;
 }
 
 /// Re-keys `pins` by repositoryInputKey. Throws if a key is not a repository input, or if two
@@ -365,6 +443,30 @@ version (unittest)
         }
         assert(false, format("task '%s' has no resolved input '%s'", taskId, name));
     }
+
+    /// `chainResolution` with every base `generations` lacks read at generation 0, the way the
+    /// shell reads them a level at a time.
+    private GraphResolution atGenerations(string projectId, in ChainTask[] chain, RerunGenerations generations = null)
+    {
+        for (auto unread = unreadRerunBases(projectId, chain, generations); unread.length > 0;
+            unread = unreadRerunBases(projectId, chain, generations))
+        {
+            foreach (base; unread) generations[base] = 0;
+        }
+        return chainResolution(projectId, chain, generations);
+    }
+
+    /// Resolves, freezes and evaluates `graph` in project "p", with no task ever rerun.
+    private GraphResolution evaluate(const TaskGraph graph, in InputPin[InputDecl] known, in InputPin[InputDecl] resolved)
+    {
+        return atGenerations("p", freezeChain(graph, resolveGraphInputs(graph, known, resolved)));
+    }
+
+    /// The fingerprint of a task never rerun.
+    private string firstFingerprint(string projectId, string taskId, in ResolvedInput[] inputs)
+    {
+        return computeFingerprint(computeBaseFingerprint(projectId, taskId, inputs), 0);
+    }
 }
 
 unittest
@@ -388,18 +490,19 @@ unittest
     assert(pending == [repositoryInput("game", "main")]);
 
     InputPin[InputDecl] resolved = [repositoryInput("game", "main"): pinOf("aaa111")];
-    auto r = resolveGraphInputs("p", graph, none, resolved);
+    auto r = evaluate(graph, none, resolved);
 
     assert(r.inputs.length == 4 && r.fingerprints.length == 4, "Every task must be resolved and fingerprinted");
     assert(r.inputs["lint"].length == 0);
-    assert(r.fingerprints["lint"] == computeNodeFingerprint("p", "lint", []));
+    assert(r.fingerprints["lint"] == firstFingerprint("p", "lint", []));
+    assert(r.bases["lint"] == computeBaseFingerprint("p", "lint", []));
 
     assert(inputNamed(r, "compile", "src").pinned == Json("aaa111"));
     assert(inputNamed(r, "compile", "flavor").pinned == Json("internal"));
     assert(inputNamed(r, "test", "bin").pinned == Json(r.fingerprints["compile"]));
     assert(inputNamed(r, "package", "report").pinned == Json(r.fingerprints["test"]));
-    assert(r.fingerprints["compile"] == computeNodeFingerprint("p", "compile", r.inputs["compile"]));
-    assert(r.fingerprints["package"] == computeNodeFingerprint("p", "package", r.inputs["package"]));
+    assert(r.fingerprints["compile"] == firstFingerprint("p", "compile", r.inputs["compile"]));
+    assert(r.fingerprints["package"] == firstFingerprint("p", "package", r.inputs["package"]));
 
     // Each task's inputs are sorted by name
     assert(r.inputs["compile"][0].name == "flavor" && r.inputs["compile"][1].name == "src");
@@ -407,12 +510,12 @@ unittest
     // Build configuration is not an input: changing steps leaves every fingerprint unchanged
     TaskNode compileSteps = compile;
     compileSteps.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
-    assert(resolveGraphInputs("p", new TaskGraph([package_, lint, test, compileSteps]), none, resolved).fingerprints
+    assert(evaluate(new TaskGraph([package_, lint, test, compileSteps]), none, resolved).fingerprints
         == r.fingerprints);
 
     // A new revision changes the repository's tasks and everything downstream, but not lint
     InputPin[InputDecl] newer = [repositoryInput("game", "main"): pinOf("bbb222")];
-    auto r2 = resolveGraphInputs("p", graph, none, newer);
+    auto r2 = evaluate(graph, none, newer);
     foreach (id; ["compile", "test", "package"]) assert(r2.fingerprints[id] != r.fingerprints[id]);
     assert(r2.fingerprints["lint"] == r.fingerprints["lint"]);
 }
@@ -441,7 +544,7 @@ unittest
         repositoryInput("game", "main"): pinOf("aaa111"),
         repositoryInput("game", "release"): pinOf("ccc333"),
     ];
-    auto r = resolveGraphInputs("p", graph, none, resolved);
+    auto r = evaluate(graph, none, resolved);
     assert(inputNamed(r, "a", "src").pinned == Json("aaa111"));
     assert(inputNamed(r, "b", "code").pinned == Json("aaa111"));
     assert(inputNamed(r, "b", "engine").pinned == Json("eee555"));
@@ -463,7 +566,7 @@ unittest
         repositoryInput("game", "main"): pinOf("from-resolver"),
         repositoryInput("engine", "stable"): pinOf("eee555"),
     ];
-    auto r = resolveGraphInputs("p", graph, known, resolved);
+    auto r = evaluate(graph, known, resolved);
     assert(inputNamed(r, "a", "src").pinned == Json("from-trigger"));
     assert(inputNamed(r, "a", "engine").pinned == Json("eee555"));
 
@@ -471,12 +574,12 @@ unittest
     known[repositoryInput("engine", "stable")] = pinOf("eee000");
     assert(unpinnedRepositoryInputs(graph, known).length == 0);
     InputPin[InputDecl] none;
-    auto r2 = resolveGraphInputs("p", graph, known, none);
+    auto r2 = evaluate(graph, known, none);
     assert(inputNamed(r2, "a", "engine").pinned == Json("eee000"));
 
     // Pins for repositories the graph does not use are ignored
     known[repositoryInput("tools", "main")] = pinOf("ttt999");
-    assert(resolveGraphInputs("p", graph, known, none).fingerprints == r2.fingerprints);
+    assert(evaluate(graph, known, none).fingerprints == r2.fingerprints);
 }
 
 unittest
@@ -494,8 +597,8 @@ unittest
     InputPin[InputDecl] withInfo = [repositoryInput("depot", "//game/main"):
         InputPin(changelist, ["description": "Fix the build"])];
 
-    auto r1 = resolveGraphInputs("p", graph, none, plain);
-    auto r2 = resolveGraphInputs("p", graph, none, withInfo);
+    auto r1 = evaluate(graph, none, plain);
+    auto r2 = evaluate(graph, none, withInfo);
     assert(inputNamed(r2, "a", "src").info.length == 1 && inputNamed(r2, "a", "src").info["description"] == "Fix the build");
     assert(inputNamed(r2, "a", "src").pinned == changelist);
     assert(r1.fingerprints == r2.fingerprints);
@@ -512,7 +615,7 @@ unittest
 
     try
     {
-        resolveGraphInputs("p", graph, none, none);
+        evaluate(graph, none, none);
         assert(false, "expected InputResolutionException");
     }
     catch (InputResolutionException ex)
@@ -524,7 +627,7 @@ unittest
     // A pin for the same repository at another ref does not cover it
     InputPin[InputDecl] otherRef = [repositoryInput("game", "release"): pinOf("ccc333")];
     bool threw = false;
-    try resolveGraphInputs("p", graph, otherRef, none);
+    try evaluate(graph, otherRef, none);
     catch (InputResolutionException) threw = true;
     assert(threw);
 
@@ -533,7 +636,7 @@ unittest
     {
         InputPin[InputDecl] badPins = [repositoryInput("game", "main"): InputPin(bad)];
         threw = false;
-        try resolveGraphInputs("p", graph, none, badPins);
+        try evaluate(graph, none, badPins);
         catch (InputResolutionException ex) threw = ex.taskId == "b" && ex.inputName == "src";
         assert(threw, "An empty pinned value must throw");
     }
@@ -548,7 +651,7 @@ unittest
     InputPin[InputDecl] valuePin = [valueInput("x"): pinOf("y")];
 
     bool threw = false;
-    try resolveGraphInputs("p", graph, valuePin, none);
+    try evaluate(graph, valuePin, none);
     catch (InputResolutionException) threw = true;
     assert(threw, "A pre-supplied pin keyed by a value input must throw");
 
@@ -564,7 +667,7 @@ unittest
     auto g2 = new TaskGraph([b]);
     InputPin[InputDecl] known = [repositoryInput("game", "main"): pinOf("aaa111")];
     assert(unpinnedRepositoryInputs(g2, known).length == 0);
-    assert(inputNamed(resolveGraphInputs("p", g2, known, none), "b", "src").pinned == Json("aaa111"));
+    assert(inputNamed(evaluate(g2, known, none), "b", "src").pinned == Json("aaa111"));
 }
 
 unittest
@@ -584,7 +687,7 @@ unittest
         assert(threw, "An incomplete repository input must not be listed for resolving");
 
         threw = false;
-        try resolveGraphInputs("p", graph, pinned, none);
+        try evaluate(graph, pinned, none);
         catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
         assert(threw, "An incomplete repository input must not resolve, even when pinned");
     }
@@ -593,7 +696,7 @@ unittest
 unittest
 {
     // A frozen chain holds every task with its declared inputs and its resolved repository and
-    // value inputs (never task outputs), and yields the same fingerprints as the resolution
+    // value inputs (never task outputs); evaluating it pins task outputs to upstream fingerprints
     TaskNode compile; compile.id = "compile";
     compile.inputs["src"] = repositoryInput("game", "main");
     compile.inputs["flavor"] = valueInput("internal");
@@ -605,8 +708,9 @@ unittest
 
     InputPin[InputDecl] none;
     InputPin[InputDecl] resolved = [repositoryInput("game", "main"): pinOf("aaa111", ["ref": "refs/heads/main"])];
-    auto resolution = resolveGraphInputs("p", graph, none, resolved);
-    auto chain = freezeChain(graph, resolution);
+    auto external = resolveGraphInputs(graph, none, resolved);
+    assert(external.length == 3 && external["test"].length == 0, "Task outputs are not resolved before evaluation");
+    auto chain = freezeChain(graph, external);
 
     assert(chain.length == 3 && chain[0].id == "compile" && chain[1].id == "lint" && chain[2].id == "test");
     assert(chain[0].inputs == compile.inputs);
@@ -616,18 +720,27 @@ unittest
     assert(chain[1].inputs.length == 0 && chain[1].resolvedInputs.length == 0);
     assert(chain[2].inputs.length == 1 && chain[2].resolvedInputs.length == 0, "Task outputs are not frozen");
 
-    assert(chainResolution("p", chain).fingerprints == resolution.fingerprints);
-    // A task's resolved inputs, task outputs included, come back exactly as resolved: they
-    // are what the task's work order carries
-    assert(chainResolution("p", chain).inputs == resolution.inputs);
-    assert(chainResolution("p", chain).inputs["test"] == [ResolvedInput("bin", InputKind.taskOutput, Json(resolution.fingerprints["compile"]))]);
-    assert(chainResolution("q", chain).fingerprints["lint"] != resolution.fingerprints["lint"], "The project is part of every fingerprint");
+    auto resolution = atGenerations("p", chain);
+    assert(resolution.fingerprints.length == 3 && resolution.bases.length == 3);
+    assert(resolution.inputs["compile"] == chain[0].resolvedInputs);
+    // A task's resolved inputs, task outputs included, are what the task's work order carries
+    assert(resolution.inputs["test"] == [ResolvedInput("bin", InputKind.taskOutput, Json(resolution.fingerprints["compile"]))]);
+    assert(atGenerations("q", chain).fingerprints["lint"] != resolution.fingerprints["lint"], "The project is part of every fingerprint");
+
+    // Resolved inputs holding a task output cannot be frozen
+    ResolvedInput[][string] withTaskOutput;
+    foreach (id, inputs; external) withTaskOutput[id] = cast(ResolvedInput[]) inputs.dup;
+    withTaskOutput["test"] = [ResolvedInput("bin", InputKind.taskOutput, Json("fp"))];
+    bool threw = false;
+    try freezeChain(graph, withTaskOutput);
+    catch (InputResolutionException ex) threw = ex.taskId == "test" && ex.inputName == "bin";
+    assert(threw);
 
     // The chain does not alias the project's tasks: editing them later changes nothing
     compile.inputs["src"] = repositoryInput("game", "release");
     compile.inputs["extra"] = valueInput("x");
     assert(chain[0].inputs.length == 2 && chain[0].inputs["src"] == repositoryInput("game", "main"));
-    assert(chainResolution("p", chain).fingerprints == resolution.fingerprints);
+    assert(atGenerations("p", chain).fingerprints == resolution.fingerprints);
 
     // Survives a serialization round trip, as when stored in and loaded from the state store
     import vibe.data.json : deserializeJson, serializeToJson;
@@ -638,7 +751,7 @@ unittest
     auto loaded = deserializeJson!BuildRecord(serializeToJson(record).toString());
     assert(loaded.chainId == "b1" && loaded.chainTasks.length == 3);
     assert(loaded.chainTasks[0].inputs["src"] == repositoryInput("game", "main"));
-    assert(chainResolution("p", loaded.chainTasks).fingerprints == resolution.fingerprints);
+    assert(atGenerations("p", loaded.chainTasks).fingerprints == resolution.fingerprints);
 }
 
 unittest
@@ -650,29 +763,129 @@ unittest
     TaskNode b; b.id = "b"; b.inputs["a"] = taskOutputInput("a");
     auto graph = new TaskGraph([a, b]);
     InputPin[InputDecl] none;
-    auto chain = freezeChain(graph, resolveGraphInputs("p", graph, none, [repositoryInput("game", "main"): pinOf("aaa111")]));
-    const base = chainResolution("p", chain).fingerprints;
+    auto chain = freezeChain(graph, resolveGraphInputs(graph, none, [repositoryInput("game", "main"): pinOf("aaa111")]));
+    const base = atGenerations("p", chain).fingerprints;
 
-    auto newer = freezeChain(graph, resolveGraphInputs("p", graph, none, [repositoryInput("game", "main"): pinOf("bbb222")]));
-    assert(chainResolution("p", newer).fingerprints["a"] != base["a"] && chainResolution("p", newer).fingerprints["b"] != base["b"]);
+    auto newer = freezeChain(graph, resolveGraphInputs(graph, none, [repositoryInput("game", "main"): pinOf("bbb222")]));
+    assert(atGenerations("p", newer).fingerprints["a"] != base["a"] && atGenerations("p", newer).fingerprints["b"] != base["b"]);
 
     ChainTask[] dropped = [ChainTask(chain[0].id, chain[0].inputs, [chain[0].resolvedInputs[1]]), chain[1]];
     bool threw = false;
-    try chainResolution("p", dropped);
+    try atGenerations("p", dropped);
     catch (Exception ex) threw = ex.msg.canFind("'src'");
     assert(threw, "A frozen repository input without a pin must throw");
 
     ChainTask[] wrongValue = [ChainTask(chain[0].id, chain[0].inputs,
         [chain[0].resolvedInputs[0], ResolvedInput("v", InputKind.value, Json("y"))]), chain[1]];
     threw = false;
-    try chainResolution("p", wrongValue);
+    try atGenerations("p", wrongValue);
     catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "v";
     assert(threw);
 
     ChainTask[] undeclared = [ChainTask(chain[0].id, chain[0].inputs,
         chain[0].resolvedInputs ~ ResolvedInput("ghost", InputKind.value, Json("z"))), chain[1]];
     threw = false;
-    try chainResolution("p", undeclared);
+    try atGenerations("p", undeclared);
     catch (InputResolutionException ex) threw = ex.inputName == "ghost";
     assert(threw);
+}
+
+unittest
+{
+    // Rerun generations: bases become known a level at a time, and a generation that has not
+    // been read is an error, never generation 0
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game", "main");
+    TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
+    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game", "main");
+    TaskNode release; release.id = "release"; release.inputs["tested"] = taskOutputInput("test");
+    release.inputs["linted"] = taskOutputInput("lint");
+    auto graph = new TaskGraph([compile, test, lint, release]);
+    InputPin[InputDecl] none;
+    auto chain = freezeChain(graph, resolveGraphInputs(graph, none, [repositoryInput("game", "main"): pinOf("aaa111")]));
+
+    RerunGenerations generations;
+    auto first = unreadRerunBases("p", chain, generations);
+    assert(first.length == 2, "Only the tasks without upstream tasks have computable bases");
+    foreach (base; first) generations[base] = 0;
+    auto second = unreadRerunBases("p", chain, generations);
+    assert(second.length == 1);
+    foreach (base; second) generations[base] = 0;
+    auto third = unreadRerunBases("p", chain, generations);
+    assert(third.length == 1);
+    foreach (base; third) generations[base] = 0;
+    assert(unreadRerunBases("p", chain, generations).length == 0);
+    auto r = chainResolution("p", chain, generations);
+    assert(r.fingerprints == atGenerations("p", chain).fingerprints);
+    foreach (id; ["compile", "test", "lint", "release"])
+    {
+        assert(r.fingerprints[id] == computeFingerprint(r.bases[id], 0));
+        assert(r.fingerprints[id] == firstFingerprint("p", id, r.inputs[id]));
+    }
+
+    RerunGenerations partial;
+    foreach (base; first) partial[base] = 0;
+    bool threw = false;
+    try chainResolution("p", chain, partial);
+    catch (InputResolutionException ex) threw = ex.taskId == "test" && ex.msg.canFind(r.bases["test"]);
+    assert(threw, "A base whose generation was not read must throw");
+}
+
+unittest
+{
+    // Bumping a task's generation changes its fingerprint and every downstream fingerprint, in
+    // every chain sharing the task's base, and nothing else
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game", "main");
+    TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
+    TaskNode report; report.id = "report"; report.inputs["results"] = taskOutputInput("test");
+    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game", "main");
+    TaskNode docs; docs.id = "docs"; docs.inputs["src"] = repositoryInput("game", "main");
+    TaskNode publish; publish.id = "publish"; publish.inputs["bin"] = taskOutputInput("compile");
+    publish.inputs["docs"] = taskOutputInput("docs");
+    InputPin[InputDecl] none;
+    InputPin[InputDecl] atA = [repositoryInput("game", "main"): pinOf("aaa111")];
+    InputPin[InputDecl] atB = [repositoryInput("game", "main"): pinOf("bbb222")];
+
+    // Two chains pinning the same revision (for example on different branches) share
+    // compile's base even with different task sets; a chain at another revision does not
+    auto graphOne = new TaskGraph([compile, test, report, lint]);
+    auto graphTwo = new TaskGraph([compile, docs, publish]);
+    auto graphOther = new TaskGraph([compile, test]);
+    auto chainOne = freezeChain(graphOne, resolveGraphInputs(graphOne, none, atA));
+    auto chainTwo = freezeChain(graphTwo, resolveGraphInputs(graphTwo, none, atA));
+    auto chainOther = freezeChain(graphOther, resolveGraphInputs(graphOther, none, atB));
+
+    auto one = atGenerations("p", chainOne);
+    auto two = atGenerations("p", chainTwo);
+    auto other = atGenerations("p", chainOther);
+    assert(one.bases["compile"] == two.bases["compile"] && one.fingerprints["compile"] == two.fingerprints["compile"]);
+    assert(other.bases["compile"] != one.bases["compile"]);
+
+    RerunGenerations rerun = [one.bases["compile"]: 1];
+    auto oneAfter = atGenerations("p", chainOne, rerun.dup);
+    auto twoAfter = atGenerations("p", chainTwo, rerun.dup);
+    auto otherAfter = atGenerations("p", chainOther, rerun.dup);
+
+    // The rerun task keeps its base and gets a new fingerprint; downstream tasks get new bases
+    assert(oneAfter.bases["compile"] == one.bases["compile"]);
+    foreach (id; ["compile", "test", "report"]) assert(oneAfter.fingerprints[id] != one.fingerprints[id], id);
+    foreach (id; ["test", "report"]) assert(oneAfter.bases[id] != one.bases[id], id);
+    assert(oneAfter.fingerprints["lint"] == one.fingerprints["lint"], "Tasks not downstream are unaffected");
+
+    foreach (id; ["compile", "publish"]) assert(twoAfter.fingerprints[id] != two.fingerprints[id], id);
+    assert(twoAfter.fingerprints["docs"] == two.fingerprints["docs"]);
+    assert(twoAfter.fingerprints["compile"] == oneAfter.fingerprints["compile"], "Chains sharing a base stay in step");
+
+    assert(otherAfter.fingerprints == other.fingerprints, "A chain that does not share the base is unaffected");
+
+    // Each further generation is new again, and a downstream task can be rerun on its own
+    RerunGenerations twice = [one.bases["compile"]: 2];
+    assert(atGenerations("p", chainOne, twice).fingerprints["compile"] != oneAfter.fingerprints["compile"]);
+    RerunGenerations testOnly = [one.bases["test"]: 1];
+    auto testRerun = atGenerations("p", chainOne, testOnly);
+    assert(testRerun.fingerprints["compile"] == one.fingerprints["compile"]);
+    assert(testRerun.fingerprints["test"] != one.fingerprints["test"] && testRerun.fingerprints["report"] != one.fingerprints["report"]);
+
+    // Generations for bases the chain does not have are ignored
+    RerunGenerations unrelated = [other.bases["compile"]: 5];
+    assert(atGenerations("p", chainOne, unrelated).fingerprints == one.fingerprints);
 }

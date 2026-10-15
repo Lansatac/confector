@@ -85,18 +85,20 @@ private void putCanonical(Out)(ref Out app, in Json value) @trusted
 }
 
 /**
- * Computes a node's fingerprint: SHA256 over the node's identity (project id and task id)
+ * Computes a node's base fingerprint: SHA256 over the node's identity (project id and task id)
  * and its resolved inputs, sorted by input name, each as `name=pinned`. Nothing else contributes; in particular, build
- * configuration (steps, environment, outputs) does not.
+ * configuration (steps, environment, outputs) does not. The node's fingerprint is
+ * `computeFingerprint` of the base and the base's rerun generation (bead confector-z7z.15).
  *
- * A task_output input's pinned value is the upstream task's fingerprint, so hashing is
- * transitive. Fields are length-prefixed so distinct inputs can never serialize alike.
- * This function is pure: it does not consult the plugin registry or any other state.
+ * A task_output input's pinned value is the upstream task's full fingerprint, so hashing, and
+ * with it a rerun, is transitive. Fields are length-prefixed so distinct inputs can never
+ * serialize alike. This function is pure: it does not consult the plugin registry or any other
+ * state.
  *
  * Throws: Exception if the project id is empty, two inputs share a name, or a pinned
  * value is undefined.
  */
-string computeNodeFingerprint(in string projectId, in string nodeId, in ResolvedInput[] inputs) @trusted
+string computeBaseFingerprint(in string projectId, in string nodeId, in ResolvedInput[] inputs) @trusted
 {
     if (projectId.length == 0)
     {
@@ -124,6 +126,27 @@ string computeNodeFingerprint(in string projectId, in string nodeId, in Resolved
         putField(app, name);
         putField(app, bindings[name]);
     }
+    return sha256Hex(app.data);
+}
+
+/**
+ * Computes a node's fingerprint from its base fingerprint (`computeBaseFingerprint`) and the
+ * base's current rerun generation (design record: bead confector-z7z.15; AGENTS.md, "Re-running
+ * a task"). A rerun increments the generation, so the node gets a new fingerprint, and every
+ * downstream node a new base, without a special-case graph walk. Generation 0, a node never
+ * rerun, is hashed like any other generation.
+ *
+ * Throws: Exception if `base` is empty.
+ */
+string computeFingerprint(in string base, ulong generation) @safe
+{
+    if (base.length == 0)
+    {
+        throw new Exception("Cannot fingerprint an empty base fingerprint");
+    }
+    auto app = appender!string();
+    putField(app, base);
+    putField(app, format("%d", generation));
     return sha256Hex(app.data);
 }
 
@@ -203,31 +226,31 @@ unittest
     auto lib = pin("lib", InputKind.repository, Json("bbb222"));
     auto flavor = pin("flavor", InputKind.value, Json("internal"));
 
-    const base = computeNodeFingerprint("p", "build", [src, lib, flavor]);
+    const base = computeBaseFingerprint("p", "build", [src, lib, flavor]);
     assert(base.length == 64, "Fingerprint must be a 64-char SHA256 hex string");
 
     // Deterministic, and independent of the order inputs are listed in
-    assert(computeNodeFingerprint("p", "build", [src, lib, flavor]) == base);
-    assert(computeNodeFingerprint("p", "build", [flavor, lib, src]) == base);
+    assert(computeBaseFingerprint("p", "build", [src, lib, flavor]) == base);
+    assert(computeBaseFingerprint("p", "build", [flavor, lib, src]) == base);
 
     // Changing any pinned value changes the fingerprint
-    assert(computeNodeFingerprint("p", "build", [pin("src", InputKind.repository, Json("aaa112")), lib, flavor]) != base);
-    assert(computeNodeFingerprint("p", "build", [src, pin("lib", InputKind.repository, Json("bbb223")), flavor]) != base);
-    assert(computeNodeFingerprint("p", "build", [src, lib, pin("flavor", InputKind.value, Json("external"))]) != base);
+    assert(computeBaseFingerprint("p", "build", [pin("src", InputKind.repository, Json("aaa112")), lib, flavor]) != base);
+    assert(computeBaseFingerprint("p", "build", [src, pin("lib", InputKind.repository, Json("bbb223")), flavor]) != base);
+    assert(computeBaseFingerprint("p", "build", [src, lib, pin("flavor", InputKind.value, Json("external"))]) != base);
 
     // Changing an input name changes the fingerprint
-    assert(computeNodeFingerprint("p", "build", [pin("source", InputKind.repository, Json("aaa111")), lib, flavor]) != base);
+    assert(computeBaseFingerprint("p", "build", [pin("source", InputKind.repository, Json("aaa111")), lib, flavor]) != base);
 
     // Adding or removing an input changes the fingerprint
-    assert(computeNodeFingerprint("p", "build", [src, lib]) != base);
+    assert(computeBaseFingerprint("p", "build", [src, lib]) != base);
 
     // Two nodes with identical inputs differ
-    assert(computeNodeFingerprint("p", "build-internal", [src, lib, flavor])
-        != computeNodeFingerprint("p", "build-external", [src, lib, flavor]));
+    assert(computeBaseFingerprint("p", "build-internal", [src, lib, flavor])
+        != computeBaseFingerprint("p", "build-external", [src, lib, flavor]));
 
     // Field boundaries cannot be forged: moving text between name and pinned value changes the hash
-    assert(computeNodeFingerprint("p", "n", [pin("a", InputKind.value, Json("b=c"))])
-        != computeNodeFingerprint("p", "n", [pin("a=b", InputKind.value, Json("c"))]));
+    assert(computeBaseFingerprint("p", "n", [pin("a", InputKind.value, Json("b=c"))])
+        != computeBaseFingerprint("p", "n", [pin("a=b", InputKind.value, Json("c"))]));
 
     // Object-valued pinned values hash the same regardless of key order
     Json objA = Json.emptyObject;
@@ -236,15 +259,15 @@ unittest
     Json objB = Json.emptyObject;
     objB["tree"] = "def";
     objB["sha"] = "abc";
-    assert(computeNodeFingerprint("p", "n", [pin("p", InputKind.repository, objA)])
-        == computeNodeFingerprint("p", "n", [pin("p", InputKind.repository, objB)]));
+    assert(computeBaseFingerprint("p", "n", [pin("p", InputKind.repository, objA)])
+        == computeBaseFingerprint("p", "n", [pin("p", InputKind.repository, objB)]));
     objB["sha"] = "abd";
-    assert(computeNodeFingerprint("p", "n", [pin("p", InputKind.repository, objA)])
-        != computeNodeFingerprint("p", "n", [pin("p", InputKind.repository, objB)]));
+    assert(computeBaseFingerprint("p", "n", [pin("p", InputKind.repository, objA)])
+        != computeBaseFingerprint("p", "n", [pin("p", InputKind.repository, objB)]));
 
     // Duplicate input names fail loudly
     bool threw = false;
-    try computeNodeFingerprint("p", "build", [src, src]);
+    try computeBaseFingerprint("p", "build", [src, src]);
     catch (Exception) threw = true;
     assert(threw, "Duplicate input names must throw");
 }
@@ -259,19 +282,19 @@ unittest
     task.environment = ["DUB_ARGS": "-q"];
     task.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
 
-    const base = computeNodeFingerprint("p", task.id, pinInputs(task, null));
+    const base = computeBaseFingerprint("p", task.id, pinInputs(task, null));
 
     TaskNode changed = task;
     changed.steps = [BuildStep("Build", "bash", null, "dub build --build=debug"), BuildStep("Extra", "bash", null, "echo")];
     changed.environment = ["DUB_ARGS": "-v", "EXTRA": "1"];
     changed.outputs.artifacts = [OutputArtifactDecl("binaries", "dist/*")];
-    assert(computeNodeFingerprint("p", changed.id, pinInputs(changed, null)) == base,
+    assert(computeBaseFingerprint("p", changed.id, pinInputs(changed, null)) == base,
         "Changing step, environment or output configuration must not change the fingerprint");
 
     // Changing a declared input does
     TaskNode newFlavor = task;
     newFlavor.inputs["flavor"] = valueInput("external");
-    assert(computeNodeFingerprint("p", newFlavor.id, pinInputs(newFlavor, null)) != base);
+    assert(computeBaseFingerprint("p", newFlavor.id, pinInputs(newFlavor, null)) != base);
 }
 
 unittest
@@ -288,15 +311,15 @@ unittest
     report.inputs["results"] = taskOutputInput("test");
 
     string[string] fps;
-    fps["compile"] = computeNodeFingerprint("p", compile.id, pinInputs(compile, null));
-    fps["test"] = computeNodeFingerprint("p", test.id, pinInputs(test, fps));
-    fps["report"] = computeNodeFingerprint("p", report.id, pinInputs(report, fps));
+    fps["compile"] = computeBaseFingerprint("p", compile.id, pinInputs(compile, null));
+    fps["test"] = computeBaseFingerprint("p", test.id, pinInputs(test, fps));
+    fps["report"] = computeBaseFingerprint("p", report.id, pinInputs(report, fps));
 
     compile.inputs["flavor"] = valueInput("external");
     string[string] fps2;
-    fps2["compile"] = computeNodeFingerprint("p", compile.id, pinInputs(compile, null));
-    fps2["test"] = computeNodeFingerprint("p", test.id, pinInputs(test, fps2));
-    fps2["report"] = computeNodeFingerprint("p", report.id, pinInputs(report, fps2));
+    fps2["compile"] = computeBaseFingerprint("p", compile.id, pinInputs(compile, null));
+    fps2["test"] = computeBaseFingerprint("p", test.id, pinInputs(test, fps2));
+    fps2["report"] = computeBaseFingerprint("p", report.id, pinInputs(report, fps2));
 
     assert(fps2["compile"] != fps["compile"]);
     assert(fps2["test"] != fps["test"], "Upstream change must change the direct dependent");
@@ -305,7 +328,7 @@ unittest
     // The order the upstream fingerprints were inserted in does not matter
     string[string] reversed;
     foreach (k; ["report", "test", "compile"]) reversed[k] = fps[k];
-    assert(computeNodeFingerprint("p", test.id, pinInputs(test, reversed)) == fps["test"]);
+    assert(computeBaseFingerprint("p", test.id, pinInputs(test, reversed)) == fps["test"]);
 
     // A task_output input with no upstream fingerprint fails loudly
     bool threw = false;
@@ -323,13 +346,13 @@ unittest
 
     ResolvedInput[string] atA = ["src": ResolvedInput("src", InputKind.repository, Json("aaa111"))];
     ResolvedInput[string] atB = ["src": ResolvedInput("src", InputKind.repository, Json("ccc333"))];
-    assert(computeNodeFingerprint("p", task.id, pinInputs(task, null, atA))
-        != computeNodeFingerprint("p", task.id, pinInputs(task, null, atB)));
+    assert(computeBaseFingerprint("p", task.id, pinInputs(task, null, atA))
+        != computeBaseFingerprint("p", task.id, pinInputs(task, null, atB)));
 
     // Display-only info is never hashed
     ResolvedInput[string] atAInfo = ["src": ResolvedInput("src", InputKind.repository, Json("aaa111"), ["branch": "main"])];
-    assert(computeNodeFingerprint("p", task.id, pinInputs(task, null, atA))
-        == computeNodeFingerprint("p", task.id, pinInputs(task, null, atAInfo)));
+    assert(computeBaseFingerprint("p", task.id, pinInputs(task, null, atA))
+        == computeBaseFingerprint("p", task.id, pinInputs(task, null, atAInfo)));
 }
 
 unittest
@@ -358,14 +381,33 @@ unittest
 {
     // Same task id and inputs in different projects never share a fingerprint
     ResolvedInput flavor = ResolvedInput("flavor", InputKind.value, Json("internal"));
-    assert(computeNodeFingerprint("alpha", "build", [flavor]) != computeNodeFingerprint("beta", "build", [flavor]));
+    assert(computeBaseFingerprint("alpha", "build", [flavor]) != computeBaseFingerprint("beta", "build", [flavor]));
     // Project and task ids cannot be shifted into each other
-    assert(computeNodeFingerprint("ab", "c", [flavor]) != computeNodeFingerprint("a", "bc", [flavor]));
+    assert(computeBaseFingerprint("ab", "c", [flavor]) != computeBaseFingerprint("a", "bc", [flavor]));
 
     bool threw = false;
-    try computeNodeFingerprint("", "build", [flavor]);
+    try computeBaseFingerprint("", "build", [flavor]);
     catch (Exception) threw = true;
     assert(threw, "An empty project id must throw");
+}
+
+unittest
+{
+    // The rerun generation is hashed with the base: every generation, 0 included, gives a
+    // distinct fingerprint that differs from the base, and the same pair always hashes alike
+    ResolvedInput flavor = ResolvedInput("flavor", InputKind.value, Json("internal"));
+    const base = computeBaseFingerprint("p", "build", [flavor]);
+    const gen0 = computeFingerprint(base, 0);
+    assert(gen0.length == 64 && gen0 != base);
+    assert(computeFingerprint(base, 0) == gen0);
+    assert(computeFingerprint(base, 1) != gen0);
+    assert(computeFingerprint(base, 2) != computeFingerprint(base, 1));
+    assert(computeFingerprint(computeBaseFingerprint("p", "test", [flavor]), 0) != gen0);
+
+    bool threw = false;
+    try computeFingerprint("", 0);
+    catch (Exception) threw = true;
+    assert(threw, "An empty base must throw");
 }
 
 unittest
@@ -375,7 +417,7 @@ unittest
     bad.name = "src";
     bad.kind = InputKind.repository;
     bool threw = false;
-    try computeNodeFingerprint("p", "build", [bad]);
+    try computeBaseFingerprint("p", "build", [bad]);
     catch (Exception) threw = true;
     assert(threw, "An undefined pin must throw");
 }
