@@ -145,6 +145,6 @@ unittest
 
     import std.string : indexOf;
     auto html = plugin.renderStepFormHtml(validParams);
-    assert(html.indexOf(`name="step_param_input"`) >= 0 && html.indexOf(`value="src"`) >= 0);
+    assert(html.indexOf(`name="step_param_input"`) >= 0 && html.indexOf(`<select`) >= 0 && html.indexOf(`value="src"`) >= 0);
     assert(html.indexOf("step_param_repository") < 0);
 }

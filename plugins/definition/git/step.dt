@@ -1,8 +1,11 @@
 div.step-subform.step-subform-git
   div.form-group
     label Repository Input
-    input.form-control.step-field-input(type="text", name="step_param_input", placeholder="Name of a repository input declared on this task, e.g. src", value=inputName)
-    small.form-help-text Checks out exactly the commit the build pinned for this input.
+    select.form-control.step-field-input(name="step_param_input")
+      option(value="", disabled=(inputName.length > 0)) -- Select a repository input --
+      - if (inputName.length > 0)
+        option(value=inputName, selected) #{inputName}
+    small.form-help-text Choose one of this task's repository inputs (Inputs tab). Checks out exactly the commit the build pinned for it.
   div.form-group
     label Target Subdirectory (Optional)
     input.form-control.step-field-target-dir(type="text", name="step_param_target_dir", placeholder="Subdirectory inside workspace (defaults to root workspace directory)", value=targetDir)

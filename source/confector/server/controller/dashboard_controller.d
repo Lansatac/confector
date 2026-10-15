@@ -5,6 +5,7 @@ import vibe.core.log : logError, logInfo, logWarn;
 import confector.core.model;
 import confector.core.storage;
 import confector.core.dag;
+import confector.core.input_resolution : InputResolutionException;
 import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
 import confector.runner_core.engine;
@@ -89,158 +90,271 @@ class TaskInputFormException : Exception
 }
 
 /**
- * Maps the task editor's input fields onto the task's declared inputs.
- *
- * The editor lists repositories (by id), upstream artifacts ("taskId:artifactId" lines)
- * and upstream tasks without artifacts. Each listed item keeps every existing input that
- * declares the same thing (same repository; same task and artifact) under its existing
- * name, so ref selectors and input names survive a save. Items without an existing input
- * get a generated name with a per-kind prefix (`repo:<id>`, `task:<id>`,
- * `artifact:<task>:<artifact>`), so generated names never collide across kinds. Value
- * inputs are not editable in the form and are kept as they are.
- *
- * Throws: TaskInputFormException if two different inputs would share a name.
+ * One row of the task editor's Inputs tab: a named input as the form submits it. Every row
+ * carries every kind's fields (the editor hides the ones that do not apply to `kind`); only
+ * the fields of the row's own kind are read.
  */
-InputDecl[string] mapTaskEditorInputs(
-    string taskId,
-    in InputDecl[string] existing,
-    in string[] repositoryValues,
-    string upstreamArtifactsText,
-    in string[] upstreamTaskValues
-) @safe
+struct TaskInputRow
 {
-    import std.algorithm.searching : findSplit;
+    string name;
+    /// An `InputKind` wire value: "repository", "value" or "task_output".
+    string kind;
+    string repository;
+    string refSelector;
+    string value;
+    string task;
+    string artifact;
+}
+
+/// The editor rows for a task's declared inputs, sorted by input name.
+TaskInputRow[] taskInputRows(in InputDecl[string] inputs) pure @safe
+{
     import std.algorithm.sorting : sort;
 
-    string[] existingNames;
-    foreach (name; existing.byKey) existingNames ~= name;
-    existingNames.sort();
+    string[] names;
+    foreach (name; inputs.byKey) names ~= name;
+    names.sort();
 
-    static string describe(in InputDecl decl) pure @safe
+    TaskInputRow[] rows;
+    foreach (name; names)
     {
-        final switch (decl.kind)
+        const decl = inputs[name];
+        TaskInputRow row;
+        row.name = name;
+        row.kind = cast(string) decl.kind;
+        row.repository = decl.spec.repository;
+        row.refSelector = decl.spec.refSelector;
+        row.value = decl.spec.value;
+        row.task = decl.spec.task;
+        row.artifact = decl.spec.artifact;
+        rows ~= row;
+    }
+    return rows;
+}
+
+/**
+ * Zips the parallel `input_*` form fields into rows.
+ *
+ * Throws: TaskInputFormException if the fields do not all have the same length.
+ */
+TaskInputRow[] taskInputRowsFromForm(
+    in string[] names, in string[] kinds, in string[] repositories, in string[] refSelectors,
+    in string[] values, in string[] tasks, in string[] artifacts
+) pure @safe
+{
+    foreach (fieldLength; [kinds.length, repositories.length, refSelectors.length, values.length, tasks.length, artifacts.length])
+    {
+        if (fieldLength != names.length)
         {
-            case InputKind.repository: return format("repository '%s'", decl.spec.repository);
-            case InputKind.value: return format("value '%s'", decl.spec.value);
-            case InputKind.taskOutput:
-                return decl.spec.artifact.length > 0
-                    ? format("artifact '%s' of task '%s'", decl.spec.artifact, decl.spec.task)
-                    : format("task '%s'", decl.spec.task);
+            throw new TaskInputFormException("The input fields of the form are inconsistent; reload the editor and try again");
         }
     }
-
-    static bool sameTarget(in InputDecl a, in InputDecl b) pure nothrow @safe
+    TaskInputRow[] rows;
+    foreach (i; 0 .. names.length)
     {
-        if (a.kind != b.kind) return false;
-        final switch (a.kind)
-        {
-            case InputKind.repository: return a.spec.repository == b.spec.repository;
-            case InputKind.value: return a.spec.value == b.spec.value;
-            case InputKind.taskOutput: return a.spec.task == b.spec.task && a.spec.artifact == b.spec.artifact;
-        }
+        rows ~= TaskInputRow(names[i], kinds[i], repositories[i], refSelectors[i], values[i], tasks[i], artifacts[i]);
     }
+    return rows;
+}
+
+/**
+ * Validates the editor's input rows and turns them into the task's declared inputs.
+ *
+ * Rows with no content at all are ignored. Every other row must have a unique name and the
+ * fields its kind needs: a repository input must name a registered repository and a ref
+ * selector (there is no default ref); a value input a value; a task output input another task
+ * of the project. All problems are reported together, one per line.
+ *
+ * Throws: TaskInputFormException listing every problem.
+ */
+InputDecl[string] parseTaskInputRows(
+    string taskId,
+    in TaskInputRow[] rows,
+    in string[] registeredRepositories,
+    in string[] otherTaskIds
+) @safe
+{
+    import std.algorithm.searching : canFind;
+    import std.array : join;
 
     InputDecl[string] result;
+    string[] errors;
+    bool[string] seenNames;
 
-    void declare(string name, InputDecl decl)
+    foreach (i, row; rows)
     {
-        if (auto p = name in result)
+        const name = row.name.strip();
+        const repository = row.repository.strip();
+        const refSelector = row.refSelector.strip();
+        const value = row.value.strip();
+        const task = row.task.strip();
+        const artifact = row.artifact.strip();
+
+        if (name.length == 0 && repository.length == 0 && refSelector.length == 0
+            && value.length == 0 && task.length == 0 && artifact.length == 0)
         {
-            if (*p == decl) return;
-            throw new TaskInputFormException(format(
-                "task '%s' would declare input '%s' twice, as %s and as %s; rename one of them",
-                taskId, name, describe(*p), describe(decl)));
+            continue;
         }
-        result[name] = decl;
+
+        const label = name.length > 0 ? format("Input '%s'", name) : format("Input %s", i + 1);
+        bool ok = true;
+        void fail(string problem)
+        {
+            errors ~= format("%s: %s", label, problem);
+            ok = false;
+        }
+
+        if (name.length == 0) fail("needs a name");
+        else if (name in seenNames) fail("the name is used by another input");
+        seenNames[name] = true;
+
+        InputDecl decl;
+        switch (row.kind)
+        {
+            case "repository":
+                if (repository.length == 0) fail("choose a repository");
+                else if (!registeredRepositories.canFind(repository)) fail(format("repository '%s' is not registered", repository));
+                if (refSelector.length == 0) fail("a ref selector is required (for example a branch or tag name); there is no default ref");
+                decl = repositoryInput(repository, refSelector);
+                break;
+            case "value":
+                if (value.length == 0) fail("needs a value");
+                decl = valueInput(value);
+                break;
+            case "task_output":
+                if (task.length == 0) fail("choose an upstream task");
+                else if (task == taskId) fail("a task cannot take its own output as an input");
+                else if (!otherTaskIds.canFind(task)) fail(format("task '%s' is not in this project", task));
+                decl = taskOutputInput(task, artifact);
+                break;
+            default:
+                fail(format("unknown input kind '%s'", row.kind));
+                break;
+        }
+
+        if (ok) result[name] = decl;
     }
 
-    void declareFromForm(string generatedName, InputDecl decl)
+    if (errors.length > 0) throw new TaskInputFormException(errors.join("\n"));
+    return result;
+}
+
+/// The step type of the built-in checkout step, whose `input` parameter names a repository input.
+enum checkoutStepType = "clone_repository";
+
+/**
+ * Problems with the checkout steps in `steps`, aligned with `steps` (empty for steps without
+ * problems and for steps of other types). A checkout step's parameters are validated with
+ * `validateParameters` (when given), which flags parameters it no longer supports, such as an
+ * old `repository` or `branch`; and its `input` must name one of the task's repository inputs.
+ */
+string[][] checkoutStepIssues(
+    in BuildStep[] steps,
+    in InputDecl[string] inputs,
+    string[] delegate(in string[string] parameters) @safe validateParameters
+) @safe
+{
+    string[][] issues;
+    issues.length = steps.length;
+    foreach (i, step; steps)
     {
-        bool kept = false;
-        foreach (name; existingNames)
+        if (step.type != checkoutStepType) continue;
+        if (validateParameters !is null) issues[i] ~= validateParameters(step.parameters);
+        if (auto name = "input" in step.parameters)
         {
-            if (sameTarget(existing[name], decl))
+            if (name.length > 0)
             {
-                declare(name, existing[name]);
-                kept = true;
+                auto decl = *name in inputs;
+                if (decl is null || decl.kind != InputKind.repository)
+                {
+                    issues[i] ~= format("Input '%s' is not a repository input declared on this task", *name);
+                }
             }
         }
-        if (!kept) declare(generatedName, decl);
     }
+    return issues;
+}
 
-    foreach (name; existingNames)
-    {
-        if (existing[name].kind == InputKind.value) declare(name, existing[name]);
-    }
+/// Formats step issues for the error banner of a rejected save.
+string formatStepIssues(in BuildStep[] steps, in string[][] issues) pure @safe
+{
+    import std.array : join;
 
-    foreach (rVal; repositoryValues)
+    string[] lines;
+    foreach (i, stepIssues; issues)
     {
-        foreach (r; rVal.split(","))
+        foreach (issue; stepIssues)
         {
-            string repoId = r.strip();
-            if (repoId.length == 0) continue;
-            declareFromForm("repo:" ~ repoId, repositoryInput(repoId, ""));
+            lines ~= format("Step %s (%s): %s", i + 1, steps[i].name.length > 0 ? steps[i].name : steps[i].type, issue);
         }
     }
-
-    foreach (line; upstreamArtifactsText.split("\n"))
-    {
-        string s = line.strip();
-        if (s.length == 0) continue;
-        auto parts = s.findSplit(":");
-        string upTask = parts[0].strip();
-        string upArtifact = parts[1].length > 0 ? parts[2].strip() : upTask;
-        declareFromForm("artifact:" ~ upTask ~ ":" ~ upArtifact, taskOutputInput(upTask, upArtifact));
-    }
-
-    foreach (dVal; upstreamTaskValues)
-    {
-        foreach (d; dVal.split(","))
-        {
-            string upTask = d.strip();
-            if (upTask.length == 0 || upTask == taskId) continue;
-            declareFromForm("task:" ~ upTask, taskOutputInput(upTask));
-        }
-    }
-
-    return result;
+    return lines.join("\n");
 }
 
 unittest
 {
-    import std.exception : assertThrown;
+    import std.exception : assertThrown, collectExceptionMsg;
+    import std.algorithm.searching : canFind;
 
-    // Round trip: names, ref selectors and value inputs survive a save of the rendered form.
+    // Round trip: declared inputs of every kind survive rendering and saving the form.
     InputDecl[string] existing = [
         "src": repositoryInput("game", "main"),
         "lib": repositoryInput("game", "release"),
         "flavor": valueInput("external"),
         "eng": taskOutputInput("build-engine", "engine.zip"),
         "setup": taskOutputInput("setup"),
-        "engine-order": taskOutputInput("build-engine"),
     ];
-    auto roundTrip = mapTaskEditorInputs("package", existing,
-        ["game"], "build-engine:engine.zip", ["setup", "build-engine"]);
-    assert(roundTrip == existing);
+    auto rows = taskInputRows(existing);
+    assert(rows.length == 5 && rows[0].name == "eng");
+    assert(parseTaskInputRows("package", rows, ["game"], ["build-engine", "setup"]) == existing);
 
-    // Items removed from the form are dropped; value inputs stay.
-    auto removed = mapTaskEditorInputs("package", existing, [], "", []);
-    assert(removed == ["flavor": valueInput("external")]);
+    // Fully blank rows are ignored; removed rows are gone.
+    assert(parseTaskInputRows("package", [TaskInputRow("", "value", "", "", "", "", "")], [], []).length == 0);
+    assert(parseTaskInputRows("package", rows[0 .. 1], [], ["build-engine"]).length == 1);
 
-    // New items get per-kind names: repository `engine` and upstream task `engine` do not collide.
-    auto fresh = mapTaskEditorInputs("package", null,
-        ["engine, tools"], "engine:engine.zip\nlib:out:dir/a.zip", ["engine", "package"]);
-    assert(fresh == [
-        "repo:engine": repositoryInput("engine", ""),
-        "repo:tools": repositoryInput("tools", ""),
-        "task:engine": taskOutputInput("engine"),
-        "artifact:engine:engine.zip": taskOutputInput("engine", "engine.zip"),
-        "artifact:lib:out:dir/a.zip": taskOutputInput("lib", "out:dir/a.zip"),
-    ]);
+    // Form fields zip into rows; mismatched lengths are rejected.
+    assert(taskInputRowsFromForm(["a"], ["value"], [""], [""], ["v"], [""], [""]) == [TaskInputRow("a", "value", "", "", "v", "", "")]);
+    assertThrown!TaskInputFormException(taskInputRowsFromForm(["a"], [], [""], [""], ["v"], [""], [""]));
 
-    // A genuine collision (an existing value input holding a generated name) is a form error.
-    InputDecl[string] clashing = ["task:engine": valueInput("x")];
-    assertThrown!TaskInputFormException(mapTaskEditorInputs("package", clashing, [], "", ["engine"]));
+    // An empty ref selector or repository is rejected, not defaulted.
+    auto noRef = collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t",
+        [TaskInputRow("src", "repository", "game", "  ", "", "", "")], ["game"], []));
+    assert(noRef.canFind("src") && noRef.canFind("ref selector"));
+    auto noRepo = collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t",
+        [TaskInputRow("src", "repository", "", "main", "", "", "")], ["game"], []));
+    assert(noRepo.canFind("choose a repository"));
+    assert(collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t",
+        [TaskInputRow("src", "repository", "gone", "main", "", "", "")], ["game"], [])).canFind("not registered"));
+
+    // Other mistakes, all reported together.
+    auto many = collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t", [
+        TaskInputRow("", "value", "", "", "x", "", ""),
+        TaskInputRow("v", "value", "", "", "", "", ""),
+        TaskInputRow("o", "task_output", "", "", "", "t", ""),
+        TaskInputRow("p", "task_output", "", "", "", "ghost", ""),
+        TaskInputRow("q", "nonsense", "", "", "", "", ""),
+        TaskInputRow("v", "value", "", "", "dup", "", ""),
+    ], [], ["up"]));
+    foreach (fragment; ["needs a name", "needs a value", "its own output", "'ghost' is not in this project", "unknown input kind", "used by another"])
+    {
+        assert(many.canFind(fragment), fragment);
+    }
+
+    // Checkout steps must name a declared repository input, and old parameters are flagged.
+    BuildStep checkout;
+    checkout.type = checkoutStepType;
+    checkout.parameters = ["input": "src"];
+    BuildStep bash;
+    bash.type = "bash";
+    bash.parameters = ["input": "ignored"];
+    BuildStep legacy;
+    legacy.type = checkoutStepType;
+    legacy.parameters = ["input": "flavor", "repository": "x"];
+    string[] validator(in string[string] p) @safe { return "repository" in p ? ["Parameter 'repository' is not supported"] : null; }
+    auto issues = checkoutStepIssues([checkout, bash, legacy], existing, &validator);
+    assert(issues.length == 3 && issues[0].length == 0 && issues[1].length == 0);
+    assert(issues[2].length == 2 && issues[2][1].canFind("flavor"));
+    assert(formatStepIssues([checkout, bash, legacy], issues).canFind("Step 3"));
 }
 
 URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
@@ -250,6 +364,56 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         registry = PluginRegistry.instance;
     }
     auto router = new URLRouter();
+
+    // Validates a checkout step's parameters with the checkout step provider's own rules.
+    string[] validateCheckoutParameters(in string[string] parameters) @trusted
+    {
+        import std.json : JSONValue, parseJSON;
+
+        if (registry is null) return null;
+        foreach (p; registry.getStepProviders())
+        {
+            if (p.stepType != checkoutStepType) continue;
+            JSONValue json = parseJSON("{}");
+            foreach (key, value; parameters) json[key] = value;
+            return p.validateParameters(json);
+        }
+        return null;
+    }
+
+    // Renders the task editor. `inputRows` are the Inputs tab rows to show: the task's declared
+    // inputs, or the submitted rows when the editor is shown again after a rejected save.
+    // `formError` is shown at the top of the editor; checkout steps with problems (including old
+    // parameters the step no longer supports) are flagged in the Steps tab.
+    void renderTaskEditor(HTTPServerResponse res, ProjectRecord project, TaskNode task,
+        TaskInputRow[] inputRows, string formError)
+    {
+        auto repositories = stateRepo !is null ? stateRepo.listRepositories() : [];
+        StepProviderViewModel[] stepProvidersView;
+        if (registry !is null)
+        {
+            foreach (p; registry.getStepProviders())
+            {
+                StepProviderViewModel vm;
+                vm.stepType = p.stepType;
+                vm.displayName = p.displayName;
+                vm.description = p.description;
+                vm.defaultHtml = p.renderStepFormHtml(p.defaultParameters());
+                stepProvidersView ~= vm;
+            }
+        }
+        // Checked against the rows being shown, which may include edits that were not saved.
+        InputDecl[string] shownInputs;
+        foreach (row; inputRows)
+        {
+            if (row.kind == InputKind.repository && row.name.strip().length > 0)
+            {
+                shownInputs[row.name.strip()] = repositoryInput(row.repository, row.refSelector);
+            }
+        }
+        string[][] stepIssues = checkoutStepIssues(task.steps, shownInputs, &validateCheckoutParameters);
+        res.render!("project/task-editor.dt", project, task, repositories, stepProvidersView, inputRows, stepIssues, formError);
+    }
 
     // Home / Dashboard
     router.get("/", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -540,34 +704,21 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             }
         }
 
-        auto repositories = stateRepo !is null ? stateRepo.listRepositories() : [];
-        StepProviderViewModel[] stepProvidersView;
-        if (registry !is null)
-        {
-            foreach (p; registry.getStepProviders())
-            {
-                StepProviderViewModel vm;
-                vm.stepType = p.stepType;
-                vm.displayName = p.displayName;
-                vm.description = p.description;
-                vm.defaultHtml = p.renderStepFormHtml(p.defaultParameters());
-                stepProvidersView ~= vm;
-            }
-        }
-        res.render!("project/task-editor.dt", project, task, repositories, stepProvidersView);
+        renderTaskEditor(res, project, task, taskInputRows(task.inputs), "");
     });
 
     router.post("/projects/tasks/save", (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.form.get("project_id", "");
+        ProjectRecord project;
+        TaskNode task;
+        TaskInputRow[] inputRows;
         try
         {
-            ProjectRecord project;
             if (stateRepo !is null && projId.length > 0)
             {
                 stateRepo.getProject(projId, project);
             }
 
-            TaskNode task;
             task.id = req.form.get("task_id", "").strip();
             if (task.id.length == 0)
             {
@@ -657,20 +808,6 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             }
             task.steps = steps;
 
-            // Inputs
-            TaskNode existingTask;
-            foreach (t; project.tasks)
-            {
-                if (t.id == task.id) existingTask = t;
-            }
-            task.inputs = mapTaskEditorInputs(
-                task.id,
-                existingTask.inputs,
-                req.form.getAll("repositories"),
-                req.form.get("upstream_artifacts", ""),
-                req.form.getAll("upstream_tasks")
-            );
-
             // Output artifacts
             string outStr = req.form.get("output_artifacts", "");
             OutputArtifactDecl[] outDecls;
@@ -746,6 +883,36 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             }
             task.triggers = triggerRules;
 
+            // Inputs. Validated here, on the server: the editor's own checks are a convenience.
+            // The submitted rows are kept so a rejected save shows the editor with the user's edits.
+            inputRows = taskInputRowsFromForm(
+                req.form.getAll("input_name"),
+                req.form.getAll("input_kind"),
+                req.form.getAll("input_repository"),
+                req.form.getAll("input_ref"),
+                req.form.getAll("input_value"),
+                req.form.getAll("input_task"),
+                req.form.getAll("input_artifact")
+            );
+            string[] registeredRepositories;
+            if (stateRepo !is null)
+            {
+                foreach (r; stateRepo.listRepositories()) registeredRepositories ~= r.name;
+            }
+            string[] otherTaskIds;
+            foreach (t; project.tasks)
+            {
+                if (t.id != task.id) otherTaskIds ~= t.id;
+            }
+            task.inputs = parseTaskInputRows(task.id, inputRows, registeredRepositories, otherTaskIds);
+
+            auto stepIssues = checkoutStepIssues(task.steps, task.inputs, &validateCheckoutParameters);
+            string stepProblems = formatStepIssues(task.steps, stepIssues);
+            if (stepProblems.length > 0)
+            {
+                throw new TaskInputFormException(stepProblems);
+            }
+
             // Replace existing or append
             bool updated = false;
             foreach (ref existing; project.tasks)
@@ -773,12 +940,17 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         }
         catch (TaskInputFormException e)
         {
-            res.writeBody("Invalid task inputs: " ~ e.msg, HTTPStatus.badRequest, "text/plain; charset=UTF-8");
+            res.statusCode = HTTPStatus.badRequest;
+            renderTaskEditor(res, project, task, inputRows, e.msg);
             return;
         }
         catch (Exception e)
         {
+            // Nothing was saved (for example the task graph is cyclic): say so, and keep the edits.
             logError("Failed to save task: %s", e.msg);
+            res.statusCode = HTTPStatus.internalServerError;
+            renderTaskEditor(res, project, task, inputRows, "Failed to save task: " ~ e.msg);
+            return;
         }
 
         res.redirect("/projects/details?id=" ~ projId);
@@ -812,35 +984,39 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         res.redirect("/projects/details?id=" ~ projId);
     });
 
-    // Execute Project Task Graph
+    // Execute Project Task Graph. A build that cannot be started (for example an input that
+    // cannot be resolved) is reported on the error page rather than logged and ignored.
     router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
+        string projId = req.form.get("id", "");
+        if (projId.length == 0) projId = req.form.get("project_id", "");
+        string targetTaskId = req.form.get("target_task_id", "");
+        if (targetTaskId.length == 0) targetTaskId = req.form.get("taskId", "");
+        if (targetTaskId.length == 0) targetTaskId = req.form.get("task_id", "");
+
+        ProjectRecord proj;
+        if (stateRepo is null || !stateRepo.getProject(projId, proj))
+        {
+            throw new HTTPStatusException(HTTPStatus.notFound, format("Cannot run project '%s': it does not exist", projId));
+        }
+        if (coordinator is null)
+        {
+            throw new HTTPStatusException(HTTPStatus.internalServerError,
+                format("Cannot run project '%s': the build coordinator is not configured", proj.id));
+        }
+
+        string buildId;
         try
         {
-            string projId = req.form.get("id", "");
-            if (projId.length == 0) projId = req.form.get("project_id", "");
-            string targetTaskId = req.form.get("target_task_id", "");
-            if (targetTaskId.length == 0) targetTaskId = req.form.get("taskId", "");
-            if (targetTaskId.length == 0) targetTaskId = req.form.get("task_id", "");
-            ProjectRecord proj;
-            if (stateRepo !is null && stateRepo.getProject(projId, proj))
-            {
-                if (coordinator !is null)
-                {
-                    string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, false, "dashboard", ".");
-                    res.redirect("/builds/details?id=" ~ buildId);
-                    return;
-                }
-                else
-                {
-                    logError("Cannot run project '%s': build coordinator is not configured", proj.id);
-                }
-            }
+            buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, false, "dashboard", ".");
         }
         catch (Exception e)
         {
-            logError("Failed to run project tasks: %s", e.msg);
+            logError("Failed to start build of project '%s': %s", proj.id, e.msg);
+            throw new HTTPStatusException(
+                cast(InputResolutionException) e !is null ? HTTPStatus.badRequest : HTTPStatus.internalServerError,
+                format("Could not start a build of project '%s': %s", proj.id, e.msg));
         }
-        res.redirect("/projects/");
+        res.redirect("/builds/details?id=" ~ buildId);
     });
 
     // Tasks List (Task-Centric View). Queued tasks will be shown by the build queue view (bead

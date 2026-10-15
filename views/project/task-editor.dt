@@ -2,33 +2,37 @@ extends layout
 
 block maincontent
   - import vibe.data.json : serializeToJson;
-  - import confector.core.model : TriggerType, BuildStep, InputKind, repositoryIds;
+  - import std.array : replace;
+  - import confector.core.model : TriggerType, BuildStep;
   - import controller.dashboard_controller : StepProviderViewModel;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
-  - string availableTasksJson = serializeToJson(availableTasksList).toString();
-  - struct ProjectTaskOpt { string id; string name; string[] repositories; }
-  - ProjectTaskOpt[] projectTasksList;
-  - foreach(t; project.tasks) { projectTasksList ~= ProjectTaskOpt(t.id, t.name, repositoryIds(t)); }
-  - string projectTasksJson = serializeToJson(projectTasksList).toString();
+  - string availableTasksJson = serializeToJson(availableTasksList).toString().replace("<", "\\u003c");
   - struct RepoOpt { string name; string address; }
   - RepoOpt[] availableReposList;
   - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
-  - string availableReposJson = serializeToJson(availableReposList).toString();
-  - string initialStepsJson = serializeToJson(task.steps).toString();
-  - string stepProvidersJson = serializeToJson(stepProvidersView).toString();
+  - string availableReposJson = serializeToJson(availableReposList).toString().replace("<", "\\u003c");
+  - string initialStepsJson = serializeToJson(task.steps).toString().replace("<", "\\u003c");
+  - string stepProvidersJson = serializeToJson(stepProvidersView).toString().replace("<", "\\u003c");
+  - string initialInputsJson = serializeToJson(inputRows).toString().replace("<", "\\u003c");
+  - string stepIssuesJson = serializeToJson(stepIssues).toString().replace("<", "\\u003c");
 
   div.projects-container
     div.header-section
       div(style="display: flex; justify-content: space-between; align-items: center;")
         div
           h1 #{task.id.length > 0 ? "Edit Task: " ~ task.id : "Add New Task"}
-          p Configure discrete DAG node inputs, dependencies, plugin build steps, and output declarations for project #{project.name}.
+          p Configure the task's named inputs, plugin build steps, and output declarations for project #{project.name}.
         div(style="display: flex; gap: 8px;")
           - if (task.id.length > 0)
             a.btn.btn-outline(href="/tasks/details?project_id=#{project.id}&task_id=#{task.id}") Back to Task Details
           a.btn.btn-outline(href="/projects/details?id=#{project.id}") Back to Project
+
+    - if (formError.length > 0)
+      div.alert.alert-danger#task-form-error(style="margin-top: 20px; white-space: pre-line;")
+        strong The task was not saved:
+        div #{formError}
 
     form#task-form(action="/projects/tasks/save", method="POST", onsubmit="prepareTaskForm()", style="margin-top: 20px;")
       input(type="hidden", name="project_id", value="#{project.id}")
@@ -53,55 +57,11 @@ block maincontent
             input.form-control#name(type="text", name="name", value="#{task.name}", placeholder="e.g. Build Release Binary")
 
         div#tab-inputs.tab-pane
-          h3 Inputs & Upstream Dependencies
-          div.form-group
-            label Task Dependencies (Other tasks in this project):
-            div#dependencies-container.dependency-list
-              - string[] plainUpstreamTasks;
-              - foreach(decl; task.inputs.byValue) { if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length == 0) plainUpstreamTasks ~= decl.spec.task; }
-              - foreach(dep; plainUpstreamTasks)
-                div.dependency-row(style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;")
-                  select.form-control(name="upstream_tasks", style="flex: 1;")
-                    option(value="", disabled) -- Select a task --
-                    - bool foundDep = false;
-                    - foreach(t; project.tasks)
-                      - if (t.id != task.id)
-                        - if (t.id == dep)
-                          - foundDep = true;
-                          option(value="#{t.id}", selected) #{t.id}#{t.name.length > 0 ? " (" ~ t.name ~ ")" : ""}
-                        - else
-                          option(value="#{t.id}") #{t.id}#{t.name.length > 0 ? " (" ~ t.name ~ ")" : ""}
-                    - if (!foundDep && dep.length > 0)
-                      option(value="#{dep}", selected) #{dep}
-                  button.btn.btn-danger.btn-sm.btn-remove-dep(type="button", onclick="removeDependency(this)", title="Remove dependency") ✕
-            div(style="margin-top: 6px;")
-              button.btn.btn-outline.btn-sm#add-dep-btn(type="button", onclick="addDependency()") + Add Dependency
-
-          div.form-group
-            label Repository Dependencies:
-            div#repo-dependencies-container.dependency-list
-              - foreach(repoDep; repositoryIds(task))
-                div.dependency-row(style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center;")
-                  select.form-control(name="repositories", style="flex: 1;")
-                    option(value="", disabled) -- Select a repository --
-                    - bool foundRepo = false;
-                    - foreach(r; repositories)
-                      - if (r.name == repoDep)
-                        - foundRepo = true;
-                        option(value="#{r.name}", selected) #{r.name}#{r.address.length > 0 ? " (" ~ r.address ~ ")" : ""}
-                      - else
-                        option(value="#{r.name}") #{r.name}#{r.address.length > 0 ? " (" ~ r.address ~ ")" : ""}
-                    - if (!foundRepo && repoDep.length > 0)
-                      option(value="#{repoDep}", selected) #{repoDep}
-                  button.btn.btn-danger.btn-sm.btn-remove-repo(type="button", onclick="removeRepoDependency(this)", title="Remove repository") ✕
-            div(style="margin-top: 6px;")
-              button.btn.btn-outline.btn-sm#add-repo-btn(type="button", onclick="addRepoDependency()") + Add Repository
-
-          div.form-group
-            label(for="upstream_artifacts") Required Upstream Artifacts (Format: taskId:artifactPath per line):
-            - string upVal = "";
-            - foreach(decl; task.inputs.byValue) { if (decl.kind == InputKind.taskOutput && decl.spec.artifact.length > 0) { if (upVal.length > 0) upVal ~= "\n"; upVal ~= decl.spec.task ~ ":" ~ decl.spec.artifact; } }
-            textarea.form-control#upstream_artifacts(name="upstream_artifacts", rows="3", placeholder="build-release:confector.exe\ncompile:build/game.zip", style="font-family: monospace;") #{upVal}
+          h3 Inputs
+          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Name everything this task depends on. A repository input is a registered repository at a ref (a branch, tag or other ref selector; there is no default). A task output input depends on an upstream task, and optionally one of its artifacts. A value input is a literal value. Checkout steps pick a repository input by name.
+          div#inputs-container
+          div(style="margin-top: 6px;")
+            button.btn.btn-outline.btn-sm#add-input-btn(type="button", onclick="addInputRow()") + Add Input
 
         div#tab-steps.tab-pane
           h3 Ordered Build Steps
@@ -164,11 +124,12 @@ block maincontent
 
   script.
     var availableTasks = !{availableTasksJson};
-    var projectTasks = !{projectTasksJson};
     var availableRepos = !{availableReposJson};
     var projectId = "#{project.id}";
     var initialSteps = !{initialStepsJson} || [];
     var stepProviders = !{stepProvidersJson} || [];
+    var initialInputs = !{initialInputsJson} || [];
+    var stepIssues = !{stepIssuesJson} || [];
 
     var stepProviderMap = {};
     for (var i = 0; i < stepProviders.length; i++) {
@@ -180,116 +141,190 @@ block maincontent
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    function getValidRepositories() {
-      var repos = [];
-      var seen = {};
+    // ---- Named inputs -------------------------------------------------------------------------
 
-      function addRepo(name, address) {
-        if (!name && !address) return;
-        var rName = name || '';
-        var rAddr = address || '';
+    var INPUT_KINDS = [
+      { value: 'repository', label: 'Repository' },
+      { value: 'task_output', label: 'Task output' },
+      { value: 'value', label: 'Value' }
+    ];
 
-        // If name matches an available repo or address is missing, look it up in availableRepos
-        if (availableRepos) {
-          for (var i = 0; i < availableRepos.length; i++) {
-            if (availableRepos[i].name === rName || availableRepos[i].address === rAddr || (rName && availableRepos[i].address === rName)) {
-              if (!rName) rName = availableRepos[i].name;
-              if (!rAddr) rAddr = availableRepos[i].address;
-              break;
-            }
-          }
-        }
-        var key = rName || rAddr;
-        if (seen[key]) return;
-        seen[key] = true;
-        repos.push({ name: rName, address: rAddr });
-      }
-
-      // 1. Repositories declared in this task's Inputs tab
-      var repoSelects = document.querySelectorAll('#repo-dependencies-container select[name="repositories"]');
-      for (var i = 0; i < repoSelects.length; i++) {
-        var val = repoSelects[i].value;
-        if (val && val.length > 0) {
-          addRepo(val, '');
-        }
-      }
-
-      // 2. Repositories from upstream dependencies (selected in upstream_tasks)
-      var depSelects = document.querySelectorAll('#dependencies-container select[name="upstream_tasks"]');
-      var depTaskIds = [];
-      for (var i = 0; i < depSelects.length; i++) {
-        var dVal = depSelects[i].value;
-        if (dVal && dVal.length > 0) depTaskIds.push(dVal);
-      }
-
-      if (projectTasks) {
-        for (var i = 0; i < projectTasks.length; i++) {
-          if (depTaskIds.indexOf(projectTasks[i].id) !== -1) {
-            if (projectTasks[i].repositories) {
-              for (var r = 0; r < projectTasks[i].repositories.length; r++) {
-                addRepo(projectTasks[i].repositories[r], '');
-              }
-            }
-          }
-        }
-      }
-
-      // 3. Fallback: if no repositories linked in inputs or upstream, list available registered repositories
-      if (repos.length === 0 && availableRepos && availableRepos.length > 0) {
-        for (var r = 0; r < availableRepos.length; r++) {
-          addRepo(availableRepos[r].name, availableRepos[r].address);
-        }
-      }
-
-      return repos;
+    function inputField(cls, labelText, control) {
+      var wrap = document.createElement('div');
+      wrap.className = 'input-field ' + cls;
+      wrap.style.cssText = 'flex: 1; min-width: 160px;';
+      var label = document.createElement('label');
+      label.style.cssText = 'font-size: 0.85em; display: block;';
+      label.textContent = labelText;
+      wrap.appendChild(label);
+      wrap.appendChild(control);
+      return wrap;
     }
 
-    function populateRepoSelect(selectElem, desiredValue) {
+    function textControl(name, value, placeholder) {
+      var el = document.createElement('input');
+      el.type = 'text';
+      el.name = name;
+      el.className = 'form-control';
+      el.placeholder = placeholder || '';
+      el.value = value || '';
+      return el;
+    }
+
+    // A select of `options` ({value, label}); keeps `current` selectable even when it is not
+    // among the options, so a stale reference is shown (and rejected on save) rather than lost.
+    function selectControl(name, options, current, placeholder) {
+      var el = document.createElement('select');
+      el.name = name;
+      el.className = 'form-control';
+      var first = document.createElement('option');
+      first.value = '';
+      first.textContent = placeholder;
+      el.appendChild(first);
+      var found = false;
+      for (var i = 0; i < options.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = options[i].value;
+        opt.textContent = options[i].label;
+        if (options[i].value === current) { opt.selected = true; found = true; }
+        el.appendChild(opt);
+      }
+      if (current && !found) {
+        var stale = document.createElement('option');
+        stale.value = current;
+        stale.textContent = current + ' (not available)';
+        stale.selected = true;
+        el.appendChild(stale);
+      }
+      return el;
+    }
+
+    function onInputKindChange(kindSelect) {
+      var row = kindSelect.closest('.input-row');
+      if (!row) return;
+      var kind = kindSelect.value;
+      var visible = { repository: ['repo', 'ref'], task_output: ['task', 'artifact'], value: ['value'] }[kind] || [];
+      var all = ['repo', 'ref', 'task', 'artifact', 'value'];
+      for (var i = 0; i < all.length; i++) {
+        var field = row.querySelector('.input-field-' + all[i]);
+        if (field) field.style.display = visible.indexOf(all[i]) !== -1 ? '' : 'none';
+      }
+      // Required in the browser only where the field applies; the server checks again.
+      var needs = { repo: 'repository', ref: 'repository', task: 'task_output', value: 'value' };
+      for (var key in needs) {
+        var control = row.querySelector('.input-field-' + key + ' select, .input-field-' + key + ' input');
+        if (control) control.required = (needs[key] === kind);
+      }
+      updateAllInputSelects();
+    }
+
+    function removeInputRow(btn) {
+      var row = btn.closest('.input-row');
+      if (row) {
+        row.remove();
+        updateAllInputSelects();
+      }
+    }
+
+    function addInputRow(data) {
+      var container = document.getElementById('inputs-container');
+      if (!container) return;
+      var d = data || {};
+
+      var row = document.createElement('div');
+      row.className = 'input-row';
+      row.style.cssText = 'display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 10px; padding: 10px; border: 1px solid #e0e0e0; border-radius: 6px; background: #fafafa;';
+
+      var nameControl = textControl('input_name', d.name, 'e.g. src');
+      nameControl.required = true;
+      nameControl.oninput = function() { updateAllInputSelects(); };
+      row.appendChild(inputField('input-field-name', 'Name', nameControl));
+
+      var kindControl = document.createElement('select');
+      kindControl.name = 'input_kind';
+      kindControl.className = 'form-control';
+      for (var i = 0; i < INPUT_KINDS.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = INPUT_KINDS[i].value;
+        opt.textContent = INPUT_KINDS[i].label;
+        if (INPUT_KINDS[i].value === (d.kind || 'repository')) opt.selected = true;
+        kindControl.appendChild(opt);
+      }
+      kindControl.onchange = function() { onInputKindChange(this); };
+      row.appendChild(inputField('input-field-kind', 'Kind', kindControl));
+
+      var repoOptions = (availableRepos || []).map(function(r) {
+        return { value: r.name, label: r.name + (r.address ? ' (' + r.address + ')' : '') };
+      });
+      row.appendChild(inputField('input-field-repo', 'Repository', selectControl('input_repository', repoOptions, d.repository, '-- Select a repository --')));
+      row.appendChild(inputField('input-field-ref', 'Ref selector (required)', textControl('input_ref', d.refSelector, 'e.g. main, v1.2.0')));
+
+      var taskOptions = (availableTasks || []).map(function(t) {
+        return { value: t.id, label: t.id + (t.name && t.name !== t.id ? ' (' + t.name + ')' : '') };
+      });
+      row.appendChild(inputField('input-field-task', 'Upstream task', selectControl('input_task', taskOptions, d.task, '-- Select a task --')));
+      row.appendChild(inputField('input-field-artifact', 'Artifact (optional)', textControl('input_artifact', d.artifact, 'artifact id; empty = depend on the task only')));
+
+      row.appendChild(inputField('input-field-value', 'Value', textControl('input_value', d.value, 'literal value')));
+
+      var removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-danger btn-sm';
+      removeBtn.textContent = '✕';
+      removeBtn.title = 'Remove input';
+      removeBtn.onclick = function() { removeInputRow(this); };
+      row.appendChild(removeBtn);
+
+      container.appendChild(row);
+      onInputKindChange(kindControl);
+    }
+
+    // Names of the repository inputs currently declared in the Inputs tab.
+    function declaredRepositoryInputs() {
+      var names = [];
+      var rows = document.querySelectorAll('#inputs-container .input-row');
+      for (var i = 0; i < rows.length; i++) {
+        var kind = rows[i].querySelector('[name="input_kind"]').value;
+        var name = rows[i].querySelector('[name="input_name"]').value.trim();
+        if (kind === 'repository' && name.length > 0 && names.indexOf(name) === -1) names.push(name);
+      }
+      return names;
+    }
+
+    // Fills a checkout step's input select with the task's repository inputs, keeping `desired`
+    // (or the current choice) selected even if it is not declared, so the mistake stays visible.
+    function populateInputSelect(selectElem, desired) {
       if (!selectElem) return;
-      var currentVal = desiredValue !== undefined ? desiredValue : selectElem.value;
+      var current = desired !== undefined ? desired : selectElem.value;
+      var names = declaredRepositoryInputs();
       selectElem.innerHTML = '';
 
-      var validRepos = getValidRepositories();
-      if (validRepos.length === 0) {
-        var emptyOpt = document.createElement('option');
-        emptyOpt.value = '';
-        emptyOpt.disabled = true;
-        emptyOpt.selected = true;
-        emptyOpt.textContent = 'No repositories available (add in Inputs tab)';
-        selectElem.appendChild(emptyOpt);
-        return;
-      }
+      var placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = names.length > 0 ? '-- Select a repository input --' : 'No repository inputs declared (add one in the Inputs tab)';
+      selectElem.appendChild(placeholder);
 
       var found = false;
-      for (var i = 0; i < validRepos.length; i++) {
-        var r = validRepos[i];
+      for (var i = 0; i < names.length; i++) {
         var opt = document.createElement('option');
-        opt.value = r.name || r.address;
-        opt.textContent = (r.name && r.address) ? (r.name + ' (' + r.address + ')') : (r.name || r.address);
-        if (currentVal && (opt.value === currentVal || r.name === currentVal || r.address === currentVal)) {
-          opt.selected = true;
-          found = true;
-        }
+        opt.value = names[i];
+        opt.textContent = names[i];
+        if (names[i] === current) { opt.selected = true; found = true; }
         selectElem.appendChild(opt);
       }
-
-      if (currentVal && currentVal.length > 0 && !found) {
-        var customOpt = document.createElement('option');
-        customOpt.value = currentVal;
-        customOpt.textContent = currentVal;
-        customOpt.selected = true;
-        selectElem.appendChild(customOpt);
-      } else if (!currentVal && validRepos.length > 0) {
-        selectElem.selectedIndex = 0;
+      if (current && !found) {
+        var stale = document.createElement('option');
+        stale.value = current;
+        stale.textContent = current + ' (not a declared repository input)';
+        stale.selected = true;
+        selectElem.appendChild(stale);
       }
     }
 
-    function updateAllRepoDropdowns() {
-      var selects = document.querySelectorAll('.step-field-repository, select[name="step_param_repository"]');
+    function updateAllInputSelects() {
+      var selects = document.querySelectorAll('#steps-container .step-field-input');
       for (var i = 0; i < selects.length; i++) {
-        if (selects[i].tagName.toLowerCase() === 'select') {
-          populateRepoSelect(selects[i]);
-        }
+        populateInputSelect(selects[i]);
       }
     }
 
@@ -377,13 +412,10 @@ block maincontent
         if (newWorkDirElem) newWorkDirElem.value = prevWorkDir;
       }
 
-      var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
-      if (repoElem && repoElem.tagName.toLowerCase() === 'select') {
-        populateRepoSelect(repoElem);
-      }
+      populateInputSelect(subformContainer.querySelector('.step-field-input'));
     }
 
-    function addBuildStep(defaultType, stepData) {
+    function addBuildStep(defaultType, stepData, issues) {
       var container = document.getElementById('steps-container');
       if (!container) return;
 
@@ -528,34 +560,33 @@ block maincontent
           }
         }
       }
-      // Check common parameter aliases
-      if (params.repository || params.url || params.address) {
-        var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
-        if (repoElem) {
-          var desiredVal = params.repository || params.url || params.address;
-          if (repoElem.tagName.toLowerCase() === 'select') {
-            populateRepoSelect(repoElem, desiredVal);
-          } else {
-            repoElem.value = desiredVal;
-          }
+      // A checkout step names one of the task's repository inputs.
+      populateInputSelect(subformContainer.querySelector('.step-field-input'), params.input || '');
+
+      // Problems found on the server (for example old parameters the step no longer supports)
+      // are shown with the step, together with what was saved, so they can be fixed here.
+      if (issues && issues.length > 0) {
+        var box = document.createElement('div');
+        box.className = 'alert alert-danger step-issues';
+        var title = document.createElement('strong');
+        title.textContent = 'This step needs attention:';
+        box.appendChild(title);
+        var list = document.createElement('ul');
+        list.style.cssText = 'margin: 6px 0 6px 18px;';
+        for (var n = 0; n < issues.length; n++) {
+          var li = document.createElement('li');
+          li.textContent = issues[n];
+          list.appendChild(li);
         }
-      } else {
-        var repoElem = subformContainer.querySelector('.step-field-repository') || subformContainer.querySelector('[name="step_param_repository"]');
-        if (repoElem && repoElem.tagName.toLowerCase() === 'select') {
-          populateRepoSelect(repoElem);
+        box.appendChild(list);
+        var saved = [];
+        for (var k in params) {
+          if (params.hasOwnProperty(k)) saved.push(k + ' = ' + params[k]);
         }
-      }
-      if (params.branch) {
-        var bElem = subformContainer.querySelector('.step-field-branch') || subformContainer.querySelector('[name="step_param_branch"]');
-        if (bElem) bElem.value = params.branch;
-      }
-      if (params.target_dir || params.targetDirectory || params.target) {
-        var tElem = subformContainer.querySelector('.step-field-target-dir') || subformContainer.querySelector('[name="step_param_target_dir"]');
-        if (tElem) tElem.value = params.target_dir || params.targetDirectory || params.target;
-      }
-      if (params.executable) {
-        var eElem = subformContainer.querySelector('.step-field-executable') || subformContainer.querySelector('[name="step_param_executable"]');
-        if (eElem) eElem.value = params.executable;
+        var detail = document.createElement('div');
+        detail.textContent = 'Saved parameters: ' + (saved.length > 0 ? saved.join(', ') : '(none)') + '. Parameters not shown in the fields below are dropped when the task is saved; declare the repository in the Inputs tab and choose it here.';
+        box.appendChild(detail);
+        body.insertBefore(box, body.firstChild);
       }
 
       body.appendChild(subformContainer);
@@ -629,128 +660,6 @@ block maincontent
       }
     }
 
-    function removeDependency(btn) {
-      var row = btn.closest('.dependency-row');
-      if (row) {
-        row.remove();
-        updateAllRepoDropdowns();
-      }
-    }
-
-    function addDependency(selectedId) {
-      var container = document.getElementById('dependencies-container');
-      if (!container) return;
-
-      var row = document.createElement('div');
-      row.className = 'dependency-row';
-      row.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
-
-      var select = document.createElement('select');
-      select.name = 'upstream_tasks';
-      select.className = 'form-control';
-      select.style.flex = '1';
-      select.onchange = function() { updateAllRepoDropdowns(); };
-
-      var defaultOpt = document.createElement('option');
-      defaultOpt.value = '';
-      defaultOpt.disabled = true;
-      if (!selectedId) defaultOpt.selected = true;
-      defaultOpt.textContent = '-- Select a task --';
-      select.appendChild(defaultOpt);
-
-      var tasks = availableTasks || [];
-      if (tasks.length === 0) {
-        var noneOpt = document.createElement('option');
-        noneOpt.value = '';
-        noneOpt.disabled = true;
-        noneOpt.textContent = 'No other tasks in this project';
-        select.appendChild(noneOpt);
-      } else {
-        for (var i = 0; i < tasks.length; i++) {
-          var opt = document.createElement('option');
-          opt.value = tasks[i].id;
-          opt.textContent = tasks[i].id + (tasks[i].name && tasks[i].name.length > 0 && tasks[i].name !== tasks[i].id ? ' (' + tasks[i].name + ')' : '');
-          if (selectedId && tasks[i].id === selectedId) {
-            opt.selected = true;
-          }
-          select.appendChild(opt);
-        }
-      }
-
-      var removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'btn btn-danger btn-sm btn-remove-dep';
-      removeBtn.textContent = '✕';
-      removeBtn.title = 'Remove dependency';
-      removeBtn.onclick = function() { removeDependency(this); };
-
-      row.appendChild(select);
-      row.appendChild(removeBtn);
-      container.appendChild(row);
-      updateAllRepoDropdowns();
-    }
-
-    function removeRepoDependency(btn) {
-      var row = btn.closest('.dependency-row');
-      if (row) {
-        row.remove();
-        updateAllRepoDropdowns();
-      }
-    }
-
-    function addRepoDependency(selectedName) {
-      var container = document.getElementById('repo-dependencies-container');
-      if (!container) return;
-
-      var row = document.createElement('div');
-      row.className = 'dependency-row';
-      row.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
-
-      var select = document.createElement('select');
-      select.name = 'repositories';
-      select.className = 'form-control';
-      select.style.flex = '1';
-      select.onchange = function() { updateAllRepoDropdowns(); };
-
-      var defaultOpt = document.createElement('option');
-      defaultOpt.value = '';
-      defaultOpt.disabled = true;
-      if (!selectedName) defaultOpt.selected = true;
-      defaultOpt.textContent = '-- Select a repository --';
-      select.appendChild(defaultOpt);
-
-      var repos = availableRepos || [];
-      if (repos.length === 0) {
-        var noneOpt = document.createElement('option');
-        noneOpt.value = '';
-        noneOpt.disabled = true;
-        noneOpt.textContent = 'No repositories configured';
-        select.appendChild(noneOpt);
-      } else {
-        for (var i = 0; i < repos.length; i++) {
-          var opt = document.createElement('option');
-          opt.value = repos[i].name;
-          opt.textContent = repos[i].name + (repos[i].address && repos[i].address.length > 0 ? ' (' + repos[i].address + ')' : '');
-          if (selectedName && repos[i].name === selectedName) {
-            opt.selected = true;
-          }
-          select.appendChild(opt);
-        }
-      }
-
-      var removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'btn btn-danger btn-sm btn-remove-repo';
-      removeBtn.textContent = '✕';
-      removeBtn.title = 'Remove repository';
-      removeBtn.onclick = function() { removeRepoDependency(this); };
-
-      row.appendChild(select);
-      row.appendChild(removeBtn);
-      container.appendChild(row);
-      updateAllRepoDropdowns();
-    }
-
     function switchTab(tabName, btn) {
       var panes = document.querySelectorAll('.tab-pane');
       for (var i = 0; i < panes.length; i++) {
@@ -768,7 +677,7 @@ block maincontent
         btn.classList.add('active');
       }
       if (tabName === 'steps') {
-        updateAllRepoDropdowns();
+        updateAllInputSelects();
       }
     }
 
@@ -873,9 +782,13 @@ block maincontent
     }
 
     document.addEventListener("DOMContentLoaded", function() {
+      // Inputs first: checkout steps pick from the repository inputs declared here.
+      for (var n = 0; n < initialInputs.length; n++) {
+        addInputRow(initialInputs[n]);
+      }
       if (initialSteps && initialSteps.length > 0) {
         for (var i = 0; i < initialSteps.length; i++) {
-          addBuildStep(initialSteps[i].type, initialSteps[i]);
+          addBuildStep(initialSteps[i].type, initialSteps[i], stepIssues[i]);
         }
       } else {
         addBuildStep('process', {
@@ -884,5 +797,5 @@ block maincontent
           script: ''
         });
       }
-      updateAllRepoDropdowns();
+      updateAllInputSelects();
     });
