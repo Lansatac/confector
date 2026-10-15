@@ -257,7 +257,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             string fingerprint = req.params["fingerprint"];
             TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
-            if (result.fingerprint.length == 0 || result.fingerprint == "unknown")
+            if (result.fingerprint.length == 0)
             {
                 result.fingerprint = fingerprint;
             }

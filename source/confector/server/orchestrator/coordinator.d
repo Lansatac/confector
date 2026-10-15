@@ -71,7 +71,7 @@ class InFlightTaskRegistry
      */
     bool isInFlight(string fingerprint) const pure nothrow @safe
     {
-        if (fingerprint.length == 0 || fingerprint == "unknown") return false;
+        if (fingerprint.length == 0) return false;
         auto p = fingerprint in m_inFlight;
         return p !is null && p.length > 0;
     }
@@ -85,7 +85,7 @@ class InFlightTaskRegistry
     {
         m_taskToFingerprint[taskKey(buildId, taskId)] = fingerprint;
 
-        if (fingerprint.length == 0 || fingerprint == "unknown")
+        if (fingerprint.length == 0)
         {
             m_inFlight[fingerprint] ~= InFlightSubscription(buildId, taskId);
             return true;
@@ -528,6 +528,32 @@ class BuildCoordinator
         m_stateRepo.setTaskStatus(active.buildId, taskId, TaskStatus.failed, message);
     }
 
+    /**
+     * Throws if a task_output input of `node` (task `taskId`) requests an artifact that the
+     * recorded result of its upstream task, at the fingerprint the input is pinned to, does not
+     * contain. Build configuration is not fingerprinted, so a cached result can predate a change
+     * to the upstream task's output declarations. An upstream result with no record here is left
+     * to the runner, which checks the artifact store when it stages the artifact.
+     */
+    private void requireUpstreamArtifacts(ref ActiveBuild active, in TaskNode node, string taskId)
+    {
+        if (m_stateRepo is null) return;
+        foreach (input; chainInputs(active, taskId))
+        {
+            if (input.kind != InputKind.taskOutput) continue;
+            const decl = node.inputs.get(input.name, InputDecl.init);
+            if (decl.spec.artifact.length == 0) continue;
+
+            string upstreamFingerprint = input.pinned.get!string;
+            ArtifactMetadata[] produced;
+            if (!m_stateRepo.getCachedFingerprint(decl.spec.task, upstreamFingerprint, produced)) continue;
+            if (!produced.canFind!(meta => (meta.artifactId.length > 0 ? meta.artifactId : meta.filePath) == decl.spec.artifact))
+            {
+                throw new Exception(missingUpstreamArtifactMessage(decl.spec.task, upstreamFingerprint, decl.spec.artifact));
+            }
+        }
+    }
+
     /// Returns task `taskId`'s resolved inputs in `active`'s chain, sorted by name. Throws if
     /// it has none (every task of a chain has an entry, empty when it declares no inputs).
     private static ResolvedInput[] chainInputs(ref ActiveBuild active, string taskId)
@@ -605,7 +631,7 @@ class BuildCoordinator
      */
     void onTaskCompleted(string fingerprint, TaskExecutionResult result, string receiptHandle = null)
     {
-        if (result.fingerprint.length == 0 || result.fingerprint == "unknown")
+        if (result.fingerprint.length == 0)
         {
             result.fingerprint = fingerprint;
         }
@@ -660,18 +686,18 @@ class BuildCoordinator
             try
             {
                 string fingerprint = result.fingerprint;
-                if (fingerprint.length == 0 || fingerprint == "unknown")
+                if (fingerprint.length == 0)
                 {
                     m_inFlightRegistry.getFingerprintForTask(buildId, taskId, fingerprint);
                 }
-                if ((fingerprint.length == 0 || fingerprint == "unknown") && (buildId in m_activeBuilds))
+                if ((fingerprint.length == 0) && (buildId in m_activeBuilds))
                 {
                     fingerprint = m_activeBuilds[buildId].resolution.fingerprints.get(taskId, null);
                 }
 
                 // Retrieve all subscribed builds/tasks for this fingerprint
                 InFlightSubscription[] subscribers;
-                if (fingerprint.length > 0 && fingerprint != "unknown")
+                if (fingerprint.length > 0)
                 {
                     subscribers = m_inFlightRegistry.completeTask(fingerprint);
                 }
@@ -702,7 +728,7 @@ class BuildCoordinator
                     rec.buildId = subBuildId;
                     rec.taskId = subTaskId;
                     rec.status = cast(string)result.status;
-                    rec.fingerprint = (result.fingerprint.length > 0 && result.fingerprint != "unknown") ? result.fingerprint : fingerprint;
+                    rec.fingerprint = (result.fingerprint.length > 0) ? result.fingerprint : fingerprint;
                     rec.exitCode = result.exitCode;
                     rec.errorMessage = result.errorMessage;
                     rec.durationMs = result.durationMs;
@@ -721,7 +747,7 @@ class BuildCoordinator
 
                         // If fingerprint is valid and artifacts exist/succeeded, save to cache
                         if ((result.status == TaskStatus.succeeded || result.status == TaskStatus.cached)
-                            && rec.fingerprint.length > 0 && rec.fingerprint != "unknown")
+                            && rec.fingerprint.length > 0)
                         {
                             m_stateRepo.saveCachedFingerprint(subTaskId, rec.fingerprint, result.producedArtifacts);
                         }
@@ -981,7 +1007,7 @@ class BuildCoordinator
                     // 3. Cache check using the fingerprint computed from the build's chain
                     string fingerprint = chainFingerprint(active, tId);
 
-                    if (!active.force && fingerprint.length > 0 && fingerprint != "unknown" && m_stateRepo !is null)
+                    if (!active.force && fingerprint.length > 0 && m_stateRepo !is null)
                     {
                         ArtifactMetadata[] cachedArtifacts;
                         if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedArtifacts))
@@ -1033,6 +1059,9 @@ class BuildCoordinator
                             }
                         }
                     }
+
+                    // Fail now, rather than on a worker, if an upstream result lacks a requested artifact
+                    requireUpstreamArtifacts(active, node, tId);
 
                     // The work order carries the task's resolved inputs from the chain (task outputs
                     // pinned to upstream fingerprints, which address the artifacts to stage) and where
@@ -2091,4 +2120,52 @@ unittest
     assert(stateRepo.getBuild(buildId, record) && record.status == "failed");
     assert(after.m_activeBuilds.length == 0 && after.inFlightRegistry.inFlightCount() == 0);
     assert(countReceivable(queue) == 0);
+}
+
+unittest
+{
+    // A task_output input requesting an artifact the upstream result lacks (output declarations
+    // changed since a cached result) fails the downstream task before dispatch, naming the
+    // upstream task, its fingerprint and the artifact; an artifact it has dispatches normally
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto storage = new InMemoryArtifactStorage();
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto queue = new InMemoryDispatchQueue();
+    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+
+    auto project = variantsProject();
+    project.tasks[1].inputs["bin"] = taskOutputInput("compile", "game.zip");
+    project.tasks[2].inputs["bin"] = taskOutputInput("compile", "tools.zip");
+
+    string buildId = coordinator.startBuild(project, "internal");
+    auto compileOrder = receiveWorkOrders(queue, 1)[0];
+    storage.storeArtifactStream(compileOrder.workOrder.fingerprint, "game.zip", (void delegate(const(ubyte)[]) sink) { sink([1, 2, 3]); });
+    ArtifactMetadata produced;
+    produced.artifactId = "game.zip";
+    TaskExecutionResult done;
+    done.taskId = "compile";
+    done.buildId = buildId;
+    done.status = TaskStatus.succeeded;
+    done.fingerprint = compileOrder.workOrder.fingerprint;
+    done.producedArtifacts = [produced];
+    coordinator.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+
+    // internal wants game.zip, which compile produced
+    auto internalOrder = receiveWorkOrders(queue, 1);
+    assert(internalOrder.length == 1 && internalOrder[0].workOrder.taskId == "internal");
+
+    // external, built later in the chain, wants tools.zip, which the cached compile result lacks
+    string externalBuild = coordinator.buildInChain(buildId, "external");
+    TaskStatus externalStatus;
+    assert(stateRepo.getTaskStatus(externalBuild, "external", externalStatus) && externalStatus == TaskStatus.failed);
+    TaskExecutionRecord externalRec;
+    assert(stateRepo.getTaskExecution(externalBuild, "external", externalRec));
+    assert(externalRec.errorMessage.canFind("'compile'") && externalRec.errorMessage.canFind(compileOrder.workOrder.fingerprint)
+        && externalRec.errorMessage.canFind("'tools.zip'") && externalRec.errorMessage.canFind("Re-run task 'compile'"), externalRec.errorMessage);
+    BuildRecord externalRecord;
+    assert(stateRepo.getBuild(externalBuild, externalRecord) && externalRecord.status == "failed");
+    assert(countReceivable(queue) == 0, "A task with a missing upstream artifact must not be dispatched");
 }

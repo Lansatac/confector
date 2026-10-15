@@ -104,29 +104,22 @@ final class ArtifactStager
         sha.start();
         ulong totalBytes = 0;
 
-        if (storage !is null && taskFingerprint.length > 0 && taskFingerprint != "unknown")
-        {
-            storage.storeArtifactStream(taskFingerprint, artId, (void delegate(const(ubyte)[]) sink) {
-                ZipPackager.pack(workspaceDir, artPath, (const(ubyte)[] chunk) {
-                    if (chunk.length > 0)
-                    {
-                        sha.put(chunk);
-                        totalBytes += chunk.length;
-                        sink(chunk);
-                    }
-                });
-            });
-        }
-        else
-        {
+        if (taskFingerprint.length == 0)
+            throw new Exception(format("Cannot store artifact '%s' of task '%s': no fingerprint; the control plane's fingerprint is required",
+                artId, taskId));
+        if (storage is null)
+            throw new Exception(format("Cannot store artifact '%s' of task '%s': no artifact storage configured", artId, taskId));
+
+        storage.storeArtifactStream(taskFingerprint, artId, (void delegate(const(ubyte)[]) sink) {
             ZipPackager.pack(workspaceDir, artPath, (const(ubyte)[] chunk) {
                 if (chunk.length > 0)
                 {
                     sha.put(chunk);
                     totalBytes += chunk.length;
+                    sink(chunk);
                 }
             });
-        }
+        });
 
         auto digest = sha.finish();
         string sha256Hex = toHexString!(LetterCase.lower)(digest).idup;
@@ -156,6 +149,7 @@ final class ArtifactStager
 unittest
 {
     import std.file : exists, rmdirRecurse, mkdirRecurse, write, readText;
+    import std.algorithm : canFind;
     import confector.core.test_storage : InMemoryArtifactStorage;
 
     string testDir = "test_artifact_stager_suite";
@@ -187,4 +181,14 @@ unittest
     string badDest = buildPath(testDir, "dest_bad");
     bool stagedBad = ArtifactStager.stageUpstreamArtifact(storage, "fp123", "my_art", badDest, "0000000000000000000000000000000000000000000000000000000000000000");
     assert(!stagedBad);
+
+    // A missing fingerprint or storage is an error, never a silent skip
+    bool noFp = false;
+    try ArtifactStager.packOutputArtifact(storage, "", "build1", "task1", wsDir, decl);
+    catch (Exception ex) noFp = ex.msg.canFind("no fingerprint");
+    assert(noFp);
+    bool noStorage = false;
+    try ArtifactStager.packOutputArtifact(null, "fp123", "build1", "task1", wsDir, decl);
+    catch (Exception ex) noStorage = ex.msg.canFind("no artifact storage");
+    assert(noStorage);
 }

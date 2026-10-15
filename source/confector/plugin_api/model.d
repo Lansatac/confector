@@ -144,6 +144,20 @@ InputDecl taskOutputInput(string task, string artifact = null) pure nothrow @saf
 }
 
 /**
+ * The error for a task_output input requesting artifact `artifact` that upstream task
+ * `upstreamTask`'s result at `upstreamFingerprint` does not contain. Build configuration is not
+ * fingerprinted, so a cached result can predate a change to the task's output declarations;
+ * re-running the upstream task is the remedy.
+ */
+string missingUpstreamArtifactMessage(string upstreamTask, string upstreamFingerprint, string artifact) pure @safe
+{
+    import std.format : format;
+
+    return format("Upstream task '%s' (fingerprint '%s') has no artifact '%s'; its result predates the artifact's declaration or did not produce it. Re-run task '%s' to produce it",
+        upstreamTask, upstreamFingerprint, artifact, upstreamTask);
+}
+
+/**
  * A declared input resolved to a pinned value, as frozen in a build chain.
  */
 struct ResolvedInput

@@ -221,10 +221,7 @@ class TaskEngine
                 if (!m_artifactStorage.artifactExists(upFp, artId))
                 {
                     result.status = TaskStatus.failed;
-                    result.errorMessage = format(
-                        "Upstream artifact '%s' from task '%s' (fingerprint '%s') not found in artifact storage",
-                        artId, upTaskId, upFp
-                    );
+                    result.errorMessage = missingUpstreamArtifactMessage(upTaskId, upFp, artId);
                     sw.stop();
                     result.durationMs = sw.peek.total!"msecs";
                     return result;
@@ -459,6 +456,7 @@ unittest
     // An upstream fingerprint with no such artifact fails the task
     auto res3 = engine.executeTask("build_1", node2, ws2, "fp_step2", [ResolvedInput("out", InputKind.taskOutput, Json("fp_other"))]);
     assert(res3.status == TaskStatus.failed && res3.errorMessage.canFind("fp_other"));
+    assert(res3.errorMessage.canFind("'step1'") && res3.errorMessage.canFind("'output.txt'") && res3.errorMessage.canFind("Re-run task 'step1'"));
 }
 
 unittest
