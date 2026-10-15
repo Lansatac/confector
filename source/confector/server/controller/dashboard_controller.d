@@ -182,7 +182,6 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             projId = proj.id;
             proj.name = req.form.get("name", "Project");
             proj.description = req.form.get("description", "");
-            proj.repositoryUrl = req.form.get("repository_url", "");
             string now = Clock.currTime.toISOString();
             proj.createdAt = now;
             proj.updatedAt = now;
@@ -303,7 +302,6 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             project.id = projId;
             project.name = req.form.get("name", project.name.length > 0 ? project.name : "Project");
             project.description = req.form.get("description", project.description);
-            project.repositoryUrl = req.form.get("repository_url", project.repositoryUrl);
 
             string tasksJsonText = req.form.get("tasks_json", "[]");
             Json parsed = parseJsonString(tasksJsonText);

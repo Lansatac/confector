@@ -9,7 +9,7 @@ import std.string : strip;
 import std.typecons : Tuple, tuple;
 import std.uri : encodeComponent;
 
-import confector.core.model : ProjectRecord, RepositoryRecord;
+import confector.core.model : ProjectRecord, RepositoryRecord, projectUsesRepository;
 import confector.core.storage : BuildStateRepository;
 import confector.orchestrator.coordinator : BuildCoordinator;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
@@ -38,9 +38,7 @@ struct ConnectedProjectViewModel
     string id;
     string name;
     string description;
-    string repositoryUrl;
     string[] matchingTasks;
-    bool isProjectDefault;
 }
 
 /// Registers or unregisters a VCS polling schedule entry for a repository.
@@ -95,19 +93,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
             ulong count = 0;
             foreach (p; projects)
             {
-                bool usesRepo = (p.repositoryUrl.length > 0 && (p.repositoryUrl == r.address || p.repositoryUrl == r.name));
-                if (!usesRepo)
-                {
-                    foreach (t; p.tasks)
-                    {
-                        if (t.inputs.repositories.canFind(r.name) || (r.address.length > 0 && t.inputs.repositories.canFind(r.address)))
-                        {
-                            usesRepo = true;
-                            break;
-                        }
-                    }
-                }
-                if (usesRepo)
+                if (projectUsesRepository(p, r))
                 {
                     count++;
                 }
@@ -302,7 +288,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
                     // Find projects that use this repository and start builds
                     foreach (proj; stateRepo.listProjects())
                     {
-                        if (proj.repositoryUrl == repoUrl)
+                        if (projectUsesRepository(proj, repoRecord))
                         {
                             coordinator.startBuild(proj, null, false, "polling");
                         }
@@ -358,7 +344,6 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
 
         foreach (p; allProjects)
         {
-            bool isDefault = (p.repositoryUrl.length > 0 && (p.repositoryUrl == repo.address || p.repositoryUrl == repo.name));
             string[] matchingTasks;
 
             foreach (t; p.tasks)
@@ -369,15 +354,13 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
                 }
             }
 
-            if (isDefault || matchingTasks.length > 0)
+            if (matchingTasks.length > 0)
             {
                 ConnectedProjectViewModel cpvm;
                 cpvm.id = p.id;
                 cpvm.name = p.name.length > 0 ? p.name : p.id;
                 cpvm.description = p.description;
-                cpvm.repositoryUrl = p.repositoryUrl;
                 cpvm.matchingTasks = matchingTasks;
-                cpvm.isProjectDefault = isDefault;
                 connectedProjects ~= cpvm;
             }
         }
@@ -410,7 +393,6 @@ unittest
     ProjectRecord p1;
     p1.id = "proj-1";
     p1.name = "Confector";
-    p1.repositoryUrl = "https://github.com/example/confector.git";
     stateRepo.saveProject(p1);
 
     auto router = repositoryRouter(stateRepo);

@@ -577,10 +577,26 @@ struct ProjectRecord
     @optional @asName("id") string id;
     @optional @asName("name") string name;
     @optional @asName("description") string description;
-    @optional @asName("repository_url") string repositoryUrl;
     @optional @asName("tasks") TaskNode[] tasks;
     @optional @asName("created_at") string createdAt;
     @optional @asName("updated_at") string updatedAt;
+}
+
+/**
+ * Returns true if any task of the project declares the repository as an input,
+ * by repository name or by address.
+ */
+bool projectUsesRepository(const ref ProjectRecord project, const ref RepositoryRecord repo) pure nothrow @safe
+{
+    foreach (ref t; project.tasks)
+    {
+        foreach (r; t.inputs.repositories)
+        {
+            if ((repo.name.length > 0 && r == repo.name) || (repo.address.length > 0 && r == repo.address))
+                return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -613,7 +629,6 @@ struct InputArtifactRef
  */
 struct TaskExecutionPayload
 {
-    @optional @asName("repository_url") string repositoryUrl;
     @optional @asName("commit_sha") string commitSha;
     @optional @asName("allowed_repositories") string[] allowedRepositories;
     @optional @asName("repository_map") string[string] repositoryMap;

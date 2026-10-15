@@ -24,7 +24,6 @@ block maincontent
             th ID
             th Project Name
             th Tasks
-            th Repository URL
             th Created At
             th Actions
         tbody
@@ -41,7 +40,6 @@ block maincontent
                       span.badge.badge-info #{t.id}
                 - else
                   span(style="color: #6c757d; font-size: 0.85em;") No tasks configured
-              td #{p.repositoryUrl.length > 0 ? p.repositoryUrl : "—"}
               td #{p.createdAt}
               td
                 a.btn.btn-sm.btn-outline(href="/projects/details?id=#{p.id}", style="margin-right: 5px;") View & Run

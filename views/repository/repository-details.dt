@@ -108,16 +108,10 @@ block maincontent
                 div.text-muted(style="font-size: 0.85em;")
                   code #{cp.id}
               td
-                - if (cp.isProjectDefault)
-                  span.badge.badge-success Default Project Repo
-                - else
-                  span.badge.badge-info Task Dependency
+                span.badge.badge-info Task Dependency
               td
-                - if (cp.matchingTasks.length > 0)
-                  div(style="display: flex; flex-wrap: wrap; gap: 4px;")
-                    - foreach(tName; cp.matchingTasks)
-                      span.badge.badge-secondary #{tName}
-                - else
-                  span.text-muted (Project default repository)
+                div(style="display: flex; flex-wrap: wrap; gap: 4px;")
+                  - foreach(tName; cp.matchingTasks)
+                    span.badge.badge-secondary #{tName}
               td
                 a.btn.btn-sm.btn-outline(href="/projects/details?id=#{cp.id}") View Project

@@ -164,7 +164,6 @@ block maincontent
     var availableTasks = !{availableTasksJson};
     var projectTasks = !{projectTasksJson};
     var availableRepos = !{availableReposJson};
-    var projectRepoUrl = "#{project.repositoryUrl}";
     var projectId = "#{project.id}";
     var initialSteps = !{initialStepsJson} || [];
     var stepProviders = !{stepProvidersJson} || [];
@@ -233,12 +232,7 @@ block maincontent
         }
       }
 
-      // 3. Project repository (if configured)
-      if (projectRepoUrl && projectRepoUrl.length > 0) {
-        addRepo(projectId || 'project', projectRepoUrl);
-      }
-
-      // 4. Fallback: if no repositories linked in inputs, upstream, or project, list available registered repositories
+      // 3. Fallback: if no repositories linked in inputs or upstream, list available registered repositories
       if (repos.length === 0 && availableRepos && availableRepos.length > 0) {
         for (var r = 0; r < availableRepos.length; r++) {
           addRepo(availableRepos[r].name, availableRepos[r].address);

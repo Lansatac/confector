@@ -1233,7 +1233,23 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                         ProjectRecord proj;
                         if (stateRepo.getProject(rule.projectId, proj))
                         {
-                            targetRepoUrl = proj.repositoryUrl;
+                            // Repositories come from task inputs: the target task first, then the rest.
+                            string[] candidates;
+                            foreach (t; proj.tasks)
+                            {
+                                if (t.id == rule.targetTaskId) candidates = t.inputs.repositories ~ candidates;
+                                else candidates ~= t.inputs.repositories;
+                            }
+                            foreach (cand; candidates)
+                            {
+                                RepositoryRecord repoRec;
+                                string addr = stateRepo.getRepository(cand, repoRec) ? repoRec.address : cand;
+                                if (addr.length > 0 && PluginRegistry.instance.findVcsResolver(addr) !is null)
+                                {
+                                    targetRepoUrl = addr;
+                                    break;
+                                }
+                            }
                             break;
                         }
                     }

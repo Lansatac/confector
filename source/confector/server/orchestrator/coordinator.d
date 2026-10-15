@@ -835,14 +835,6 @@ class BuildCoordinator
                     catch (Exception) {}
                 }
 
-                if (active.project.repositoryUrl.length > 0)
-                {
-                    allowedRepos ~= active.project.repositoryUrl;
-                    if (active.project.id.length > 0 && active.project.id !in repoMap)
-                    {
-                        repoMap[active.project.id] = active.project.repositoryUrl;
-                    }
-                }
                 if (active.graph !is null)
                 {
                     try
@@ -893,7 +885,6 @@ class BuildCoordinator
                 }
 
                 TaskExecutionPayload payload;
-                payload.repositoryUrl = active.project.repositoryUrl;
                 payload.allowedRepositories = allowedRepos;
                 payload.repositoryMap = repoMap;
                 payload.environment = node.environment;

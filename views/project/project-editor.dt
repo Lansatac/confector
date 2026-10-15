@@ -6,7 +6,7 @@ block maincontent
       div(style="display: flex; justify-content: space-between; align-items: center;")
         div
           h1 Edit Project & Task Graph: #{project.name}
-          p Configure project repository settings and author arbitrary discrete task DAG nodes.
+          p Author arbitrary discrete task DAG nodes.
         div
           a.btn.btn-outline(href="/projects/details?id=#{project.id}") Back to Project
 
@@ -37,10 +37,6 @@ block maincontent
           div.form-group
             label(for="description") Description:
             textarea.form-control#description(name="description", rows="2") #{project.description}
-
-          div.form-group
-            label(for="repository_url") Repository URL:
-            input.form-control#repository_url(type="text", name="repository_url", value="#{project.repositoryUrl}", placeholder="https://github.com/org/repo")
 
         div.card
           h3 Task Graph Definition (JSON)
