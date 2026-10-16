@@ -1,0 +1,15 @@
+{
+	"name": "confector-testing",
+	"description": "In-memory fakes and backend conformance suites. Test-only: depend on this from a unittest configuration, never from production code.",
+	"targetType": "library",
+	"targetName": "confector_testing",
+	"targetPath": "../../../out/lib",
+	"sourcePaths": ["."],
+	"importPaths": ["../.."],
+	"dependencies": {
+		"confector-plugin-api": {
+			"path": "../plugin_api"
+		},
+		"vibe-d": "~>0.10.3"
+	}
+}

@@ -600,7 +600,7 @@ private T[] listAll(T)(DocumentCollection!T collection)
 
 version (unittest)
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
 
     private bool throwsWith(scope void delegate() action, string text)
     {

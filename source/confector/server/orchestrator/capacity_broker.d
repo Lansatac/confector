@@ -168,10 +168,10 @@ class DefaultCapacityBroker : CapacityBroker
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.core.state_stores : StateStores;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.plugin_api.dispatch_queue : DispatchQueue;
     import confector.orchestrator.coordinator : BuildCoordinator, countReceivable, receiveWorkOrders, defaultPoolQueue;
 

@@ -78,7 +78,7 @@ final class StateStores
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.core.model : ProjectRecord;
 
     // Every store is declared over one document store; a restarted process redeclares the same

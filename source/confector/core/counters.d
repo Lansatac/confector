@@ -102,7 +102,7 @@ final class CounterStore
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import std.algorithm.searching : canFind;
 
     // Counters start at 0, hand out 1, 2, ... and are independent and durable
@@ -130,7 +130,7 @@ unittest
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import core.thread : Thread;
 
     // Increments from many threads at once each get a distinct value, and none is lost

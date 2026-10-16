@@ -4,8 +4,12 @@
 	"targetType": "library",
 	"targetName": "confector_mongo_document_store",
 	"targetPath": "../../../out/lib",
-	"sourcePaths": ["."],
-	"importPaths": ["."],
+	"sourcePaths": [
+		"."
+	],
+	"importPaths": [
+		"."
+	],
 	"dependencies": {
 		"confector-plugin-api": {
 			"path": "../../../source/confector/plugin_api"
@@ -14,7 +18,18 @@
 			"path": "../../../source/confector/mongo_helpers"
 		}
 	},
-	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"],
+	"libs-windows": [
+		"ws2_32",
+		"userenv",
+		"advapi32",
+		"kernel32",
+		"user32",
+		"legacy_stdio_definitions",
+		"ucrt",
+		"vcruntime",
+		"msvcrt",
+		"oldnames"
+	],
 	"configurations": [
 		{
 			"name": "library"
@@ -22,8 +37,8 @@
 		{
 			"name": "unittest",
 			"dependencies": {
-				"confector-core": {
-					"path": "../../../source/confector/core"
+				"confector-testing": {
+					"path": "../../../source/confector/testing"
 				}
 			}
 		}

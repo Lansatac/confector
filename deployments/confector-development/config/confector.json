@@ -6,9 +6,11 @@
       "bindAddress": "0.0.0.0"
     },
     "storage": {
-      "mongoHost": "mongo:27017/confector",
-      "secretPath": "/run/secrets/mongo-readwrite-password",
       "artifactsDir": "/runner/artifacts"
+    },
+    "documentStore": {
+      "connectionString": "mongodb://mongo:27017",
+      "database": "confector"
     },
     "plugins": {
       "pluginsUploadDir": "",

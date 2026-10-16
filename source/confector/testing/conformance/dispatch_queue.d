@@ -1,4 +1,4 @@
-module confector.core.conformance.dispatch_queue;
+module confector.testing.conformance.dispatch_queue;
 
 /**
  * Conformance suite for DispatchQueue backends. Every backend, including in-memory test fakes,
@@ -497,7 +497,7 @@ void concurrentReceive(Context context)
 
 unittest
 {
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import core.time : MonoTime;
 
     // A fake clock, so lease and delay checks run without waiting.

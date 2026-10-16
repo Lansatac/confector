@@ -2,8 +2,7 @@ module app;
 
 import std.algorithm.searching : canFind;
 import std.conv : to;
-import std.encoding : BOM, getBOM;
-import std.file : exists, isDir, read;
+import std.file : exists, isDir;
 import std.format : format;
 import std.functional : toDelegate;
 import std.path : buildPath;
@@ -14,13 +13,14 @@ import std.uri : encodeComponent;
 import vibe.vibe;
 
 import confector.config;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireDocumentStoreConfig;
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.git_resolver : GitRepositoryResolver;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.memory_document_store : InMemoryDocumentStore;
 import confector.core.state_stores : StateStores;
+import confector.mongo_helpers : MongoConnection;
+import plugins.document_store.mongo : MongoDocumentStore;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 import confector.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.plugin_api.dispatch_queue : DispatchQueue;
@@ -40,46 +40,6 @@ import controller.repositorycontroller : repositoryRouter;
 void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInfo error)
 {
     res.render!("error.dt", req, error);
-}
-
-/// Reads a secret file, handling various BOM encodings.
-string readSecretFile(string path)
-{
-    if (!exists(path))
-        return "";
-
-    try
-    {
-        auto raw = cast(const(ubyte)[]) read(path);
-        if (raw.length == 0)
-            return "";
-
-        auto bom = getBOM(raw);
-        auto payload = raw[bom.sequence.length .. $];
-
-        switch (bom.schema)
-        {
-            case BOM.utf16le:
-                return (cast(const(wchar)[]) payload).to!string.strip;
-            case BOM.utf16be:
-                // Byte-swap big-endian UTF-16 to host endian
-                wchar[] wbuf = new wchar[](payload.length / 2);
-                for (size_t i = 0; i + 1 < payload.length; i += 2)
-                    wbuf[i / 2] = cast(wchar)((payload[i] << 8) | payload[i + 1]);
-                return wbuf.to!string.strip;
-            case BOM.utf32le:
-                return (cast(const(dchar)[]) payload).to!string.strip;
-            case BOM.utf8:
-            case BOM.none:
-            default:
-                return (cast(const(char)[]) payload).to!string.strip;
-        }
-    }
-    catch (Exception e)
-    {
-        logError("Could not read mongo secret: ", e.msg);
-        return "";
-    }
 }
 
 /// Discovers and loads bundled plugins as well as dynamically configured plugins via server config / CONFECTOR_PLUGINS.
@@ -304,17 +264,20 @@ void main()
     // Load all plugins (storage, queue, definition, worker, artifact) via plugin loader
     initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
 
-    // The state stores run over the in-memory document store: nothing survives a restart.
-    // Choosing a persistent DocumentStore (such as the Mongo one in plugins/document_store/mongo)
-    // from deployment configuration is bead confector-z7z.31.1.
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    logWarn("[state] State is kept in memory and is lost when the server stops; a persistent document store is not configurable yet (bead confector-z7z.31.1).");
+    // The state stores run over the Mongo document store, configured under server.documentStore.
+    // Missing settings or an unreachable MongoDB end startup here (constructing StateStores
+    // declares every collection, which needs the database). Choosing the backend from
+    // configuration is bead confector-z7z.31.1.
+    requireDocumentStoreConfig(serverConfig.documentStore);
+    auto stores = new StateStores(new MongoDocumentStore(
+        new MongoConnection(serverConfig.documentStore.connectionString),
+        serverConfig.documentStore.database));
+    logInfo("[state] State is kept in MongoDB database '%s'.", serverConfig.documentStore.database);
 
     DispatchQueue dispatchQueue = PluginRegistry.instance.getDispatchQueue();
     if (dispatchQueue is null)
     {
-        logError("Fatal: No dispatch queue plugin registered.");
-        return;
+        throw new Exception("No dispatch queue plugin registered: the server cannot start without one.");
     }
     logInfo("Using dispatch queue %s.", typeid(cast(Object) dispatchQueue).name);
 
@@ -322,8 +285,7 @@ void main()
     auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
     if (artifactStorage is null)
     {
-        logError("[storage] No artifact storage plugin registered! Please ensure a valid artifact plugin is available.");
-        return;
+        throw new Exception("No artifact storage plugin registered: the server cannot start without one.");
     }
 
     // Use ConfiguredArtifactStorage so that TaskEngine and BuildCoordinator always forward
@@ -386,6 +348,8 @@ void main()
 
     // Load scheduler plugin
     auto scheduler = PluginRegistry.instance.getDefaultScheduler();
+    if (scheduler is null)
+        throw new Exception("No scheduler plugin registered; VCS polling, cron triggers and capacity evaluation cannot run");
 
     // Configure router and server settings
     auto router = createRouter(taskEngine,
@@ -472,10 +436,6 @@ void main()
             logInfo("[scheduler] Registered cron trigger '%s' for project '%s' (cron: %s)", rule.name, rule.projectId, rule.criteria);
         }
     }
-    else
-    {
-        logWarn("[scheduler] No scheduler plugin registered — periodic tasks will not run");
-    }
 
     logInfo("Starting server on port %d", serverConfig.http.port);
     runApplication();
@@ -483,9 +443,9 @@ void main()
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
 
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
@@ -509,7 +469,7 @@ unittest
 
     broker.registerProvisioner(new TestProvisioner());
 
-    auto router = createRouter(engine, queue, coordinator, stores, null, broker);
+    auto router = createRouter(engine, queue, coordinator, stores, broker);
     assert(router !is null);
 
     assert(broker.provisioners.length == 1);

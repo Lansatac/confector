@@ -406,7 +406,7 @@ unittest
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
 
     PluginRegistry.instance.shutdownAll();
     PluginRegistry.instance.registerPlugin(new MockStepRunner());

@@ -706,7 +706,7 @@ class MongoDocumentStore : DocumentStore
  */
 unittest
 {
-    import confector.core.conformance.document_store : checkDocumentStore;
+    import confector.testing.conformance.document_store : checkDocumentStore;
     import std.process : environment;
 
     const uri = environment.get("CONFECTOR_TEST_MONGO_URI", null);

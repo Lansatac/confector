@@ -3,8 +3,12 @@
 	"targetType": "library",
 	"targetName": "confector_core",
 	"targetPath": "../../../out/lib",
-	"sourcePaths": ["."],
-	"importPaths": ["../.."],
+	"sourcePaths": [
+		"."
+	],
+	"importPaths": [
+		"../.."
+	],
 	"dependencies": {
 		"confector-config": {
 			"path": "../config"
@@ -13,5 +17,18 @@
 			"path": "../plugin_api"
 		},
 		"vibe-d": "~>0.10.3"
-	}
+	},
+	"configurations": [
+		{
+			"name": "library"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector-testing": {
+					"path": "../testing"
+				}
+			}
+		}
+	]
 }

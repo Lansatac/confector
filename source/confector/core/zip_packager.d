@@ -432,3 +432,65 @@ unittest
     assert(exists(buildPath(outDir3, "bin", "app.exe")));
     assert(cast(string) read(buildPath(outDir3, "bin", "app.exe")) == "binary data 123");
 }
+
+/// ZipPackager round-trips through an artifact storage's streams.
+unittest
+{
+    // ==========================================
+    // ZipPackager round-trip tests
+    // ==========================================
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import std.array : Appender;
+    auto storage = new InMemoryArtifactStorage();
+
+    string fp1 = "fingerprint_node_100";
+    string art1 = "bin_app";
+
+    assert(!storage.artifactExists(fp1, art1));
+
+    // Test stream storage write
+    storage.storeArtifactStream(fp1, art1, (sink) {
+        sink(cast(const(ubyte)[]) "zip payload chunk 1; ");
+        sink(cast(const(ubyte)[]) "zip payload chunk 2;");
+    });
+
+    assert(storage.artifactExists(fp1, art1));
+
+    // Test stream storage read
+    Appender!(ubyte[]) retrievedBytes;
+    storage.retrieveArtifactStream(fp1, art1, (const(ubyte)[] chunk) {
+        retrievedBytes.put(chunk);
+    });
+    assert(cast(string) retrievedBytes.data == "zip payload chunk 1; zip payload chunk 2;");
+
+    // Test ZipPackager round-trip with InMemoryArtifactStorage
+    import std.file : exists, mkdirRecurse, read, rmdirRecurse, write, tempDir;
+    import std.path : buildPath;
+    string testDir2 = buildPath(tempDir, "test_artifacts_storage_zip");
+    if (exists(testDir2)) rmdirRecurse(testDir2);
+    scope(exit) if (exists(testDir2)) rmdirRecurse(testDir2);
+
+    string wsDir = buildPath(testDir2, "ws_source");
+    string unpackDir = buildPath(testDir2, "ws_unpacked");
+    mkdirRecurse(buildPath(wsDir, "dist"));
+    write(buildPath(wsDir, "dist", "bundle.js"), "console.log('hello');");
+    write(buildPath(wsDir, "dist", "style.css"), "body { margin: 0; }");
+
+    string fp2 = "fingerprint_node_200";
+    string art2 = "dist_assets";
+
+    storage.storeArtifactStream(fp2, art2, (sink) {
+        ZipPackager.pack(wsDir, ["dist/*"], sink);
+    });
+
+    assert(storage.artifactExists(fp2, art2));
+
+    ZipPackager.unpackStream((sink) {
+        storage.retrieveArtifactStream(fp2, art2, sink);
+    }, unpackDir);
+
+    assert(exists(buildPath(unpackDir, "dist", "bundle.js")));
+    assert(exists(buildPath(unpackDir, "dist", "style.css")));
+    assert(cast(string) read(buildPath(unpackDir, "dist", "bundle.js")) == "console.log('hello');");
+    assert(cast(string) read(buildPath(unpackDir, "dist", "style.css")) == "body { margin: 0; }");
+}

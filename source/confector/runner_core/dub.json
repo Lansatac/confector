@@ -3,11 +3,28 @@
 	"targetType": "library",
 	"targetName": "confector_runner_core",
 	"targetPath": "../../../out/lib",
-	"sourcePaths": ["."],
-	"importPaths": ["../.."],
+	"sourcePaths": [
+		"."
+	],
+	"importPaths": [
+		"../.."
+	],
 	"dependencies": {
 		"confector-core": {
 			"path": "../core"
 		}
-	}
+	},
+	"configurations": [
+		{
+			"name": "library"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector-testing": {
+					"path": "../testing"
+				}
+			}
+		}
+	]
 }

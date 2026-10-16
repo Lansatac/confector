@@ -4,10 +4,19 @@
 	"targetName": "confector_server",
 	"targetPath": "../../../out/server",
 	"workingDirectory": "../../../out/server",
-	"sourcePaths": ["."],
-	"importPaths": ["../.."],
-	"stringImportPaths": ["../../../views"],
-	"copyFiles": ["../../../public"],
+	"sourcePaths": [
+		"."
+	],
+	"importPaths": [
+		"../..",
+		"../../.."
+	],
+	"stringImportPaths": [
+		"../../../views"
+	],
+	"copyFiles": [
+		"../../../public"
+	],
 	"dependencies": {
 		"confector-config": {
 			"path": "../config"
@@ -19,6 +28,25 @@
 			"path": "../runner_core"
 		},
 		"diet-ng": "~>1.8",
-		"vibe-d": "~>0.10.3"
-	}
+		"vibe-d": "~>0.10.3",
+		"mongo_document_store": {
+			"path": "../../../plugins/document_store/mongo"
+		},
+		"confector-mongo-helpers": {
+			"path": "../mongo_helpers"
+		}
+	},
+	"configurations": [
+		{
+			"name": "application"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector-testing": {
+					"path": "../testing"
+				}
+			}
+		}
+	]
 }

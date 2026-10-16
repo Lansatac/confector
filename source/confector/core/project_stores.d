@@ -219,7 +219,7 @@ private T[] listAll(T)(DocumentCollection!T collection)
 
 version (unittest)
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import vibe.data.json : Json;
 
     private bool throwsA(E)(scope void delegate() action)

@@ -368,7 +368,7 @@ extern(C) export Plugin confector_create_plugin()
  */
 unittest
 {
-    import confector.core.conformance.dispatch_queue : checkDispatchQueue;
+    import confector.testing.conformance.dispatch_queue : checkDispatchQueue;
     import core.thread : Thread;
     import core.time : msecs;
     import std.process : environment;

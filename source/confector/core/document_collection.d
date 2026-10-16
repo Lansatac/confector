@@ -298,7 +298,7 @@ string hashedId(const(string)[] parts...) @safe
 
 version (unittest)
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import std.algorithm.searching : canFind;
     import vibe.data.serialization : optional;
 
@@ -396,7 +396,7 @@ unittest
 {
     // put and removeLatest conflict, rather than overwrite, when another write lands between
     // their read and their write
-    import confector.core.memory_document_store : InterleavingDocumentStore;
+    import confector.testing.memory_document_store : InterleavingDocumentStore;
 
     auto documents = new InMemoryDocumentStore();
     auto other = items(documents);

@@ -1215,8 +1215,8 @@ URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry 
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto storage = new InMemoryArtifactStorage();

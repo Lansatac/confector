@@ -207,7 +207,7 @@ version (unittest)
 {
     import confector.core.dag : TaskGraph;
     import confector.core.input_resolution : freezeChain, resolveGraphInputs;
-    import confector.core.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import confector.core.model;
 
     import std.algorithm.searching : canFind;

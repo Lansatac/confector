@@ -381,7 +381,7 @@ URLRouter repositoryRouter(StateStores stores, BuildCoordinator coordinator = nu
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     auto stores = new StateStores(new InMemoryDocumentStore());
 
     RepositoryRecord r1;

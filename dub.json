@@ -19,6 +19,7 @@
     "source/confector/plugin_api",
     "source/confector/mongo_helpers",
     "source/confector/core",
+    "source/confector/testing",
     "source/confector/runner_core",
     "source/confector/runner",
     "./plugins/definition/bash",

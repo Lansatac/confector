@@ -1373,9 +1373,9 @@ version (unittest)
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
 
     // Unit tests for BuildCoordinator
     auto storage = new InMemoryArtifactStorage();
@@ -1960,9 +1960,9 @@ unittest
 {
     // A chain resolves the whole DAG once, stores resolved inputs for every task, and later
     // requests on the chain reuse them without resolving again or reading the edited project
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import vibe.data.json : Json;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
@@ -2058,9 +2058,9 @@ unittest
 {
     // A restarted coordinator resumes a build from its chain: no resolution and no fingerprints
     // or structure from the project as edited meanwhile (bug confector-3qh)
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     stores.repositories.put(gameRepository());
@@ -2114,9 +2114,9 @@ unittest
 {
     // A failed resolution fails chain creation loudly: nothing is recorded or dispatched
     import confector.core.input_resolution : InputResolutionException;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     stores.repositories.put(gameRepository());
@@ -2159,9 +2159,9 @@ unittest
 {
     // A repository input whose repository has no address cannot be dispatched: there would be
     // nothing to check it out from
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     RepositoryRecord noAddress = gameRepository();
@@ -2184,9 +2184,9 @@ unittest
     // A task that cannot be dispatched mid-build fails, and so does its build, instead of the
     // build waiting forever: here a restarted coordinator resumes a build whose next task was
     // deleted from the project meanwhile
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     stores.repositories.put(gameRepository());
@@ -2225,9 +2225,9 @@ unittest
     // A task_output input requesting an artifact the upstream result lacks (output declarations
     // changed since a cached result) fails the downstream task before dispatch, naming the
     // upstream task, its fingerprint and the artifact; an artifact it has dispatches normally
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto storage = new InMemoryArtifactStorage();
     auto stores = new StateStores(new InMemoryDocumentStore());
@@ -2275,9 +2275,9 @@ unittest
     // Every execution result records the definition it ran with and its hash: an executed
     // result, a failed one, and one resolved from the cache
     import confector.core.definition_hash : computeDefinitionHash;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto storage = new InMemoryArtifactStorage();
     auto stores = new StateStores(new InMemoryDocumentStore());
@@ -2331,9 +2331,9 @@ unittest
     // is edited while it runs; and a definition that cannot be found (here, after a restart the
     // task was deleted from the project) never drops the completion
     import confector.core.definition_hash : computeDefinitionHash;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto storage = new InMemoryArtifactStorage();
     auto stores = new StateStores(new InMemoryDocumentStore());

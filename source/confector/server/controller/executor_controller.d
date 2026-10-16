@@ -376,7 +376,7 @@ URLRouter executorRouter(
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.core.plugin : Plugin, PluginContext, PluginCategory;
     import confector.core.executor : ComputeProvider, ComputeInstance, WorkerRecord;
     import confector.config : ConfigDefinition;
@@ -445,8 +445,8 @@ unittest
     assert(repo.workers.list().length == 0);
 
     // Test with CapacityBroker and BuildCoordinator
-    import confector.core.test_storage : InMemoryArtifactStorage;
-    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 
     class TestComputeProvisioner : ComputeProvisioner

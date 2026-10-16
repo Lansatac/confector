@@ -508,7 +508,7 @@ private void requireNonEmpty(string value, lazy string message)
 
 version (unittest)
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import vibe.data.json : Json;
 
     private bool throwsA(E)(scope void delegate() action)
@@ -809,7 +809,7 @@ unittest
 {
     // Claims: two dispatchers racing for one fingerprint produce exactly one winner; the loser's
     // write conflicts, and re-reading shows it lost
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto documents = new InMemoryDocumentStore();
     auto rival = new FingerprintClaimStore(documents);

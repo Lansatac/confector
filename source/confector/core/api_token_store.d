@@ -110,7 +110,7 @@ final class ApiTokenStore
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     bool throwsA(E)(scope void delegate() action)
     {

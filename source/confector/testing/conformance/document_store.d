@@ -1,4 +1,4 @@
-module confector.core.conformance.document_store;
+module confector.testing.conformance.document_store;
 
 /**
  * Conformance suite for DocumentStore backends. Every backend, including in-memory test fakes,
@@ -659,7 +659,7 @@ bool canFindId(const string[] ids, string id)
 
 unittest
 {
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     checkDocumentStore(
         () => cast(DocumentStore) new InMemoryDocumentStore(),

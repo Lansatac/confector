@@ -1,4 +1,4 @@
-module confector.core.memory_dispatch_queue;
+module confector.testing.memory_dispatch_queue;
 
 import confector.plugin_api.dispatch_queue;
 import core.time : Duration, MonoTime;
@@ -7,7 +7,7 @@ import vibe.data.json : Json;
 
 /**
  * DispatchQueue kept in process memory. Used by tests; passes the DispatchQueue conformance
- * suite (confector.core.conformance.dispatch_queue).
+ * suite (confector.testing.conformance.dispatch_queue).
  *
  * Lease and delay times are read from the clock passed to the constructor, so tests can expire
  * leases without waiting. Sent and received messages are deep copies.

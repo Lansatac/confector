@@ -56,6 +56,8 @@ Execution runtimes, version control providers, and storage backends are decouple
    - MongoDB: `localhost:27017`
    - Mongo Express UI: `http://localhost:8081`
 
+   The server keeps all state in MongoDB and will not start without it: set `server.documentStore.connectionString` (or `CONFECTOR_MONGO_URI`) and `server.documentStore.database` in `confector.json` (see `deployments/confector-development/config/confector.json`). A missing setting or an unreachable MongoDB stops startup with an error.
+
 2. **Generate build files & compile:**
    ```bash
    reggae -b ninja .

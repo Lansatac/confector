@@ -131,6 +131,11 @@ Target mongoDocumentStore()
   return dubPathTarget("plugins/document_store/mongo");
 }
 
+Target testingLib()
+{
+  return dubPathTarget("source/confector/testing");
+}
+
 Target localScheduler()
 {
   return dubPathTarget("plugins/scheduler/local");
@@ -164,5 +169,6 @@ mixin build!(
   mongoQueue,
   mongoDocumentStore,
   localScheduler,
+  testingLib,
   optional!test,
 );

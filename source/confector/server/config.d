@@ -16,19 +16,32 @@ struct HttpConfig
 }
 
 /**
- * Storage and Database configuration.
+ * Artifact storage configuration.
  */
 struct StorageConfig
 {
-    @Description("MongoDB host and database name")
-    string mongoHost = "mongo:27017/confector";
-
-    @Description("Path to MongoDB authentication secret file")
-    string secretPath = "/run/secrets/mongo-readwrite-password";
-
     @Required
     @Description("Base directory for artifact storage (required)")
     string artifactsDir = "";
+}
+
+/**
+ * Where the server keeps its state: the MongoDB behind the document store. Both settings are
+ * required and have no defaults; the server refuses to start without them (see
+ * requireDocumentStoreConfig). The connection string is shared with the mongo-queue plugin
+ * through CONFECTOR_MONGO_URI. This is an interim shape until backends are chosen from
+ * configuration (bead confector-z7z.31.1).
+ */
+struct DocumentStoreConfig
+{
+    @Required
+    @Env("CONFECTOR_MONGO_URI")
+    @Description("MongoDB connection URI for the document store (required), e.g. mongodb://mongo:27017")
+    string connectionString = "";
+
+    @Required
+    @Description("MongoDB database holding the document store's collections (required)")
+    string database = "";
 }
 
 /**
@@ -66,6 +79,7 @@ struct ServerConfig
 
     HttpConfig http;
     StorageConfig storage;
+    DocumentStoreConfig documentStore;
     PluginsConfig plugins;
     CapacityConfig capacity;
 }
@@ -78,6 +92,19 @@ void registerServerConfigDefinitions(ConfigRegistry registry)
     if (registry is null) return;
 
     registry.bindDefinition!ServerConfig("server");
+}
+
+/**
+ * Throws, naming the missing setting, unless the document store is fully configured.
+ */
+void requireDocumentStoreConfig(in DocumentStoreConfig config)
+{
+    if (config.connectionString.length == 0)
+        throw new Exception("[config] Required setting 'server.documentStore.connectionString' is missing "
+            ~ "(server.documentStore.connectionString or CONFECTOR_MONGO_URI): the server cannot start without a document store.");
+    if (config.database.length == 0)
+        throw new Exception("[config] Required setting 'server.documentStore.database' is missing "
+            ~ "(server.documentStore.database): the server cannot start without a document store.");
 }
 
 /**
@@ -103,7 +130,24 @@ unittest
     assert(cfg.logLevel == "info");
     assert(cfg.http.port == 8080);
     assert(cfg.http.bindAddress == "0.0.0.0");
-    assert(cfg.storage.mongoHost == "mongo:27017/confector");
+    assert(cfg.documentStore.database == "");
     assert(cfg.storage.artifactsDir == "");
     assert(cfg.plugins.bundledPluginsDir == "plugins");
+}
+
+unittest
+{
+    import std.exception : assertThrown, collectException;
+
+    DocumentStoreConfig config;
+    assertThrown!Exception(requireDocumentStoreConfig(config));
+
+    config.connectionString = "mongodb://mongo:27017";
+    auto message = collectException(requireDocumentStoreConfig(config));
+    assert(message !is null && message.msg.length > 0);
+    import std.algorithm.searching : canFind;
+    assert(message.msg.canFind("database"));
+
+    config.database = "confector";
+    requireDocumentStoreConfig(config);
 }
