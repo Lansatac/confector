@@ -168,7 +168,9 @@ class DefaultCapacityBroker : CapacityBroker
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.state_stores : StateStores;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.plugin_api.dispatch_queue : DispatchQueue;
     import confector.orchestrator.coordinator : BuildCoordinator, countReceivable, receiveWorkOrders, defaultPoolQueue;
@@ -251,9 +253,9 @@ unittest
 
     // 2. End-to-end integration: BuildCoordinator + DispatchQueue + DefaultCapacityBroker
     auto storage = new InMemoryArtifactStorage();
-    auto stateRepo = new InMemoryBuildStateRepository();
+    auto stores = new StateStores(new InMemoryDocumentStore());
     auto e2eQueue = new InMemoryDispatchQueue();
-    auto coord = new BuildCoordinator(storage, stateRepo, e2eQueue);
+    auto coord = new BuildCoordinator(storage, stores, e2eQueue);
     auto e2eBroker = new DefaultCapacityBroker(() => coord.queuedDemand());
 
     // Provisioner that acts as an automated executor worker
@@ -329,7 +331,7 @@ unittest
     // All steps done
     assert(countReceivable(e2eQueue) == 0);
     BuildRecord finalBuild;
-    assert(stateRepo.getBuild(buildId, finalBuild));
+    assert(stores.legacyBuilds.getBuild(buildId, finalBuild));
     assert(finalBuild.status == "succeeded");
     assert(finalBuild.executedTasks.length == 4);
 }

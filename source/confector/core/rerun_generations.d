@@ -207,44 +207,11 @@ version (unittest)
 {
     import confector.core.dag : TaskGraph;
     import confector.core.input_resolution : freezeChain, resolveGraphInputs;
-    import confector.core.memory_document_store : InMemoryDocumentStore;
+    import confector.core.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import confector.core.model;
 
     import std.algorithm.searching : canFind;
     import std.typecons : Nullable;
-
-    /// Passes everything through to `inner`, running `beforeNextWrite` (once) just before the
-    /// next create or replace, to interleave a concurrent writer deterministically.
-    private final class InterleavingStore : DocumentStore
-    {
-        DocumentStore inner;
-        void delegate() beforeNextWrite;
-
-        this(DocumentStore inner) { this.inner = inner; }
-
-        private void interleave()
-        {
-            if (beforeNextWrite is null) return;
-            auto run = beforeNextWrite;
-            beforeNextWrite = null;
-            run();
-        }
-
-        override void declare(const(CollectionSpec)[] collections) { inner.declare(collections); }
-        override Nullable!Document get(string collection, string id) { return inner.get(collection, id); }
-        override Document create(string collection, string id, Json content)
-        {
-            interleave();
-            return inner.create(collection, id, content);
-        }
-        override Document replace(string collection, string id, Json content, ulong expectedVersion)
-        {
-            interleave();
-            return inner.replace(collection, id, content, expectedVersion);
-        }
-        override void remove(string collection, string id, ulong expectedVersion) { inner.remove(collection, id, expectedVersion); }
-        override QueryPage query(string collection, const IndexQuery lookup) { return inner.query(collection, lookup); }
-    }
 
     /// A chain of compile -> test -> report plus an independent lint, at revision `sha`.
     private ChainTask[] sampleChain(string sha)
@@ -336,7 +303,7 @@ unittest
     // or to append to it, re-reads and takes the next generation
     auto documents = new InMemoryDocumentStore();
     auto racer = new RerunGenerationStore(documents);
-    auto interleaving = new InterleavingStore(documents);
+    auto interleaving = new InterleavingDocumentStore(documents);
     auto store = new RerunGenerationStore(interleaving);
 
     interleaving.beforeNextWrite = () { assert(racer.bump("a") == 1); };

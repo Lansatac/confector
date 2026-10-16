@@ -3,7 +3,8 @@ module controller.api_controller;
 import vibe.vibe;
 import confector.core.model;
 import confector.core.dag;
-import confector.core.storage;
+import confector.core.document_collection : tryValue;
+import confector.core.state_stores : StateStores;
 import confector.core.trigger;
 import confector.core.executor : CapacityBroker;
 import confector.runner_core.engine;
@@ -14,7 +15,7 @@ import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordinator coordinator = null, BuildStateRepository stateRepo = null, CapacityBroker capacityBroker = null)
+URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordinator coordinator = null, StateStores stores = null, CapacityBroker capacityBroker = null)
 {
     import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
@@ -92,9 +93,9 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                         WorkOrder order = deserializeJson!WorkOrder(lease.message);
                         // Mark the task running, so capacity demand stops counting it.
                         TaskStatus status;
-                        if (stateRepo !is null && stateRepo.getTaskStatus(order.buildId, order.taskId, status) && status == TaskStatus.queued)
+                        if (stores !is null && stores.legacyBuilds.getTaskStatus(order.buildId, order.taskId, status) && status == TaskStatus.queued)
                         {
-                            stateRepo.setTaskStatus(order.buildId, order.taskId, TaskStatus.running);
+                            stores.legacyBuilds.setTaskStatus(order.buildId, order.taskId, TaskStatus.running);
                         }
                         Json item = Json.emptyObject;
                         item["receipt"] = Json(lease.receipt);
@@ -180,14 +181,13 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
     getRoute("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = stateRepo;
             string statusFilter = req.query.get("status", "");
             string projectFilter = req.query.get("project_id", "");
             string limitStr = req.query.get("limit", "50");
             size_t limit = 50;
             try { import std.conv : to; limit = limitStr.to!size_t; } catch (Exception) {}
 
-            auto tasks = repo !is null ? repo.listRecentTaskExecutions(limit, statusFilter, projectFilter) : [];
+            auto tasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(limit, statusFilter, projectFilter) : [];
             res.writeJsonBody(tasks);
         }
         catch (Exception e)
@@ -204,10 +204,9 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             string buildId = req.params["build_id"];
             string taskId = req.params["task_id"];
-            auto repo = stateRepo;
 
             TaskExecutionRecord record;
-            if (repo !is null && repo.getTaskExecution(buildId, taskId, record))
+            if (stores !is null && stores.legacyBuilds.getTaskExecution(buildId, taskId, record))
             {
                 res.writeJsonBody(record);
             }
@@ -233,9 +232,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             string buildId = req.params["build_id"];
             string taskId = req.params["task_id"];
-            auto repo = stateRepo;
 
-            string[] logs = repo !is null ? repo.getTaskLogs(buildId, taskId) : [];
+            string[] logs = stores !is null ? stores.logs.getTaskLogs(buildId, taskId) : [];
             Json resp = Json.emptyObject;
             resp["build_id"] = Json(buildId);
             resp["task_id"] = Json(taskId);
@@ -270,11 +268,11 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             {
                 coordinator.onTaskCompleted(fingerprint, result);
             }
-            else if (stateRepo !is null)
+            else if (stores !is null)
             {
                 if (result.buildId.length > 0 && result.taskId.length > 0)
                 {
-                    stateRepo.setTaskStatus(result.buildId, result.taskId, result.status, result.errorMessage);
+                    stores.legacyBuilds.setTaskStatus(result.buildId, result.taskId, result.status, result.errorMessage);
                 }
             }
 
@@ -309,9 +307,9 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             {
                 coordinator.onTaskCompleted(buildId, taskId, result);
             }
-            else if (stateRepo !is null)
+            else if (stores !is null)
             {
-                stateRepo.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
+                stores.legacyBuilds.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
             }
 
             Json resp = Json.emptyObject;
@@ -349,13 +347,12 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                 lines = [bodyJson["line"].get!string];
             }
 
-            auto repo = stateRepo;
-            if (repo !is null)
+            if (stores !is null)
             {
                 foreach (line; lines)
                 {
-                    repo.appendBuildLog(buildId, format("[%s] %s", taskId, line));
-                    repo.appendTaskLog(buildId, taskId, line);
+                    stores.logs.appendBuildLog(buildId, format("[%s] %s", taskId, line));
+                    stores.logs.appendTaskLog(buildId, taskId, line);
                 }
             }
 
@@ -387,9 +384,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             bool force = pForce !is null ? pForce.get!bool : false;
             string workspaceDir = pWorkspace !is null ? pWorkspace.get!string : "";
 
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo is null || !repo.getProject(projectId, proj))
+            if (stores is null || !stores.projects.get(projectId).tryValue(proj))
             {
                 res.statusCode = HTTPStatus.notFound;
                 Json err = Json.emptyObject;
@@ -428,9 +424,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string projectId = req.params["id"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo is null || !repo.getProject(projectId, proj))
+            if (stores is null || !stores.projects.get(projectId).tryValue(proj))
             {
                 res.statusCode = HTTPStatus.notFound;
                 Json err = Json.emptyObject;
@@ -555,13 +550,12 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
     getRoute("/builds", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = stateRepo;
-            if (repo is null)
+            if (stores is null)
             {
                 res.writeJsonBody(Json.emptyArray);
                 return;
             }
-            auto builds = repo.listBuilds(50);
+            auto builds = stores.legacyBuilds.listBuilds(50);
             res.writeJsonBody(builds);
         }
         catch (Exception e)
@@ -577,18 +571,17 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string buildId = req.query.get("id", "");
-            auto repo = stateRepo;
-            if (repo is null)
+            if (stores is null)
             {
                 res.statusCode = HTTPStatus.notFound;
-                res.writeJsonBody(["error": "No state repository configured"]);
+                res.writeJsonBody(["error": "No state stores configured"]);
                 return;
             }
 
             BuildRecord buildRec;
-            if (repo.getBuild(buildId, buildRec))
+            if (stores.legacyBuilds.getBuild(buildId, buildRec))
             {
-                auto taskRecs = repo.getTaskExecutionsForBuild(buildId);
+                auto taskRecs = stores.legacyBuilds.getTaskExecutionsForBuild(buildId);
                 foreach (rec; taskRecs)
                 {
                     buildRec.taskRecords[rec.taskId] = rec;
@@ -616,8 +609,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string buildId = req.query.get("id", "");
-            auto repo = stateRepo;
-            string[] logs = repo !is null ? repo.getBuildLogs(buildId) : [];
+            string[] logs = stores !is null ? stores.logs.getBuildLogs(buildId) : [];
             Json resp = Json.emptyObject;
             resp["build_id"] = Json(buildId);
             resp["logs"] = serializeToJson(logs);
@@ -636,8 +628,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
     getRoute("/triggers", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = stateRepo;
-            auto rules = repo !is null ? repo.listTriggerRules() : [];
+            auto rules = stores !is null ? stores.triggerRules.list() : [];
             res.writeJsonBody(rules);
         }
         catch (Exception e)
@@ -662,10 +653,9 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                 rule.createdAt = Clock.currTime.toISOString();
             }
 
-            auto repo = stateRepo;
-            if (repo !is null)
+            if (stores !is null)
             {
-                repo.saveTriggerRule(rule);
+                stores.triggerRules.save(rule);
             }
             res.writeJsonBody(rule);
         }
@@ -682,8 +672,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string ruleId = req.json["id"].get!string;
-            auto repo = stateRepo;
-            bool ok = repo !is null && repo.deleteTriggerRule(ruleId);
+            bool ok = stores !is null && stores.triggerRules.remove(ruleId);
             Json resp = Json.emptyObject;
             resp["deleted"] = Json(ok);
             res.writeJsonBody(resp);
@@ -701,8 +690,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
     getRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            auto repo = stateRepo;
-            auto projects = repo !is null ? repo.listProjects() : [];
+            auto projects = stores !is null ? stores.projects.list() : [];
             res.writeJsonBody(projects);
         }
         catch (Exception e)
@@ -729,10 +717,9 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             }
             proj.updatedAt = now;
 
-            auto repo = stateRepo;
-            if (repo !is null)
+            if (stores !is null)
             {
-                repo.saveProject(proj);
+                stores.projects.put(proj);
             }
             res.writeJsonBody(proj);
         }
@@ -749,9 +736,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string projId = req.params["id"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo !is null && repo.getProject(projId, proj))
+            if (stores !is null && stores.projects.get(projId).tryValue(proj))
             {
                 res.writeJsonBody(proj);
             }
@@ -776,8 +762,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string projId = req.params["id"];
-            auto repo = stateRepo;
-            bool ok = repo !is null && repo.deleteProject(projId);
+            bool ok = stores !is null && stores.projects.remove(projId);
             if (ok)
             {
                 Json resp = Json.emptyObject;
@@ -806,9 +791,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string projId = req.params["id"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo !is null && repo.getProject(projId, proj))
+            if (stores !is null && stores.projects.get(projId).tryValue(proj))
             {
                 res.writeJsonBody(proj.tasks);
             }
@@ -833,9 +817,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string projId = req.params["id"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo is null || !repo.getProject(projId, proj))
+            if (stores is null || !stores.projects.get(projId).tryValue(proj))
             {
                 res.statusCode = HTTPStatus.notFound;
                 Json err = Json.emptyObject;
@@ -870,7 +853,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             auto graph = new TaskGraph(proj.tasks);
 
             proj.updatedAt = Clock.currTime.toISOString();
-            repo.saveProject(proj);
+            stores.projects.put(proj);
 
             res.writeJsonBody(task);
         }
@@ -888,9 +871,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             string projId = req.params["id"];
             string taskId = req.params["taskId"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo !is null && repo.getProject(projId, proj))
+            if (stores !is null && stores.projects.get(projId).tryValue(proj))
             {
                 foreach (task; proj.tasks)
                 {
@@ -927,9 +909,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             string projId = req.params["id"];
             string taskId = req.params["taskId"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo is null || !repo.getProject(projId, proj))
+            if (stores is null || !stores.projects.get(projId).tryValue(proj))
             {
                 res.statusCode = HTTPStatus.notFound;
                 Json err = Json.emptyObject;
@@ -963,7 +944,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
 
             proj.tasks = remainingTasks;
             proj.updatedAt = Clock.currTime.toISOString();
-            repo.saveProject(proj);
+            stores.projects.put(proj);
 
             Json resp = Json.emptyObject;
             resp["deleted"] = Json(true);
@@ -983,9 +964,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         try
         {
             string projId = req.params["id"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo is null || !repo.getProject(projId, proj))
+            if (stores is null || !stores.projects.get(projId).tryValue(proj))
             {
                 res.statusCode = HTTPStatus.notFound;
                 Json err = Json.emptyObject;
@@ -1047,9 +1027,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             string projId = req.params["id"];
             string targetTaskId = req.params["taskId"];
-            auto repo = stateRepo;
             ProjectRecord proj;
-            if (repo is null || !repo.getProject(projId, proj))
+            if (stores is null || !stores.projects.get(projId).tryValue(proj))
             {
                 res.statusCode = HTTPStatus.notFound;
                 Json err = Json.emptyObject;
@@ -1157,7 +1136,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             bool changed = false;
             string fromRevision = "";
 
-            if (stateRepo && stateRepo.getRepositoryState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
+            if (stores && stores.vcsStates.getState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
             {
                 fromRevision = previousState.revision;
                 if (previousState.revision != resolvedState.revision)
@@ -1171,10 +1150,10 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             }
 
             // Save the new state
-            if (stateRepo)
+            if (stores)
             {
                 resolvedState.updatedAt = Clock.currTime.toISOString();
-                stateRepo.saveRepositoryState(resolvedState);
+                stores.vcsStates.saveState(resolvedState);
 
                 if (changed)
                 {
@@ -1187,7 +1166,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                     change.toRevision = resolvedState.revision;
                     change.detectedAt = Clock.currTime.toISOString();
                     change.triggerSource = "webhook";
-                    stateRepo.recordRepositoryChange(change);
+                    stores.vcsStates.recordChange(change);
                 }
             }
 
@@ -1221,9 +1200,9 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
 
             // Look up the trigger rule to find the associated repository
             VcsRepositoryState resolvedState;
-            if (stateRepo)
+            if (stores)
             {
-                auto rules = stateRepo.listTriggerRules();
+                auto rules = stores.triggerRules.list();
                 string targetRepoUrl = "";
                 foreach (rule; rules)
                 {
@@ -1231,7 +1210,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                     {
                         // Try to find the project associated with this trigger
                         ProjectRecord proj;
-                        if (stateRepo.getProject(rule.projectId, proj))
+                        if (stores.projects.get(rule.projectId).tryValue(proj))
                         {
                             // Repositories come from task inputs: the target task first, then the rest.
                             string[] candidates;
@@ -1244,7 +1223,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                             {
                                 // Candidates are repository ids; only registered repositories have an address.
                                 RepositoryRecord repoRec;
-                                if (!stateRepo.getRepository(cand, repoRec)) continue;
+                                if (!stores.repositories.get(cand).tryValue(repoRec)) continue;
                                 if (repoRec.address.length > 0 && PluginRegistry.instance.findVcsResolver(repoRec.address) !is null)
                                 {
                                     targetRepoUrl = repoRec.address;
@@ -1305,7 +1284,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                 bool changed = false;
                 string fromRevision = "";
 
-                if (stateRepo.getRepositoryState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
+                if (stores.vcsStates.getState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
                 {
                     fromRevision = previousState.revision;
                     if (previousState.revision != resolvedState.revision)
@@ -1319,7 +1298,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                 }
 
                 resolvedState.updatedAt = Clock.currTime.toISOString();
-                stateRepo.saveRepositoryState(resolvedState);
+                stores.vcsStates.saveState(resolvedState);
 
                 if (changed)
                 {
@@ -1332,14 +1311,14 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
                     change.toRevision = resolvedState.revision;
                     change.detectedAt = Clock.currTime.toISOString();
                     change.triggerSource = "webhook";
-                    stateRepo.recordRepositoryChange(change);
+                    stores.vcsStates.recordChange(change);
                 }
             }
             else
             {
                 res.statusCode = HTTPStatus.serviceUnavailable;
                 Json err = Json.emptyObject;
-                err["error"] = Json("No state repository available");
+                err["error"] = Json("No state stores available");
                 res.writeJsonBody(err);
                 return;
             }
@@ -1390,7 +1369,8 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
 unittest
 {
     import confector.core.plugin;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
@@ -1413,7 +1393,7 @@ unittest
 
     PluginRegistry.instance.registerPlugin(new MockApiPlugin());
     auto storage = new InMemoryArtifactStorage();
-    auto stateRepo = new InMemoryBuildStateRepository();
+    auto stores = new StateStores(new InMemoryDocumentStore());
     auto engine = new TaskEngine(storage);
     auto queue = new InMemoryDispatchQueue();
 
@@ -1426,22 +1406,23 @@ unittest
     rule.name = "CI Build";
     rule.triggerType = "git_push";
     rule.criteria = "main";
-    stateRepo.saveTriggerRule(rule);
+    stores.triggerRules.save(rule);
 
-    assert(stateRepo.listTriggerRules().length == 1);
-    assert(stateRepo.listTriggerRules()[0].name == "CI Build");
+    assert(stores.triggerRules.list().length == 1);
+    assert(stores.triggerRules.list()[0].name == "CI Build");
 
     // Test Build record tracking
     BuildRecord bRec;
     bRec.buildId = "build_test_1";
     bRec.status = "succeeded";
-    stateRepo.recordBuild(bRec);
-    stateRepo.appendBuildLog("build_test_1", "Test log line");
+    bRec.startedAt = "2026-10-15T14:02:00Z";
+    stores.legacyBuilds.createBuild(bRec);
+    stores.logs.appendBuildLog("build_test_1", "Test log line");
 
     BuildRecord fetched;
-    assert(stateRepo.getBuild("build_test_1", fetched));
+    assert(stores.legacyBuilds.getBuild("build_test_1", fetched));
     assert(fetched.status == "succeeded");
-    assert(stateRepo.getBuildLogs("build_test_1").length == 1);
+    assert(stores.logs.getBuildLogs("build_test_1").length == 1);
 
     // Test Projects and Tasks via repo
     ProjectRecord proj;
@@ -1451,17 +1432,17 @@ unittest
     node.id = "n1";
     node.steps = [BuildStep("Echo", "bash", null, "echo hi")];
     proj.tasks = [node];
-    stateRepo.saveProject(proj);
-    assert(stateRepo.listProjects().length == 1);
+    stores.projects.put(proj);
+    assert(stores.projects.list().length == 1);
 
     ProjectRecord fetchedProj;
-    assert(stateRepo.getProject("proj_api_1", fetchedProj));
+    assert(stores.projects.get("proj_api_1").tryValue(fetchedProj));
     assert(fetchedProj.name == "API Project");
     assert(fetchedProj.tasks.length == 1);
     assert(fetchedProj.tasks[0].id == "n1");
 
     // Test BuildCoordinator integration with apiRouter
-    auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
+    auto coordinator = new BuildCoordinator(storage, stores, queue);
     auto routerWithCoord = apiRouter(engine, queue, coordinator);
     assert(routerWithCoord !is null);
 
@@ -1482,11 +1463,11 @@ unittest
     coordinator.onTaskCompleted(bldId, "n1", workerRes);
 
     BuildRecord bldDetails;
-    assert(stateRepo.getBuild(bldId, bldDetails));
+    assert(stores.legacyBuilds.getBuild(bldId, bldDetails));
     assert(bldDetails.status == "succeeded");
 
     TaskExecutionRecord taskRec;
-    assert(stateRepo.getTaskExecution(bldId, "n1", taskRec));
+    assert(stores.legacyBuilds.getTaskExecution(bldId, "n1", taskRec));
     assert(taskRec.status == "succeeded");
     assert(taskRec.durationMs == 85);
 }

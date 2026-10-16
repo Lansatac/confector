@@ -253,3 +253,48 @@ class InMemoryDocumentStore : DocumentStore
         return Document(document.id, document.version_, document.content.clone());
     }
 }
+
+version (unittest)
+{
+    import std.typecons : Nullable;
+
+    /**
+     * For tests: passes everything through to `inner`, running `beforeNextWrite` (once) just
+     * before the next create, replace or remove, to interleave a concurrent writer
+     * deterministically.
+     */
+    final class InterleavingDocumentStore : DocumentStore
+    {
+        DocumentStore inner;
+        void delegate() beforeNextWrite;
+
+        this(DocumentStore inner) { this.inner = inner; }
+
+        private void interleave()
+        {
+            if (beforeNextWrite is null) return;
+            auto run = beforeNextWrite;
+            beforeNextWrite = null;
+            run();
+        }
+
+        override void declare(const(CollectionSpec)[] collections) { inner.declare(collections); }
+        override Nullable!Document get(string collection, string id) { return inner.get(collection, id); }
+        override Document create(string collection, string id, Json content)
+        {
+            interleave();
+            return inner.create(collection, id, content);
+        }
+        override Document replace(string collection, string id, Json content, ulong expectedVersion)
+        {
+            interleave();
+            return inner.replace(collection, id, content, expectedVersion);
+        }
+        override void remove(string collection, string id, ulong expectedVersion)
+        {
+            interleave();
+            inner.remove(collection, id, expectedVersion);
+        }
+        override QueryPage query(string collection, const IndexQuery lookup) { return inner.query(collection, lookup); }
+    }
+}

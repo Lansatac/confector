@@ -4,7 +4,7 @@ import confector.core.model;
 import confector.core.executor;
 import confector.core.system;
 import confector.core.plugin;
-import confector.core.storage;
+import confector.plugin_api.model : ArtifactStorage;
 import confector.runner_core.logging;
 import confector.runner_core.artifacts;
 

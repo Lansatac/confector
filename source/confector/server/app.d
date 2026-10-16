@@ -19,7 +19,8 @@ import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProv
 import confector.core.git_resolver : GitRepositoryResolver;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
-import confector.core.storage : BuildStateRepository;
+import confector.core.memory_document_store : InMemoryDocumentStore;
+import confector.core.state_stores : StateStores;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 import confector.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.plugin_api.dispatch_queue : DispatchQueue;
@@ -98,7 +99,6 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
               [PluginCategory.definition,
                PluginCategory.worker,
                PluginCategory.artifact,
-               PluginCategory.storage,
                PluginCategory.queue,
                PluginCategory.scheduler]
               );
@@ -146,7 +146,7 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
             { 
                 try
                 {
-                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.storage, PluginCategory.queue, PluginCategory.scheduler]);
+                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.queue, PluginCategory.scheduler]);
                     if (p !is null)
                     {
                         logInfo("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
@@ -172,7 +172,7 @@ URLRouter createRouter(
     TaskEngine taskEngine,
     DispatchQueue dispatchQueue,
     BuildCoordinator buildCoordinator,
-    BuildStateRepository stateRepo,
+    StateStores stores,
     CapacityBroker capacityBroker = null,
     ConfiguredArtifactStorage configuredStorage = null,
     Scheduler scheduler = null,
@@ -192,29 +192,29 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, dispatchQueue, buildCoordinator, stateRepo, capacityBroker);
+    auto api = apiRouter(taskEngine, dispatchQueue, buildCoordinator, stores, capacityBroker);
     router.any("/api/v1/*", api);
     router.any("/api/*", api);
 
     // Dashboard, builds, projects, executors, and admin UI
-    router.any("/projects/*", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
+    router.any("/projects/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
     router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
 
-    router.any("/builds/*", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
+    router.any("/builds/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
     router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/builds/"); });
 
-    router.any("/tasks/*", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
+    router.any("/tasks/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
     router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/tasks/"); });
 
-    router.any("/executors/*", executorRouter(stateRepo, PluginRegistry.instance, capacityBroker, buildCoordinator));
+    router.any("/executors/*", executorRouter(stores, PluginRegistry.instance, capacityBroker, buildCoordinator));
     router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
 
     router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
     router.get("/admin", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/admin/plugins"); });
 
-    router.get("/", dashboardRouter(taskEngine, stateRepo, null, buildCoordinator));
+    router.get("/", dashboardRouter(taskEngine, stores, null, buildCoordinator));
 
-    router.any("/repositories/*", repositoryRouter(stateRepo, buildCoordinator, scheduler, serverPort));
+    router.any("/repositories/*", repositoryRouter(stores, buildCoordinator, scheduler, serverPort));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
     router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
@@ -304,19 +304,19 @@ void main()
     // Load all plugins (storage, queue, definition, worker, artifact) via plugin loader
     initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
 
-    // Use plugin-based storage and queue
-    BuildStateRepository stateRepo = PluginRegistry.instance.getDefaultStateRepository();
-    DispatchQueue dispatchQueue = PluginRegistry.instance.getDispatchQueue();
+    // The state stores run over the in-memory document store: nothing survives a restart.
+    // Choosing a persistent DocumentStore (such as the Mongo one in plugins/document_store/mongo)
+    // from deployment configuration is bead confector-z7z.31.1.
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    logWarn("[state] State is kept in memory and is lost when the server stops; a persistent document store is not configurable yet (bead confector-z7z.31.1).");
 
-    if (stateRepo is null || dispatchQueue is null)
+    DispatchQueue dispatchQueue = PluginRegistry.instance.getDispatchQueue();
+    if (dispatchQueue is null)
     {
-        logError("Fatal: No state repository or dispatch queue plugin registered.");
+        logError("Fatal: No dispatch queue plugin registered.");
         return;
     }
-
-    logInfo("Using plugin-based storage (%s) and dispatch queue (%s).",
-        PluginRegistry.instance.getDefaultStateRepositoryType(),
-        typeid(cast(Object) dispatchQueue).name);
+    logInfo("Using dispatch queue %s.", typeid(cast(Object) dispatchQueue).name);
 
     // Validate that at least one artifact storage plugin is registered
     auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
@@ -381,7 +381,7 @@ void main()
 
     // Git is the only built-in version control provider, so every repository input resolves
     // through it (bead confector-z7z.20.7).
-    buildCoordinator = new BuildCoordinator(configuredStorage, stateRepo, dispatchQueue, capacityBroker, "", new GitRepositoryResolver());
+    buildCoordinator = new BuildCoordinator(configuredStorage, stores, dispatchQueue, capacityBroker, "", new GitRepositoryResolver());
     logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Load scheduler plugin
@@ -391,7 +391,7 @@ void main()
     auto router = createRouter(taskEngine,
       dispatchQueue,
       buildCoordinator,
-      stateRepo,
+      stores,
       capacityBroker,
       configuredStorage,
       scheduler,
@@ -428,7 +428,7 @@ void main()
 
         // Register VCS polling schedule entries for repositories with polling policy
         import confector.plugin_api.model : RepositoryRecord;
-        auto allRepos = stateRepo.listRepositories();
+        auto allRepos = stores.repositories.list();
         foreach (repo; allRepos)
         {
             string policy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
@@ -449,7 +449,7 @@ void main()
         // Register schedule entries for each cron trigger rule
         // Each cron rule points directly to /projects/run with the project ID
         import confector.plugin_api.model : TriggerRuleRecord;
-        auto cronRules = stateRepo.listTriggerRules();
+        auto cronRules = stores.triggerRules.list();
         foreach (rule; cronRules)
         {
             if (rule.triggerType != "cron")
@@ -483,18 +483,19 @@ void main()
 
 unittest
 {
-    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
 
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
     PluginRegistry.instance.setConfigRegistry(configRegistry);
 
-    auto stateRepo = new InMemoryBuildStateRepository();
+    auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
     auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
-    auto coordinator = new BuildCoordinator(storage, stateRepo, queue);
+    auto coordinator = new BuildCoordinator(storage, stores, queue);
     auto broker = new DefaultCapacityBroker(() => coordinator.queuedDemand());
 
     class TestProvisioner : ComputeProvisioner
@@ -508,7 +509,7 @@ unittest
 
     broker.registerProvisioner(new TestProvisioner());
 
-    auto router = createRouter(engine, queue, coordinator, stateRepo, null, broker);
+    auto router = createRouter(engine, queue, coordinator, stores, null, broker);
     assert(router !is null);
 
     assert(broker.provisioners.length == 1);

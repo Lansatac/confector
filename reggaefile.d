@@ -121,11 +121,6 @@ Target localArtifact()
   return dubPathTarget("plugins/artifact/local");
 }
 
-Target mongoStorage()
-{
-  return dubPathTarget("plugins/storage/mongo");
-}
-
 Target mongoQueue()
 {
   return dubPathTarget("plugins/queue/mongo");
@@ -166,7 +161,6 @@ mixin build!(
   powershellRunner,
   localProcess,
   localArtifact,
-  mongoStorage,
   mongoQueue,
   mongoDocumentStore,
   localScheduler,

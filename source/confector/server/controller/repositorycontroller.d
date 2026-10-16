@@ -10,7 +10,8 @@ import std.typecons : Tuple, tuple;
 import std.uri : encodeComponent;
 
 import confector.core.model : ProjectRecord, RepositoryRecord, projectUsesRepository, repositoryIds;
-import confector.core.storage : BuildStateRepository;
+import confector.core.document_collection : tryValue;
+import confector.core.state_stores : StateStores;
 import confector.orchestrator.coordinator : BuildCoordinator;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 
@@ -68,7 +69,7 @@ void updateVcsPollingSchedule(Scheduler scheduler, ushort serverPort, string rep
 /**
  * Creates the URL router for the /repositories endpoints.
  */
-URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coordinator = null,
+URLRouter repositoryRouter(StateStores stores, BuildCoordinator coordinator = null,
     Scheduler scheduler = null, ushort serverPort = 8080)
 {
     auto router = new URLRouter();
@@ -76,8 +77,8 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
     // 1. Repositories list view
     void handleIndex(HTTPServerRequest req, HTTPServerResponse res)
     {
-        auto repos = stateRepo !is null ? stateRepo.listRepositories() : [];
-        auto projects = stateRepo !is null ? stateRepo.listProjects() : [];
+        auto repos = stores !is null ? stores.repositories.list() : [];
+        auto projects = stores !is null ? stores.projects.list() : [];
 
         RepositoryViewModel[] repoViews;
         ulong totalConnectedProjects = 0;
@@ -137,10 +138,10 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
             refreshPolicy = "webhook";
         }
 
-        if (stateRepo !is null)
+        if (stores !is null)
         {
             RepositoryRecord existing;
-            if (stateRepo.getRepository(name, existing))
+            if (stores.repositories.get(name).tryValue(existing))
             {
                 res.redirect("/repositories/add?error=Repository+with+this+name+already+exists");
                 return;
@@ -151,7 +152,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
             record.address = address;
             record.refreshPolicy = refreshPolicy;
             record.createdAt = Clock.currTime.toISOString();
-            stateRepo.saveRepository(record);
+            stores.repositories.put(record);
 
             // Register VCS polling schedule entry if needed
             updateVcsPollingSchedule(scheduler, serverPort, name, address, refreshPolicy);
@@ -181,10 +182,10 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
             refreshPolicy = "webhook";
         }
 
-        if (stateRepo !is null)
+        if (stores !is null)
         {
             RepositoryRecord record;
-            if (stateRepo.getRepository(name, record))
+            if (stores.repositories.get(name).tryValue(record))
             {
                 // Unschedule the old entry if the address is changing
                 if (record.address != address)
@@ -198,7 +199,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
                 }
                 record.address = address;
                 record.refreshPolicy = refreshPolicy;
-                stateRepo.saveRepository(record);
+                stores.repositories.put(record);
             }
         }
 
@@ -208,7 +209,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
     router.post("/repositories/edit", &handleEditSubmit);
 
     // 4. Per-repository VCS polling endpoint (called by scheduler)
-    if (stateRepo !is null)
+    if (stores !is null)
     {
         router.post("/repositories/:repoName/poll", (HTTPServerRequest req, HTTPServerResponse res) {
             try
@@ -230,7 +231,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
 
                 // Look up the repository record to get the address
                 RepositoryRecord repoRecord;
-                if (!stateRepo.getRepository(repoName, repoRecord))
+                if (!stores.repositories.get(repoName).tryValue(repoRecord))
                 {
                     res.statusCode = HTTPStatus.notFound;
                     Json err = Json.emptyObject;
@@ -256,7 +257,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
                 bool changed = false;
                 string fromRevision = "";
 
-                if (stateRepo.getRepositoryState(newState.repositoryUrl, newState.targetRef, previousState))
+                if (stores.vcsStates.getState(newState.repositoryUrl, newState.targetRef, previousState))
                 {
                     fromRevision = previousState.revision;
                     if (previousState.revision != newState.revision)
@@ -270,7 +271,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
                 }
 
                 newState.updatedAt = Clock.currTime.toISOString();
-                stateRepo.saveRepositoryState(newState);
+                stores.vcsStates.saveState(newState);
 
                 if (changed && coordinator !is null)
                 {
@@ -283,10 +284,10 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
                     change.toRevision = newState.revision;
                     change.detectedAt = Clock.currTime.toISOString();
                     change.triggerSource = "polling";
-                    stateRepo.recordRepositoryChange(change);
+                    stores.vcsStates.recordChange(change);
 
                     // Find projects that use this repository and start builds
-                    foreach (proj; stateRepo.listProjects())
+                    foreach (proj; stores.projects.list())
                     {
                         if (projectUsesRepository(proj, repoRecord))
                         {
@@ -325,9 +326,9 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
 
         RepositoryRecord repo;
         bool found = false;
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            found = stateRepo.getRepository(name, repo);
+            found = stores.repositories.get(name).tryValue(repo);
         }
 
         if (!found)
@@ -339,7 +340,7 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
 
         string repoRefreshPolicy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
 
-        auto allProjects = stateRepo !is null ? stateRepo.listProjects() : [];
+        auto allProjects = stores !is null ? stores.projects.list() : [];
         ConnectedProjectViewModel[] connectedProjects;
 
         foreach (p; allProjects)
@@ -380,22 +381,22 @@ URLRouter repositoryRouter(BuildStateRepository stateRepo, BuildCoordinator coor
 
 unittest
 {
-    import confector.core.test_storage : InMemoryBuildStateRepository;
-    auto stateRepo = new InMemoryBuildStateRepository();
+    import confector.core.memory_document_store : InMemoryDocumentStore;
+    auto stores = new StateStores(new InMemoryDocumentStore());
 
     RepositoryRecord r1;
     r1.name = "confector-core";
     r1.address = "https://github.com/example/confector.git";
     r1.refreshPolicy = "polling";
     r1.createdAt = "2026-10-04T12:00:00Z";
-    stateRepo.saveRepository(r1);
+    stores.repositories.put(r1);
 
     ProjectRecord p1;
     p1.id = "proj-1";
     p1.name = "Confector";
-    stateRepo.saveProject(p1);
+    stores.projects.put(p1);
 
-    auto router = repositoryRouter(stateRepo);
+    auto router = repositoryRouter(stores);
     assert(router !is null);
-    assert(stateRepo.listRepositories().length == 1);
+    assert(stores.repositories.list().length == 1);
 }

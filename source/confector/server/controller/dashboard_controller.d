@@ -3,7 +3,8 @@ module controller.dashboard_controller;
 import vibe.vibe;
 import vibe.core.log : logError, logInfo, logWarn;
 import confector.core.model;
-import confector.core.storage;
+import confector.core.document_collection : tryValue;
+import confector.core.state_stores : StateStores;
 import confector.core.dag;
 import confector.core.input_resolution : InputResolutionException;
 import confector.core.plugin : PluginRegistry;
@@ -357,7 +358,7 @@ unittest
     assert(formatStepIssues([checkout, bash, legacy], issues).canFind("Step 3"));
 }
 
-URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, PluginRegistry registry = null, BuildCoordinator coordinator = null)
+URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry registry = null, BuildCoordinator coordinator = null)
 {
     if (registry is null)
     {
@@ -388,7 +389,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
     void renderTaskEditor(HTTPServerResponse res, ProjectRecord project, TaskNode task,
         TaskInputRow[] inputRows, string formError)
     {
-        auto repositories = stateRepo !is null ? stateRepo.listRepositories() : [];
+        auto repositories = stores !is null ? stores.repositories.list() : [];
         StepProviderViewModel[] stepProvidersView;
         if (registry !is null)
         {
@@ -417,9 +418,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
 
     // Home / Dashboard
     router.get("/", (HTTPServerRequest req, HTTPServerResponse res) {
-        auto projects = stateRepo !is null ? stateRepo.listProjects() : [];
-        auto builds = stateRepo !is null ? stateRepo.listBuilds(10) : [];
-        auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(10) : [];
+        auto projects = stores !is null ? stores.projects.list() : [];
+        auto builds = stores !is null ? stores.legacyBuilds.listBuilds(10) : [];
+        auto recentTasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(10) : [];
 
         ulong totalBuilds = builds.length;
         ulong successfulBuilds = builds.filter!(b => b.status == "succeeded" || b.status == "cached").count;
@@ -446,9 +447,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
                 tvm.upstreamTasks = upstreamTaskIds(task);
 
                 TaskExecutionRecord latestExec;
-                if (stateRepo !is null)
+                if (stores !is null)
                 {
-                    auto execs = stateRepo.listTaskExecutionsForTask(proj.id, task.id, 1);
+                    auto execs = stores.legacyBuilds.listTaskExecutionsForTask(proj.id, task.id, 1);
                     if (execs.length > 0)
                     {
                         latestExec = execs[0];
@@ -492,7 +493,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
 
     // Projects Management
     router.get("/projects/", (HTTPServerRequest req, HTTPServerResponse res) {
-        auto projects = stateRepo !is null ? stateRepo.listProjects() : [];
+        auto projects = stores !is null ? stores.projects.list() : [];
         res.render!("project/projects.dt", projects);
     });
 
@@ -517,9 +518,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             proj.createdAt = now;
             proj.updatedAt = now;
 
-            if (stateRepo !is null)
+            if (stores !is null)
             {
-                stateRepo.saveProject(proj);
+                stores.projects.put(proj);
             }
         }
         catch (Exception e)
@@ -540,81 +541,26 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
     router.get("/projects/details", (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("id", "");
         ProjectRecord project;
-        bool found = stateRepo !is null && stateRepo.getProject(projId, project);
+        bool found = stores !is null && stores.projects.get(projId).tryValue(project);
         if (!found)
         {
             project.id = projId;
             project.name = "Unknown Project";
         }
 
-        // Collect all repository names used by tasks in this project
-        string[] repoNames;
-        {
-            bool[string] seenRepos;
-            foreach (task; project.tasks)
-            {
-                foreach (repo; repositoryIds(task))
-                {
-                    string trimmed = repo.strip;
-                    if (trimmed.length > 0 && !(trimmed in seenRepos))
-                    {
-                        seenRepos[trimmed] = true;
-                        repoNames ~= trimmed;
-                    }
-                }
-            }
-        }
-
-        // Count pending changes (VcsChangeRecords) per repository
-        ulong[string] pendingCommitCounts;
-        if (stateRepo !is null && repoNames.length > 0)
-        {
-            import confector.plugin_api.model : VcsChangeRecord;
-            // Get all repositories to map names to addresses
-            auto allRepos = stateRepo.listRepositories();
-            string[string] repoNameToAddress;
-            foreach (r; allRepos)
-            {
-                if (r.name.length > 0 && r.address.length > 0)
-                {
-                    repoNameToAddress[r.name] = r.address;
-                }
-            }
-
-            // Get all change records and count by repository
-            auto allChanges = stateRepo.listRepositoryChanges("", 1000);
-            foreach (change; allChanges)
-            {
-                // Match change's repository URL to a repo name
-                foreach (rName; repoNames)
-                {
-                    string addr = rName in repoNameToAddress ? repoNameToAddress[rName] : rName;
-                    if (change.repositoryUrl == addr || change.repositoryUrl == rName)
-                    {
-                        pendingCommitCounts[rName]++;
-                    }
-                }
-            }
-        }
-
-        // Convert counts to string map for JSON serialization
-        string[string] pendingCommits;
-        foreach (rName, cnt; pendingCommitCounts)
-        {
-            pendingCommits[rName] = cnt.to!string;
-        }
-
+        // TODO(confector-z7z.24.1): show pending changes per repository from tracked branches.
+        // Until then there are none to show; the count this replaced always came out empty.
+        string pendingCommitsJson = "{}";
         string tasksJson = serializeToJson(project.tasks).toString();
-        string pendingCommitsJson = serializeToJson(pendingCommits).toString();
         res.render!("project/project-details.dt", project, tasksJson, pendingCommitsJson);
     });
 
     router.get("/projects/edit", (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("id", "");
         ProjectRecord project;
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            stateRepo.getProject(projId, project);
+            stores.projects.get(projId).tryValue(project);
         }
         string tasksJson = serializeToJson(project.tasks).toString();
         res.render!("project/project-editor.dt", project, tasksJson);
@@ -625,9 +571,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         try
         {
             ProjectRecord project;
-            if (stateRepo !is null && projId.length > 0)
+            if (stores !is null && projId.length > 0)
             {
-                stateRepo.getProject(projId, project);
+                stores.projects.get(projId).tryValue(project);
             }
 
             project.id = projId;
@@ -645,9 +591,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             auto graph = new TaskGraph(project.tasks);
 
             project.updatedAt = Clock.currTime.toISOString();
-            if (stateRepo !is null)
+            if (stores !is null)
             {
-                stateRepo.saveProject(project);
+                stores.projects.put(project);
             }
         }
         catch (Exception e)
@@ -661,9 +607,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         try
         {
             string projId = req.form.get("id", "");
-            if (stateRepo !is null && projId.length > 0)
+            if (stores !is null && projId.length > 0)
             {
-                stateRepo.deleteProject(projId);
+                stores.projects.remove(projId);
             }
         }
         catch (Exception e)
@@ -686,9 +632,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         if (taskId.length == 0) taskId = req.query.get("id", "");
 
         ProjectRecord project;
-        if (stateRepo !is null && projId.length > 0)
+        if (stores !is null && projId.length > 0)
         {
-            stateRepo.getProject(projId, project);
+            stores.projects.get(projId).tryValue(project);
         }
 
         TaskNode task;
@@ -714,9 +660,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         TaskInputRow[] inputRows;
         try
         {
-            if (stateRepo !is null && projId.length > 0)
+            if (stores !is null && projId.length > 0)
             {
-                stateRepo.getProject(projId, project);
+                stores.projects.get(projId).tryValue(project);
             }
 
             task.id = req.form.get("task_id", "").strip();
@@ -895,9 +841,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
                 req.form.getAll("input_artifact")
             );
             string[] registeredRepositories;
-            if (stateRepo !is null)
+            if (stores !is null)
             {
-                foreach (r; stateRepo.listRepositories()) registeredRepositories ~= r.name;
+                foreach (r; stores.repositories.list()) registeredRepositories ~= r.name;
             }
             string[] otherTaskIds;
             foreach (t; project.tasks)
@@ -933,9 +879,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             auto graph = new TaskGraph(project.tasks);
 
             project.updatedAt = Clock.currTime.toISOString();
-            if (stateRepo !is null)
+            if (stores !is null)
             {
-                stateRepo.saveProject(project);
+                stores.projects.put(project);
             }
         }
         catch (TaskInputFormException e)
@@ -962,7 +908,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         try
         {
             ProjectRecord project;
-            if (stateRepo !is null && projId.length > 0 && stateRepo.getProject(projId, project))
+            if (stores !is null && projId.length > 0 && stores.projects.get(projId).tryValue(project))
             {
                 TaskNode[] remaining;
                 foreach (t; project.tasks)
@@ -974,7 +920,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
                 }
                 project.tasks = remaining;
                 project.updatedAt = Clock.currTime.toISOString();
-                stateRepo.saveProject(project);
+                stores.projects.put(project);
             }
         }
         catch (Exception e)
@@ -994,7 +940,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         if (targetTaskId.length == 0) targetTaskId = req.form.get("task_id", "");
 
         ProjectRecord proj;
-        if (stateRepo is null || !stateRepo.getProject(projId, proj))
+        if (stores is null || !stores.projects.get(projId).tryValue(proj))
         {
             throw new HTTPStatusException(HTTPStatus.notFound, format("Cannot run project '%s': it does not exist", projId));
         }
@@ -1024,7 +970,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
     router.get("/tasks/", (HTTPServerRequest req, HTTPServerResponse res) {
         string statusFilter = req.query.get("status", "");
         string projectFilter = req.query.get("project_id", "");
-        auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(50, statusFilter, projectFilter) : [];
+        auto recentTasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(50, statusFilter, projectFilter) : [];
         res.render!("task/tasks.dt", recentTasks, statusFilter, projectFilter);
     });
 
@@ -1053,9 +999,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         TaskNode taskNode;
         bool foundTask = false;
 
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            if (projectId.length > 0 && stateRepo.getProject(projectId, project))
+            if (projectId.length > 0 && stores.projects.get(projectId).tryValue(project))
             {
                 foreach (t; project.tasks)
                 {
@@ -1070,7 +1016,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
 
             if (!foundTask)
             {
-                foreach (p; stateRepo.listProjects())
+                foreach (p; stores.projects.list())
                 {
                     foreach (t; p.tasks)
                     {
@@ -1096,7 +1042,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             if (project.name.length == 0) project.name = project.id;
         }
 
-        TaskExecutionRecord[] history = stateRepo !is null ? stateRepo.listTaskExecutionsForTask(projectId, taskId, 50) : [];
+        TaskExecutionRecord[] history = stores !is null ? stores.legacyBuilds.listTaskExecutionsForTask(projectId, taskId, 50) : [];
         TaskExecutionRecord latestExec = history.length > 0 ? history[0] : TaskExecutionRecord.init;
         string changeStatus = computeStubTaskChangeStatus(taskNode, latestExec);
 
@@ -1111,7 +1057,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         if (taskId.length == 0) taskId = req.query.get("id", "");
 
         TaskExecutionRecord taskRecord;
-        bool foundRecord = stateRepo !is null && stateRepo.getTaskExecution(buildId, taskId, taskRecord);
+        bool foundRecord = stores !is null && stores.legacyBuilds.getTaskExecution(buildId, taskId, taskRecord);
         if (!foundRecord)
         {
             taskRecord.buildId = buildId;
@@ -1119,10 +1065,10 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
             taskRecord.status = "unknown";
         }
 
-        string[] logs = stateRepo !is null ? stateRepo.getTaskLogs(buildId, taskId) : [];
-        if (logs.length == 0 && stateRepo !is null && buildId.length > 0)
+        string[] logs = stores !is null ? stores.logs.getTaskLogs(buildId, taskId) : [];
+        if (logs.length == 0 && stores !is null && buildId.length > 0)
         {
-            auto bLogs = stateRepo.getBuildLogs(buildId);
+            auto bLogs = stores.logs.getBuildLogs(buildId);
             string prefix = format("[%s]", taskId);
             foreach (line; bLogs)
             {
@@ -1135,9 +1081,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         }
 
         BuildRecord build;
-        if (stateRepo !is null && buildId.length > 0)
+        if (stores !is null && buildId.length > 0)
         {
-            stateRepo.getBuild(buildId, build);
+            stores.legacyBuilds.getBuild(buildId, build);
         }
 
         string projectId = taskRecord.projectId.length > 0 ? taskRecord.projectId : build.projectId;
@@ -1145,9 +1091,9 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         TaskNode taskNode;
         bool foundTask = false;
 
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            if (projectId.length > 0 && stateRepo.getProject(projectId, project))
+            if (projectId.length > 0 && stores.projects.get(projectId).tryValue(project))
             {
                 foreach (t; project.tasks)
                 {
@@ -1162,7 +1108,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
 
             if (!foundTask)
             {
-                foreach (p; stateRepo.listProjects())
+                foreach (p; stores.projects.list())
                 {
                     foreach (t; p.tasks)
                     {
@@ -1191,8 +1137,8 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
     // Builds List. Queued tasks will be shown by the build queue view (bead confector-z7z.31.21);
     // the dispatch queue is never read for display.
     router.get("/builds/", (HTTPServerRequest req, HTTPServerResponse res) {
-        auto builds = stateRepo !is null ? stateRepo.listBuilds(50) : [];
-        auto recentTasks = stateRepo !is null ? stateRepo.listRecentTaskExecutions(25) : [];
+        auto builds = stores !is null ? stores.legacyBuilds.listBuilds(50) : [];
+        auto recentTasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(25) : [];
         res.render!("build/builds.dt", builds, recentTasks);
     });
 
@@ -1200,8 +1146,8 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
     router.get("/builds/details", (HTTPServerRequest req, HTTPServerResponse res) {
         string buildId = req.query.get("id", "");
         BuildRecord build;
-        bool found = stateRepo !is null && stateRepo.getBuild(buildId, build);
-        string[] logs = stateRepo !is null ? stateRepo.getBuildLogs(buildId) : [];
+        bool found = stores !is null && stores.legacyBuilds.getBuild(buildId, build);
+        string[] logs = stores !is null ? stores.logs.getBuildLogs(buildId) : [];
 
         if (!found)
         {
@@ -1212,7 +1158,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
 
         TaskNode[] tasks;
         ProjectRecord project;
-        if (stateRepo !is null && build.projectId.length > 0 && stateRepo.getProject(build.projectId, project))
+        if (stores !is null && build.projectId.length > 0 && stores.projects.get(build.projectId).tryValue(project))
         {
             tasks = project.tasks;
         }
@@ -1229,7 +1175,7 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
         }
 
         string[string] taskStatuses;
-        auto recordedStatuses = stateRepo !is null ? stateRepo.getTaskStatusesForBuild(build.buildId) : (TaskStatus[string]).init;
+        auto recordedStatuses = stores !is null ? stores.legacyBuilds.getTaskStatusesForBuild(build.buildId) : (TaskStatus[string]).init;
         foreach (t; tasks)
         {
             if (auto p = t.id in recordedStatuses)
@@ -1269,13 +1215,14 @@ URLRouter dashboardRouter(TaskEngine engine, BuildStateRepository stateRepo, Plu
 
 unittest
 {
-    import confector.core.test_storage : InMemoryBuildStateRepository, InMemoryArtifactStorage;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
-    auto stateRepo = new InMemoryBuildStateRepository();
+    auto stores = new StateStores(new InMemoryDocumentStore());
     auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
 
-    auto router = dashboardRouter(engine, stateRepo);
+    auto router = dashboardRouter(engine, stores);
     assert(router !is null);
 
     // Populate dummy build & trigger
@@ -1283,17 +1230,18 @@ unittest
     b.buildId = "b_dash_1";
     b.projectName = "main_project";
     b.status = "succeeded";
-    stateRepo.recordBuild(b);
+    b.startedAt = "2026-10-15T14:02:00Z";
+    stores.legacyBuilds.createBuild(b);
 
     TriggerRuleRecord t;
     t.id = "t_dash_1";
     t.name = "Weekly Nightly";
     t.triggerType = "cron";
     t.criteria = "0 0 * * 0";
-    stateRepo.saveTriggerRule(t);
+    stores.triggerRules.save(t);
 
-    assert(stateRepo.listBuilds().length == 1);
-    assert(stateRepo.listTriggerRules().length == 1);
+    assert(stores.legacyBuilds.listBuilds().length == 1);
+    assert(stores.triggerRules.list().length == 1);
 
     // Populate and verify Project & Task state
     ProjectRecord p;
@@ -1310,17 +1258,17 @@ unittest
     tNode2.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 2")];
     tNode2.triggers = [TriggerRule(TriggerType.webhook, null, null, "/api/v1/deploy")];
     p.tasks = [tNode1, tNode2];
-    stateRepo.saveProject(p);
-    assert(stateRepo.listProjects().length == 1);
+    stores.projects.put(p);
+    assert(stores.projects.list().length == 1);
 
     RepositoryRecord rRecord;
     rRecord.name = "repo_main";
     rRecord.address = "https://github.com/example/repo_main.git";
-    stateRepo.saveRepository(rRecord);
-    assert(stateRepo.listRepositories().length == 1);
+    stores.repositories.put(rRecord);
+    assert(stores.repositories.list().length == 1);
 
     ProjectRecord fetchedProj;
-    assert(stateRepo.getProject("proj_dash_1", fetchedProj));
+    assert(stores.projects.get("proj_dash_1").tryValue(fetchedProj));
     assert(fetchedProj.tasks.length == 2);
     assert(fetchedProj.tasks[0].id == "test_node_1");
     assert(fetchedProj.tasks[0].inputs == ["repo_main": repositoryInput("repo_main", "main")]);
@@ -1339,30 +1287,28 @@ unittest
     b2.projectName = "Dashboard Project";
     b2.executedTasks = ["test_node_1", "test_node_2"];
     b2.status = "succeeded";
-    stateRepo.recordBuild(b2);
-    stateRepo.setTaskStatus("b_dash_2", "test_node_1", TaskStatus.cached);
-    stateRepo.setTaskStatus("b_dash_2", "test_node_2", TaskStatus.succeeded);
+    b2.startedAt = "2026-10-15T15:00:00Z";
+    stores.legacyBuilds.createBuild(b2);
+    stores.legacyBuilds.setTaskStatus("b_dash_2", "test_node_1", TaskStatus.cached);
+    stores.legacyBuilds.setTaskStatus("b_dash_2", "test_node_2", TaskStatus.succeeded);
 
     TaskStatus st1, st2;
-    assert(stateRepo.getTaskStatus("b_dash_2", "test_node_1", st1) && st1 == TaskStatus.cached);
-    assert(stateRepo.getTaskStatus("b_dash_2", "test_node_2", st2) && st2 == TaskStatus.succeeded);
+    assert(stores.legacyBuilds.getTaskStatus("b_dash_2", "test_node_1", st1) && st1 == TaskStatus.cached);
+    assert(stores.legacyBuilds.getTaskStatus("b_dash_2", "test_node_2", st2) && st2 == TaskStatus.succeeded);
 
     // Test task execution record and task-scoped log queries
-    TaskExecutionRecord taskRec;
-    taskRec.buildId = "b_dash_2";
-    taskRec.taskId = "test_node_2";
-    taskRec.status = "succeeded";
-    taskRec.durationMs = 45;
-    taskRec.fingerprint = "0123456789abcdef";
-    stateRepo.recordTaskExecution(taskRec);
-    stateRepo.appendTaskLog("b_dash_2", "test_node_2", "Task step log line 1");
+    stores.legacyBuilds.updateTaskExecution("b_dash_2", "test_node_2", (ref TaskExecutionRecord taskRec) {
+        taskRec.durationMs = 45;
+        taskRec.fingerprint = "0123456789abcdef";
+    });
+    stores.logs.appendTaskLog("b_dash_2", "test_node_2", "Task step log line 1");
 
-    auto recentTasks = stateRepo.listRecentTaskExecutions();
+    auto recentTasks = stores.legacyBuilds.listRecentTaskExecutions();
     assert(recentTasks.length >= 1);
-    assert(stateRepo.getTaskLogs("b_dash_2", "test_node_2") == ["Task step log line 1"]);
+    assert(stores.logs.getTaskLogs("b_dash_2", "test_node_2") == ["Task step log line 1"]);
 
     // Test listTaskExecutionsForTask
-    auto taskExecs = stateRepo.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
+    auto taskExecs = stores.legacyBuilds.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
     assert(taskExecs.length >= 1);
     assert(taskExecs[0].taskId == "test_node_2");
 
@@ -1413,7 +1359,7 @@ unittest
 
     // Test dashboard project assembly loop logic
     DashboardProjectViewModel[] testDashboardProjects;
-    foreach (proj; stateRepo.listProjects())
+    foreach (proj; stores.projects.list())
     {
         DashboardProjectViewModel pvm;
         pvm.project = proj;
@@ -1427,7 +1373,7 @@ unittest
             tvm.upstreamTasks = upstreamTaskIds(task);
 
             TaskExecutionRecord latestExec;
-            auto execs = stateRepo.listTaskExecutionsForTask(proj.id, task.id, 1);
+            auto execs = stores.legacyBuilds.listTaskExecutionsForTask(proj.id, task.id, 1);
             if (execs.length > 0)
             {
                 latestExec = execs[0];
@@ -1465,17 +1411,19 @@ unittest
     assert(testDashboardProjects.length == 1);
     assert(testDashboardProjects[0].tasks.length == 2);
     assert(testDashboardProjects[0].tasks[0].id == "test_node_1");
-    assert(testDashboardProjects[0].tasks[0].changeStatus == "never_run");
+    // A status set on a build's task records it under the build's project
+    assert(testDashboardProjects[0].tasks[0].changeStatus == "up_to_date");
+    assert(testDashboardProjects[0].tasks[0].lastStatus == "cached");
     assert(testDashboardProjects[0].tasks[1].id == "test_node_2");
     assert(testDashboardProjects[0].tasks[1].changeStatus == "up_to_date");
     assert(testDashboardProjects[0].tasks[1].lastStatus == "succeeded");
-    assert(testDashboardProjects[0].successfulTasks == 1);
+    assert(testDashboardProjects[0].successfulTasks == 2);
 
     // Test Task Details definition resolution and execution history retrieval
     ProjectRecord detailProj;
     TaskNode detailTask;
     bool foundDetailTask = false;
-    assert(stateRepo.getProject("proj_dash_1", detailProj));
+    assert(stores.projects.get("proj_dash_1").tryValue(detailProj));
     foreach (tsk; detailProj.tasks)
     {
         if (tsk.id == "test_node_2")
@@ -1490,7 +1438,7 @@ unittest
     assert(detailTask.steps.length == 1);
     assert(upstreamTaskIds(detailTask) == ["test_node_1"]);
 
-    auto node2History = stateRepo.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
+    auto node2History = stores.legacyBuilds.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
     assert(node2History.length == 1);
     assert(node2History[0].buildId == "b_dash_2");
     assert(node2History[0].status == "succeeded");
@@ -1499,10 +1447,10 @@ unittest
 
     // Test Task Execution instance lookup and log retrieval
     TaskExecutionRecord execRec;
-    assert(stateRepo.getTaskExecution("b_dash_2", "test_node_2", execRec));
+    assert(stores.legacyBuilds.getTaskExecution("b_dash_2", "test_node_2", execRec));
     assert(execRec.status == "succeeded");
     assert(execRec.durationMs == 45);
-    auto execLogs = stateRepo.getTaskLogs("b_dash_2", "test_node_2");
+    auto execLogs = stores.logs.getTaskLogs("b_dash_2", "test_node_2");
     assert(execLogs.length == 1);
     assert(execLogs[0] == "Task step log line 1");
 

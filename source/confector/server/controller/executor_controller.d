@@ -2,7 +2,7 @@ module controller.executor_controller;
 
 import vibe.vibe;
 import confector.core.model;
-import confector.core.storage : BuildStateRepository;
+import confector.core.state_stores : StateStores;
 import confector.core.plugin : PluginRegistry;
 import confector.core.executor : ComputeProvider, WorkerRecord, ComputeInstance, CapacityBroker, ComputeProvisioner;
 import confector.orchestrator.coordinator : BuildCoordinator;
@@ -100,7 +100,7 @@ private Json toVibeJson(in JSONValue stdJson)
  * Creates the URL router for the /executors endpoints.
  */
 URLRouter executorRouter(
-    BuildStateRepository stateRepo,
+    StateStores stores,
     PluginRegistry registry,
     CapacityBroker broker = null,
     BuildCoordinator coordinator = null)
@@ -109,7 +109,7 @@ URLRouter executorRouter(
 
     // 1. Executors List View
     router.get("/executors/", (HTTPServerRequest req, HTTPServerResponse res) {
-        auto executors = stateRepo !is null ? stateRepo.listExecutors() : [];
+        auto executors = stores !is null ? stores.workers.list() : [];
         auto providers = registry !is null ? registry.getComputeProviders() : [];
         ComputeProvisioner[] provisioners = broker !is null ? broker.provisioners : [];
 
@@ -266,9 +266,9 @@ URLRouter executorRouter(
         record.createdAt = now;
         record.updatedAt = now;
 
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            stateRepo.saveExecutor(record);
+            stores.workers.save(record);
         }
 
         res.redirect("/executors/details?id=" ~ execId);
@@ -278,7 +278,7 @@ URLRouter executorRouter(
     router.get("/executors/details", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.query.get("id", "");
         WorkerRecord executor;
-        bool found = stateRepo !is null && stateRepo.getExecutor(id, executor);
+        bool found = stores !is null && stores.workers.get(id, executor);
         if (!found)
         {
             executor.id = id;
@@ -297,7 +297,7 @@ URLRouter executorRouter(
     router.get("/executors/edit", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.query.get("id", "");
         WorkerRecord executor;
-        bool found = stateRepo !is null && stateRepo.getExecutor(id, executor);
+        bool found = stores !is null && stores.workers.get(id, executor);
 
         ComputeProvider provider = registry !is null ? registry.getComputeProvider(executor.providerType) : null;
         string configFormHtml = provider !is null ? provider.renderConfigFormHtml(executor.configuration) : "";
@@ -326,7 +326,7 @@ URLRouter executorRouter(
         }
 
         WorkerRecord existing;
-        bool found = stateRepo !is null && stateRepo.getExecutor(id, existing);
+        bool found = stores !is null && stores.workers.get(id, existing);
 
         WorkerRecord record;
         record.id = id;
@@ -338,9 +338,9 @@ URLRouter executorRouter(
         record.createdAt = existing.createdAt.length > 0 ? existing.createdAt : Clock.currTime.toISOString();
         record.updatedAt = Clock.currTime.toISOString();
 
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            stateRepo.saveExecutor(record);
+            stores.workers.save(record);
         }
 
         res.redirect("/executors/details?id=" ~ id);
@@ -350,11 +350,11 @@ URLRouter executorRouter(
     router.post("/executors/toggle", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.form.get("id", "");
         WorkerRecord executor;
-        if (stateRepo !is null && stateRepo.getExecutor(id, executor))
+        if (stores !is null && stores.workers.get(id, executor))
         {
             executor.enabled = !executor.enabled;
             executor.updatedAt = Clock.currTime.toISOString();
-            stateRepo.saveExecutor(executor);
+            stores.workers.save(executor);
         }
 
         string redirectTo = req.form.get("redirect_to", "/executors/");
@@ -364,9 +364,9 @@ URLRouter executorRouter(
     // 8. Delete Executor
     router.post("/executors/delete", (HTTPServerRequest req, HTTPServerResponse res) {
         string id = req.form.get("id", "");
-        if (stateRepo !is null)
+        if (stores !is null)
         {
-            stateRepo.deleteExecutor(id);
+            stores.workers.remove(id);
         }
         res.redirect("/executors/");
     });
@@ -376,7 +376,7 @@ URLRouter executorRouter(
 
 unittest
 {
-    import confector.core.test_storage : InMemoryBuildStateRepository;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
     import confector.core.plugin : Plugin, PluginContext, PluginCategory;
     import confector.core.executor : ComputeProvider, ComputeInstance, WorkerRecord;
     import confector.config : ConfigDefinition;
@@ -407,7 +407,7 @@ unittest
         ComputeProvisioner createProvisioner(in WorkerRecord record) { return null; }
     }
 
-    auto repo = new InMemoryBuildStateRepository();
+    auto repo = new StateStores(new InMemoryDocumentStore());
     auto reg = PluginRegistry.instance;
     reg.shutdownAll();
 
@@ -427,22 +427,22 @@ unittest
     exec.providerType = "mock-local";
     exec.enabled = false;
     exec.configuration = mockPlugin.defaultConfig();
-    repo.saveExecutor(exec);
+    repo.workers.save(exec);
 
-    assert(repo.listExecutors().length == 1);
+    assert(repo.workers.list().length == 1);
     WorkerRecord fetched;
-    assert(repo.getExecutor("exec-test-init", fetched));
+    assert(repo.workers.get("exec-test-init", fetched));
     assert(!fetched.enabled);
 
     // Toggle status
     fetched.enabled = true;
-    repo.saveExecutor(fetched);
-    assert(repo.getExecutor("exec-test-init", fetched));
+    repo.workers.save(fetched);
+    assert(repo.workers.get("exec-test-init", fetched));
     assert(fetched.enabled);
 
     // Delete
-    assert(repo.deleteExecutor("exec-test-init"));
-    assert(repo.listExecutors().length == 0);
+    assert(repo.workers.remove("exec-test-init"));
+    assert(repo.workers.list().length == 0);
 
     // Test with CapacityBroker and BuildCoordinator
     import confector.core.test_storage : InMemoryArtifactStorage;

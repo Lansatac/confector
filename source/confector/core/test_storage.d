@@ -1,16 +1,9 @@
 module confector.core.test_storage;
 
 /**
- * In-memory implementations of storage interfaces for unit testing only (the in-memory dispatch
- * queue is confector.core.memory_dispatch_queue). Import this module conditionally in your
- * unittest blocks:
- *
- *     unittest
- *     {
- *         import confector.core.test_storage;
- *         auto repo = new InMemoryBuildStateRepository();
- *         auto storage = new InMemoryArtifactStorage();
- *     }
+ * In-memory artifact storage for unit testing only. The in-memory dispatch queue is
+ * confector.core.memory_dispatch_queue and the in-memory document store, over which the state
+ * stores (confector.core.state_stores) run in tests, is confector.core.memory_document_store.
  */
 
 import confector.plugin_api.model;
@@ -115,435 +108,107 @@ class InMemoryArtifactStorage : ArtifactStorage
     }
 }
 
-
-/**
- * In-memory thread-safe implementation of BuildStateRepository.
- */
-class InMemoryBuildStateRepository : BuildStateRepository
+unittest
 {
-    private struct CacheRecord
-    {
-        string fingerprint;
-        CachedResult result;
-    }
+    auto storage = new InMemoryArtifactStorage();
 
-    private TaskStatus[string] m_taskStatuses;
-    private TaskExecutionRecord[string] m_taskRecords;
-    private CacheRecord[string] m_fingerprintCache;
-    private BuildRecord[string] m_builds;
-    private string[][string] m_buildLogs;
-    private string[][string] m_taskLogs;
-    private TriggerRuleRecord[string] m_triggerRules;
-    private ProjectRecord[string] m_projects;
-    private RepositoryRecord[string] m_repositories;
-    private WorkerRecord[string] m_executors;
-    private VcsRepositoryState[string] m_repositoryStates;
-    private VcsChangeRecord[] m_changeRecords;
+    // Test stream-based content-addressed artifact storage
+    string fingerprint = "fp123";
+    string artifactId = "output.txt";
+    string contents = "test artifact contents";
 
-    private static string statusKey(string buildId, string taskId) pure nothrow @safe
-    {
-        return buildId ~ ":" ~ taskId;
-    }
+    // Store artifact via stream
+    storage.storeArtifactStream(fingerprint, artifactId, (void delegate(const(ubyte)[]) sink) {
+        sink(cast(ubyte[])contents.dup);
+    });
 
-    private static string cacheKey(string taskId, string fingerprint) pure nothrow @safe
-    {
-        return taskId ~ ":" ~ fingerprint;
-    }
+    // Verify artifact exists
+    assert(storage.artifactExists(fingerprint, artifactId));
+    assert(!storage.artifactExists(fingerprint, "nonexistent"));
+    assert(!storage.artifactExists("", artifactId));
 
-    @property string backendType() const pure nothrow @safe
-    {
-        return "memory";
-    }
+    // Retrieve artifact via stream
+    import std.array : Appender;
+    Appender!(ubyte[]) retrievedBuffer;
+    storage.retrieveArtifactStream(fingerprint, artifactId, (const(ubyte)[] chunk) {
+        retrievedBuffer.put(chunk);
+    });
+    assert(retrievedBuffer.data == contents.dup);
 
-    override void recordTaskExecution(TaskExecutionRecord record)
-    {
-        string key = statusKey(record.buildId, record.taskId);
-        if (record.projectId.length == 0 || record.projectName.length == 0)
-        {
-            if (auto pb = record.buildId in m_builds)
-            {
-                if (record.projectId.length == 0) record.projectId = pb.projectId;
-                if (record.projectName.length == 0) record.projectName = pb.projectName;
-            }
-        }
-        m_taskRecords[key] = record;
-        m_taskStatuses[key] = cast(TaskStatus)record.status;
-        if (auto pb = record.buildId in m_builds)
-        {
-            pb.taskRecords[record.taskId] = record;
-        }
-    }
+    // Delete artifact
+    storage.deleteArtifact(fingerprint, artifactId);
+    assert(!storage.artifactExists(fingerprint, artifactId));
 
-    override TaskExecutionRecord[] listRecentTaskExecutions(size_t limit = 50, string statusFilter = null, string projectIdFilter = null)
-    {
-        TaskExecutionRecord[] list;
-        foreach (k, rec; m_taskRecords)
-        {
-            if (statusFilter.length > 0 && rec.status != statusFilter) continue;
-            if (projectIdFilter.length > 0 && rec.projectId != projectIdFilter) continue;
-            list ~= rec;
-        }
-        if (list.length > limit)
-        {
-            list = list[$ - limit .. $];
-        }
-        return list;
-    }
+    // ==========================================
+    // Stream-based Content-Addressed Storage Tests
+    // ==========================================
+    import confector.core.zip_packager : ZipPackager;
+    import std.array : Appender;
 
-    override TaskExecutionRecord[] listTaskExecutionsForTask(string projectId, string taskId, size_t limit = 20)
-    {
-        TaskExecutionRecord[] list;
-        foreach (k, rec; m_taskRecords)
-        {
-            if (taskId.length > 0 && rec.taskId != taskId) continue;
-            if (projectId.length > 0 && rec.projectId != projectId) continue;
-            list ~= rec;
-        }
-        import std.algorithm.sorting : sort;
-        sort!((a, b) => a.startedAt > b.startedAt)(list);
-        if (list.length > limit)
-        {
-            list = list[0 .. limit];
-        }
-        return list;
-    }
+    string fp1 = "fingerprint_node_100";
+    string art1 = "bin_app";
 
-    override void appendTaskLog(string buildId, string taskId, string line)
-    {
-        string key = statusKey(buildId, taskId);
-        m_taskLogs[key] ~= line;
-    }
+    assert(!storage.artifactExists(fp1, art1));
 
-    override string[] getTaskLogs(string buildId, string taskId)
-    {
-        string key = statusKey(buildId, taskId);
-        if (auto p = key in m_taskLogs)
-        {
-            return *p;
-        }
-        return null;
-    }
+    // Test stream storage write
+    storage.storeArtifactStream(fp1, art1, (sink) {
+        sink(cast(const(ubyte)[]) "zip payload chunk 1; ");
+        sink(cast(const(ubyte)[]) "zip payload chunk 2;");
+    });
 
-    override bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record)
-    {
-        auto p = statusKey(buildId, taskId) in m_taskRecords;
-        if (p !is null)
-        {
-            record = *p;
-            return true;
-        }
-        return false;
-    }
+    assert(storage.artifactExists(fp1, art1));
 
-    override TaskExecutionRecord[] getTaskExecutionsForBuild(string buildId)
-    {
-        TaskExecutionRecord[] list;
-        foreach (k, rec; m_taskRecords)
-        {
-            if (rec.buildId == buildId)
-            {
-                list ~= rec;
-            }
-        }
-        return list;
-    }
+    // Test stream storage read
+    Appender!(ubyte[]) retrievedBytes;
+    storage.retrieveArtifactStream(fp1, art1, (const(ubyte)[] chunk) {
+        retrievedBytes.put(chunk);
+    });
+    assert(cast(string) retrievedBytes.data == "zip payload chunk 1; zip payload chunk 2;");
 
-    override TaskStatus[string] getTaskStatusesForBuild(string buildId)
-    {
-        TaskStatus[string] statuses;
-        string prefix = buildId ~ ":";
-        foreach (k, status; m_taskStatuses)
-        {
-            if (k.length > prefix.length && k[0 .. prefix.length] == prefix)
-            {
-                string taskId = k[prefix.length .. $];
-                statuses[taskId] = status;
-            }
-        }
-        return statuses;
-    }
+    // Test ZipPackager round-trip with InMemoryArtifactStorage
+    import std.file : exists, mkdirRecurse, read, rmdirRecurse, write, tempDir;
+    import std.path : buildPath;
+    string testDir2 = buildPath(tempDir, "test_artifacts_storage_zip");
+    if (exists(testDir2)) rmdirRecurse(testDir2);
+    scope(exit) if (exists(testDir2)) rmdirRecurse(testDir2);
 
-    override void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null)
-    {
-        string key = statusKey(buildId, taskId);
-        m_taskStatuses[key] = status;
-        if (auto p = key in m_taskRecords)
-        {
-            p.status = cast(string)status;
-            if (errorMessage.length > 0)
-            {
-                p.errorMessage = errorMessage;
-            }
-            if (auto pb = buildId in m_builds)
-            {
-                pb.taskRecords[taskId] = *p;
-            }
-        }
-        else
-        {
-            TaskExecutionRecord rec;
-            rec.buildId = buildId;
-            rec.taskId = taskId;
-            rec.status = cast(string)status;
-            rec.errorMessage = errorMessage;
-            m_taskRecords[key] = rec;
-            if (auto pb = buildId in m_builds)
-            {
-                pb.taskRecords[taskId] = rec;
-            }
-        }
-    }
+    string wsDir = buildPath(testDir2, "ws_source");
+    string unpackDir = buildPath(testDir2, "ws_unpacked");
+    mkdirRecurse(buildPath(wsDir, "dist"));
+    write(buildPath(wsDir, "dist", "bundle.js"), "console.log('hello');");
+    write(buildPath(wsDir, "dist", "style.css"), "body { margin: 0; }");
 
-    override bool getTaskStatus(string buildId, string taskId, out TaskStatus status)
-    {
-        auto p = statusKey(buildId, taskId) in m_taskStatuses;
-        if (p !is null)
-        {
-            status = *p;
-            return true;
-        }
-        return false;
-    }
+    string fp2 = "fingerprint_node_200";
+    string art2 = "dist_assets";
 
-    override void saveCachedFingerprint(string taskId, string fingerprint, CachedResult result)
-    {
-        CacheRecord rec;
-        rec.fingerprint = fingerprint;
-        rec.result = result;
-        m_fingerprintCache[cacheKey(taskId, fingerprint)] = rec;
-    }
+    storage.storeArtifactStream(fp2, art2, (sink) {
+        ZipPackager.pack(wsDir, ["dist/*"], sink);
+    });
 
-    override bool getCachedFingerprint(string taskId, string fingerprint, out CachedResult result)
-    {
-        auto p = cacheKey(taskId, fingerprint) in m_fingerprintCache;
-        if (p !is null)
-        {
-            result = p.result;
-            return true;
-        }
-        return false;
-    }
+    assert(storage.artifactExists(fp2, art2));
 
-    override void recordBuild(BuildRecord build)
-    {
-        m_builds[build.buildId] = build;
-    }
+    ZipPackager.unpackStream((sink) {
+        storage.retrieveArtifactStream(fp2, art2, sink);
+    }, unpackDir);
 
-    override bool getBuild(string buildId, out BuildRecord build)
-    {
-        auto p = buildId in m_builds;
-        if (p !is null)
-        {
-            build = *p;
-            return true;
-        }
-        return false;
-    }
+    assert(exists(buildPath(unpackDir, "dist", "bundle.js")));
+    assert(exists(buildPath(unpackDir, "dist", "style.css")));
+    assert(cast(string) read(buildPath(unpackDir, "dist", "bundle.js")) == "console.log('hello');");
+    assert(cast(string) read(buildPath(unpackDir, "dist", "style.css")) == "body { margin: 0; }");
 
-    override BuildRecord[] listBuilds(size_t limit = 50)
-    {
-        BuildRecord[] list;
-        foreach (b; m_builds)
-        {
-            list ~= b;
-            if (list.length >= limit) break;
-        }
-        return list;
-    }
+    // Test deletion
+    storage.deleteArtifact(fp1, art1);
+    assert(!storage.artifactExists(fp1, art1));
 
-    override void appendBuildLog(string buildId, string line)
+    // Test retrieval of nonexistent artifact
+    bool caughtNotFound = false;
+    try
     {
-        m_buildLogs[buildId] ~= line;
+        storage.retrieveArtifactStream("no_such_fp", "no_such_art", (chunk) {});
     }
-
-    override string[] getBuildLogs(string buildId)
+    catch (Exception)
     {
-        auto p = buildId in m_buildLogs;
-        if (p !is null)
-        {
-            return (*p).dup;
-        }
-        return [];
+        caughtNotFound = true;
     }
-
-    override void saveTriggerRule(TriggerRuleRecord rule)
-    {
-        m_triggerRules[rule.id] = rule;
-    }
-
-    override TriggerRuleRecord[] listTriggerRules()
-    {
-        TriggerRuleRecord[] list;
-        foreach (r; m_triggerRules)
-        {
-            list ~= r;
-        }
-        return list;
-    }
-
-    override bool deleteTriggerRule(string ruleId)
-    {
-        auto p = ruleId in m_triggerRules;
-        if (p !is null)
-        {
-            m_triggerRules.remove(ruleId);
-            return true;
-        }
-        return false;
-    }
-
-    override void saveProject(in ProjectRecord project)
-    {
-        m_projects[project.id] = cast()project;
-    }
-
-    override bool getProject(string projectId, out ProjectRecord project)
-    {
-        auto p = projectId in m_projects;
-        if (p !is null)
-        {
-            project = *p;
-            return true;
-        }
-        return false;
-    }
-
-    override ProjectRecord[] listProjects()
-    {
-        ProjectRecord[] list;
-        foreach (p; m_projects)
-        {
-            list ~= p;
-        }
-        return list;
-    }
-
-    override bool deleteProject(string projectId)
-    {
-        auto p = projectId in m_projects;
-        if (p !is null)
-        {
-            m_projects.remove(projectId);
-            return true;
-        }
-        return false;
-    }
-
-    override void saveRepository(in RepositoryRecord repo)
-    {
-        m_repositories[repo.name] = cast()repo;
-    }
-
-    override bool getRepository(string name, out RepositoryRecord repo)
-    {
-        auto p = name in m_repositories;
-        if (p !is null)
-        {
-            repo = *p;
-            return true;
-        }
-        return false;
-    }
-
-    override RepositoryRecord[] listRepositories()
-    {
-        RepositoryRecord[] list;
-        foreach (r; m_repositories)
-        {
-            list ~= r;
-        }
-        return list;
-    }
-
-    override bool deleteRepository(string name)
-    {
-        auto p = name in m_repositories;
-        if (p !is null)
-        {
-            m_repositories.remove(name);
-            return true;
-        }
-        return false;
-    }
-
-    override void saveExecutor(in WorkerRecord executor)
-    {
-        m_executors[executor.id] = cast()executor;
-    }
-
-    override bool getExecutor(string id, out WorkerRecord executor)
-    {
-        auto p = id in m_executors;
-        if (p !is null)
-        {
-            executor = *p;
-            return true;
-        }
-        return false;
-    }
-
-    override WorkerRecord[] listExecutors()
-    {
-        WorkerRecord[] list;
-        foreach (e; m_executors)
-        {
-            list ~= e;
-        }
-        return list;
-    }
-
-    override bool deleteExecutor(string id)
-    {
-        auto p = id in m_executors;
-        if (p !is null)
-        {
-            m_executors.remove(id);
-            return true;
-        }
-        return false;
-    }
-
-    private static string repoStateKey(string repositoryUrl, string targetRef) pure nothrow @safe
-    {
-        return repositoryUrl ~ ":" ~ targetRef;
-    }
-
-    override void saveRepositoryState(in VcsRepositoryState state)
-    {
-        string key = repoStateKey(state.repositoryUrl, state.targetRef);
-        m_repositoryStates[key] = cast(VcsRepositoryState)state;
-    }
-
-    override bool getRepositoryState(string repositoryUrl, string targetRef, out VcsRepositoryState state)
-    {
-        auto p = repoStateKey(repositoryUrl, targetRef) in m_repositoryStates;
-        if (p !is null)
-        {
-            state = *p;
-            return true;
-        }
-        return false;
-    }
-
-    override void recordRepositoryChange(in VcsChangeRecord change)
-    {
-        m_changeRecords ~= change;
-    }
-
-    override VcsChangeRecord[] listRepositoryChanges(string repositoryUrl, size_t limit = 20)
-    {
-        VcsChangeRecord[] list;
-        foreach (rec; m_changeRecords)
-        {
-            if (rec.repositoryUrl == repositoryUrl)
-            {
-                list ~= rec;
-            }
-        }
-        if (list.length > limit)
-        {
-            list = list[$ - limit .. $];
-        }
-        return list;
-    }
+    assert(caughtNotFound);
 }

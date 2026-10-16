@@ -1,7 +1,7 @@
 module confector.runner_core.worker;
 
 import confector.core.model;
-import confector.core.storage;
+import confector.plugin_api.model : ArtifactStorage;
 import confector.core.plugin;
 import confector.core.plugin_loader;
 import confector.plugin_api.dispatch_queue : Lease;

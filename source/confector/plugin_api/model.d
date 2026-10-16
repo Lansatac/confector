@@ -595,8 +595,8 @@ struct ChainTask
 
 /**
  * Persisted record of a build execution, in the build model that BuildRequest, BuildChain,
- * TaskExecution and FingerprintClaim replace. It is removed with the BuildCoordinator and
- * BuildStateRepository (beads confector-z7z.23.10 and confector-z7z.31.18).
+ * TaskExecution and FingerprintClaim replace. It is removed with the BuildCoordinator (bead
+ * confector-z7z.23.10).
  *
  * A build record is both a request and the chain it runs on: `chainTasks` is the chain
  * snapshot and `chainId` names the build that created it. A later request to build another
@@ -825,6 +825,79 @@ struct FingerprintClaim
 }
 
 /**
+ * Kinds of ref a tracked branch can be (bead confector-z7z.19).
+ */
+enum RefKind : string
+{
+    branch = "branch",
+    tag = "tag",
+    /// A pull request, merge request, code review or shelf, as its provider exposes it.
+    changeRequest = "change_request"
+}
+
+/**
+ * Whether a tracked branch still exists in its repository. A deleted branch is hidden and no
+ * longer triggers, but its record and history are kept.
+ */
+enum BranchStatus : string
+{
+    active = "active",
+    deleted = "deleted"
+}
+
+/**
+ * A ref of a repository that Confector tracks (bead confector-z7z.19), independent of the
+ * version control system: git branches, Plastic branches and Perforce streams all map onto it.
+ * Kept current by webhooks and polling. Identified by repository, kind and ref name, which never
+ * change.
+ */
+struct TrackedBranch
+{
+    /// The repository's id (`RepositoryRecord.name`).
+    @asName("repository_id") string repositoryId;
+    RefKind kind;
+    /// The ref's name as the provider reports it, e.g. `main` or `pull/123`.
+    @asName("ref_name") string refName;
+    /// The provider's pinned value for the ref's current head (git: the commit SHA), with
+    /// display details.
+    InputPin head;
+    BranchStatus status;
+    /// When the ref was last seen by a webhook or poll (ISO 8601 UTC).
+    @asName("last_seen_at") string lastSeenAt;
+}
+
+/**
+ * Global roles (bead confector-z7z.10). Per-project permissions come later.
+ */
+enum Role : string
+{
+    /// No role, granting nothing. First, so an identity or token whose role was never set fails
+    /// closed; never stored on a token.
+    none = "none",
+    admin = "admin",
+    member = "member",
+    viewer = "viewer"
+}
+
+/**
+ * An API token (bead confector-z7z.10). Only a hash of the token's secret is stored, never the
+ * secret itself; the hash identifies the token, so authenticating a request is a read by id.
+ */
+struct ApiToken
+{
+    /// SHA-256 of the secret, in lowercase hex.
+    @asName("secret_hash") string secretHash;
+    /// A label chosen by its owner.
+    string name;
+    /// The identity that owns the token; requests made with it act as this identity.
+    string owner;
+    Role role;
+    @asName("created_at") string createdAt;
+    /// Set when the token is revoked; a revoked token authenticates nothing.
+    @optional @asName("revoked_at") string revokedAt;
+}
+
+/**
  * Persisted configuration for a node-level trigger rule.
  */
 struct TriggerRuleRecord
@@ -989,197 +1062,6 @@ class FingerprintException : Exception
     {
         super(msg, file, line);
     }
-}
-
-/**
- * Interface for build and task state persistence (caching, status tracking, metadata).
- */
-interface BuildStateRepository
-{
-    /**
-     * Returns a short identifier for the backend type (e.g., "mongo", "memory").
-     */
-    @property string backendType() const;
-
-    /**
-     * Records or updates the granular execution record of a task.
-     */
-    void recordTaskExecution(TaskExecutionRecord record);
-
-    /**
-     * Retrieves the granular execution record of a task.
-     */
-    bool getTaskExecution(string buildId, string taskId, out TaskExecutionRecord record);
-
-    /**
-     * Lists recent task executions across all builds with optional filtering.
-     */
-    TaskExecutionRecord[] listRecentTaskExecutions(size_t limit = 50, string statusFilter = null, string projectIdFilter = null);
-
-    /**
-     * Lists execution records for a specific task (optionally scoped to a project).
-     */
-    TaskExecutionRecord[] listTaskExecutionsForTask(string projectId, string taskId, size_t limit = 20);
-
-    /**
-     * Appends a log line to a task's isolated output stream.
-     */
-    void appendTaskLog(string buildId, string taskId, string line);
-
-    /**
-     * Retrieves all log lines for a specific task execution.
-     */
-    string[] getTaskLogs(string buildId, string taskId);
-
-    /**
-     * Retrieves all task execution records for a build.
-     */
-    TaskExecutionRecord[] getTaskExecutionsForBuild(string buildId);
-
-    /**
-     * Retrieves all recorded task statuses for a build.
-     */
-    TaskStatus[string] getTaskStatusesForBuild(string buildId);
-
-    /**
-     * Records or updates the status of a task execution.
-     */
-    void setTaskStatus(string buildId, string taskId, TaskStatus status, string errorMessage = null);
-
-    /**
-     * Retrieves the recorded status of a task.
-     */
-    bool getTaskStatus(string buildId, string taskId, out TaskStatus status);
-
-    /**
-     * Records a successful execution fingerprint for memoization.
-     */
-    void saveCachedFingerprint(string taskId, string fingerprint, CachedResult result);
-
-    /**
-     * Checks if a cached fingerprint is recorded and returns the result it reuses.
-     */
-    bool getCachedFingerprint(string taskId, string fingerprint, out CachedResult result);
-
-    /**
-     * Saves or updates a build execution record.
-     */
-    void recordBuild(BuildRecord build);
-
-    /**
-     * Retrieves a build execution record.
-     */
-    bool getBuild(string buildId, out BuildRecord build);
-
-    /**
-     * Lists recent build execution records.
-     */
-    BuildRecord[] listBuilds(size_t limit = 50);
-
-    /**
-     * Appends a log line to a build's execution output stream.
-     */
-    void appendBuildLog(string buildId, string line);
-
-    /**
-     * Retrieves all log lines for a build execution.
-     */
-    string[] getBuildLogs(string buildId);
-
-    /**
-     * Saves a trigger rule configuration.
-     */
-    void saveTriggerRule(TriggerRuleRecord rule);
-
-    /**
-     * Lists configured trigger rules.
-     */
-    TriggerRuleRecord[] listTriggerRules();
-
-    /**
-     * Deletes a configured trigger rule by ID.
-     */
-    bool deleteTriggerRule(string ruleId);
-
-    /**
-     * Saves or updates a project record.
-     */
-    void saveProject(in ProjectRecord project);
-
-    /**
-     * Retrieves a project record by ID.
-     */
-    bool getProject(string projectId, out ProjectRecord project);
-
-    /**
-     * Lists all registered projects.
-     */
-    ProjectRecord[] listProjects();
-
-    /**
-     * Deletes a project record by ID.
-     */
-    bool deleteProject(string projectId);
-
-    /**
-     * Saves or updates a repository record.
-     */
-    void saveRepository(in RepositoryRecord repo);
-
-    /**
-     * Retrieves a repository record by name.
-     */
-    bool getRepository(string name, out RepositoryRecord repo);
-
-    /**
-     * Lists all registered repositories.
-     */
-    RepositoryRecord[] listRepositories();
-
-    /**
-     * Deletes a repository record by name.
-     */
-    bool deleteRepository(string name);
-
-    /**
-     * Saves or updates an executor record.
-     */
-    void saveExecutor(in WorkerRecord executor);
-
-    /**
-     * Retrieves an executor record by ID.
-     */
-    bool getExecutor(string id, out WorkerRecord executor);
-
-    /**
-     * Lists all configured executors.
-     */
-    WorkerRecord[] listExecutors();
-
-    /**
-     * Deletes an executor record by ID.
-     */
-    bool deleteExecutor(string id);
-
-    /**
-     * Saves or updates the latest revision state for a repository.
-     */
-    void saveRepositoryState(in VcsRepositoryState state);
-
-    /**
-     * Retrieves the latest revision state for a repository and target ref.
-     */
-    bool getRepositoryState(string repositoryUrl, string targetRef, out VcsRepositoryState state);
-
-    /**
-     * Records a detected repository change event.
-     */
-    void recordRepositoryChange(in VcsChangeRecord change);
-
-    /**
-     * Lists recent change records for a repository.
-     */
-    VcsChangeRecord[] listRepositoryChanges(string repositoryUrl, size_t limit = 20);
 }
 
 /// Re-export WorkerRecord from executor module so it's available via model
@@ -1437,4 +1319,37 @@ unittest
     auto released = FingerprintClaim("fp1");
     assert(roundTrip(released) == released);
     assert(deserializeJson!FingerprintClaim(`{"fingerprint": "fp1"}`) == released);
+}
+
+unittest
+{
+    // A tracked branch and an API token round-trip with snake_case names and string enums
+    TrackedBranch branch;
+    branch.repositoryId = "game";
+    branch.kind = RefKind.changeRequest;
+    branch.refName = "pull/12";
+    branch.head = InputPin(Json("aaa111"), ["subject": "Fix the build"]);
+    branch.status = BranchStatus.active;
+    branch.lastSeenAt = "2026-10-15T14:02:00Z";
+    auto branchJson = serializeToJson(branch);
+    assert(branchJson["repository_id"].get!string == "game");
+    assert(branchJson["kind"].get!string == "change_request");
+    assert(branchJson["ref_name"].get!string == "pull/12");
+    assert(branchJson["head"]["pinned"].get!string == "aaa111");
+    assert(branchJson["last_seen_at"].get!string == "2026-10-15T14:02:00Z");
+    assert(roundTrip(branch) == branch);
+
+    ApiToken token;
+    token.secretHash = "0123abcd";
+    token.name = "ci";
+    token.owner = "jason";
+    token.role = Role.admin;
+    token.createdAt = "2026-10-15T14:02:00Z";
+    auto tokenJson = serializeToJson(token);
+    assert(tokenJson["secret_hash"].get!string == "0123abcd");
+    assert(tokenJson["role"].get!string == "admin");
+    assert(roundTrip(token) == token);
+    auto unrevoked = deserializeJson!ApiToken(`{"secret_hash": "h", "name": "ci", "owner": "jason", "role": "viewer", "created_at": "2026-10-15T14:02:00Z"}`);
+    assert(unrevoked.role == Role.viewer && unrevoked.revokedAt.length == 0);
+    assert(ApiToken.init.role == Role.none, "An unset role grants nothing");
 }

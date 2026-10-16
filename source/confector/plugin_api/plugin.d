@@ -11,7 +11,6 @@ enum PluginCategory : string
     step_executor = "step_executor", // Step Execution Plugins (BuildStepSystem)
     worker = "worker",              // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
     artifact = "artifact",          // Artifact Storage Plugins (content-addressed artifact backend)
-    storage = "storage",            // State Storage Plugins (BuildStateRepository - builds, tasks, projects, etc.)
     queue = "queue",                // Dispatch Queue Plugins (DispatchQueue - delivery of work to workers)
     scheduler = "scheduler"         // Scheduler Plugins (periodic job execution)
 }
@@ -72,14 +71,6 @@ interface WorkerPlugin : Plugin
  * Provides a content-addressed artifact backend (local filesystem, S3, Artifactory, etc.).
  */
 interface ArtifactStoragePlugin : Plugin
-{
-}
-
-/**
- * Interface for State Storage Plugins.
- * Provides a backend for build and task state persistence (MongoDB, DynamoDB, etc.).
- */
-interface StateStoragePlugin : Plugin
 {
 }
 

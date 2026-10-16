@@ -2,7 +2,8 @@ module confector.orchestrator.coordinator;
 
 import confector.core.model;
 import confector.core.dag;
-import confector.core.storage;
+import confector.core.document_collection : tryValue;
+import confector.core.state_stores : StateStores;
 import confector.core.chain_resolver : resolveChain;
 import confector.core.definition_hash : recordDefinition;
 import confector.core.executor : CapacityBroker;
@@ -234,7 +235,7 @@ enum defaultPoolQueue = "default";
 class BuildCoordinator
 {
     private ArtifactStorage m_artifactStorage;
-    private BuildStateRepository m_stateRepo;
+    private StateStores m_stores;
     private DispatchQueue m_dispatchQueue;
     private CapacityBroker m_capacityBroker;
     private string m_callbackBaseUrl;
@@ -254,7 +255,7 @@ class BuildCoordinator
      */
     this(
         ArtifactStorage artifactStorage,
-        BuildStateRepository stateRepo,
+        StateStores stores,
         DispatchQueue dispatchQueue,
         CapacityBroker capacityBroker = null,
         string callbackBaseUrl = "",
@@ -263,7 +264,7 @@ class BuildCoordinator
     {
         m_repositoryResolver = repositoryResolver;
         m_artifactStorage = artifactStorage;
-        m_stateRepo = stateRepo;
+        m_stores = stores;
         m_dispatchQueue = dispatchQueue;
         if (m_dispatchQueue !is null)
         {
@@ -276,7 +277,7 @@ class BuildCoordinator
     }
 
     @property ArtifactStorage artifactStorage() { return m_artifactStorage; }
-    @property BuildStateRepository stateRepository() { return m_stateRepo; }
+    @property StateStores stores() { return m_stores; }
     @property DispatchQueue dispatchQueue() { return m_dispatchQueue; }
     @property InFlightTaskRegistry inFlightRegistry() { return m_inFlightRegistry; }
 
@@ -297,9 +298,9 @@ class BuildCoordinator
                     continue;
                 }
                 TaskStatus[string] statuses;
-                if (m_stateRepo !is null)
+                if (m_stores !is null)
                 {
-                    statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
+                    statuses = m_stores.legacyBuilds.getTaskStatusesForBuild(buildId);
                 }
                 foreach (taskId, taskDemand; active.queuedDemand)
                 {
@@ -346,9 +347,9 @@ class BuildCoordinator
             string buildId = "bld_" ~ randomUUID().toString()[0 .. 8];
 
             // Persist project if not already saved
-            if (project.id.length > 0 && m_stateRepo !is null)
+            if (project.id.length > 0 && m_stores !is null)
             {
-                m_stateRepo.saveProject(project);
+                m_stores.projects.put(project);
             }
 
             return startOnChainLocked(project, chain, buildId, buildId, targetTaskId, force, triggerSource, workspaceDir);
@@ -374,12 +375,12 @@ class BuildCoordinator
     {
         synchronized (m_mutex)
         {
-            if (m_stateRepo is null)
+            if (m_stores is null)
             {
-                throw new Exception("Cannot build in an existing chain without a state repository");
+                throw new Exception("Cannot build in an existing chain without state stores");
             }
             BuildRecord origin;
-            if (!m_stateRepo.getBuild(chainBuildId, origin))
+            if (!m_stores.legacyBuilds.getBuild(chainBuildId, origin))
             {
                 throw new Exception(format("Build '%s' does not exist", chainBuildId));
             }
@@ -388,7 +389,7 @@ class BuildCoordinator
                 throw new Exception(format("Build '%s' has no build chain", chainBuildId));
             }
             ProjectRecord project;
-            if (!m_stateRepo.getProject(origin.projectId, project))
+            if (!m_stores.projects.get(origin.projectId).tryValue(project))
             {
                 throw new Exception(format("Project '%s' of build '%s' does not exist", origin.projectId, chainBuildId));
             }
@@ -459,13 +460,14 @@ class BuildCoordinator
         buildRecord.startedAt = Clock.currTime.toISOString();
         buildRecord.executedTasks = [];
 
-        if (m_stateRepo !is null)
+        if (m_stores !is null)
         {
+            // The build first: a task record takes its project from its build.
+            m_stores.legacyBuilds.createBuild(buildRecord);
             foreach (tId; targetTaskIds)
             {
-                m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.pending);
+                m_stores.legacyBuilds.setTaskStatus(buildId, tId, TaskStatus.pending);
             }
-            m_stateRepo.recordBuild(buildRecord);
         }
 
         ActiveBuild active;
@@ -492,12 +494,12 @@ class BuildCoordinator
     /// Looks up a repository record for input resolution. Throws if it is not registered.
     private RepositoryRecord lookupRepository(string repositoryId)
     {
-        if (m_stateRepo is null)
+        if (m_stores is null)
         {
-            throw new Exception("no state repository is configured to look repositories up in");
+            throw new Exception("no state stores are configured to look repositories up in");
         }
         RepositoryRecord repository;
-        if (!m_stateRepo.getRepository(repositoryId, repository))
+        if (!m_stores.repositories.get(repositoryId).tryValue(repository))
         {
             throw new Exception(format("repository '%s' is not registered", repositoryId));
         }
@@ -540,16 +542,56 @@ class BuildCoordinator
         active.queuedDemand.remove(taskId);
 
         TaskExecutionRecord rec;
-        rec.buildId = active.buildId;
-        rec.taskId = taskId;
-        rec.projectId = active.project.id;
         rec.status = cast(string) TaskStatus.failed;
         rec.errorMessage = message;
         rec.exitCode = 1;
         rec.finishedAt = Clock.currTime.toISOString();
         if (node !is null) recordDefinition(rec, *node);
-        m_stateRepo.recordTaskExecution(rec);
-        m_stateRepo.setTaskStatus(active.buildId, taskId, TaskStatus.failed, message);
+        recordTaskResult(active.buildId, taskId, rec);
+    }
+
+    /**
+     * Records the outcome in `result` (status, fingerprint, exit code, error, duration,
+     * artifacts, finish time and definition) on task `taskId`'s record in build `buildId`, by
+     * compare-and-set so a concurrent status change is not lost. The record is created first if
+     * the build never recorded the task.
+     */
+    private void recordTaskResult(string buildId, string taskId, TaskExecutionRecord result)
+    {
+        TaskExecutionRecord existing;
+        if (!m_stores.legacyBuilds.getTaskExecution(buildId, taskId, existing))
+        {
+            m_stores.legacyBuilds.setTaskStatus(buildId, taskId, TaskStatus.pending);
+        }
+        m_stores.legacyBuilds.updateTaskExecution(buildId, taskId, (ref TaskExecutionRecord rec) {
+            rec.status = result.status;
+            rec.fingerprint = result.fingerprint;
+            rec.exitCode = result.exitCode;
+            rec.errorMessage = result.errorMessage;
+            rec.durationMs = result.durationMs;
+            rec.producedArtifacts = result.producedArtifacts;
+            rec.finishedAt = result.finishedAt;
+            rec.definition = result.definition;
+            rec.definitionHash = result.definitionHash;
+        });
+    }
+
+    /// Applies `change` to build `buildId`'s record, if it exists, by compare-and-set.
+    private void updateBuildIfRecorded(string buildId, void delegate(ref BuildRecord) change)
+    {
+        BuildRecord existing;
+        if (m_stores.legacyBuilds.getBuild(buildId, existing))
+        {
+            m_stores.legacyBuilds.updateBuild(buildId, change);
+        }
+    }
+
+    /// Adds `taskId` to build `buildId`'s executed tasks, if the build is recorded.
+    private void recordExecutedTask(string buildId, string taskId)
+    {
+        updateBuildIfRecorded(buildId, (ref BuildRecord b) {
+            if (!b.executedTasks.canFind(taskId)) b.executedTasks ~= taskId;
+        });
     }
 
     /**
@@ -561,7 +603,7 @@ class BuildCoordinator
      */
     private void requireUpstreamArtifacts(ref ActiveBuild active, in TaskNode node, string taskId)
     {
-        if (m_stateRepo is null) return;
+        if (m_stores is null) return;
         foreach (input; chainInputs(active, taskId))
         {
             if (input.kind != InputKind.taskOutput) continue;
@@ -570,7 +612,7 @@ class BuildCoordinator
 
             string upstreamFingerprint = input.pinned.get!string;
             CachedResult upstream;
-            if (!m_stateRepo.getCachedFingerprint(decl.spec.task, upstreamFingerprint, upstream)) continue;
+            if (!m_stores.resultCache.get(upstreamFingerprint, upstream)) continue;
             if (!upstream.artifacts.canFind!(meta => (meta.artifactId.length > 0 ? meta.artifactId : meta.filePath) == decl.spec.artifact))
             {
                 throw new Exception(missingUpstreamArtifactMessage(decl.spec.task, upstreamFingerprint, decl.spec.artifact));
@@ -649,12 +691,12 @@ class BuildCoordinator
             return dispatchTask(*active, taskId);
         }
         BuildRecord build;
-        if (!m_stateRepo.getBuild(buildId, build))
+        if (!m_stores.legacyBuilds.getBuild(buildId, build))
         {
             throw new Exception(format("Build '%s' does not exist", buildId));
         }
         ProjectRecord project;
-        if (!m_stateRepo.getProject(build.projectId, project))
+        if (!m_stores.projects.get(build.projectId).tryValue(project))
         {
             throw new Exception(format("Project '%s' of build '%s' does not exist", build.projectId, buildId));
         }
@@ -759,7 +801,7 @@ class BuildCoordinator
                 if (subscribers.length == 0)
                 {
                     BuildRecord origBuild;
-                    bool origBuildExists = (m_stateRepo !is null && m_stateRepo.getBuild(buildId, origBuild));
+                    bool origBuildExists = (m_stores !is null && m_stores.legacyBuilds.getBuild(buildId, origBuild));
                     bool origBuildNonTerminal = origBuildExists && 
                         (origBuild.status != "cancelled" && origBuild.status != "failed" && origBuild.status != "succeeded");
                     
@@ -788,9 +830,7 @@ class BuildCoordinator
 
                     // Record task execution record
                     TaskExecutionRecord rec;
-                    rec.buildId = subBuildId;
-                    rec.taskId = subTaskId;
-                    if (m_stateRepo !is null)
+                    if (m_stores !is null)
                     {
                         // A missing definition must never drop the completion
                         try
@@ -810,33 +850,24 @@ class BuildCoordinator
                     rec.producedArtifacts = result.producedArtifacts;
                     rec.finishedAt = Clock.currTime.toISOString();
 
-                    if (m_stateRepo !is null)
+                    if (m_stores !is null)
                     {
-                        m_stateRepo.recordTaskExecution(rec);
-                        m_stateRepo.setTaskStatus(subBuildId, subTaskId, result.status, result.errorMessage);
-
-                        foreach (line; result.logs)
-                        {
-                            m_stateRepo.appendBuildLog(subBuildId, line);
-                        }
+                        recordTaskResult(subBuildId, subTaskId, rec);
 
                         // If fingerprint is valid and artifacts exist/succeeded, save to cache
                         if ((result.status == TaskStatus.succeeded || result.status == TaskStatus.cached)
                             && rec.fingerprint.length > 0)
                         {
-                            m_stateRepo.saveCachedFingerprint(subTaskId, rec.fingerprint,
+                            m_stores.resultCache.save(rec.fingerprint,
                                 CachedResult(result.producedArtifacts, rec.definition, rec.definitionHash));
                         }
 
-                        // Update build executedTasks list
-                        BuildRecord b;
-                        if (m_stateRepo.getBuild(subBuildId, b))
+                        recordExecutedTask(subBuildId, subTaskId);
+
+                        // Logs last, after the state they describe is recorded
+                        foreach (line; result.logs)
                         {
-                            if (!b.executedTasks.canFind(subTaskId))
-                            {
-                                b.executedTasks ~= subTaskId;
-                                m_stateRepo.recordBuild(b);
-                            }
+                            m_stores.logs.appendBuildLog(subBuildId, line);
                         }
                     }
 
@@ -866,22 +897,19 @@ class BuildCoordinator
     {
         synchronized (m_mutex)
         {
-            if (m_stateRepo !is null)
+            if (m_stores !is null)
             {
-                BuildRecord b;
-                if (m_stateRepo.getBuild(buildId, b))
-                {
+                updateBuildIfRecorded(buildId, (ref BuildRecord b) {
                     b.status = "cancelled";
                     b.finishedAt = Clock.currTime.toISOString();
-                    m_stateRepo.recordBuild(b);
-                }
+                });
 
-                auto statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
+                auto statuses = m_stores.legacyBuilds.getTaskStatusesForBuild(buildId);
                 foreach (tId, status; statuses)
                 {
                     if (status == TaskStatus.pending || status == TaskStatus.queued || status == TaskStatus.running)
                     {
-                        m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cancelled, "Build cancelled by user");
+                        m_stores.legacyBuilds.setTaskStatus(buildId, tId, TaskStatus.cancelled, "Build cancelled by user");
                     }
                 }
             }
@@ -900,10 +928,10 @@ class BuildCoordinator
         if (pActive is null)
         {
             // Try to reconstruct active build from repository
-            if (m_stateRepo !is null)
+            if (m_stores !is null)
             {
                 BuildRecord b;
-                if (m_stateRepo.getBuild(buildId, b))
+                if (m_stores.legacyBuilds.getBuild(buildId, b))
                 {
                     if (b.status == "cancelled" || b.status == "failed" || b.status == "succeeded")
                     {
@@ -916,7 +944,7 @@ class BuildCoordinator
                         throw new Exception(format("Build '%s' has no build chain and cannot be resumed", buildId));
                     }
                     ProjectRecord proj;
-                    if (!m_stateRepo.getProject(b.projectId, proj))
+                    if (!m_stores.projects.get(b.projectId).tryValue(proj))
                     {
                         throw new Exception(format("Project '%s' of build '%s' does not exist", b.projectId, buildId));
                     }
@@ -944,10 +972,11 @@ class BuildCoordinator
                         // Nothing of this build can be dispatched any more: fail it rather
                         // than leave it running forever.
                         logError("[coordinator] Build '%s' cannot be resumed: %s", buildId, e.msg);
-                        b.status = "failed";
-                        b.errorMessage = e.msg;
-                        b.finishedAt = Clock.currTime.toISOString();
-                        m_stateRepo.recordBuild(b);
+                        m_stores.legacyBuilds.updateBuild(buildId, (ref BuildRecord failed) {
+                            failed.status = "failed";
+                            failed.errorMessage = e.msg;
+                            failed.finishedAt = Clock.currTime.toISOString();
+                        });
                         return;
                     }
                     m_activeBuilds[buildId] = act;
@@ -963,9 +992,9 @@ class BuildCoordinator
 
         ActiveBuild active = *pActive;
         TaskStatus[string] statuses;
-        if (m_stateRepo !is null)
+        if (m_stores !is null)
         {
-            statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
+            statuses = m_stores.legacyBuilds.getTaskStatusesForBuild(buildId);
         }
 
         // 1. Check for failure termination
@@ -978,7 +1007,7 @@ class BuildCoordinator
             {
                 hasFailure = true;
                 TaskExecutionRecord taskRec;
-                if (m_stateRepo.getTaskExecution(buildId, tId, taskRec))
+                if (m_stores.legacyBuilds.getTaskExecution(buildId, tId, taskRec))
                 {
                     failureMsg = taskRec.errorMessage;
                 }
@@ -996,27 +1025,24 @@ class BuildCoordinator
                 auto pStat = tId in statuses;
                 if (pStat is null || *pStat == TaskStatus.pending || *pStat == TaskStatus.queued)
                 {
-                    if (m_stateRepo !is null)
+                    if (m_stores !is null)
                     {
-                        m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cancelled, "Cancelled due to upstream task failure");
+                        m_stores.legacyBuilds.setTaskStatus(buildId, tId, TaskStatus.cancelled, "Cancelled due to upstream task failure");
                     }
                 }
             }
 
             // Update build status
-            if (m_stateRepo !is null)
+            if (m_stores !is null)
             {
-                BuildRecord b;
-                if (m_stateRepo.getBuild(buildId, b))
-                {
+                updateBuildIfRecorded(buildId, (ref BuildRecord b) {
                     b.status = "failed";
                     b.finishedAt = Clock.currTime.toISOString();
                     if (failureMsg.length > 0)
                     {
                         b.errorMessage = failureMsg;
                     }
-                    m_stateRepo.recordBuild(b);
-                }
+                });
             }
 
             m_inFlightRegistry.unsubscribeBuild(buildId);
@@ -1030,9 +1056,9 @@ class BuildCoordinator
         do
         {
             stateChanged = false;
-            if (m_stateRepo !is null)
+            if (m_stores !is null)
             {
-                statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
+                statuses = m_stores.legacyBuilds.getTaskStatusesForBuild(buildId);
             }
 
             foreach (tId; active.targetTaskIds)
@@ -1086,10 +1112,10 @@ class BuildCoordinator
                     // 3. Cache check using the fingerprint computed from the build's chain
                     string fingerprint = chainFingerprint(active, tId);
 
-                    if (!active.force && fingerprint.length > 0 && m_stateRepo !is null)
+                    if (!active.force && fingerprint.length > 0 && m_stores !is null)
                     {
                         CachedResult cachedResult;
-                        if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedResult))
+                        if (m_stores.resultCache.get(fingerprint, cachedResult))
                         {
                             auto cachedArtifacts = cachedResult.artifacts;
                             // Verify artifacts exist in stream storage by (taskFingerprint, artifactId)
@@ -1114,8 +1140,6 @@ class BuildCoordinator
 
                                 // Resolve immediately as cached
                                 TaskExecutionRecord cacheRec;
-                                cacheRec.buildId = buildId;
-                                cacheRec.taskId = tId;
                                 cacheRec.definition = cachedResult.definition;
                                 cacheRec.definitionHash = cachedResult.definitionHash;
                                 cacheRec.status = "cached";
@@ -1123,18 +1147,8 @@ class BuildCoordinator
                                 cacheRec.producedArtifacts = cachedArtifacts;
                                 cacheRec.finishedAt = Clock.currTime.toISOString();
 
-                                m_stateRepo.recordTaskExecution(cacheRec);
-                                m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.cached);
-
-                                BuildRecord b;
-                                if (m_stateRepo.getBuild(buildId, b))
-                                {
-                                    if (!b.executedTasks.canFind(tId))
-                                    {
-                                        b.executedTasks ~= tId;
-                                        m_stateRepo.recordBuild(b);
-                                    }
-                                }
+                                recordTaskResult(buildId, tId, cacheRec);
+                                recordExecutedTask(buildId, tId);
 
                                 stateChanged = true;
                                 continue;
@@ -1230,9 +1244,9 @@ class BuildCoordinator
                     // Mark the task queued and record its demand before sending: a worker may receive
                     // the work order (moving the task to running) as soon as it is sent, and the
                     // capacity evaluation below counts only queued tasks.
-                    if (m_stateRepo !is null)
+                    if (m_stores !is null)
                     {
-                        m_stateRepo.setTaskStatus(buildId, tId, TaskStatus.queued);
+                        m_stores.legacyBuilds.setTaskStatus(buildId, tId, TaskStatus.queued);
                     }
                     pActive.queuedDemand[tId] = QueueDemand(executorType, 1, requirements);
                     if (m_dispatchQueue !is null)
@@ -1245,7 +1259,7 @@ class BuildCoordinator
                 {
                     // A task that cannot be dispatched fails, so the build fails rather than
                     // waiting forever for a work order that was never sent.
-                    if (m_stateRepo is null) throw e;
+                    if (m_stores is null) throw e;
                     failDispatch(*pActive, tId, registeredFingerprint, e.msg, haveNode ? &node : null);
                     dispatchFailed = true;
                     continue;
@@ -1268,9 +1282,9 @@ class BuildCoordinator
         }
 
         // 5. Check if all target tasks are finished
-        if (m_stateRepo !is null)
+        if (m_stores !is null)
         {
-            statuses = m_stateRepo.getTaskStatusesForBuild(buildId);
+            statuses = m_stores.legacyBuilds.getTaskStatusesForBuild(buildId);
         }
 
         bool allCompleted = true;
@@ -1295,15 +1309,12 @@ class BuildCoordinator
             string finalStatus = allCached ? "cached" : "succeeded";
             logInfo("[coordinator] Build '%s' completed successfully with status '%s'", buildId, finalStatus);
 
-            if (m_stateRepo !is null)
+            if (m_stores !is null)
             {
-                BuildRecord b;
-                if (m_stateRepo.getBuild(buildId, b))
-                {
+                updateBuildIfRecorded(buildId, (ref BuildRecord b) {
                     b.status = finalStatus;
                     b.finishedAt = Clock.currTime.toISOString();
-                    m_stateRepo.recordBuild(b);
-                }
+                });
             }
 
             m_inFlightRegistry.unsubscribeBuild(buildId);
@@ -1362,14 +1373,15 @@ version (unittest)
 
 unittest
 {
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
 
     // Unit tests for BuildCoordinator
     auto storage = new InMemoryArtifactStorage();
-    auto stateRepo = new InMemoryBuildStateRepository();
+    auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
-    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "http://127.0.0.1:8080");
+    auto coordinator = new BuildCoordinator(storage, stores, queue, null, "http://127.0.0.1:8080");
 
     // 1. Single Task Graph
     TaskNode singleTask;
@@ -1398,7 +1410,7 @@ unittest
     coordinator.onTaskCompleted(b1, "lint", res1);
 
     BuildRecord b1Rec;
-    assert(stateRepo.getBuild(b1, b1Rec));
+    assert(stores.legacyBuilds.getBuild(b1, b1Rec));
     assert(b1Rec.status == "succeeded");
     assert(b1Rec.executedTasks == ["lint"]);
 
@@ -1455,7 +1467,7 @@ unittest
     coordinator.onTaskCompleted(bLinear, "C", resC);
 
     BuildRecord bLinearRec;
-    assert(stateRepo.getBuild(bLinear, bLinearRec));
+    assert(stores.legacyBuilds.getBuild(bLinear, bLinearRec));
     assert(bLinearRec.status == "succeeded");
     assert(bLinearRec.executedTasks.length == 3);
 
@@ -1525,7 +1537,7 @@ unittest
     coordinator.onTaskCompleted(bDiamond, "merge", resMerge);
 
     BuildRecord bDiamondRec;
-    assert(stateRepo.getBuild(bDiamond, bDiamondRec));
+    assert(stores.legacyBuilds.getBuild(bDiamond, bDiamondRec));
     assert(bDiamondRec.status == "succeeded");
 
     // 4. Failure Early Termination
@@ -1544,17 +1556,17 @@ unittest
     assert(countReceivable(queue) == 0);
 
     BuildRecord bFailRec;
-    assert(stateRepo.getBuild(bFail, bFailRec));
+    assert(stores.legacyBuilds.getBuild(bFail, bFailRec));
     assert(bFailRec.status == "failed");
     assert(bFailRec.errorMessage == "Compiler syntax error");
 
     TaskStatus statusB;
-    assert(stateRepo.getTaskStatus(bFail, "B", statusB));
+    assert(stores.legacyBuilds.getTaskStatus(bFail, "B", statusB));
     assert(statusB == TaskStatus.cancelled);
 
     // 5. In-Flight Task Coalescing & Multi-Build Notification
     {
-        auto coord5 = new BuildCoordinator(storage, stateRepo, queue);
+        auto coord5 = new BuildCoordinator(storage, stores, queue);
 
         TaskNode taskRoot;
         taskRoot.id = "fetch";
@@ -1592,7 +1604,7 @@ unittest
 
         // Build 2 (targeting only "fetch") should now be completed!
         BuildRecord b2Rec;
-        assert(stateRepo.getBuild(b2_coalesce, b2Rec));
+        assert(stores.legacyBuilds.getBuild(b2_coalesce, b2Rec));
         assert(b2Rec.status == "succeeded");
         assert(b2Rec.executedTasks.canFind("fetch"));
 
@@ -1610,14 +1622,14 @@ unittest
         coord5.onTaskCompleted(b1_coalesce, "process", resProc);
 
         BuildRecord b1Rec_c;
-        assert(stateRepo.getBuild(b1_coalesce, b1Rec_c));
+        assert(stores.legacyBuilds.getBuild(b1_coalesce, b1Rec_c));
         assert(b1Rec_c.status == "succeeded");
         assert(b1Rec_c.executedTasks.length == 2);
     }
 
     // 6. Cache Hit Subgraph Short-Circuiting
     {
-        auto coord6 = new BuildCoordinator(storage, stateRepo, queue);
+        auto coord6 = new BuildCoordinator(storage, stores, queue);
 
         TaskNode taskAlpha;
         taskAlpha.id = "alpha";
@@ -1656,7 +1668,7 @@ unittest
         coord6.onTaskCompleted(bFirst, "beta", resBeta);
 
         BuildRecord bFirstRec;
-        assert(stateRepo.getBuild(bFirst, bFirstRec));
+        assert(stores.legacyBuilds.getBuild(bFirst, bFirstRec));
         assert(bFirstRec.status == "succeeded");
 
         // Second run with identical inputs and force=false: full cache hit!
@@ -1665,19 +1677,19 @@ unittest
         assert(countReceivable(queue) == 0);
 
         BuildRecord bCachedRec;
-        assert(stateRepo.getBuild(bCached, bCachedRec));
+        assert(stores.legacyBuilds.getBuild(bCached, bCachedRec));
         assert(bCachedRec.status == "cached");
 
         TaskStatus stAlpha, stBeta;
-        assert(stateRepo.getTaskStatus(bCached, "alpha", stAlpha));
+        assert(stores.legacyBuilds.getTaskStatus(bCached, "alpha", stAlpha));
         assert(stAlpha == TaskStatus.cached);
-        assert(stateRepo.getTaskStatus(bCached, "beta", stBeta));
+        assert(stores.legacyBuilds.getTaskStatus(bCached, "beta", stBeta));
         assert(stBeta == TaskStatus.cached);
     }
 
     // 7. Multi-Build In-Flight Cancellation Isolation
     {
-        auto coord7 = new BuildCoordinator(storage, stateRepo, queue);
+        auto coord7 = new BuildCoordinator(storage, stores, queue);
 
         TaskNode taskShared;
         taskShared.id = "shared_task";
@@ -1697,7 +1709,7 @@ unittest
         coord7.cancelBuild(bCancel1);
 
         BuildRecord bCancel1Rec;
-        assert(stateRepo.getBuild(bCancel1, bCancel1Rec));
+        assert(stores.legacyBuilds.getBuild(bCancel1, bCancel1Rec));
         assert(bCancel1Rec.status == "cancelled");
 
         // Complete shared task
@@ -1710,18 +1722,18 @@ unittest
 
         // Build 1 was NOT cancelled and should receive completion successfully
         BuildRecord bCancel2Rec;
-        assert(stateRepo.getBuild(bCancel2, bCancel2Rec));
+        assert(stores.legacyBuilds.getBuild(bCancel2, bCancel2Rec));
         assert(bCancel2Rec.status == "succeeded");
 
         // Build 1 must remain cancelled
         BuildRecord bCancel1RecAfter;
-        assert(stateRepo.getBuild(bCancel1, bCancel1RecAfter));
+        assert(stores.legacyBuilds.getBuild(bCancel1, bCancel1RecAfter));
         assert(bCancel1RecAfter.status == "cancelled");
     }
 
     // 8. Only-Subscriber Cancellation Edge Case: Cancelled build should not be overwritten by completion
     {
-        auto coord8 = new BuildCoordinator(storage, stateRepo, queue);
+        auto coord8 = new BuildCoordinator(storage, stores, queue);
 
         TaskNode taskSolo;
         taskSolo.id = "solo_task";
@@ -1740,7 +1752,7 @@ unittest
         coord8.cancelBuild(bSolo);
 
         BuildRecord bSoloRecCancelled;
-        assert(stateRepo.getBuild(bSolo, bSoloRecCancelled));
+        assert(stores.legacyBuilds.getBuild(bSolo, bSoloRecCancelled));
         assert(bSoloRecCancelled.status == "cancelled");
 
         // Worker reports completion for the task
@@ -1753,18 +1765,18 @@ unittest
 
         // Build must remain cancelled, not be overwritten to succeeded
         BuildRecord bSoloRecAfter;
-        assert(stateRepo.getBuild(bSolo, bSoloRecAfter));
+        assert(stores.legacyBuilds.getBuild(bSolo, bSoloRecAfter));
         assert(bSoloRecAfter.status == "cancelled", "Cancelled build should remain cancelled after task completion");
 
         // Task status should also remain cancelled, not be overwritten to succeeded
         TaskStatus taskStatusAfter;
-        assert(stateRepo.getTaskStatus(bSolo, "solo_task", taskStatusAfter));
+        assert(stores.legacyBuilds.getTaskStatus(bSolo, "solo_task", taskStatusAfter));
         assert(taskStatusAfter == TaskStatus.cancelled, "Task status should remain cancelled for cancelled build");
     }
 
     // 9. Structured WorkOrder Construction & Tag Resolution
     {
-        auto coord9 = new BuildCoordinator(storage, stateRepo, queue);
+        auto coord9 = new BuildCoordinator(storage, stores, queue);
 
         TaskNode gpuTask;
         gpuTask.id = "train_model";
@@ -1808,13 +1820,13 @@ unittest
         coord9.onTaskCompleted(bWorkOrder, "train_model", resGpu);
 
         BuildRecord bWorkOrderRec;
-        assert(stateRepo.getBuild(bWorkOrder, bWorkOrderRec));
+        assert(stores.legacyBuilds.getBuild(bWorkOrder, bWorkOrderRec));
         assert(bWorkOrderRec.status == "succeeded");
     }
 
     // 10. Queue Message Acknowledgment & stepBuild Progression
     {
-        auto coord10 = new BuildCoordinator(storage, stateRepo, queue);
+        auto coord10 = new BuildCoordinator(storage, stores, queue);
 
         TaskNode step1;
         step1.id = "step1";
@@ -1866,7 +1878,7 @@ unittest
         coord10.onTaskCompleted(bAck, "step2", resStep2, deqStep2[0].receipt);
 
         BuildRecord bAckRec;
-        assert(stateRepo.getBuild(bAck, bAckRec));
+        assert(stores.legacyBuilds.getBuild(bAck, bAckRec));
         assert(bAckRec.status == "succeeded");
     }
 }
@@ -1949,21 +1961,22 @@ unittest
     // A chain resolves the whole DAG once, stores resolved inputs for every task, and later
     // requests on the chain reuse them without resolving again or reading the edited project
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
     import vibe.data.json : Json;
 
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto queue = new InMemoryDispatchQueue();
     auto resolver = new FakeRepositoryResolver();
-    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue, null, "", resolver);
+    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stores, queue, null, "", resolver);
 
     auto project = variantsProject();
     string internalBuild = coordinator.startBuild(project, "internal");
     assert(resolver.calls == 1, "game@main is declared three times but must be resolved once");
 
     BuildRecord chainRecord;
-    assert(stateRepo.getBuild(internalBuild, chainRecord));
+    assert(stores.legacyBuilds.getBuild(internalBuild, chainRecord));
     assert(chainRecord.chainId == internalBuild);
     assert(chainRecord.chainTasks.length == 3, "Every task is in the chain, including the untargeted external build");
     foreach (ref task; chainRecord.chainTasks)
@@ -1999,7 +2012,7 @@ unittest
     edited.tasks[0].inputs = ["src": repositoryInput("game", "release")];
     edited.tasks[2].inputs = ["bin": taskOutputInput("compile"), "flavor": valueInput("changed")];
     edited.tasks[2].steps = [BuildStep("External", "bash", null, "echo external v2")];
-    stateRepo.saveProject(edited);
+    stores.projects.put(edited);
 
     // Building the not-yet-run external task in the chain: no resolution, chain fingerprints,
     // compile reused from cache, frozen inputs with the current configuration
@@ -2007,12 +2020,12 @@ unittest
     assert(resolver.calls == 1, "Building a task of an existing chain must not resolve again");
 
     BuildRecord externalRecord;
-    assert(stateRepo.getBuild(externalBuild, externalRecord));
+    assert(stores.legacyBuilds.getBuild(externalBuild, externalRecord));
     assert(externalRecord.chainId == internalBuild);
     assert(chainResolutionBeforeReruns(project.id, externalRecord.chainTasks).fingerprints == expected);
 
     TaskStatus compileStatus;
-    assert(stateRepo.getTaskStatus(externalBuild, "compile", compileStatus) && compileStatus == TaskStatus.cached);
+    assert(stores.legacyBuilds.getTaskStatus(externalBuild, "compile", compileStatus) && compileStatus == TaskStatus.cached);
     auto external = completeNext(coordinator, queue, "external");
     assert(external.fingerprint == expected["external"]);
     assert(external.taskNode.inputs["flavor"] == valueInput("external"), "Inputs come from the chain");
@@ -2024,7 +2037,7 @@ unittest
     assert(external.payload.repositoryAddresses.length == 0);
 
     BuildRecord externalDone;
-    assert(stateRepo.getBuild(externalBuild, externalDone) && externalDone.status == "succeeded");
+    assert(stores.legacyBuilds.getBuild(externalBuild, externalDone) && externalDone.status == "succeeded");
 
     // A task that is not in the chain cannot be built in it
     bool threw = false;
@@ -2037,7 +2050,7 @@ unittest
     string newBuild = coordinator.startBuild(edited, "compile", true);
     assert(resolver.calls == 3);
     BuildRecord newRecord;
-    assert(stateRepo.getBuild(newBuild, newRecord) && newRecord.chainId == newBuild);
+    assert(stores.legacyBuilds.getBuild(newBuild, newRecord) && newRecord.chainId == newBuild);
     assert(chainResolutionBeforeReruns(edited.id, newRecord.chainTasks).fingerprints["compile"] != expected["compile"]);
 }
 
@@ -2046,18 +2059,19 @@ unittest
     // A restarted coordinator resumes a build from its chain: no resolution and no fingerprints
     // or structure from the project as edited meanwhile (bug confector-3qh)
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto storage = new InMemoryArtifactStorage();
     auto queue = new InMemoryDispatchQueue();
     auto project = variantsProject();
 
-    auto before = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto before = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
     string buildId = before.startBuild(project, "internal", true);
     BuildRecord record;
-    assert(stateRepo.getBuild(buildId, record));
+    assert(stores.legacyBuilds.getBuild(buildId, record));
     auto expected = chainResolutionBeforeReruns(project.id, record.chainTasks).fingerprints;
 
     auto compileOrder = receiveWorkOrders(queue, 1)[0];
@@ -2066,11 +2080,11 @@ unittest
     edited.tasks = project.tasks.dup;
     edited.tasks[1].inputs = ["bin": taskOutputInput("compile"), "src": repositoryInput("game", "release"),
         "flavor": valueInput("internal"), "extra": valueInput("x")];
-    stateRepo.saveProject(edited);
+    stores.projects.put(edited);
 
     auto resolverAfter = new FakeRepositoryResolver();
     resolverAfter.liveSha = "ccc333";
-    auto after = new BuildCoordinator(storage, stateRepo, queue, null, "", resolverAfter);
+    auto after = new BuildCoordinator(storage, stores, queue, null, "", resolverAfter);
     TaskExecutionResult done;
     done.taskId = "compile";
     done.buildId = buildId;
@@ -2086,13 +2100,13 @@ unittest
     // A task deleted from the project fails loudly when its chain asks to build it
     ProjectRecord shrunk = project;
     shrunk.tasks = project.tasks[0 .. 2].dup;
-    stateRepo.saveProject(shrunk);
-    const buildsBefore = stateRepo.listBuilds().length;
+    stores.projects.put(shrunk);
+    const buildsBefore = stores.legacyBuilds.listBuilds().length;
     bool threw = false;
     try after.buildInChain(buildId, "external");
     catch (Exception ex) threw = ex.msg.canFind("deleted from project");
     assert(threw);
-    assert(stateRepo.listBuilds().length == buildsBefore, "A rejected request must not record a build");
+    assert(stores.legacyBuilds.listBuilds().length == buildsBefore, "A rejected request must not record a build");
     assert(countReceivable(queue) == 0, "A rejected request must not dispatch work");
 }
 
@@ -2101,14 +2115,15 @@ unittest
     // A failed resolution fails chain creation loudly: nothing is recorded or dispatched
     import confector.core.input_resolution : InputResolutionException;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto queue = new InMemoryDispatchQueue();
     auto resolver = new FakeRepositoryResolver();
     resolver.fail = true;
-    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue, null, "", resolver);
+    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stores, queue, null, "", resolver);
 
     string failure(BuildCoordinator c, ProjectRecord p)
     {
@@ -2126,7 +2141,7 @@ unittest
     auto unknown = variantsProject();
     unknown.tasks[0].inputs = ["src": repositoryInput("tools", "main")];
     assert(failure(coordinator, unknown).canFind("'tools'"));
-    auto noResolver = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue);
+    auto noResolver = new BuildCoordinator(new InMemoryArtifactStorage(), stores, queue);
     assert(failure(noResolver, variantsProject()).canFind("no repository resolver"));
 
     // An empty ref selector: there is no default branch
@@ -2136,7 +2151,7 @@ unittest
     assert(failure(coordinator, noRef).canFind("no ref selector"));
     assert(resolver.calls == callsBefore);
 
-    assert(stateRepo.listBuilds().length == 0, "A failed chain creation must not record a build");
+    assert(stores.legacyBuilds.listBuilds().length == 0, "A failed chain creation must not record a build");
     assert(countReceivable(queue) == 0, "A failed chain creation must not dispatch work");
 }
 
@@ -2145,21 +2160,22 @@ unittest
     // A repository input whose repository has no address cannot be dispatched: there would be
     // nothing to check it out from
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
-    auto stateRepo = new InMemoryBuildStateRepository();
+    auto stores = new StateStores(new InMemoryDocumentStore());
     RepositoryRecord noAddress = gameRepository();
     noAddress.address = "";
-    stateRepo.saveRepository(noAddress);
+    stores.repositories.put(noAddress);
     auto queue = new InMemoryDispatchQueue();
-    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), stores, queue, null, "", new FakeRepositoryResolver());
 
     bool threw = false;
     try coordinator.startBuild(variantsProject(), "compile");
     catch (Exception ex) threw = ex.msg.canFind("'src'") && ex.msg.canFind("no address");
     assert(threw);
     assert(countReceivable(queue) == 0);
-    assert(stateRepo.listBuilds().length == 0, "The request must fail before a build is recorded");
+    assert(stores.legacyBuilds.listBuilds().length == 0, "The request must fail before a build is recorded");
     assert(coordinator.m_activeBuilds.length == 0, "No active build may remain");
 }
 
@@ -2169,23 +2185,24 @@ unittest
     // build waiting forever: here a restarted coordinator resumes a build whose next task was
     // deleted from the project meanwhile
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto storage = new InMemoryArtifactStorage();
     auto queue = new InMemoryDispatchQueue();
     auto project = variantsProject();
 
-    auto before = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto before = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
     string buildId = before.startBuild(project, "internal", true);
     auto compileOrder = receiveWorkOrders(queue, 1)[0];
 
     ProjectRecord shrunk = project;
     shrunk.tasks = [project.tasks[0], project.tasks[2]];
-    stateRepo.saveProject(shrunk);
+    stores.projects.put(shrunk);
 
-    auto after = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto after = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
     TaskExecutionResult done;
     done.taskId = "compile";
     done.buildId = buildId;
@@ -2194,11 +2211,11 @@ unittest
     after.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
 
     TaskStatus internalStatus;
-    assert(stateRepo.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.failed);
+    assert(stores.legacyBuilds.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.failed);
     TaskExecutionRecord internalRec;
-    assert(stateRepo.getTaskExecution(buildId, "internal", internalRec) && internalRec.errorMessage.canFind("deleted from project"));
+    assert(stores.legacyBuilds.getTaskExecution(buildId, "internal", internalRec) && internalRec.errorMessage.canFind("deleted from project"));
     BuildRecord record;
-    assert(stateRepo.getBuild(buildId, record) && record.status == "failed");
+    assert(stores.legacyBuilds.getBuild(buildId, record) && record.status == "failed");
     assert(after.m_activeBuilds.length == 0 && after.inFlightRegistry.inFlightCount() == 0);
     assert(countReceivable(queue) == 0);
 }
@@ -2209,13 +2226,14 @@ unittest
     // changed since a cached result) fails the downstream task before dispatch, naming the
     // upstream task, its fingerprint and the artifact; an artifact it has dispatches normally
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
     auto storage = new InMemoryArtifactStorage();
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto queue = new InMemoryDispatchQueue();
-    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto coordinator = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
 
     auto project = variantsProject();
     project.tasks[1].inputs["bin"] = taskOutputInput("compile", "game.zip");
@@ -2241,14 +2259,14 @@ unittest
     // external, built later in the chain, wants tools.zip, which the cached compile result lacks
     string externalBuild = coordinator.buildInChain(buildId, "external");
     TaskStatus externalStatus;
-    assert(stateRepo.getTaskStatus(externalBuild, "external", externalStatus) && externalStatus == TaskStatus.failed);
+    assert(stores.legacyBuilds.getTaskStatus(externalBuild, "external", externalStatus) && externalStatus == TaskStatus.failed);
     TaskExecutionRecord externalRec;
-    assert(stateRepo.getTaskExecution(externalBuild, "external", externalRec));
+    assert(stores.legacyBuilds.getTaskExecution(externalBuild, "external", externalRec));
     assert(externalRec.definitionHash.length == 64 && externalRec.definition.id == "external", "A task that could not be dispatched still records its definition");
     assert(externalRec.errorMessage.canFind("'compile'") && externalRec.errorMessage.canFind(compileOrder.workOrder.fingerprint)
         && externalRec.errorMessage.canFind("'tools.zip'") && externalRec.errorMessage.canFind("Re-run task 'compile'"), externalRec.errorMessage);
     BuildRecord externalRecord;
-    assert(stateRepo.getBuild(externalBuild, externalRecord) && externalRecord.status == "failed");
+    assert(stores.legacyBuilds.getBuild(externalBuild, externalRecord) && externalRecord.status == "failed");
     assert(countReceivable(queue) == 0, "A task with a missing upstream artifact must not be dispatched");
 }
 
@@ -2258,13 +2276,14 @@ unittest
     // result, a failed one, and one resolved from the cache
     import confector.core.definition_hash : computeDefinitionHash;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
     auto storage = new InMemoryArtifactStorage();
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto queue = new InMemoryDispatchQueue();
-    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto coordinator = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
 
     auto project = variantsProject();
     string buildId = coordinator.startBuild(project, "internal");
@@ -2277,7 +2296,7 @@ unittest
     coordinator.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
 
     TaskExecutionRecord compileRec;
-    assert(stateRepo.getTaskExecution(buildId, "compile", compileRec));
+    assert(stores.legacyBuilds.getTaskExecution(buildId, "compile", compileRec));
     assert(compileRec.definitionHash == computeDefinitionHash(project.tasks[0]));
     assert(compileRec.definition.steps[0].script == "echo compile");
 
@@ -2289,7 +2308,7 @@ unittest
     failed.fingerprint = internalOrder.workOrder.fingerprint;
     coordinator.onTaskCompleted(buildId, "internal", failed, internalOrder.receipt);
     TaskExecutionRecord internalRec;
-    assert(stateRepo.getTaskExecution(buildId, "internal", internalRec));
+    assert(stores.legacyBuilds.getTaskExecution(buildId, "internal", internalRec));
     assert(internalRec.status == "failed" && internalRec.definitionHash == computeDefinitionHash(project.tasks[1]));
 
     // The compile step is edited; the fingerprint does not change, so compile is resolved from
@@ -2297,10 +2316,10 @@ unittest
     ProjectRecord edited = project;
     edited.tasks = project.tasks.dup;
     edited.tasks[0].steps = [BuildStep("Compile", "bash", null, "echo compile v2")];
-    stateRepo.saveProject(edited);
+    stores.projects.put(edited);
     string externalBuild = coordinator.buildInChain(buildId, "external");
     TaskExecutionRecord cachedRec;
-    assert(stateRepo.getTaskExecution(externalBuild, "compile", cachedRec));
+    assert(stores.legacyBuilds.getTaskExecution(externalBuild, "compile", cachedRec));
     assert(cachedRec.status == "cached" && cachedRec.definitionHash == computeDefinitionHash(project.tasks[0]));
     assert(cachedRec.definitionHash != computeDefinitionHash(edited.tasks[0]));
     assert(cachedRec.definition.steps[0].script == "echo compile");
@@ -2313,22 +2332,23 @@ unittest
     // task was deleted from the project) never drops the completion
     import confector.core.definition_hash : computeDefinitionHash;
     import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+    import confector.core.test_storage : InMemoryArtifactStorage;
+    import confector.core.memory_document_store : InMemoryDocumentStore;
 
     auto storage = new InMemoryArtifactStorage();
-    auto stateRepo = new InMemoryBuildStateRepository();
-    stateRepo.saveRepository(gameRepository());
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    stores.repositories.put(gameRepository());
     auto queue = new InMemoryDispatchQueue();
     auto project = variantsProject();
 
-    auto first = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    auto first = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
     string buildId = first.startBuild(project, "internal");
     auto compileOrder = receiveWorkOrders(queue, 1)[0];
 
     ProjectRecord edited = project;
     edited.tasks = project.tasks.dup;
     edited.tasks[0].steps = [BuildStep("Compile", "bash", null, "echo compile v2")];
-    stateRepo.saveProject(edited);
+    stores.projects.put(edited);
 
     TaskExecutionResult done;
     done.taskId = "compile";
@@ -2337,15 +2357,15 @@ unittest
     done.fingerprint = compileOrder.workOrder.fingerprint;
     first.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
     TaskExecutionRecord compileRec;
-    assert(stateRepo.getTaskExecution(buildId, "compile", compileRec));
+    assert(stores.legacyBuilds.getTaskExecution(buildId, "compile", compileRec));
     assert(compileRec.definitionHash == computeDefinitionHash(project.tasks[0]), "Recorded as dispatched, not as edited since");
 
     // Restart: the new coordinator has no dispatched definition, and the task is gone
     auto internalOrder = receiveWorkOrders(queue, 1)[0];
     ProjectRecord shrunk = project;
     shrunk.tasks = [project.tasks[0], project.tasks[2]];
-    stateRepo.saveProject(shrunk);
-    auto second = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    stores.projects.put(shrunk);
+    auto second = new BuildCoordinator(storage, stores, queue, null, "", new FakeRepositoryResolver());
     TaskExecutionResult internalDone;
     internalDone.taskId = "internal";
     internalDone.buildId = buildId;
@@ -2354,12 +2374,12 @@ unittest
     second.onTaskCompleted(buildId, "internal", internalDone, internalOrder.receipt);
 
     TaskStatus internalStatus;
-    assert(stateRepo.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.succeeded);
+    assert(stores.legacyBuilds.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.succeeded);
     TaskExecutionRecord internalRec;
-    assert(stateRepo.getTaskExecution(buildId, "internal", internalRec));
+    assert(stores.legacyBuilds.getTaskExecution(buildId, "internal", internalRec));
     assert(internalRec.status == "succeeded" && internalRec.definitionHash.length == 0);
     BuildRecord record;
-    assert(stateRepo.getBuild(buildId, record) && record.status == "succeeded", "The completion must still advance the build");
+    assert(stores.legacyBuilds.getBuild(buildId, record) && record.status == "succeeded", "The completion must still advance the build");
     CachedResult cached;
-    assert(stateRepo.getCachedFingerprint("internal", internalOrder.workOrder.fingerprint, cached));
+    assert(stores.resultCache.get(internalOrder.workOrder.fingerprint, cached));
 }

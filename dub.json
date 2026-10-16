@@ -29,7 +29,6 @@
     "./plugins/step_executor/powershell",
     "./plugins/worker/local_process",
     "./plugins/artifact/local",
-    "./plugins/storage/mongo",
     "./plugins/queue/mongo",
     "./plugins/document_store/mongo",
     "./plugins/scheduler/local",
@@ -45,7 +44,6 @@
         "powershell_runner": { "path": "plugins/step_executor/powershell" },
         "local_process": { "path": "plugins/worker/local_process" },
         "local_artifact": { "path": "plugins/artifact/local" },
-        "mongo_storage": { "path": "plugins/storage/mongo" },
         "mongo_queue": { "path": "plugins/queue/mongo" },
         "local_scheduler": { "path": "plugins/scheduler/local" }
       }
