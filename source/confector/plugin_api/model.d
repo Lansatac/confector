@@ -514,6 +514,22 @@ struct TaskExecutionRecord
     @optional @asName("duration_ms") ulong durationMs = 0;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
+    /// The task definition the execution ran with, and its hash (`computeDefinitionHash`), so a
+    /// result that predates a configuration change can be recognized. Not part of the fingerprint.
+    @optional @asName("definition") TaskNode definition;
+    @optional @asName("definition_hash") string definitionHash;
+}
+
+/**
+ * What a cache hit reuses: the artifacts a successful execution produced and the task
+ * definition (with its hash) that execution ran with, so a result resolved from the cache
+ * still shows the configuration it was built with.
+ */
+struct CachedResult
+{
+    @optional ArtifactMetadata[] artifacts;
+    @optional @asName("definition") TaskNode definition;
+    @optional @asName("definition_hash") string definitionHash;
 }
 
 /**
@@ -820,12 +836,12 @@ interface BuildStateRepository
     /**
      * Records a successful execution fingerprint for memoization.
      */
-    void saveCachedFingerprint(string taskId, string fingerprint, ArtifactMetadata[] producedArtifacts);
+    void saveCachedFingerprint(string taskId, string fingerprint, CachedResult result);
 
     /**
-     * Checks if a cached fingerprint is recorded and returns previously produced artifact metadata.
+     * Checks if a cached fingerprint is recorded and returns the result it reuses.
      */
-    bool getCachedFingerprint(string taskId, string fingerprint, out ArtifactMetadata[] producedArtifacts);
+    bool getCachedFingerprint(string taskId, string fingerprint, out CachedResult result);
 
     /**
      * Saves or updates a build execution record.

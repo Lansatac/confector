@@ -124,7 +124,7 @@ class InMemoryBuildStateRepository : BuildStateRepository
     private struct CacheRecord
     {
         string fingerprint;
-        ArtifactMetadata[] artifacts;
+        CachedResult result;
     }
 
     private TaskStatus[string] m_taskStatuses;
@@ -305,20 +305,20 @@ class InMemoryBuildStateRepository : BuildStateRepository
         return false;
     }
 
-    override void saveCachedFingerprint(string taskId, string fingerprint, ArtifactMetadata[] producedArtifacts)
+    override void saveCachedFingerprint(string taskId, string fingerprint, CachedResult result)
     {
         CacheRecord rec;
         rec.fingerprint = fingerprint;
-        rec.artifacts = producedArtifacts;
+        rec.result = result;
         m_fingerprintCache[cacheKey(taskId, fingerprint)] = rec;
     }
 
-    override bool getCachedFingerprint(string taskId, string fingerprint, out ArtifactMetadata[] producedArtifacts)
+    override bool getCachedFingerprint(string taskId, string fingerprint, out CachedResult result)
     {
         auto p = cacheKey(taskId, fingerprint) in m_fingerprintCache;
         if (p !is null)
         {
-            producedArtifacts = p.artifacts;
+            result = p.result;
             return true;
         }
         return false;

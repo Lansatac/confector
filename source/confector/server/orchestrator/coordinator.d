@@ -4,6 +4,7 @@ import confector.core.model;
 import confector.core.dag;
 import confector.core.storage;
 import confector.core.chain_resolver : resolveChain;
+import confector.core.definition_hash : recordDefinition;
 import confector.core.executor : CapacityBroker;
 import confector.core.input_resolution : GraphResolution, RerunGenerations, chainGraph;
 import confector.core.rerun_generations : readChainResolution;
@@ -240,6 +241,9 @@ class BuildCoordinator
     private Mutex m_mutex;
     private ActiveBuild[string] m_activeBuilds;
     private InFlightTaskRegistry m_inFlightRegistry;
+    /// The definition each in-flight execution was dispatched with, by fingerprint, to record
+    /// on its result. Lost on restart; see `completedDefinition`.
+    private TaskNode[string] m_dispatchedDefinitions;
     private RepositoryResolver m_repositoryResolver;
 
     /**
@@ -520,15 +524,17 @@ class BuildCoordinator
     /**
      * Records task `taskId` of `active` as failed because it could not be dispatched, and
      * forgets that it was sent: its in-flight registration (`registeredFingerprint`, empty if
-     * it was not registered yet) and queued demand. Must be called with m_mutex held.
+     * it was not registered yet) and queued demand. The record carries the task's definition
+     * when it is known (`node` is null if the task was deleted). Must be called with m_mutex held.
      */
-    private void failDispatch(ref ActiveBuild active, string taskId, string registeredFingerprint, string error)
+    private void failDispatch(ref ActiveBuild active, string taskId, string registeredFingerprint, string error, const(TaskNode)* node)
     {
         string message = format("Task '%s' could not be dispatched: %s", taskId, error);
         logError("[coordinator] Build '%s': %s", active.buildId, message);
         if (registeredFingerprint.length > 0)
         {
             m_inFlightRegistry.completeTask(registeredFingerprint);
+            m_dispatchedDefinitions.remove(registeredFingerprint);
         }
         active.enqueuedTasks.remove(taskId);
         active.queuedDemand.remove(taskId);
@@ -541,6 +547,7 @@ class BuildCoordinator
         rec.errorMessage = message;
         rec.exitCode = 1;
         rec.finishedAt = Clock.currTime.toISOString();
+        if (node !is null) recordDefinition(rec, *node);
         m_stateRepo.recordTaskExecution(rec);
         m_stateRepo.setTaskStatus(active.buildId, taskId, TaskStatus.failed, message);
     }
@@ -562,9 +569,9 @@ class BuildCoordinator
             if (decl.spec.artifact.length == 0) continue;
 
             string upstreamFingerprint = input.pinned.get!string;
-            ArtifactMetadata[] produced;
-            if (!m_stateRepo.getCachedFingerprint(decl.spec.task, upstreamFingerprint, produced)) continue;
-            if (!produced.canFind!(meta => (meta.artifactId.length > 0 ? meta.artifactId : meta.filePath) == decl.spec.artifact))
+            CachedResult upstream;
+            if (!m_stateRepo.getCachedFingerprint(decl.spec.task, upstreamFingerprint, upstream)) continue;
+            if (!upstream.artifacts.canFind!(meta => (meta.artifactId.length > 0 ? meta.artifactId : meta.filePath) == decl.spec.artifact))
             {
                 throw new Exception(missingUpstreamArtifactMessage(decl.spec.task, upstreamFingerprint, decl.spec.artifact));
             }
@@ -627,6 +634,35 @@ class BuildCoordinator
         }
         throw new Exception(format("Task '%s' of build '%s' was deleted from project '%s' after its build chain was created",
             taskId, active.buildId, active.project.id));
+    }
+
+    /**
+     * Returns the build configuration of task `taskId` of build `buildId` as the project defines it
+     * now. Used to record a result's definition when the one the task was dispatched with is
+     * unknown, as after a restart, so it is the best available rather than certain. Throws if
+     * the build, its project or the task no longer exists.
+     */
+    private TaskNode completedDefinition(string buildId, string taskId)
+    {
+        if (auto active = buildId in m_activeBuilds)
+        {
+            return dispatchTask(*active, taskId);
+        }
+        BuildRecord build;
+        if (!m_stateRepo.getBuild(buildId, build))
+        {
+            throw new Exception(format("Build '%s' does not exist", buildId));
+        }
+        ProjectRecord project;
+        if (!m_stateRepo.getProject(build.projectId, project))
+        {
+            throw new Exception(format("Project '%s' of build '%s' does not exist", build.projectId, buildId));
+        }
+        foreach (task; project.tasks)
+        {
+            if (task.id == taskId) return task;
+        }
+        throw new Exception(format("Task '%s' of build '%s' was deleted from project '%s'", taskId, buildId, build.projectId));
     }
 
     /**
@@ -735,6 +771,16 @@ class BuildCoordinator
 
                 string[] buildsToEvaluate;
 
+                // The definition the execution was dispatched with, if this process dispatched it
+                TaskNode dispatched;
+                bool haveDispatched = false;
+                if (auto p = fingerprint in m_dispatchedDefinitions)
+                {
+                    dispatched = *p;
+                    haveDispatched = true;
+                    m_dispatchedDefinitions.remove(fingerprint);
+                }
+
                 foreach (sub; subscribers)
                 {
                     string subBuildId = sub.buildId;
@@ -744,6 +790,18 @@ class BuildCoordinator
                     TaskExecutionRecord rec;
                     rec.buildId = subBuildId;
                     rec.taskId = subTaskId;
+                    if (m_stateRepo !is null)
+                    {
+                        // A missing definition must never drop the completion
+                        try
+                        {
+                            recordDefinition(rec, haveDispatched ? dispatched : completedDefinition(subBuildId, subTaskId));
+                        }
+                        catch (Exception e)
+                        {
+                            logError("[coordinator] Build '%s': recording task '%s' without its definition: %s", subBuildId, subTaskId, e.msg);
+                        }
+                    }
                     rec.status = cast(string)result.status;
                     rec.fingerprint = (result.fingerprint.length > 0) ? result.fingerprint : fingerprint;
                     rec.exitCode = result.exitCode;
@@ -766,7 +824,8 @@ class BuildCoordinator
                         if ((result.status == TaskStatus.succeeded || result.status == TaskStatus.cached)
                             && rec.fingerprint.length > 0)
                         {
-                            m_stateRepo.saveCachedFingerprint(subTaskId, rec.fingerprint, result.producedArtifacts);
+                            m_stateRepo.saveCachedFingerprint(subTaskId, rec.fingerprint,
+                                CachedResult(result.producedArtifacts, rec.definition, rec.definitionHash));
                         }
 
                         // Update build executedTasks list
@@ -1017,18 +1076,22 @@ class BuildCoordinator
                 }
 
                 string registeredFingerprint;
+                TaskNode node;
+                bool haveNode = false;
                 try
                 {
-                    TaskNode node = dispatchTask(active, tId);
+                    node = dispatchTask(active, tId);
+                    haveNode = true;
 
                     // 3. Cache check using the fingerprint computed from the build's chain
                     string fingerprint = chainFingerprint(active, tId);
 
                     if (!active.force && fingerprint.length > 0 && m_stateRepo !is null)
                     {
-                        ArtifactMetadata[] cachedArtifacts;
-                        if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedArtifacts))
+                        CachedResult cachedResult;
+                        if (m_stateRepo.getCachedFingerprint(tId, fingerprint, cachedResult))
                         {
+                            auto cachedArtifacts = cachedResult.artifacts;
                             // Verify artifacts exist in stream storage by (taskFingerprint, artifactId)
                             bool allValid = true;
                             foreach (meta; cachedArtifacts)
@@ -1053,6 +1116,8 @@ class BuildCoordinator
                                 TaskExecutionRecord cacheRec;
                                 cacheRec.buildId = buildId;
                                 cacheRec.taskId = tId;
+                                cacheRec.definition = cachedResult.definition;
+                                cacheRec.definitionHash = cachedResult.definitionHash;
                                 cacheRec.status = "cached";
                                 cacheRec.fingerprint = fingerprint;
                                 cacheRec.producedArtifacts = cachedArtifacts;
@@ -1097,6 +1162,7 @@ class BuildCoordinator
                         continue;
                     }
                     registeredFingerprint = fingerprint;
+                    m_dispatchedDefinitions[fingerprint] = node;
 
                     TaskExecutionPayload payload;
                     payload.inputs = inputs;
@@ -1180,7 +1246,7 @@ class BuildCoordinator
                     // A task that cannot be dispatched fails, so the build fails rather than
                     // waiting forever for a work order that was never sent.
                     if (m_stateRepo is null) throw e;
-                    failDispatch(*pActive, tId, registeredFingerprint, e.msg);
+                    failDispatch(*pActive, tId, registeredFingerprint, e.msg, haveNode ? &node : null);
                     dispatchFailed = true;
                     continue;
                 }
@@ -2178,9 +2244,122 @@ unittest
     assert(stateRepo.getTaskStatus(externalBuild, "external", externalStatus) && externalStatus == TaskStatus.failed);
     TaskExecutionRecord externalRec;
     assert(stateRepo.getTaskExecution(externalBuild, "external", externalRec));
+    assert(externalRec.definitionHash.length == 64 && externalRec.definition.id == "external", "A task that could not be dispatched still records its definition");
     assert(externalRec.errorMessage.canFind("'compile'") && externalRec.errorMessage.canFind(compileOrder.workOrder.fingerprint)
         && externalRec.errorMessage.canFind("'tools.zip'") && externalRec.errorMessage.canFind("Re-run task 'compile'"), externalRec.errorMessage);
     BuildRecord externalRecord;
     assert(stateRepo.getBuild(externalBuild, externalRecord) && externalRecord.status == "failed");
     assert(countReceivable(queue) == 0, "A task with a missing upstream artifact must not be dispatched");
+}
+
+unittest
+{
+    // Every execution result records the definition it ran with and its hash: an executed
+    // result, a failed one, and one resolved from the cache
+    import confector.core.definition_hash : computeDefinitionHash;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto storage = new InMemoryArtifactStorage();
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto queue = new InMemoryDispatchQueue();
+    auto coordinator = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+
+    auto project = variantsProject();
+    string buildId = coordinator.startBuild(project, "internal");
+    auto compileOrder = receiveWorkOrders(queue, 1)[0];
+    TaskExecutionResult done;
+    done.taskId = "compile";
+    done.buildId = buildId;
+    done.status = TaskStatus.succeeded;
+    done.fingerprint = compileOrder.workOrder.fingerprint;
+    coordinator.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+
+    TaskExecutionRecord compileRec;
+    assert(stateRepo.getTaskExecution(buildId, "compile", compileRec));
+    assert(compileRec.definitionHash == computeDefinitionHash(project.tasks[0]));
+    assert(compileRec.definition.steps[0].script == "echo compile");
+
+    auto internalOrder = receiveWorkOrders(queue, 1)[0];
+    TaskExecutionResult failed;
+    failed.taskId = "internal";
+    failed.buildId = buildId;
+    failed.status = TaskStatus.failed;
+    failed.fingerprint = internalOrder.workOrder.fingerprint;
+    coordinator.onTaskCompleted(buildId, "internal", failed, internalOrder.receipt);
+    TaskExecutionRecord internalRec;
+    assert(stateRepo.getTaskExecution(buildId, "internal", internalRec));
+    assert(internalRec.status == "failed" && internalRec.definitionHash == computeDefinitionHash(project.tasks[1]));
+
+    // The compile step is edited; the fingerprint does not change, so compile is resolved from
+    // the cache, and that record carries the definition of the execution that built it
+    ProjectRecord edited = project;
+    edited.tasks = project.tasks.dup;
+    edited.tasks[0].steps = [BuildStep("Compile", "bash", null, "echo compile v2")];
+    stateRepo.saveProject(edited);
+    string externalBuild = coordinator.buildInChain(buildId, "external");
+    TaskExecutionRecord cachedRec;
+    assert(stateRepo.getTaskExecution(externalBuild, "compile", cachedRec));
+    assert(cachedRec.status == "cached" && cachedRec.definitionHash == computeDefinitionHash(project.tasks[0]));
+    assert(cachedRec.definitionHash != computeDefinitionHash(edited.tasks[0]));
+    assert(cachedRec.definition.steps[0].script == "echo compile");
+}
+
+unittest
+{
+    // A result is recorded with the definition its task was dispatched with, even if the project
+    // is edited while it runs; and a definition that cannot be found (here, after a restart the
+    // task was deleted from the project) never drops the completion
+    import confector.core.definition_hash : computeDefinitionHash;
+    import confector.core.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
+
+    auto storage = new InMemoryArtifactStorage();
+    auto stateRepo = new InMemoryBuildStateRepository();
+    stateRepo.saveRepository(gameRepository());
+    auto queue = new InMemoryDispatchQueue();
+    auto project = variantsProject();
+
+    auto first = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    string buildId = first.startBuild(project, "internal");
+    auto compileOrder = receiveWorkOrders(queue, 1)[0];
+
+    ProjectRecord edited = project;
+    edited.tasks = project.tasks.dup;
+    edited.tasks[0].steps = [BuildStep("Compile", "bash", null, "echo compile v2")];
+    stateRepo.saveProject(edited);
+
+    TaskExecutionResult done;
+    done.taskId = "compile";
+    done.buildId = buildId;
+    done.status = TaskStatus.succeeded;
+    done.fingerprint = compileOrder.workOrder.fingerprint;
+    first.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+    TaskExecutionRecord compileRec;
+    assert(stateRepo.getTaskExecution(buildId, "compile", compileRec));
+    assert(compileRec.definitionHash == computeDefinitionHash(project.tasks[0]), "Recorded as dispatched, not as edited since");
+
+    // Restart: the new coordinator has no dispatched definition, and the task is gone
+    auto internalOrder = receiveWorkOrders(queue, 1)[0];
+    ProjectRecord shrunk = project;
+    shrunk.tasks = [project.tasks[0], project.tasks[2]];
+    stateRepo.saveProject(shrunk);
+    auto second = new BuildCoordinator(storage, stateRepo, queue, null, "", new FakeRepositoryResolver());
+    TaskExecutionResult internalDone;
+    internalDone.taskId = "internal";
+    internalDone.buildId = buildId;
+    internalDone.status = TaskStatus.succeeded;
+    internalDone.fingerprint = internalOrder.workOrder.fingerprint;
+    second.onTaskCompleted(buildId, "internal", internalDone, internalOrder.receipt);
+
+    TaskStatus internalStatus;
+    assert(stateRepo.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.succeeded);
+    TaskExecutionRecord internalRec;
+    assert(stateRepo.getTaskExecution(buildId, "internal", internalRec));
+    assert(internalRec.status == "succeeded" && internalRec.definitionHash.length == 0);
+    BuildRecord record;
+    assert(stateRepo.getBuild(buildId, record) && record.status == "succeeded", "The completion must still advance the build");
+    CachedResult cached;
+    assert(stateRepo.getCachedFingerprint("internal", internalOrder.workOrder.fingerprint, cached));
 }

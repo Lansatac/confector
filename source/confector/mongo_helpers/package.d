@@ -8,7 +8,7 @@ import std.uuid : randomUUID;
 import vibe.data.json : serializeToJson, deserializeJson;
 
 public import kaleidic.mongo_standalone;
-import confector.plugin_api.model : ArtifactMetadata;
+import confector.plugin_api.model : ArtifactMetadata, CachedResult;
 
 /**
  * Serialize a struct to a JSON string for MongoDB storage.
@@ -148,6 +148,6 @@ struct FingerprintCacheEntry
 {
     string taskId;
     string fingerprint;
-    ArtifactMetadata[] artifacts;
+    CachedResult result;
     string cachedAt;
 }

@@ -189,14 +189,14 @@ class MongoStoragePlugin : StateStoragePlugin, BuildStateRepository
         return true;
     }
 
-    override void saveCachedFingerprint(string taskId, string fingerprint, ArtifactMetadata[] producedArtifacts)
+    override void saveCachedFingerprint(string taskId, string fingerprint, CachedResult result)
     {
-        auto cacheEntry = FingerprintCacheEntry(taskId, fingerprint, producedArtifacts, Clock.currTime.toISOString());
+        auto cacheEntry = FingerprintCacheEntry(taskId, fingerprint, result, Clock.currTime.toISOString());
         auto json = toJsonString(cacheEntry);
         m_db.upsert("fingerprint_cache", "task_id", taskId, json);
     }
 
-    override bool getCachedFingerprint(string taskId, string fingerprint, out ArtifactMetadata[] producedArtifacts)
+    override bool getCachedFingerprint(string taskId, string fingerprint, out CachedResult result)
     {
         auto json = m_db.findOne("fingerprint_cache", "task_id", taskId);
         if (json is null || json.length == 0)
@@ -204,7 +204,7 @@ class MongoStoragePlugin : StateStoragePlugin, BuildStateRepository
         auto entry = fromJsonString!FingerprintCacheEntry(json);
         if (entry.fingerprint != fingerprint)
             return false;
-        producedArtifacts = entry.artifacts;
+        result = entry.result;
         return true;
     }
 

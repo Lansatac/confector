@@ -8,7 +8,7 @@ public import confector.plugin_api.model : BuildStateRepository, ArtifactStorage
 unittest
 {
     import confector.core.test_storage : InMemoryArtifactStorage, InMemoryBuildStateRepository;
-    import confector.plugin_api.model : ArtifactMetadata, BuildRecord, TriggerRuleRecord, ProjectRecord, TaskNode, BuildStep, RepositoryRecord, TaskExecutionRecord, TaskStatus;
+    import confector.plugin_api.model : ArtifactMetadata, CachedResult, BuildRecord, TriggerRuleRecord, ProjectRecord, TaskNode, BuildStep, RepositoryRecord, TaskExecutionRecord, TaskStatus;
     auto storage = new InMemoryArtifactStorage();
     auto stateRepo = new InMemoryBuildStateRepository();
 
@@ -41,11 +41,17 @@ unittest
 
     ArtifactMetadata testMeta;
     testMeta.sha256 = "abc123";
-    stateRepo.saveCachedFingerprint("t1", "hash123", [testMeta]);
-    ArtifactMetadata[] cachedMetas;
-    assert(stateRepo.getCachedFingerprint("t1", "hash123", cachedMetas));
-    assert(cachedMetas.length == 1);
-    assert(cachedMetas[0].sha256 == "abc123");
+    CachedResult cachedResult;
+    cachedResult.artifacts = [testMeta];
+    cachedResult.definition.steps = [BuildStep("Build", "bash", null, "make")];
+    cachedResult.definitionHash = "hash_t1";
+    stateRepo.saveCachedFingerprint("t1", "hash123", cachedResult);
+    CachedResult cached;
+    assert(stateRepo.getCachedFingerprint("t1", "hash123", cached));
+    assert(cached.artifacts.length == 1);
+    assert(cached.artifacts[0].sha256 == "abc123");
+    assert(cached.definition.steps[0].script == "make");
+    assert(cached.definitionHash == "hash_t1");
 
     // Build recording and logging
     BuildRecord bRecord;
@@ -149,6 +155,9 @@ unittest
     taskRec.durationMs = 150;
     taskRec.producedArtifacts = [testMeta];
     taskRec.upstreamArtifactHashes = ["t0": "hash0"];
+    taskRec.definition.id = "t1";
+    taskRec.definition.steps = [BuildStep("Build", "bash", null, "make")];
+    taskRec.definitionHash = "hash_t1";
     stateRepo.recordTaskExecution(taskRec);
 
     TaskExecutionRecord fetchedTaskRec;
@@ -159,6 +168,8 @@ unittest
     assert(fetchedTaskRec.durationMs == 150);
     assert(fetchedTaskRec.producedArtifacts.length == 1);
     assert(fetchedTaskRec.upstreamArtifactHashes["t0"] == "hash0");
+    assert(fetchedTaskRec.definition.steps[0].script == "make");
+    assert(fetchedTaskRec.definitionHash == "hash_t1");
 
     auto buildTaskRecs = stateRepo.getTaskExecutionsForBuild("b1");
     assert(buildTaskRecs.length == 1);
