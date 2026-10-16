@@ -5,5 +5,6 @@
     "editor.detectIndentation": false,
     "cmake.configureOnOpen": false,
     "d.stdlibPath": "auto",
-    "d.manyProjectsThreshold": 20
+    "d.manyProjectsThreshold": 20,
+    "d.disabledRootGlobs": ["/code"]
 }
