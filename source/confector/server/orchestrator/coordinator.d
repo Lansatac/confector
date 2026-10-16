@@ -9,7 +9,7 @@ import confector.core.executor : CapacityBroker;
 import confector.core.input_resolution : GraphResolution, RerunGenerations, chainGraph;
 import confector.core.rerun_generations : readChainResolution;
 import confector.plugin_api.dispatch_queue;
-import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
+import confector.plugin_api.input_resolver : RepositoryResolver;
 
 import std.algorithm : canFind, filter;
 import std.array : array;
@@ -1873,7 +1873,7 @@ unittest
 
 version (unittest)
 {
-    import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
+    import confector.plugin_api.input_resolver : RepositoryResolver;
 
     /// A repository resolver that answers with a settable "live" revision and counts its calls.
     class FakeRepositoryResolver : RepositoryResolver

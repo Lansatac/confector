@@ -15,7 +15,7 @@ module confector.core.chain_resolver;
 import confector.core.dag : TaskGraph;
 import confector.core.input_resolution;
 import confector.core.model;
-import confector.plugin_api.input_resolver : InputPin, RepositoryResolver;
+import confector.plugin_api.input_resolver : RepositoryResolver;
 
 import vibe.data.json : Json;
 

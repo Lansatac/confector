@@ -4,7 +4,9 @@ import std.json : JSONValue, JSONType, parseJSON;
 import vibe.data.serialization : asName = name, optional, ignore;
 
 /**
- * Task execution status states.
+ * Task execution status states, in the build model that BuildChain and TaskExecution replace.
+ * ExecutionStatus supersedes it: there, cached and skipped are derived chain task states, not
+ * stored statuses.
  */
 enum TaskStatus : string
 {
@@ -170,6 +172,20 @@ struct ResolvedInput
     /// the value; for a task output input, the upstream task's fingerprint.
     Json pinned;
     /// Display-only details (branch, URL, commit subject, ...). Never hashed.
+    @optional string[string] info;
+}
+
+/**
+ * A pinned value for a declared input, as a RepositoryResolver returns it or as it is supplied
+ * up front (from a trigger payload, an existing chain, or a user's pin).
+ */
+struct InputPin
+{
+    /// Canonical pinned value; hashed into fingerprints. Opaque to the core: each provider
+    /// defines its own (git: the commit SHA alone, never the URL, branch or checkout path).
+    /// Must not be undefined or null.
+    Json pinned;
+    /// Display-only details (branch, commit subject, author, ...). Never hashed.
     @optional string[string] info;
 }
 
@@ -578,12 +594,14 @@ struct ChainTask
 }
 
 /**
- * Persisted record of a build execution.
+ * Persisted record of a build execution, in the build model that BuildRequest, BuildChain,
+ * TaskExecution and FingerprintClaim replace. It is removed with the BuildCoordinator and
+ * BuildStateRepository (beads confector-z7z.23.10 and confector-z7z.31.18).
  *
- * Until the BuildRequest/BuildChain split (bead confector-z7z.23.1), a build record is both a
- * request and the chain it runs on: `chainTasks` is the chain snapshot and `chainId` names the
- * build that created it. A later request to build another task of the same chain is a new
- * record carrying the same `chainId` and `chainTasks`, never a re-resolution.
+ * A build record is both a request and the chain it runs on: `chainTasks` is the chain
+ * snapshot and `chainId` names the build that created it. A later request to build another
+ * task of the same chain is a new record carrying the same `chainId` and `chainTasks`, never a
+ * re-resolution.
  */
 struct BuildRecord
 {
@@ -604,6 +622,205 @@ struct BuildRecord
     @optional @asName("executed_tasks") string[] executedTasks;
     @optional @asName("task_records") TaskExecutionRecord[string] taskRecords;
     @optional @asName("error_message") string errorMessage;
+}
+
+// The build model (design records: beads confector-z7z.14, confector-z7z.15 and confector-z7z.2;
+// AGENTS.md, "What a build is"). A request joins or creates a chain; chain state is derived from
+// the chain, its requests, the rerun generations and the executions for its fingerprints, and is
+// never stored. Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
+// (`SysTime.toISOExtString` of a UTC time), so they sort as text.
+
+/**
+ * What a build request asks for. See AGENTS.md, "What a build is" and "Re-running a task".
+ */
+enum BuildIntent : string
+{
+    /// Build the targets and their upstream tasks, reusing every result the cache allows.
+    build = "build",
+    /// Run failed or cancelled targets again in the same chain, at the same fingerprints.
+    retry = "retry",
+    /// Stop using the target's succeeded result: bump its rerun generation, so it and every task
+    /// downstream of it get new fingerprints, in every chain sharing its base fingerprint.
+    rerun = "rerun"
+}
+
+/**
+ * What made a build request.
+ */
+struct BuildTrigger
+{
+    TriggerType type;
+    /// The trigger rule that matched (`TriggerRuleRecord.id`); empty for a request made by hand
+    /// or through the API. One request is made per matched rule.
+    @optional @asName("rule_id") string ruleId;
+    /// Event details as the trigger source reported them (ref, revision, sender, ...), for
+    /// display and audit only: what the trigger pins is in `BuildRequest.pins`.
+    @optional string[string] payload;
+}
+
+/**
+ * A pinned value supplied with a build request, from the trigger payload or a user, for the
+ * repository input `input`. Resolution takes it as given instead of resolving the input live.
+ */
+struct RequestPin
+{
+    /// The repository input it pins, reduced to its kind, repository id and ref selector
+    /// (`repositoryInputKey`), so it pins that repository at that ref for every task.
+    InputDecl input;
+    InputPin pin;
+}
+
+/**
+ * Who asked for what (bead confector-z7z.14). Immutable: written once, after the input
+ * resolver has found or created the chain the request runs on.
+ */
+struct BuildRequest
+{
+    string id;
+    @asName("project_id") string projectId;
+    /// The chain the request joined or created.
+    @asName("chain_id") string chainId;
+    /// The task ids to build. The request also runs their upstream tasks, never downstream ones.
+    /// A rerun names exactly the task to rerun.
+    string[] targets;
+    BuildIntent intent;
+    BuildTrigger trigger;
+    /// Pins for repository inputs, at most one per repository input, applied when the request
+    /// created its chain. A request that joined an existing chain resolved nothing.
+    @optional RequestPin[] pins;
+    /// The identity that made the request: a user, an API token, or the trigger source.
+    @asName("requested_by") string requestedBy;
+    @asName("requested_at") string requestedAt;
+}
+
+/**
+ * Kinds of event in a chain's history.
+ */
+enum ChainEventKind : string
+{
+    /// A task sharing a base fingerprint with one of the chain's tasks was rerun; the chain's
+    /// earlier result for it is superseded. Reruns are recorded on every affected chain.
+    rerun = "rerun"
+}
+
+/**
+ * One entry in a chain's history: something that changed what the chain uses after it was
+ * created. Who caused it and when are not repeated here: they are the `requestedBy` and
+ * `requestedAt` of the BuildRequest that `requestId` names.
+ */
+struct ChainEvent
+{
+    ChainEventKind kind;
+    /// The request that caused the event. For a rerun it may belong to another chain.
+    @asName("request_id") string requestId;
+    /// The chain's task the event concerns. rerun: the task whose result is superseded.
+    @asName("task_id") string taskId;
+    /// rerun: the base fingerprint whose generation was bumped, and the generation it was
+    /// bumped to.
+    @optional string base;
+    @optional ulong generation;
+}
+
+/**
+ * A snapshot of a project's whole DAG (beads confector-z7z.14 and confector-z7z.15); what the
+ * UI calls a build. Everything but `labels` and `events` is immutable once created. The chain
+ * stores every task's declared and resolved external inputs once; requests refer to it by id.
+ * Fingerprints are not stored: they are computed from `tasks` and the current rerun
+ * generations (`chainResolution`).
+ */
+struct BuildChain
+{
+    string id;
+    @asName("project_id") string projectId;
+    /// Canonical per-project number ("build #123"), allocated when the chain is created.
+    ulong number;
+    /// The join key: a request whose resolution has this hash joins the chain instead of
+    /// creating one. Stored so the join can find the chain by index query.
+    @asName("snapshot_hash") string snapshotHash;
+    /// Every task of the project's DAG when the chain was created, sorted by id
+    /// (`freezeChain`).
+    ChainTask[] tasks;
+    @asName("created_at") string createdAt;
+    /// User-editable labels, separate from the number.
+    @optional string[] labels;
+    /// The chain's history, oldest first. Appended to, never rewritten.
+    @optional ChainEvent[] events;
+}
+
+/**
+ * Status of a task execution. Only `queued` and `running` are active; an execution never
+ * leaves a terminal status.
+ *
+ * Supersedes TaskStatus in the new build model. TaskStatus's other states are not execution
+ * states: whether a chain's task is pending, cached or skipped is derived from the chain and
+ * its executions, never stored.
+ */
+enum ExecutionStatus : string
+{
+    /// Recorded and dispatched; no worker has claimed it yet, or its last worker was lost and
+    /// it waits for another attempt.
+    queued = "queued",
+    /// A worker holds it.
+    running = "running",
+    succeeded = "succeeded",
+    /// The task failed, or infrastructure failures used up its attempts. Never retried
+    /// automatically and never a cache hit.
+    failed = "failed",
+    /// Stopped on request. Never a cache hit.
+    cancelled = "cancelled"
+}
+
+/**
+ * One run of one task at one fingerprint ("task run" in the UI; bead confector-z7z.14).
+ * Append-only and shared across chains: records are never overwritten by another execution,
+ * and a cache hit is a chain using an execution another chain produced. A terminal execution
+ * does not change again.
+ */
+struct TaskExecution
+{
+    string id;
+    @asName("project_id") string projectId;
+    @asName("task_id") string taskId;
+    /// Computed by the control plane from the chain, never reported by a worker.
+    string fingerprint;
+    ExecutionStatus status;
+    /// How many times a worker has claimed the execution. Infrastructure failures (a lost
+    /// worker, an expired lease, a queue redelivery) retry within the same execution up to an
+    /// admin-configured limit; a user's retry is a new execution.
+    ulong attempts;
+    /// The full task definition the execution ran with, read from the project when it was
+    /// dispatched, and its hash (`computeDefinitionHash`). Not part of the fingerprint.
+    TaskNode definition;
+    @asName("definition_hash") string definitionHash;
+    /// Artifacts the execution produced.
+    @optional ArtifactMetadata[] artifacts;
+    /// The worker that holds or last held it (`WorkerRecord.id`); empty until claimed.
+    @optional string worker;
+    @asName("created_at") string createdAt;
+    /// When the current attempt started, and when the execution reached a terminal status.
+    @optional @asName("started_at") string startedAt;
+    @optional @asName("finished_at") string finishedAt;
+    /// The exit code of the task's steps; meaningful only when `status` is succeeded or failed
+    /// and the task ran to completion. An infrastructure failure or cancellation has no exit
+    /// code: read `status` and `errorMessage`.
+    @optional @asName("exit_code") int exitCode;
+    @optional @asName("error_message") string errorMessage;
+}
+
+/**
+ * The claim on a fingerprint (bead confector-z7z.2): at most one active (queued or running)
+ * execution per fingerprint, enforced by compare-and-set on the document's version, with the
+ * fingerprint as the document id. A dispatcher claims a fingerprint by setting
+ * `executionId`; a loser re-reads and does nothing. A claim is released by clearing
+ * `executionId`, never by removing the document, so its version only grows and a writer
+ * holding an older version always loses.
+ */
+struct FingerprintClaim
+{
+    /// The claimed fingerprint; mirrors the document id.
+    string fingerprint;
+    /// The fingerprint's active execution; empty when it has none.
+    @optional @asName("execution_id") string executionId;
 }
 
 /**
@@ -1000,4 +1217,223 @@ unittest
 
     auto back = deserializeJson!TaskNode(json);
     assert(back.inputs == node.inputs);
+}
+
+version (unittest)
+{
+    /// Serializes `value` to JSON text and back, as the state store stores documents.
+    private T roundTrip(T)(T value)
+    {
+        return deserializeJson!T(serializeToJson(value).toString());
+    }
+}
+
+unittest
+{
+    // A build request round-trips, pins included, with snake_case names and string intents
+    BuildRequest request;
+    request.id = "r1";
+    request.projectId = "game";
+    request.chainId = "c1";
+    request.targets = ["internal", "tests"];
+    request.intent = BuildIntent.build;
+    request.trigger = BuildTrigger(TriggerType.gitPush, "rule-1", ["ref": "refs/heads/main", "revision": "aaa111"]);
+    request.pins = [RequestPin(repositoryInput("game", "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    request.requestedBy = "webhook:github";
+    request.requestedAt = "2026-10-15T14:02:00Z";
+
+    auto json = serializeToJson(request);
+    assert(json["intent"].get!string == "build");
+    assert(json["trigger"]["type"].get!string == "git_push");
+    assert(json["trigger"]["rule_id"].get!string == "rule-1");
+    assert(json["pins"][0]["input"]["spec"]["ref"].get!string == "main");
+    assert(json["requested_by"].get!string == "webhook:github");
+    assert(roundTrip(request) == request);
+
+    // A rerun request made by hand: no rule, no payload, no pins
+    BuildRequest rerun;
+    rerun.id = "r2";
+    rerun.projectId = "game";
+    rerun.chainId = "c1";
+    rerun.targets = ["release"];
+    rerun.intent = BuildIntent.rerun;
+    rerun.trigger.type = TriggerType.manual;
+    rerun.requestedBy = "jason";
+    rerun.requestedAt = "2026-10-15T15:00:00Z";
+    assert(serializeToJson(rerun)["intent"].get!string == "rerun");
+    assert(roundTrip(rerun) == rerun);
+}
+
+unittest
+{
+    // A build chain round-trips its frozen tasks, number, join key, labels and history
+    BuildChain chain;
+    chain.id = "c1";
+    chain.projectId = "game";
+    chain.number = 123;
+    chain.snapshotHash = "0123abcd";
+    ChainTask compile;
+    compile.id = "compile";
+    compile.inputs["src"] = repositoryInput("game", "main");
+    compile.resolvedInputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["branch": "main"])];
+    ChainTask release;
+    release.id = "release";
+    release.inputs["bin"] = taskOutputInput("compile", "game.zip");
+    release.inputs["flavor"] = valueInput("external");
+    release.resolvedInputs = [ResolvedInput("flavor", InputKind.value, Json("external"))];
+    chain.tasks = [compile, release];
+    chain.createdAt = "2026-10-15T14:02:01Z";
+    chain.labels = ["release candidate"];
+    chain.events = [ChainEvent(ChainEventKind.rerun, "r2", "release", "base-fingerprint", 1)];
+
+    auto json = serializeToJson(chain);
+    assert(json["number"].get!long == 123);
+    assert(json["snapshot_hash"].get!string == "0123abcd");
+    assert(json["tasks"][0]["resolved_inputs"][0]["pinned"].get!string == "aaa111");
+    assert(json["events"][0]["kind"].get!string == "rerun");
+    assert(json["events"][0]["request_id"].get!string == "r2");
+    assert(json["events"][0]["task_id"].get!string == "release");
+    assert(json["events"][0]["generation"].get!long == 1);
+    assert(roundTrip(chain) == chain);
+
+    // A new chain has no labels or history yet: both serialize as empty arrays and read back
+    // empty
+    BuildChain fresh = chain;
+    fresh.labels = null;
+    fresh.events = null;
+    auto freshJson = serializeToJson(fresh);
+    assert(freshJson["labels"].type == Json.Type.array && freshJson["labels"].length == 0);
+    assert(freshJson["events"].type == Json.Type.array && freshJson["events"].length == 0);
+    auto freshBack = roundTrip(fresh);
+    assert(freshBack.labels.length == 0 && freshBack.events.length == 0);
+    assert(freshBack.tasks == chain.tasks);
+}
+
+unittest
+{
+    // Hand-written documents deserialize, with every optional field left out
+    auto request = deserializeJson!BuildRequest(`{
+        "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
+        "intent": "retry", "trigger": {"type": "manual"},
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
+    }`);
+    assert(request.intent == BuildIntent.retry && request.trigger.type == TriggerType.manual);
+    assert(request.trigger.ruleId.length == 0 && request.trigger.payload.length == 0);
+    assert(request.pins.length == 0 && request.targets == ["internal"]);
+
+    // A pin without display info
+    auto pinned = deserializeJson!BuildRequest(`{
+        "id": "r2", "project_id": "game", "chain_id": "c2", "targets": ["internal"],
+        "intent": "build", "trigger": {"type": "git_push", "rule_id": "rule-1", "payload": {"ref": "main"}},
+        "pins": [{"input": {"kind": "repository", "spec": {"repository": "game", "ref": "main"}},
+                  "pin": {"pinned": "aaa111"}}],
+        "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z"
+    }`);
+    assert(pinned.pins.length == 1 && pinned.pins[0].input == repositoryInput("game", "main"));
+    assert(pinned.pins[0].pin.pinned == Json("aaa111") && pinned.pins[0].pin.info.length == 0);
+    assert(pinned.trigger.payload == ["ref": "main"]);
+
+    auto chain = deserializeJson!BuildChain(`{
+        "id": "c1", "project_id": "game", "number": 7, "snapshot_hash": "abc",
+        "tasks": [{"id": "compile", "inputs": {"src": {"kind": "repository", "spec": {"repository": "game", "ref": "main"}}},
+                   "resolved_inputs": [{"name": "src", "kind": "repository", "pinned": "aaa111"}]},
+                  {"id": "lint"}],
+        "created_at": "2026-10-15T14:02:01Z"
+    }`);
+    assert(chain.number == 7 && chain.tasks.length == 2);
+    assert(chain.tasks[0].resolvedInputs[0].pinned == Json("aaa111") && chain.tasks[0].resolvedInputs[0].info.length == 0);
+    assert(chain.tasks[1].inputs.length == 0 && chain.tasks[1].resolvedInputs.length == 0);
+    assert(chain.labels.length == 0 && chain.events.length == 0);
+
+    // A rerun event without the optional fields of other kinds still reads
+    auto withEvent = deserializeJson!BuildChain(`{
+        "id": "c1", "project_id": "game", "number": 7, "snapshot_hash": "abc", "tasks": [],
+        "created_at": "2026-10-15T14:02:01Z", "labels": ["rc"],
+        "events": [{"kind": "rerun", "request_id": "r2", "task_id": "compile", "base": "b", "generation": 2}]
+    }`);
+    assert(withEvent.labels == ["rc"]);
+    assert(withEvent.events == [ChainEvent(ChainEventKind.rerun, "r2", "compile", "b", 2)]);
+
+    auto execution = deserializeJson!TaskExecution(`{
+        "id": "e1", "project_id": "game", "task_id": "compile", "fingerprint": "fp1",
+        "status": "queued", "attempts": 0, "definition": {"id": "compile"},
+        "definition_hash": "def1", "created_at": "2026-10-15T14:02:02Z"
+    }`);
+    assert(execution.status == ExecutionStatus.queued && execution.attempts == 0);
+    assert(execution.definition.id == "compile" && execution.definition.steps.length == 0);
+    assert(execution.artifacts.length == 0 && execution.worker.length == 0);
+    assert(execution.startedAt.length == 0 && execution.finishedAt.length == 0);
+    assert(execution.exitCode == 0 && execution.errorMessage.length == 0);
+
+    // A required field left out fails loudly rather than defaulting
+    bool threw = false;
+    try deserializeJson!TaskExecution(`{"id": "e1", "project_id": "game", "task_id": "compile", "status": "queued"}`);
+    catch (Exception) threw = true;
+    assert(threw, "A missing fingerprint must not deserialize");
+}
+
+unittest
+{
+    // A task execution round-trips its definition, artifacts and timestamps
+    TaskExecution execution;
+    execution.id = "e1";
+    execution.projectId = "game";
+    execution.taskId = "compile";
+    execution.fingerprint = "fp1";
+    execution.status = ExecutionStatus.succeeded;
+    execution.attempts = 2;
+    execution.definition.id = "compile";
+    execution.definition.inputs["src"] = repositoryInput("game", "main");
+    execution.definition.steps = [BuildStep("Checkout", "checkout", ["input": "src"]), BuildStep("Compile", "bash", null, "make")];
+    execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
+    execution.definitionHash = "def1";
+    ArtifactMetadata artifact;
+    artifact.artifactId = "game.zip";
+    artifact.taskFingerprint = "fp1";
+    artifact.sha256 = "abc";
+    artifact.sizeBytes = 1024;
+    artifact.storageBackend = "local";
+    execution.artifacts = [artifact];
+    execution.worker = "worker-1";
+    execution.createdAt = "2026-10-15T14:02:02Z";
+    execution.startedAt = "2026-10-15T14:03:00Z";
+    execution.finishedAt = "2026-10-15T14:09:00Z";
+
+    auto json = serializeToJson(execution);
+    assert(json["status"].get!string == "succeeded");
+    assert(json["attempts"].get!long == 2);
+    assert(json["definition_hash"].get!string == "def1");
+    assert(json["definition"]["steps"][1]["script"].get!string == "make");
+    assert(roundTrip(execution) == execution);
+
+    // A failed execution keeps its exit code and error; a queued one has no worker or times yet
+    TaskExecution failed = execution;
+    failed.status = ExecutionStatus.failed;
+    failed.artifacts = null;
+    failed.exitCode = 2;
+    failed.errorMessage = "make: *** [all] Error 2";
+    assert(roundTrip(failed) == failed);
+
+    TaskExecution queued;
+    queued.id = "e2";
+    queued.projectId = "game";
+    queued.taskId = "compile";
+    queued.fingerprint = "fp2";
+    queued.status = ExecutionStatus.queued;
+    queued.definition.id = "compile";
+    queued.definitionHash = "def1";
+    queued.createdAt = "2026-10-15T14:02:02Z";
+    assert(roundTrip(queued) == queued);
+}
+
+unittest
+{
+    // A fingerprint claim round-trips with and without an active execution
+    auto claimed = FingerprintClaim("fp1", "e1");
+    assert(serializeToJson(claimed)["execution_id"].get!string == "e1");
+    assert(roundTrip(claimed) == claimed);
+
+    auto released = FingerprintClaim("fp1");
+    assert(roundTrip(released) == released);
+    assert(deserializeJson!FingerprintClaim(`{"fingerprint": "fp1"}`) == released);
 }

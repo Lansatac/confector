@@ -11,22 +11,7 @@ module confector.plugin_api.input_resolver;
  * never does.
  */
 
-import confector.plugin_api.model : InputDecl, RepositoryRecord;
-import vibe.data.json : Json;
-
-/**
- * A pinned value for a declared input, as returned by a resolver or supplied up front (from a
- * trigger payload, an existing chain, or a user's pin).
- */
-struct InputPin
-{
-    /// Canonical pinned value; hashed into fingerprints. Opaque to the core: each provider
-    /// defines its own (git: the commit SHA alone, never the URL, branch or checkout path).
-    /// Must not be undefined or null.
-    Json pinned;
-    /// Display-only details (branch, commit subject, author, ...). Never hashed.
-    string[string] info;
-}
+import confector.plugin_api.model : InputDecl, InputPin, RepositoryRecord;
 
 /**
  * Resolves repository inputs for one version control provider. How the shell selects the

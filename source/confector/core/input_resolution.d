@@ -28,7 +28,6 @@ module confector.core.input_resolution;
 import confector.core.dag : TaskGraph;
 import confector.core.fingerprinter : computeBaseFingerprint, computeFingerprint, pinInputs;
 import confector.core.model;
-import confector.plugin_api.input_resolver : InputPin;
 
 import vibe.data.json : Json;
 

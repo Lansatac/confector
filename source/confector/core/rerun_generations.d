@@ -209,7 +209,6 @@ version (unittest)
     import confector.core.input_resolution : freezeChain, resolveGraphInputs;
     import confector.core.memory_document_store : InMemoryDocumentStore;
     import confector.core.model;
-    import confector.plugin_api.input_resolver : InputPin;
 
     import std.algorithm.searching : canFind;
     import std.typecons : Nullable;
