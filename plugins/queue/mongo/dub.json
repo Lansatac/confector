@@ -1,21 +1,15 @@
 {
-	"name": "mongo_queue",
+	"name": "queue-mongo",
 	"description": "MongoDB queue plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_mongo_queue",
 	"targetPath": "../../../out/server/plugins",
-	"sourcePaths": [
-		"."
-	],
-	"importPaths": [
-		"."
-	],
 	"dependencies": {
-		"confector-plugin-api": {
-			"path": "../../../source/confector/plugin_api"
+		"confector:plugin-api": {
+			"path": "../../.."
 		},
-		"confector-mongo-helpers": {
-			"path": "../../../source/confector/mongo_helpers"
+		"confector:mongo-helpers": {
+			"path": "../../.."
 		}
 	},
 	"libs-windows": [
@@ -37,8 +31,8 @@
 		{
 			"name": "unittest",
 			"dependencies": {
-				"confector-testing": {
-					"path": "../../../source/confector/testing"
+				"confector:testing": {
+					"path": "../../.."
 				}
 			}
 		}

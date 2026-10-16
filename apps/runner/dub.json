@@ -1,0 +1,16 @@
+{
+	"name": "runner",
+	"targetType": "executable",
+	"targetName": "confector-runner",
+	"mainSourceFile": "source/confector/runner/main.d",
+	"targetPath": "../../out/runner",
+	"workingDirectory": "../../out",
+	"dependencies": {
+		"confector:core": {
+			"path": "../.."
+		},
+		"confector:runner-core": {
+			"path": "../.."
+		}
+	}
+}

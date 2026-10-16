@@ -1,0 +1,43 @@
+{
+	"name": "server",
+	"targetType": "executable",
+	"targetName": "confector_server",
+	"mainSourceFile": "source/confector/server/app.d",
+	"targetPath": "../../out/server",
+	"workingDirectory": "../../out/server",
+	"copyFiles": [
+		"public"
+	],
+	"dependencies": {
+		"confector:config": {
+			"path": "../.."
+		},
+		"confector:core": {
+			"path": "../.."
+		},
+		"confector:runner-core": {
+			"path": "../.."
+		},
+		"confector:mongo-helpers": {
+			"path": "../.."
+		},
+		"confector:document-store-mongo": {
+			"path": "../.."
+		},
+		"diet-ng": "~>1.8",
+		"vibe-d": "~>0.10.3"
+	},
+	"configurations": [
+		{
+			"name": "application"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector:testing": {
+					"path": "../.."
+				}
+			}
+		}
+	]
+}

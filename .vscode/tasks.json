@@ -1,59 +1,41 @@
 {
-	"version": "2.0.0",
-	"tasks": [
+  "version": "2.0.0",
+  "tasks": [
     {
-      "type": "dub",
-      "run": true,
-      "cwd": "c:/Users/Jason/projects/confector",
-      "compiler": "$current",
-      "archType": "$current",
-      "buildType": "$current",
-      "configuration": "$current",
-      "problemMatcher": [
-        "$dmd"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "label": "dub: Run confector",
-      "detail": "dub run --compiler=dmd.EXE -a=x86_64 -b=debug -c=application"
+      "label": "reggae: build server",
+      "type": "shell",
+      "command": "ninja server",
+      "options": { "cwd": "${workspaceFolder}/build" },
+      "problemMatcher": ["$dmd"],
+      "group": { "kind": "build", "isDefault": true }
     },
     {
-      "type": "dub",
-      "run": true,
-      "cwd": "${workspaceFolder}",
-      "compiler": "$current",
-      "archType": "$current",
-      "buildType": "$current",
-      "configuration": "$current",
-      "problemMatcher": [
-        "$dmd"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "label": "dub: Run confector",
-      "detail": "dub run --verror --compiler=ldc2 -b=debug -c=application"
+      "label": "reggae: build all",
+      "type": "shell",
+      "command": "ninja",
+      "options": { "cwd": "${workspaceFolder}/build" },
+      "problemMatcher": ["$dmd"],
+      "group": "build"
     },
     {
-      "type": "dub",
-      "test": true,
-      "cwd": "c:/Users/Jason/projects/confector",
-      "compiler": "$current",
-      "archType": "$current",
-      "buildType": "$current",
-      "configuration": "$current",
-      "problemMatcher": [
-        "$dmd"
+      "label": "dub: test package",
+      "type": "shell",
+      "command": "dub test :${input:package}",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$dmd"],
+      "group": "test"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "package",
+      "type": "pickString",
+      "description": "Sub-package to test",
+      "options": [
+        "core", "plugin-api", "config", "mongo-helpers", "runner-core", "testing", "server", "runner",
+        "document-store-mongo", "queue-mongo"
       ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "label": "dub: Test confector",
-      "detail": "dub test --compiler=dmd -a=x86_64 -b=debug -c=application"
+      "default": "core"
     }
   ]
 }

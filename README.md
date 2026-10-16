@@ -60,30 +60,33 @@ Execution runtimes, version control providers, and storage backends are decouple
 
 2. **Generate build files & compile:**
    ```bash
-   reggae -b ninja .
+   mkdir build && cd build
+   reggae -b ninja ..
    ninja
    ```
-   This builds the server executable (`bin/confector`), compiles all plugin shared libraries (`bin/plugins/`), and copies required `views/` and `public/` assets into the `bin/` artifact directory.
+   This builds the server (`build/out/server/`), the runner (`build/out/runner/`), and every plugin shared library, and copies the server's `public/` assets next to it.
 
    **Granular build targets:**
-   - `ninja app` — Compile the main server and synchronize assets
-   - `ninja plugins` — Compile all dynamic plugins (`bash`, `git`, `powershell`, `local_process`)
-   - `ninja plugin-<name>` — Compile a specific plugin (e.g., `ninja plugin-git`)
+   - `ninja server` — Compile the server and copy its assets
+   - `ninja runner` — Compile the runner
+   - `ninja plugins` — Compile all loadable plugins
+
+   Without reggae, dub builds the same targets from the repository root: `dub build :server`, `dub build :runner`, `dub build :plugins` (output in `out/`).
 
 3. **Run the server:**
    - **Linux / Dev Container:**
      ```bash
-     ./bin/confector
+     cd build/out/server && ./confector_server
      ```
    - **Windows:**
      ```powershell
-     .\bin\confector.exe
+     cd build\out\server; .\confector_server.exe
      ```
    Once running, open [http://localhost:8083](http://localhost:8083) in your browser.
 
 4. **Run tests:**
    ```bash
-   dub test confector:core
+   dub test :core
    ```
 
 ---

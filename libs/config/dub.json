@@ -1,0 +1,9 @@
+{
+	"name": "config",
+	"targetType": "library",
+	"targetName": "confector_config",
+	"dependencies": {
+		"vibe-serialization": "~>1.2.0"
+	},
+	"targetPath": "../../out/lib"
+}

@@ -1,0 +1,24 @@
+{
+	"name": "runner-core",
+	"targetType": "library",
+	"targetName": "confector_runner_core",
+	"dependencies": {
+		"confector:core": {
+			"path": "../.."
+		}
+	},
+	"configurations": [
+		{
+			"name": "library"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector:testing": {
+					"path": "../.."
+				}
+			}
+		}
+	],
+	"targetPath": "../../out/lib"
+}

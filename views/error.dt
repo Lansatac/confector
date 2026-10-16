@@ -1,6 +1,0 @@
-extends layout
-
-block maincontent
-  h1 Error #{error.code}
-  p An error has occured!
-  p Details: #{error.message}

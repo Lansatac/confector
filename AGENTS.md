@@ -568,12 +568,12 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 
 Be aware of these so you do not spread them:
 
-- **The build coordinator** (`source/confector/server/orchestrator/coordinator.d`) mixes graph
+- **The build coordinator** (`apps/server/source/confector/server/orchestrator/coordinator.d`) mixes graph
   evaluation with dispatch, splits state between memory and the database, and contains silent
   fallbacks. It is being replaced (see "Coordinating builds"; bead `confector-z7z.23`). Make
   minimal changes there.
-- **The data model** (`source/confector/plugin_api/model.d`) has accumulated aliases: several ways
-  to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
+- **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has accumulated
+  aliases: several ways to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
   build step. **Do not add another alias.** If a representation is wrong, change it and update its
   callers.
 - **There are no external consumers.** Do not add "backward compatibility" shims, re-export
@@ -586,16 +586,21 @@ Be aware of these so you do not spread them:
 
 ### Orientation
 
-- `source/confector/core/` — graph construction and evaluation, fingerprinting, trigger matching,
-  plugin registry.
-- `source/confector/plugin_api/` — data types and interfaces shared with plugins.
-- `source/confector/runner_core/` — executes a single task on a worker.
-- `source/confector/runner/` — the runner command-line program.
-- `source/confector/server/` — web server, API, dashboard, and build coordinator.
-- `source/confector/config/` — configuration types.
-- `plugins/` — plugins by category (step definitions and executors, workers, artifact storage,
-  state storage, queue, scheduler).
-- `views/`, `public/` — web UI templates and static assets.
+Each dub package is a directory with its own `dub.json` and a `source/` folder holding the full
+module path (for example `libs/core/source/confector/core/`).
+
+- `libs/core/` — graph construction and evaluation, fingerprinting, trigger matching, plugin
+  registry.
+- `libs/plugin_api/` — data types and interfaces shared with plugins.
+- `libs/runner_core/` — executes a single task on a worker.
+- `libs/config/` — configuration types.
+- `libs/mongo_helpers/` — MongoDB connection and BSON helpers.
+- `libs/testing/` — in-memory fakes and backend conformance suites (test-only).
+- `apps/runner/` — the runner command-line program.
+- `apps/server/` — web server, API, dashboard, and build coordinator, with its web UI templates
+  (`views/`) and static assets (`public/`).
+- `plugins/<category>/<name>/` — plugins by category (step definitions and executors, workers,
+  artifact storage, document store, queue, scheduler).
 
 Explore the code for anything more specific; file-level details change too often to list here.
 
@@ -617,11 +622,16 @@ Explore the code for anything more specific; file-level details change too often
 
 ## Build and test
 
-Subpackage names are prefixed with `confector-`. From the repository root:
+Every package is a subpackage of the root `confector` package, and packages depend on each other
+as `"confector:<name>": {"path": "<relative path to the repository root>"}`. The root
+`dub.selections.json` is marked `inheritable`, so building any package — from the root or from its
+own directory — uses the same dependency versions; do not commit `dub.selections.json` files
+anywhere else. From the repository root:
 
-- Run core unit tests: `dub test :confector-core`
-- Other subpackages follow the same pattern, for example `:confector-server` or
-  `:confector-runner-core`; check each subpackage's `dub.json` for its exact name.
+- Run core unit tests: `dub test :core`
+- Other subpackages follow the same pattern, for example `:server` or `:runner-core`; check each
+  subpackage's `dub.json` for its exact name.
+- Build everything: `dub build :server`, `dub build :runner`, `dub build :plugins`.
 
 **dub is the source of truth for the build.** Change `dub.json` files to change what is built;
 never make `reggaefile.d` the only place something is defined.
@@ -630,9 +640,10 @@ never make `reggaefile.d` the only place something is defined.
 for incremental builds). From the repository root:
 
 ```
-cd build && reggae -b ninja .. && ninja server
+cd build && reggae -b ninja .. && ninja
 ```
 
-Known issue: the server executable lands under `build/.reggae/objs/server.objs/out/server/`
-rather than `build/out/server/` (bead `confector-z7z.44`). Release builds should use LDC (bead
-`confector-z7z.45`).
+Targets: `server`, `runner`, `plugins` (plain `ninja` builds all three).
+
+Outputs land in `build/out/server/` and `build/out/runner/`, with plugins in their `plugins/`
+subdirectories. Release builds should use LDC (bead `confector-z7z.45`).

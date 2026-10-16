@@ -1,0 +1,28 @@
+{
+	"name": "core",
+	"targetType": "library",
+	"targetName": "confector_core",
+	"dependencies": {
+		"confector:config": {
+			"path": "../.."
+		},
+		"confector:plugin-api": {
+			"path": "../.."
+		},
+		"vibe-d": "~>0.10.3"
+	},
+	"configurations": [
+		{
+			"name": "library"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector:testing": {
+					"path": "../.."
+				}
+			}
+		}
+	],
+	"targetPath": "../../out/lib"
+}

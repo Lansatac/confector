@@ -30,11 +30,17 @@ RUN curl -fsS https://dlang.org/install.sh | bash -s install dmd -p /opt/dlang \
     && echo "${DMD_DIR}/linux/lib64" > /etc/ld.so.conf.d/dlang.conf && ldconfig \
     && chmod -R a+rX /opt/dlang
 
-# Pre-build and install Reggae globally
+# Pre-build and install Reggae globally. Reggae compiles each reggaefile against the dub library,
+# so the dub version it pins goes in the system package cache, where every user's dub finds it
+# (the dev user's ~/.dub is a volume and would hide anything installed there).
 RUN dub fetch reggae \
+   && REGGAE_SELECTIONS=$(find /root/.dub/packages/reggae/ -path '*/reggae/dub.selections.json' | head -n 1) \
+   && DUB_LIB_VERSION=$(sed -n 's/.*"dub": *"\([^"]*\)".*/\1/p' "${REGGAE_SELECTIONS}") \
+   && dub fetch "dub@${DUB_LIB_VERSION}" --cache=system \
    && dub build reggae \
    && REGGAE_BIN=$(find /root/.dub/packages/reggae/ -name reggae -type f -perm /111 | head -n 1) \
    && cp "${REGGAE_BIN}" /usr/local/bin/reggae \
+   && chmod -R a+rX /var/lib/dub \
    && rm -rf /root/.dub
 
 # Create a non-root dev user matching standard dev container setups

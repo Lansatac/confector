@@ -6,13 +6,16 @@ import reggae.rules.dub.external : DubPath, dubPackage;
 Target dubPathTarget(string path)
 {
   import std.array : replace;
-  import std.path : dirSeparator;
+  import std.path : buildPath, dirSeparator, isAbsolute;
 
   auto opts = options.dup;
   opts.allAtOnce = true;
   // Use native separators: on Windows, dub reports subpackage paths with backslashes, and a
   // forward-slash path here makes ninja see each subpackage's dub.json as a duplicate output.
-  return dubPackage(opts, DubPath(path.replace("/", dirSeparator), Configuration("default")));
+  // Anchor outputs at $builddir: reggae otherwise moves the relative outputs of a target nested
+  // in a phony (server, plugins) into that phony's .reggae/objs directory.
+  return dubPackage(opts, DubPath(path.replace("/", dirSeparator), Configuration("default")))
+    .mapOutputs((string o) => o.isAbsolute ? o : buildPath("$builddir", o));
 }
 
 Target serverPublicAssets()
@@ -20,9 +23,9 @@ Target serverPublicAssets()
   import std.file : dirEntries, SpanMode;
   import std.path : buildPath;
 
-  // The build generator runs from the build directory, so scan the project's public/ explicitly.
-  Target[] inputs = [Target("$project/public")];
-  foreach (entry; dirEntries(buildPath(options.projectPath, "public"), SpanMode.depth))
+  // The build generator runs from the build directory, so scan the server's public/ explicitly.
+  Target[] inputs = [Target("$project/apps/server/public")];
+  foreach (entry; dirEntries(buildPath(options.projectPath, "apps", "server", "public"), SpanMode.depth))
   {
     if (entry.isFile)
       inputs ~= Target(entry.name);
@@ -30,9 +33,9 @@ Target serverPublicAssets()
 
   // ninja runs commands without a shell on Windows, so the copy needs a native command there.
   version (Windows)
-    enum copyCommand = `cmd /c "xcopy "$project\public" out\server\public\ /E /I /Y /Q > nul && type nul > $out"`;
+    enum copyCommand = `cmd /c "xcopy "$project\apps\server\public" out\server\public\ /E /I /Y /Q > nul && type nul > $out"`;
   else
-    enum copyCommand = "mkdir -p out/server && cp -R $project/public out/server/ && touch $out";
+    enum copyCommand = "mkdir -p out/server && cp -R $project/apps/server/public out/server/ && touch $out";
 
   return Target(
     "$builddir/out/server/public/.reggae-copy.stamp",
@@ -46,99 +49,35 @@ Target server()
   return Target.phony(
     "server",
     "",
-    dubPathTarget("source/confector/server"),
+    dubPathTarget("apps/server"),
     serverPublicAssets(),
   );
 }
 
 Target runner()
 {
-  return dubPathTarget("source/confector/runner");
+  return dubPathTarget("apps/runner");
 }
 
-Target configLib()
+// Libraries are not top-level targets: the executables and plugins that use them build them.
+Target plugins()
 {
-  return dubPathTarget("source/confector/config");
-}
-
-Target pluginApiLib()
-{
-  return dubPathTarget("source/confector/plugin_api");
-}
-
-Target mongoHelpersLib()
-{
-  return dubPathTarget("source/confector/mongo_helpers");
-}
-
-Target coreLib()
-{
-  return dubPathTarget("source/confector/core");
-}
-
-Target runnerCoreLib()
-{
-  return dubPathTarget("source/confector/runner_core");
-}
-
-Target bashDef()
-{
-  return dubPathTarget("plugins/definition/bash");
-}
-
-Target bashRunner()
-{
-  return dubPathTarget("plugins/step_executor/bash");
-}
-
-Target gitDef()
-{
-  return dubPathTarget("plugins/definition/git");
-}
-
-Target gitRunner()
-{
-  return dubPathTarget("plugins/step_executor/git");
-}
-
-Target powershellDef()
-{
-  return dubPathTarget("plugins/definition/powershell");
-}
-
-Target powershellRunner()
-{
-  return dubPathTarget("plugins/step_executor/powershell");
-}
-
-Target localProcess()
-{
-  return dubPathTarget("plugins/worker/local_process");
-}
-
-Target localArtifact()
-{
-  return dubPathTarget("plugins/artifact/local");
-}
-
-Target mongoQueue()
-{
-  return dubPathTarget("plugins/queue/mongo");
-}
-
-Target mongoDocumentStore()
-{
-  return dubPathTarget("plugins/document_store/mongo");
-}
-
-Target testingLib()
-{
-  return dubPathTarget("source/confector/testing");
-}
-
-Target localScheduler()
-{
-  return dubPathTarget("plugins/scheduler/local");
+  return Target.phony(
+    "plugins",
+    "",
+    [
+      dubPathTarget("plugins/definition/bash"),
+      dubPathTarget("plugins/definition/git"),
+      dubPathTarget("plugins/definition/powershell"),
+      dubPathTarget("plugins/step_executor/bash"),
+      dubPathTarget("plugins/step_executor/git"),
+      dubPathTarget("plugins/step_executor/powershell"),
+      dubPathTarget("plugins/worker/local_process"),
+      dubPathTarget("plugins/artifact/local"),
+      dubPathTarget("plugins/queue/mongo"),
+      dubPathTarget("plugins/scheduler/local"),
+    ],
+  );
 }
 
 // Optional unit test target
@@ -153,22 +92,6 @@ Target test()
 mixin build!(
   server,
   runner,
-  configLib,
-  pluginApiLib,
-  mongoHelpersLib,
-  coreLib,
-  runnerCoreLib,
-  bashDef,
-  bashRunner,
-  gitDef,
-  gitRunner,
-  powershellDef,
-  powershellRunner,
-  localProcess,
-  localArtifact,
-  mongoQueue,
-  mongoDocumentStore,
-  localScheduler,
-  testingLib,
+  plugins,
   optional!test,
 );

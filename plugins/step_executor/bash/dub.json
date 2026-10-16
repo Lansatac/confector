@@ -1,15 +1,24 @@
 {
-	"name": "bash_runner",
+	"name": "step-executor-bash",
 	"description": "Bash Step Runner Plugin for Confector",
 	"targetType": "dynamicLibrary",
 	"targetName": "confector_bash_runner",
 	"targetPath": "../../../out/runner/plugins",
-	"sourcePaths": ["."],
-	"importPaths": ["."],
 	"dependencies": {
-		"confector-plugin-api": {
-			"path": "../../../source/confector/plugin_api"
+		"confector:plugin-api": {
+			"path": "../../.."
 		}
 	},
-	"libs-windows": ["ws2_32", "userenv", "advapi32", "kernel32", "user32", "legacy_stdio_definitions", "ucrt", "vcruntime", "msvcrt", "oldnames"]
+	"libs-windows": [
+		"ws2_32",
+		"userenv",
+		"advapi32",
+		"kernel32",
+		"user32",
+		"legacy_stdio_definitions",
+		"ucrt",
+		"vcruntime",
+		"msvcrt",
+		"oldnames"
+	]
 }
