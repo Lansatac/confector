@@ -628,7 +628,8 @@ struct BuildRecord
 // AGENTS.md, "What a build is"). A request joins or creates a chain; chain state is derived from
 // the chain, its requests, the rerun generations and the executions for its fingerprints, and is
 // never stored. Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
-// (`SysTime.toISOExtString` of a UTC time), so they sort as text.
+// (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because toISOExtString
+// leaves out zero fractional seconds: parse them to compare.
 
 /**
  * What a build request asks for. See AGENTS.md, "What a build is" and "Re-running a task".
