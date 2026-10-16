@@ -135,6 +135,19 @@ Prefer obvious failures to silent degradation, within reason.
 plugin context, wrong database connection strings, absent artifact directories. Each one cost far
 more time to find than a crash would have.
 
+### Prefer message passing to locks
+
+Coordinate concurrent work by passing messages, not by sharing mutable state behind mutexes.
+State that must be shared across processes lives in the state store and is changed with
+single-document compare-and-set. State that must be shared inside a process is owned by a single
+task (an actor) that other code sends messages to. Do not add mutexes; if one seems necessary,
+raise it as a design question first.
+
+*Why:* the owner prefers an actor model. It also matches the coordination design: correctness
+comes from compare-and-set and level-triggered re-evaluation, which hold across several server
+instances, whereas an in-process lock excludes nothing between instances (and a recursive mutex
+does not exclude fibers on the same thread).
+
 ### YAGNI, except at boundaries
 
 Do not build speculative features. But design the interfaces *between* subsystems deliberately —

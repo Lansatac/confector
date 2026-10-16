@@ -22,8 +22,9 @@ class DefaultCapacityBroker : CapacityBroker
     private Mutex m_mutex;
 
     /**
-     * demandSource returns the work waiting for a worker, one QueueDemand per work order or
-     * grouped. (The dispatch queue cannot be inspected, so demand comes from the coordinator.)
+     * demandSource returns the work waiting for a worker, one QueueDemand per execution or
+     * grouped: normally confector.core.execution_dispatcher.queuedDemand over the state store
+     * (the dispatch queue is never inspected).
      */
     this(QueueDemand[] delegate() demandSource)
     {
@@ -86,8 +87,7 @@ class DefaultCapacityBroker : CapacityBroker
 
     void evaluateDemand()
     {
-        // Ask for demand before taking the broker's lock: the source may take its own lock, and
-        // the coordinator calls evaluateDemand while holding that one.
+        // Ask for demand before taking the broker's lock: reading it is I/O.
         QueueDemand[] pending = m_demandSource();
         if (pending.length == 0)
         {
@@ -173,7 +173,8 @@ unittest
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.plugin_api.dispatch_queue : DispatchQueue;
-    import confector.orchestrator.coordinator : BuildCoordinator, countReceivable, receiveWorkOrders, defaultPoolQueue;
+    import confector.orchestrator.coordinator : BuildCoordinator, countReceivable, receiveWorkOrders;
+    import confector.core.execution_dispatcher : defaultPoolQueue, queuedDemand;
 
     // Test Mock Provisioner
     class MockProvisioner : ComputeProvisioner
@@ -256,7 +257,7 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto e2eQueue = new InMemoryDispatchQueue();
     auto coord = new BuildCoordinator(storage, stores, e2eQueue);
-    auto e2eBroker = new DefaultCapacityBroker(() => coord.queuedDemand());
+    auto e2eBroker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
 
     // Provisioner that acts as an automated executor worker
     class AutoExecutingProvisioner : ComputeProvisioner
@@ -282,7 +283,7 @@ unittest
 
         void requestCapacity(in QueueDemand demand)
         {
-            foreach (received; receiveWorkOrders(m_q, demand.pendingWorkOrderCount))
+            foreach (received; receiveWorkOrders(stores, m_q, demand.pendingWorkOrderCount))
             {
                 auto order = received.workOrder;
                 TaskExecutionResult res;

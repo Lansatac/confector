@@ -27,6 +27,7 @@ import confector.plugin_api.dispatch_queue : DispatchQueue;
 import confector.plugin_api.model : QueueDemand;
 import confector.orchestrator.capacity_broker : DefaultCapacityBroker;
 import confector.orchestrator.coordinator : BuildCoordinator;
+import confector.core.execution_dispatcher : queuedDemand;
 import confector.runner_core.engine : TaskEngine;
 
 import controller.admin_controller : adminRouter;
@@ -166,7 +167,7 @@ URLRouter createRouter(
     router.any("/tasks/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
     router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/tasks/"); });
 
-    router.any("/executors/*", executorRouter(stores, PluginRegistry.instance, capacityBroker, buildCoordinator));
+    router.any("/executors/*", executorRouter(stores, PluginRegistry.instance, capacityBroker));
     router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
 
     router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
@@ -293,17 +294,9 @@ void main()
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
     auto taskEngine = new TaskEngine(configuredStorage);
 
-    // The broker and the coordinator refer to each other: the coordinator asks the broker for
-    // capacity, and the broker reads demand from the coordinator. Create the broker first and
-    // give it a demand source that fails loudly if asked before the coordinator exists.
-    BuildCoordinator buildCoordinator;
-    QueueDemand[] coordinatorDemand()
-    {
-        if (buildCoordinator is null)
-            throw new Exception("Capacity demand was requested before the build coordinator was created");
-        return buildCoordinator.queuedDemand();
-    }
-    auto capacityBroker = new DefaultCapacityBroker(&coordinatorDemand);
+    // Demand is the executions sent and waiting for a worker, read from the state store; the
+    // coordinator asks the broker to evaluate it after dispatching.
+    auto capacityBroker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
 
     // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
     foreach (plugin; PluginRegistry.instance.allPlugins())
@@ -343,7 +336,7 @@ void main()
 
     // Git is the only built-in version control provider, so every repository input resolves
     // through it (bead confector-z7z.20.7).
-    buildCoordinator = new BuildCoordinator(configuredStorage, stores, dispatchQueue, capacityBroker, "", new GitRepositoryResolver());
+    auto buildCoordinator = new BuildCoordinator(configuredStorage, stores, dispatchQueue, capacityBroker, new GitRepositoryResolver());
     logInfo("Initialized Confector execution engine and build coordinator.");
 
     // Load scheduler plugin
@@ -456,7 +449,7 @@ unittest
     auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
     auto coordinator = new BuildCoordinator(storage, stores, queue);
-    auto broker = new DefaultCapacityBroker(() => coordinator.queuedDemand());
+    auto broker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
 
     class TestProvisioner : ComputeProvisioner
     {

@@ -10,6 +10,7 @@ import confector.core.executor : CapacityBroker;
 import confector.runner_core.engine;
 import confector.orchestrator.coordinator;
 import confector.plugin_api.dispatch_queue;
+import confector.core.execution_dispatcher : defaultPoolQueue;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -79,46 +80,59 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
             try
             {
                 import core.time : seconds;
+                import confector.core.work_orders : receiveWork;
 
+                if (stores is null)
+                {
+                    throw new Exception("Receiving work needs the state stores: the dispatch queue carries only execution ids");
+                }
                 auto pMax = "max_messages" in req.json;
                 auto pVis = "visibility_timeout" in req.json;
+                auto pWorker = "worker_id" in req.json;
                 size_t maxMsgs = pMax !is null ? pMax.get!size_t : 1;
                 long visibility = pVis !is null ? pVis.get!long : 30;
-                auto received = queue.receive(defaultPoolQueue, maxMsgs, visibility.seconds);
-                Json leases = Json.emptyArray;
+                // Required: the execution records which worker holds it (receiveWork rejects an
+                // empty id)
+                string workerId = pWorker !is null ? pWorker.get!string : null;
+                // The queue carries execution ids; the work order is built from the execution's
+                // record, which receiving starts
+                auto received = receiveWork(stores, queue, defaultPoolQueue, maxMsgs, visibility.seconds, workerId);
                 try
                 {
-                    foreach (lease; received)
+                    Json leases = Json.emptyArray;
+                    foreach (ref item; received)
                     {
-                        WorkOrder order = deserializeJson!WorkOrder(lease.message);
-                        // Mark the task running, so capacity demand stops counting it.
+                        // Mark the task running in the build that dispatched it
                         TaskStatus status;
-                        if (stores !is null && stores.legacyBuilds.getTaskStatus(order.buildId, order.taskId, status) && status == TaskStatus.queued)
+                        const order = item.workOrder;
+                        if (order.buildId.length > 0 && stores.legacyBuilds.getTaskStatus(order.buildId, order.taskId, status)
+                            && status == TaskStatus.queued)
                         {
                             stores.legacyBuilds.setTaskStatus(order.buildId, order.taskId, TaskStatus.running);
                         }
-                        Json item = Json.emptyObject;
-                        item["receipt"] = Json(lease.receipt);
-                        item["receive_count"] = Json(lease.receiveCount);
-                        item["work_order"] = lease.message;
-                        leases ~= item;
+                        Json lease = Json.emptyObject;
+                        lease["receipt"] = Json(item.receipt);
+                        lease["receive_count"] = Json(item.receiveCount);
+                        lease["work_order"] = serializeToJson(item.workOrder);
+                        leases ~= lease;
                     }
+                    res.writeJsonBody(leases);
                 }
                 catch (Exception e)
                 {
                     // The worker will never see these leases; give them back rather than leave the
                     // work invisible until the leases expire. Best effort: the original error is
-                    // what the caller needs.
-                    foreach (lease; received)
+                    // what the caller needs. (The executions were started, so redelivery counts
+                    // as another attempt.)
+                    foreach (ref item; received)
                     {
                         try
-                            queue.release(defaultPoolQueue, lease.receipt);
+                            queue.release(defaultPoolQueue, item.receipt);
                         catch (Exception releaseError)
-                            logError("[api] Failed to release receipt '%s' after a failed receive: %s", lease.receipt, releaseError.msg);
+                            logError("[api] Failed to release receipt '%s' after a failed receive: %s", item.receipt, releaseError.msg);
                     }
                     throw e;
                 }
-                res.writeJsonBody(leases);
             }
             catch (Exception e)
             {
@@ -1448,7 +1462,7 @@ unittest
 
     string bldId = coordinator.startBuild(proj, null, true);
     assert(bldId.length > 0);
-    auto received = receiveWorkOrders(queue, 10);
+    auto received = receiveWorkOrders(stores, queue, 10);
     assert(received.length == 1);
     assert(received[0].workOrder.taskId == "n1");
     assert(received[0].workOrder.buildId == bldId);

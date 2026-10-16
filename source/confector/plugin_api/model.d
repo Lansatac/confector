@@ -563,6 +563,9 @@ struct TaskExecutionResult
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("duration_ms") ulong durationMs = 0;
     @optional @asName("receipt_handle") string receiptHandle;
+    /// The execution the result is for (`WorkOrder.executionId`), echoed by the worker. The
+    /// control plane rejects a result for an execution that no longer holds its fingerprint.
+    @optional @asName("execution_id") string executionId;
 }
 
 /**
@@ -793,6 +796,17 @@ struct TaskExecution
     /// dispatched, and its hash (`computeDefinitionHash`). Not part of the fingerprint.
     TaskNode definition;
     @asName("definition_hash") string definitionHash;
+    /// The task's resolved inputs, sorted by name, as the chain that dispatched the execution
+    /// pins them (every chain at one fingerprint pins the same values). Fixed at dispatch; the
+    /// work order a worker receives is built from them.
+    @optional ResolvedInput[] inputs;
+    /// Where to fetch each repository input from, keyed by input name: how to fetch, not what,
+    /// so never hashed. Read from the repository records at dispatch and fixed then.
+    @optional @asName("repository_addresses") string[string] repositoryAddresses;
+    /// When a message for the execution was last sent to the dispatch queue; empty while none has
+    /// been. A queued execution that was never sent (its dispatcher failed or crashed between
+    /// recording and sending it) is sent by the next dispatch of its fingerprint.
+    @optional @asName("sent_at") string sentAt;
     /// Artifacts the execution produced.
     @optional ArtifactMetadata[] artifacts;
     /// The worker that holds or last held it (`WorkerRecord.id`); empty until claimed.
@@ -1013,16 +1027,18 @@ struct TaskExecutionPayload
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
     @optional string[string] environment;
     @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
-    @optional @asName("workspace_dir") string workspaceDir;
-    @optional @asName("callback_url") string callbackUrl;
-    @optional @asName("force") bool force = false;
 }
 
 /**
- * Represents a fully resolved, ready-to-execute work order dispatched to a worker or queue.
+ * A fully resolved, ready-to-execute work order, as a worker receives it. The dispatch queue
+ * never carries one: it carries a DispatchMessage naming the execution, and the control plane
+ * builds the work order from the execution's record when a worker receives it
+ * (confector.core.work_orders).
  */
 struct WorkOrder
 {
+    /// The execution to run (`TaskExecution.id`).
+    @optional @asName("execution_id") string executionId;
     @optional @asName("build_id") string buildId;
     @optional @asName("task_id") string taskId;
     /// The task definition to execute.

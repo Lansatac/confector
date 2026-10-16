@@ -25,6 +25,9 @@ module confector.core.chain_evaluator;
  * - **A task needs an execution** when it is requested, has no success and no active execution,
  *   no failure or cancellation settles its latest request, and every upstream task has
  *   succeeded. A task whose upstream task failed or was cancelled is blocked.
+ * - **A requested task whose active execution was never sent** (`TaskExecution.sentAt` is empty)
+ *   is needed too, so the dispatcher sends it: this is how a dispatcher that failed or crashed
+ *   between recording an execution and sending it is repaired by the next evaluation.
  * - **Reruns are strict.** Fingerprints are computed from the chain and the current rerun
  *   generations (`chainResolution`), so after a rerun the rerun task and everything downstream
  *   of it have new fingerprints, and earlier successes are not used: downstream tasks wait for
@@ -86,10 +89,11 @@ enum WaitReason : string
 {
     /// The task is not waiting.
     none = "",
-    /// It needs an execution, which the dispatcher has not yet recorded.
+    /// It needs dispatching: the dispatcher has not yet recorded an execution for it, or recorded
+    /// one (`ChainTaskState.executionId`) but never sent it to the dispatch queue.
     dispatch = "dispatch",
-    /// Its execution is queued: not yet claimed by a worker, or waiting for another attempt after
-    /// its worker was lost.
+    /// Its execution is queued and was sent to the dispatch queue: not yet claimed by a worker,
+    /// or waiting for another attempt after its worker was lost.
     queued = "queued",
     /// An upstream task has not succeeded yet.
     upstream = "upstream"
@@ -126,8 +130,10 @@ struct ChainTaskState
 }
 
 /**
- * A fingerprint that needs an execution: the dispatcher claims it, records the execution and
- * enqueues a work order carrying the task's resolved inputs (`ChainEvaluation.resolution`).
+ * A fingerprint that needs dispatching: it has no active execution, or its active execution was
+ * recorded but never sent. The execution dispatcher (confector.core.execution_dispatcher) claims
+ * it, records the execution with the task's resolved inputs (`ChainEvaluation.resolution`) and
+ * sends it, or sends the unsent execution it finds holding the claim.
  */
 struct NeededExecution
 {
@@ -215,6 +221,14 @@ ChainEvaluation evaluateChain(
             if (summary.active.status == ExecutionStatus.running)
             {
                 state.status = ChainTaskStatus.running;
+            }
+            else if (summary.active.sentAt.length == 0)
+            {
+                // Recorded but never sent: its dispatcher failed or crashed before sending it.
+                // The dispatcher sends the execution it finds holding the claim.
+                state.status = ChainTaskStatus.waiting;
+                state.waitingFor = WaitReason.dispatch;
+                result.needed ~= NeededExecution(taskId, state.fingerprint);
             }
             else
             {
@@ -488,6 +502,7 @@ version (unittest)
             e.definition.id = taskId;
             e.definitionHash = "def";
             e.createdAt = createdAt;
+            e.sentAt = createdAt;
             if (status != ExecutionStatus.queued && status != ExecutionStatus.running) e.finishedAt = createdAt;
             byFingerprint[fingerprint] ~= e;
         }
@@ -633,6 +648,21 @@ unittest
     // A retry while an execution is active attaches to it too
     auto retry = evaluate(chain, requests ~ request("r2", ["compile"], "2026-10-15T11:00:00Z", BuildIntent.retry), queued);
     assert(retry.needed.length == 0 && retry.tasks["compile"].executionId == "e-compile");
+
+    // A queued execution that was recorded but never sent (its dispatcher failed or crashed
+    // before sending) needs dispatching again, naming the execution to send; a running one
+    // never does
+    Executions unsent;
+    unsent.add("e-compile", "compile", fp["compile"], ExecutionStatus.queued, "2026-10-15T10:00:02Z", 0);
+    unsent.byFingerprint[fp["compile"]][0].sentAt = null;
+    unsent.add("e-lint", "lint", fp["lint"], ExecutionStatus.running, "2026-10-15T09:00:00Z");
+    unsent.byFingerprint[fp["lint"]][0].sentAt = null;
+    auto repair = evaluate(chain, requests, unsent);
+    assert(neededTasks(repair) == ["compile"]);
+    assert(repair.tasks["compile"].status == ChainTaskStatus.waiting && repair.tasks["compile"].waitingFor == WaitReason.dispatch);
+    assert(repair.tasks["compile"].executionId == "e-compile");
+    assert(repair.tasks["lint"].status == ChainTaskStatus.running);
+    assert(evaluate(chain, [], unsent).needed.length == 0, "An unrequested task is never dispatched");
 }
 
 unittest

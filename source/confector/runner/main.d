@@ -205,7 +205,6 @@ int handleRun(string[] args)
             order.fingerprint,
             order.payload.inputs,
             order.payload.repositoryAddresses,
-            order.payload.force,
             (line) {
                 stderr.writeln(line);
             }

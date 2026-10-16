@@ -143,7 +143,6 @@ class TaskEngine
      *                 plane; the runner never computes its own. Required.
      *   inputs = The task's resolved inputs from the work order, one per declared input.
      *   repositoryAddresses = Where to fetch each repository input from, keyed by input name.
-     *   force = Whether to force execution regardless of caching.
      *   logCallback = Optional log callback receiving execution output lines.
      *   manageArtifacts = When true, engine stages upstream artifacts and packs outputs.
      *
@@ -157,7 +156,6 @@ class TaskEngine
         string fingerprint,
         in ResolvedInput[] inputs,
         in string[string] repositoryAddresses = null,
-        bool force = false,
         LogDelegate logCallback = null,
         bool manageArtifacts = true
     )
@@ -167,8 +165,8 @@ class TaskEngine
         result.taskId = task.id;
         result.buildId = buildId;
 
-        logInfo("[engine] Starting executeTask for task '%s' (build '%s', workspace '%s', force=%s, manageArtifacts=%s)",
-            task.id, buildId, workspaceDir, force, manageArtifacts);
+        logInfo("[engine] Starting executeTask for task '%s' (build '%s', workspace '%s', manageArtifacts=%s)",
+            task.id, buildId, workspaceDir, manageArtifacts);
 
         // 1. The fingerprint is the control plane's; outputs are stored under it.
         if (fingerprint.length == 0)

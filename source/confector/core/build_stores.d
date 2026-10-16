@@ -288,7 +288,7 @@ final class ExecutionStore
      *
      * Throws: DocumentConflictException if the execution changed since `current` was read;
      * InvalidStateTransitionException if `current` is terminal or `next` changes its identity,
-     * or the definition (and its hash) it was dispatched with.
+     * or the definition (and its hash), inputs or repository addresses it was dispatched with.
      */
     Versioned!TaskExecution update(in Versioned!TaskExecution current, TaskExecution next)
     {
@@ -298,8 +298,9 @@ final class ExecutionStore
         requireValid(next.id == was.id && next.projectId == was.projectId && next.taskId == was.taskId
             && next.fingerprint == was.fingerprint && next.createdAt == was.createdAt,
             format("The identity of execution '%s' cannot change", was.id));
-        requireValid(next.definitionHash == was.definitionHash && next.definition == cast(TaskNode) was.definition,
-            format("Execution '%s' ran with the definition it was dispatched with; it cannot change", was.id));
+        requireValid(next.definitionHash == was.definitionHash && next.definition == cast(TaskNode) was.definition
+            && next.inputs == was.inputs && next.repositoryAddresses == cast(string[string]) was.repositoryAddresses,
+            format("Execution '%s' runs with the definition and inputs it was dispatched with; they cannot change", was.id));
         return m_executions.replace(was.id, next, current.version_);
     }
 
@@ -731,6 +732,15 @@ unittest
     TaskExecution restepped = v3.value;
     restepped.definition.steps = [BuildStep("Compile", "bash", null, "make release")];
     assert(throwsA!InvalidStateTransitionException({ executions.update(v3, restepped); }), "The definition is fixed at dispatch");
+    TaskExecution repinned = v3.value;
+    repinned.inputs = [ResolvedInput("src", InputKind.repository, Json("bbb222"))];
+    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, repinned); }), "The inputs are fixed at dispatch");
+    TaskExecution readdressed = v3.value;
+    readdressed.repositoryAddresses = ["src": "https://example.test/other.git"];
+    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, readdressed); }));
+    TaskExecution sent = v3.value;
+    sent.sentAt = "2026-10-15T14:03:30Z";
+    v3 = executions.update(v3, sent);
 
     TaskExecution succeeded = v3.value;
     succeeded.status = ExecutionStatus.succeeded;

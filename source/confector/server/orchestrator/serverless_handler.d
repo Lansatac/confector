@@ -23,7 +23,6 @@ struct ServerlessTaskRequest
     @optional ResolvedInput[] inputs;
     /// Address of each repository input, keyed by input name, as a work order carries them.
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
-    bool force = false;
 }
 
 /**
@@ -88,8 +87,7 @@ ServerlessTaskResponse executeServerlessTask(
         request.workspaceDir,
         request.fingerprint,
         request.inputs,
-        request.repositoryAddresses,
-        request.force
+        request.repositoryAddresses
     );
 
     ServerlessTaskResponse response;

@@ -255,7 +255,8 @@ class HttpWorkerClient
         }
     }
 
-    bool reportCompletion(string buildId, string taskId, in TaskExecutionResult result, string callbackUrl = null)
+    /// Reports a task's completion. Returns false, logging why, if the server did not record it.
+    bool reportCompletion(string buildId, string taskId, in TaskExecutionResult result)
     {
         bool success = false;
         try
@@ -268,22 +269,6 @@ class HttpWorkerClient
         catch (Exception e)
         {
             logError("[HttpWorkerClient] Failed to report task completion to server (build: %s, task: %s): %s", buildId, taskId, e.msg);
-        }
-
-        if (callbackUrl.length > 0)
-        {
-            try
-            {
-                auto http = HTTP(callbackUrl);
-                http.addRequestHeader("Content-Type", "application/json");
-                string bodyStr = serializeToJsonString(result);
-                http.setPostData(bodyStr, "application/json");
-                http.perform();
-            }
-            catch (Exception e)
-            {
-                logWarn("[HttpWorkerClient] Failed to notify callback URL '%s': %s", callbackUrl, e.msg);
-            }
         }
 
         return success;
@@ -477,7 +462,6 @@ class HttpWorkerDaemon
                 msg.fingerprint,
                 msg.payload.inputs,
                 msg.payload.repositoryAddresses,
-                msg.payload.force,
                 &onLogLine
             );
         }
@@ -501,11 +485,16 @@ class HttpWorkerDaemon
             m_client.streamLogs(buildId, taskId, finalLogs);
         }
 
-        // Report task completion over HTTP
-        m_client.reportCompletion(buildId, taskId, result, msg.payload.callbackUrl);
-
-        // Acknowledge the work order
-        if (lease.receipt.length > 0)
+        // Report task completion over HTTP, naming the execution the work order is for
+        result.executionId = msg.executionId;
+        if (!m_client.reportCompletion(buildId, taskId, result))
+        {
+            // Not acknowledged: the lease expires and the work order is delivered again, rather
+            // than the work order disappearing with its completion never recorded.
+            logError("[worker] Completion of task '%s' (execution '%s') was not recorded; leaving receipt '%s' unacknowledged so it is delivered again",
+                taskId, msg.executionId, lease.receipt);
+        }
+        else if (lease.receipt.length > 0)
         {
             m_client.ackTask(lease.receipt);
         }
@@ -637,6 +626,7 @@ unittest
     bool ackCalled = false;
 
     WorkOrder mockOrder;
+    mockOrder.executionId = "exe_mock_1";
     mockOrder.buildId = "build_test_1";
     mockOrder.taskId = "task_test_1";
     mockOrder.fingerprint = "fp_mock_123";
@@ -666,10 +656,21 @@ unittest
         res.writeJsonBody(["status": "ok"]);
     });
 
+    bool rejectCompletion = false;
+    string reportedExecution;
     router.post("/api/v1/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         completeCalled = true;
+        // The result's status is not checked: the worker runs on its own thread, whose
+        // (thread-local) plugin registry lacks the mock step system, so the task fails there.
+        // These tests cover the control-plane protocol.
         auto result = deserializeJson!TaskExecutionResult(req.json);
-        assert(result.status == TaskStatus.succeeded);
+        reportedExecution = result.executionId;
+        if (rejectCompletion)
+        {
+            res.statusCode = 400;
+            res.writeJsonBody(["error": "Execution 'exe_mock_1' no longer holds fingerprint fp_mock_123"]);
+            return;
+        }
         res.writeJsonBody(["status": "recorded"]);
     });
 
@@ -711,6 +712,22 @@ unittest
     assert(dequeueCalled);
     assert(completeCalled);
     assert(ackCalled);
+    assert(reportedExecution == "exe_mock_1", "The result names the work order's execution");
+
+    // A completion the server does not record leaves the lease unacknowledged, so the work order
+    // is delivered again instead of disappearing
+    rejectCompletion = true;
+    ackCalled = false;
+    completeCalled = false;
+    auto lease = Lease("receipt_xyz", 1, serializeToJson(mockOrder));
+    auto retryThread = new Thread({ workerRunner.processOneMessage(lease); });
+    retryThread.start();
+    while (retryThread.isRunning)
+    {
+        sleep(50.msecs);
+    }
+    retryThread.join();
+    assert(completeCalled && !ackCalled);
 }
 
 unittest
@@ -815,8 +832,7 @@ unittest
     router.post("/api/v1/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         string tId = req.params["task_id"];
         completedTasks ~= tId;
-        auto result = deserializeJson!TaskExecutionResult(req.json);
-        assert(result.status == TaskStatus.succeeded);
+        // Status not checked; see the previous test
         res.writeJsonBody(["status": "recorded"]);
     });
 
