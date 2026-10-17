@@ -647,3 +647,8 @@ Targets: `server`, `runner`, `plugins` (plain `ninja` builds all three).
 
 Outputs land in `build/out/server/` and `build/out/runner/`, with plugins in their `plugins/`
 subdirectories. Release builds should use LDC (bead `confector-z7z.45`).
+
+**The server's views are not copied to the output directory, and that is correct.** The `.dt`
+templates in `apps/server/views` are compiled into the server binary (`render!("x.dt", ...)` is
+compile-time, and dub's `views` string-import path supplies them), so the executable needs no
+views directory at runtime. Do not "fix" a missing `views` folder next to the binary.

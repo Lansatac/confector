@@ -30,7 +30,7 @@ __dub_cache__/
 out/
 
 # Intermediate build files
-build/
+/build/
 .reggae
 *.ninja*
 compile_commands.json
