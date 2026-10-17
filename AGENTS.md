@@ -256,8 +256,10 @@ How they fit together:
   tasks, never downstream ones.
 - **Any task in a chain can be built later** against the chain's pinned inputs, without
   re-resolving. This is how an external build is made from exactly what was tested.
-- **Chain state is derived, never stored**, from the chain's requests and the executions for its
-  fingerprints.
+- **Chain state is derived from authoritative inputs**: the chain, its requests, the executions
+  for its fingerprints, and the rerun generations. A small mutable *chain state* document per
+  chain holds demand and a dirty marker so signals have somewhere durable to land; it can always
+  be rebuilt from those inputs.
 - **A configuration change does not trigger a rebuild** of a chain whose task already succeeded;
   re-run the task to apply it.
 - **Retry and rerun are different.** *Retry* runs a failed or cancelled task again in the same
@@ -293,30 +295,48 @@ surprising given that meaning.
 
 ## Coordinating builds
 
-Decided October 2026 (design record: bead `confector-z7z.2`).
+Decided October 2026 (design record: bead `confector-z7z.2`), amended October 2026 with the ledger
+and chain state (bead `confector-z7z.48`).
 
 - **Three components, split along what-versus-how.** An *input resolver* turns a request into a
-  chain (resolving inputs, finding or creating the chain). A pure *chain evaluator* takes a chain,
-  its requests, the rerun generations, and the executions for its fingerprints, and returns each
-  task's state plus the fingerprints that need an execution. An *execution dispatcher* claims each
+  chain (resolving inputs, finding or creating the chain). A pure *chain evaluator* takes a chain's
+  state, the rerun generations, and the ledgers of its fingerprints, and returns each task's state
+  plus the fingerprints that need an execution. An *execution dispatcher* claims each
   needed fingerprint, records the execution, and enqueues it.
-- **All state is persisted; nothing lives only in memory.** At most one active execution per
-  fingerprint is enforced with compare-and-set in the store, not with locks. *Why:* multiple
-  instances and serverless deployment must work, and a restart must lose nothing.
+- **All state is persisted; nothing lives only in memory.** Each fingerprint has a *ledger*
+  document, read by id, holding its active execution (at most one), its latest success, its latest
+  stopped execution with a sequence number, and the chains waiting on the active execution. At
+  most one active execution per fingerprint is enforced with compare-and-set on the ledger, not
+  with locks. *Why:* multiple instances and serverless deployment must work, and a restart must
+  lose nothing.
+- **Decisions read only what the store guarantees fresh.** Reading by id and compare-and-set are
+  the only operations treated as current; listing and index queries may lag, so they are used for
+  discovery (history pages, finding dirty chains), never to decide whether something finished.
 - **Level-triggered, not event-sourced.** Every input — a trigger, a completion, a cancel, a
-  rerun, an expired lease — only signals that something changed. The handler re-evaluates the
-  affected chains and dispatches whatever is missing. Every step is idempotent, so a crash between
-  saving state and enqueuing work is repaired by the next evaluation.
+  rerun, an expired lease — only signals that something changed. A signal marks the affected
+  chains dirty, through the ledger's waiting chains or directly; a chain stays dirty until a
+  re-evaluation commits. The handler re-evaluates the chain and dispatches whatever is missing.
+  Every step is idempotent, so a crash between saving state and enqueuing work is repaired by the
+  next evaluation, and a waiting chain cannot be forgotten.
+- **Every way an execution ends wakes its waiters.** Completion, failure, lost lease, dead letter
+  and cancel all finish the execution, then fold the result into the ledger and mark the waiting
+  chains dirty. A half-finished fold is completed by whoever next reads the ledger.
+- **Ordering uses sequence numbers, not clocks.** Whether a failure settles an earlier request is
+  decided by the ledger's sequence numbers, never by comparing timestamps written by different
+  instances.
 - **The control plane owns fingerprints.** Work orders carry an execution id; a worker's
   completion names that id, and the fingerprint comes from the control plane's own record.
 - **Infrastructure failures retry automatically; task failures do not.** A lost worker or expired
   lease counts as an attempt, up to an admin-configured limit tracked on the execution. A task
   that fails is retried only when a user asks.
-- **Expired leases are found by a sweep that runs only while work is active.** The sweep is
-  registered with the scheduler when executions are active and removed when none are, keeping an
-  idle installation free. Scheduler calls may be duplicated or missed, so every dispatch and
-  completion re-asserts whether the sweep should exist.
-- **Chain state is computed when read.** Add a cached summary only if it proves too slow.
+- **Expired leases, dirty chains and unfinished folds are found by a sweep that runs only while
+  such work exists.** The sweep is registered with the scheduler when executions are active or
+  anything awaits reconciliation, and removed when none is, keeping an idle installation free.
+  Scheduler calls may be duplicated or missed, and discovery may lag, so every dispatch and
+  completion re-asserts whether the sweep should exist and the sweep does not stop on a single
+  empty look.
+- **The dashboard reads chain state** from the chain state document. Add a cached summary only if
+  that proves too slow.
 
 ## Branches
 
@@ -558,6 +578,10 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   it; tasks can declare which environment they deploy to, giving a view of what was most recently
   deployed where. Deploy tasks will need a flag to never reuse cached results (bead
   `confector-z7z.42`).
+- **How far a rerun reaches.** "Re-running a task" says a rerun updates every chain that shares
+  the task's inputs. For a widely shared task that rebuilds the history of every branch. Whether
+  a rerun reaches only the requested chain, the chains confirmed in the prompt and open chains, or
+  all of them is undecided (design record: bead `confector-z7z.48`; decision bead below it).
 - **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
   Preferred shape: an input kind that pins to another project's chain, not chains that span
   projects.
@@ -570,8 +594,10 @@ Be aware of these so you do not spread them:
 
 - **The build coordinator** (`apps/server/source/confector/server/orchestrator/coordinator.d`) mixes graph
   evaluation with dispatch, splits state between memory and the database, and contains silent
-  fallbacks. It is being replaced (see "Coordinating builds"; bead `confector-z7z.23`). Make
-  minimal changes there.
+  fallbacks. It is being replaced (see "Coordinating builds"; beads `confector-z7z.23` and
+  `confector-z7z.48`). It is to be deleted outright, not patched: do not fix bugs in it, extend
+  it, or implement a feature on both the old and the new path. Nothing in the project is kept for
+  backward compatibility.
 - **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has accumulated
   aliases: several ways to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
   build step. **Do not add another alias.** If a representation is wrong, change it and update its
