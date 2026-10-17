@@ -30,8 +30,6 @@ html(lang="en")
             isActive = true;
           } else if (href !== '/' && currentPath.indexOf(href) === 0) {
             isActive = true;
-          } else if (route === 'admin' && currentPath.indexOf('/admin') === 0) {
-            isActive = true;
           } else if (route === 'artifacts' && currentPath.indexOf('/artifacts') === 0) {
             isActive = true;
           }

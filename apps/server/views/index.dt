@@ -1,4 +1,0 @@
-extends layout
-
-block maincontent
-	h1 Confector - Home

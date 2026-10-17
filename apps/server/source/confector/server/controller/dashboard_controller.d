@@ -8,7 +8,6 @@ import confector.core.state_stores : StateStores;
 import confector.core.dag;
 import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
-import confector.runner_core.engine;
 import confector.server.controller.api_controller : buildsNotImplemented;
 
 import std.algorithm : canFind;
@@ -321,7 +320,7 @@ unittest
     assert(formatStepIssues([checkout, bash, legacy], issues).canFind("Step 3"));
 }
 
-URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry registry = null)
+URLRouter dashboardRouter(StateStores stores, PluginRegistry registry = null)
 {
     if (registry is null)
     {
@@ -916,14 +915,11 @@ URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry 
 
 unittest
 {
-    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto storage = new InMemoryArtifactStorage();
-    auto engine = new TaskEngine(storage);
 
-    auto router = dashboardRouter(engine, stores);
+    auto router = dashboardRouter(stores);
     assert(router !is null);
 
     // Populate a trigger rule

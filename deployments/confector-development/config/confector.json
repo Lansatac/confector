@@ -5,9 +5,6 @@
       "port": 8080,
       "bindAddress": "0.0.0.0"
     },
-    "storage": {
-      "artifactsDir": "/runner/artifacts"
-    },
     "documentStore": {
       "connectionString": "mongodb://mongo:27017",
       "database": "confector"
@@ -16,9 +13,7 @@
       "callbackSecret": "dev-scheduler-secret"
     },
     "plugins": {
-      "pluginsUploadDir": "",
-      "bundledPluginsDir": "./plugins",
-      "confectorPlugins": ""
+      "bundledPluginsDir": "./plugins"
     }
   },
   "plugins": {

@@ -7,7 +7,5 @@ div.navbar-container
   nav.navbar-nav
     a.nav-item(href="/", data-route="dashboard") Dashboard
     a.nav-item(href="/projects/", data-route="projects") Projects
-    a.nav-item(href="/executors/", data-route="executors") Executors
     a.nav-item(href="/repositories/", data-route="repositories") Repositories
     a.nav-item(href="/artifacts/", data-route="artifacts") Artifacts
-    a.nav-item(href="/admin/plugins", data-route="admin") Admin

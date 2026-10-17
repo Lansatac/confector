@@ -34,15 +34,6 @@ block maincontent
                 code #{repoAddress}
               - else
                 span.text-muted Not specified
-          tr
-            th Refresh Policy
-            td
-              - if (repoRefreshPolicy == "webhook")
-                span.badge.badge-primary Webhook
-              - else if (repoRefreshPolicy == "polling")
-                span.badge.badge-warning Polling
-              - else
-                span.badge.badge-info Both
           - if (repoCreatedAt.length > 0)
             tr
               th Registered At
@@ -55,23 +46,6 @@ block maincontent
           div.form-group
             label(for="edit-address") Remote Address / URL:
             input.form-control#edit-address(type="text", name="address", value=repoAddress, required)
-
-          div.form-group
-            label(for="edit-refresh-policy") Change Detection Policy:
-            select.form-control#edit-refresh-policy(name="refresh-policy")
-              - if (repoRefreshPolicy == "webhook")
-                option(value="webhook", selected) Webhook — React to push events from the VCS provider
-                option(value="polling") Polling — Periodically check for new revisions
-                option(value="both") Both — Use webhooks and polling together
-              - else if (repoRefreshPolicy == "polling")
-                option(value="webhook") Webhook — React to push events from the VCS provider
-                option(value="polling", selected) Polling — Periodically check for new revisions
-                option(value="both") Both — Use webhooks and polling together
-              - else
-                option(value="webhook") Webhook — React to push events from the VCS provider
-                option(value="polling") Polling — Periodically check for new revisions
-                option(value="both", selected) Both — Use webhooks and polling together
-            small.text-muted(style="display: block; margin-top: 4px;") Webhooks require the VCS provider to send events to this server. Polling works without external configuration.
 
           div(style="margin-top: 20px;")
             button.btn.btn-primary(type="submit") Save Changes

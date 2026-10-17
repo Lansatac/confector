@@ -1,14 +1,11 @@
 module confector.server.app;
 
-import std.algorithm.searching : canFind;
 import std.conv : to;
 import std.file : exists, isDir;
 import std.format : format;
 import std.functional : toDelegate;
 import std.path : buildPath;
 import std.process : environment;
-import std.string : split, strip;
-import std.uri : encodeComponent;
 
 import vibe.vibe;
 
@@ -20,20 +17,17 @@ import confector.core.plugin_loader : PluginLoader;
 import confector.core.state_stores : StateStores;
 import confector.mongo_helpers : MongoConnection;
 import confector.plugins.document_store.mongo : MongoDocumentStore;
-import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
+import confector.plugin_api.scheduler : ScheduleEntry;
 import confector.server.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.plugin_api.dispatch_queue : DispatchQueue;
 import confector.plugin_api.model : QueueDemand;
 import confector.server.orchestrator.capacity_broker : DefaultCapacityBroker;
 import confector.core.execution_dispatcher : queuedDemand;
-import confector.runner_core.engine : TaskEngine;
 
-import confector.server.controller.admin_controller : adminRouter;
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
 import confector.server.controller.dashboard_controller : dashboardRouter;
-import confector.server.controller.executor_controller : executorRouter;
-import confector.server.controller.repositorycontroller : repositoryRouter, vcsPollUrl;
+import confector.server.controller.repositorycontroller : repositoryRouter;
 
 /// Renders the default error page.
 void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInfo error)
@@ -41,10 +35,9 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
     res.render!("error.dt", req, error);
 }
 
-/// Discovers and loads bundled plugins as well as dynamically configured plugins via server config / CONFECTOR_PLUGINS.
-void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
+/// Discovers and loads the bundled plugins.
+void initPlugins(string bundledPluginsDir = "")
 {
-    // Automatically load bundled plugins from out/plugins and plugins directories (definition and worker plugins only)
     Plugin[] bundledPlugins;
     string[] searchDirs = bundledPluginsDir.length > 0
         ? [bundledPluginsDir]
@@ -76,66 +69,16 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
         logInfo("[plugins] No bundled plugins found in ./plugins.");
     }
 
-    // Dynamically load additional configured plugins via extraPlugins or CONFECTOR_PLUGINS
-    string confectorPluginsEnv = extraPlugins.length > 0 ? extraPlugins : environment.get("CONFECTOR_PLUGINS", "");
-    string[] pluginPaths;
-    if (confectorPluginsEnv.length > 0)
-    {
-        version (Windows)
-        {
-            pluginPaths = confectorPluginsEnv.split(";");
-        }
-        else
-        {
-            pluginPaths = confectorPluginsEnv.split(":");
-        }
-
-        if (pluginPaths.length == 1 && confectorPluginsEnv.canFind(","))
-        {
-            pluginPaths = confectorPluginsEnv.split(",");
-        }
-    }
-
-    if (pluginPaths.length > 0)
-    {
-        foreach (path; pluginPaths)
-        {
-            string trimmed = path.strip;
-            if (trimmed.length > 0)
-            { 
-                try
-                {
-                    auto p = PluginLoader.instance.loadPlugin(trimmed, false, [PluginCategory.definition, PluginCategory.worker, PluginCategory.artifact, PluginCategory.queue, PluginCategory.scheduler]);
-                    if (p !is null)
-                    {
-                        logInfo("[plugins] Dynamically loaded plugin '%s' v%s (%s) from %s", p.name, p.versionString, p.category, trimmed);
-                    }
-                }
-                catch (Exception e)
-                {
-                    logWarn("[plugins] Failed to load configured plugin '%s': %s", trimmed, e.msg);
-                }
-            }
-        }
-    }
-    else
-    {
-        logInfo("[plugins] No additional external plugins configured via CONFECTOR_PLUGINS.");
-    }
-
     logInfo("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
 }
 
 /// Configures application URL routing.
 URLRouter createRouter(
-    TaskEngine taskEngine,
     DispatchQueue dispatchQueue,
     StateStores stores,
     string schedulerCallbackSecret,
     CapacityBroker capacityBroker = null,
-    ConfiguredArtifactStorage configuredStorage = null,
-    Scheduler scheduler = null,
-    ushort serverPort = 8080)
+    ConfiguredArtifactStorage configuredStorage = null)
 {
     auto router = new URLRouter();
 
@@ -150,27 +93,19 @@ URLRouter createRouter(
     fsettings.serverPathPrefix = "/static";
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
-    // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, schedulerCallbackSecret, dispatchQueue, stores, capacityBroker);
-    router.any("/api/v1/*", api);
-    router.any("/api/*", api);
+    // API endpoints
+    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, dispatchQueue, stores, capacityBroker));
 
-    // Dashboard, projects, tasks, executors, and admin UI. Build views wait for request intake
+    // Dashboard, projects, tasks, repositories and artifacts UI. Build views wait for request intake
     // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
-    router.any("/projects/*", dashboardRouter(taskEngine, stores));
+    router.any("/projects/*", dashboardRouter(stores));
     router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
 
-    router.any("/tasks/*", dashboardRouter(taskEngine, stores));
+    router.any("/tasks/*", dashboardRouter(stores));
 
-    router.any("/executors/*", executorRouter(stores, PluginRegistry.instance, capacityBroker));
-    router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
+    router.get("/", dashboardRouter(stores));
 
-    router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
-    router.get("/admin", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/admin/plugins"); });
-
-    router.get("/", dashboardRouter(taskEngine, stores));
-
-    router.any("/repositories/*", repositoryRouter(stores, schedulerCallbackSecret, scheduler, serverPort));
+    router.any("/repositories/*", repositoryRouter(stores));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
     router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
@@ -237,7 +172,6 @@ void main()
 {
     // Initialize central ConfigRegistry
     auto configRegistry = loadConfigRegistry();
-    registerServerConfigDefinitions(configRegistry);
     // Connect ConfigRegistry to PluginRegistry for scoped plugin configs
     PluginRegistry.instance.setConfigRegistry(configRegistry);
 
@@ -262,7 +196,7 @@ void main()
     setLogLevel(configuredLogLevel);
 
     // Load all plugins (storage, queue, definition, worker, artifact) via plugin loader
-    initPlugins(serverConfig.plugins.bundledPluginsDir, serverConfig.plugins.confectorPlugins);
+    initPlugins(serverConfig.plugins.bundledPluginsDir);
 
     // The state stores run over the Mongo document store, configured under server.documentStore.
     // Missing settings or an unreachable MongoDB end startup here (constructing StateStores
@@ -288,10 +222,7 @@ void main()
         throw new Exception("No artifact storage plugin registered: the server cannot start without one.");
     }
 
-    // Use ConfiguredArtifactStorage so that TaskEngine always forwards
-    // to the currently configured storage, allowing runtime changes via the Artifacts UI.
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
-    auto taskEngine = new TaskEngine(configuredStorage);
 
     // Demand is the executions sent and waiting for a worker, read from the state store; the
     // scheduler asks the broker to evaluate it (/broker/evaluate).
@@ -333,24 +264,17 @@ void main()
         logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
-    // Nothing starts builds until request intake lands (bead confector-z7z.23.7): the routes that
-    // would start one fail loudly (see buildsNotImplemented).
-    logInfo("Initialized Confector execution engine.");
-
     // Load scheduler plugin
     auto scheduler = PluginRegistry.instance.getDefaultScheduler();
     if (scheduler is null)
-        throw new Exception("No scheduler plugin registered; VCS polling, cron triggers and capacity evaluation cannot run");
+        throw new Exception("No scheduler plugin registered; capacity evaluation cannot run");
 
     // Configure router and server settings
-    auto router = createRouter(taskEngine,
-      dispatchQueue,
+    auto router = createRouter(dispatchQueue,
       stores,
       serverConfig.scheduler.callbackSecret,
       capacityBroker,
-      configuredStorage,
-      scheduler,
-      serverConfig.http.port);
+      configuredStorage);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -380,52 +304,6 @@ void main()
         capacityEntry.recurring = true;
         scheduler.schedule(capacityEntry);
         logInfo("[scheduler] Registered capacity evaluation entry (every %d min)", evalInterval);
-
-        // Register VCS polling schedule entries for repositories with polling policy
-        import confector.plugin_api.model : RepositoryRecord;
-        auto allRepos = stores.repositories.list();
-        foreach (repo; allRepos)
-        {
-            string policy = repo.refreshPolicy.length > 0 ? repo.refreshPolicy : "webhook";
-            if ((policy == "polling" || policy == "both") && repo.address.length > 0)
-            {
-                ScheduleEntry pollEntry;
-                pollEntry.id = "vcs-poll-" ~ repo.name;
-                pollEntry.name = format("VCS Poll: %s", repo.name);
-                pollEntry.uri = vcsPollUrl(serverConfig.http.port, repo.name);
-                pollEntry.httpMethod = "POST";
-                pollEntry.cronExpression = "*/5 * * * *";  // Every 5 minutes
-                pollEntry.recurring = true;
-                scheduler.schedule(pollEntry);
-                logInfo("[scheduler] Registered VCS polling for '%s' (every 5 min)", repo.name);
-            }
-        }
-
-        // Register schedule entries for each cron trigger rule
-        // Each cron rule posts to /api/v1/projects/<id>/run (served by schedulerRoute in apiRouter)
-        import confector.plugin_api.model : TriggerRuleRecord;
-        auto cronRules = stores.triggerRules.list();
-        foreach (rule; cronRules)
-        {
-            if (rule.triggerType != "cron")
-            {
-                continue;
-            }
-            if (rule.criteria.length == 0)
-            {
-                continue;
-            }
-
-            ScheduleEntry cronEntry;
-            cronEntry.id = "cron-" ~ rule.id;
-            cronEntry.name = format("Cron Trigger: %s (%s)", rule.name, rule.criteria);
-            cronEntry.uri = format("http://127.0.0.1:%d/api/v1/projects/%s/run", serverConfig.http.port, encodeComponent(rule.projectId));
-            cronEntry.httpMethod = "POST";
-            cronEntry.cronExpression = rule.criteria;
-            cronEntry.recurring = true;
-            scheduler.schedule(cronEntry);
-            logInfo("[scheduler] Registered cron trigger '%s' for project '%s' (cron: %s)", rule.name, rule.projectId, rule.criteria);
-        }
     }
 
     logInfo("Starting server on port %d", serverConfig.http.port);
@@ -434,7 +312,6 @@ void main()
 
 unittest
 {
-    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
 
@@ -444,8 +321,6 @@ unittest
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
-    auto storage = new InMemoryArtifactStorage();
-    auto engine = new TaskEngine(storage);
     auto broker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
 
     class TestProvisioner : ComputeProvisioner
@@ -459,7 +334,7 @@ unittest
 
     broker.registerProvisioner(new TestProvisioner());
 
-    auto router = createRouter(engine, queue, stores, "test-scheduler-secret", broker);
+    auto router = createRouter(queue, stores, "test-scheduler-secret", broker);
     assert(router !is null);
 
     assert(broker.provisioners.length == 1);

@@ -7,7 +7,6 @@ import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.core.trigger;
 import confector.core.executor : CapacityBroker;
-import confector.runner_core.engine;
 import confector.plugin_api.dispatch_queue;
 import confector.core.execution_dispatcher : defaultPoolQueue;
 import confector.server.scheduler_callback : schedulerCallback;
@@ -24,18 +23,19 @@ import std.datetime.systime : Clock;
  */
 enum string buildsNotImplemented = "Starting builds is not implemented until request intake (bead confector-z7z.23.7)";
 
-URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQueue queue = null, StateStores stores = null, CapacityBroker capacityBroker = null)
+/**
+ * The REST API, served under /api/v1. Every route is registered once, with the prefix; the route
+ * helpers take paths relative to it.
+ */
+URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, StateStores stores = null, CapacityBroker capacityBroker = null)
 {
-    import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
+
+    enum string apiPrefix = "/api/v1";
 
     void postRoute(H)(string path, H handler)
     {
-        router.post(path, handler);
-        if (!path.startsWith("/api/v1"))
-        {
-            router.post("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
-        }
+        router.post(apiPrefix ~ path, handler);
     }
 
     // Routes the scheduler calls back into. Each one requires the scheduler secret; see
@@ -47,29 +47,12 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
 
     void getRoute(H)(string path, H handler)
     {
-        router.get(path, handler);
-        if (!path.startsWith("/api/v1"))
-        {
-            router.get("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
-        }
-    }
-
-    void anyRoute(H)(string path, H handler)
-    {
-        router.any(path, handler);
-        if (!path.startsWith("/api/v1"))
-        {
-            router.any("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
-        }
+        router.get(apiPrefix ~ path, handler);
     }
 
     void deleteRoute(H)(string path, H handler)
     {
-        router.delete_(path, handler);
-        if (!path.startsWith("/api/v1"))
-        {
-            router.delete_("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
-        }
+        router.delete_(apiPrefix ~ path, handler);
     }
 
     // The routes that start builds fail loudly until request intake lands; see
@@ -363,68 +346,6 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         writeBuildsNotImplemented(res);
     });
 
-    // Trigger Rules API
-    getRoute("/triggers", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            auto rules = stores !is null ? stores.triggerRules.list() : [];
-            res.writeJsonBody(rules);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    postRoute("/triggers/create", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            TriggerRuleRecord rule = deserializeJson!TriggerRuleRecord(req.json);
-            if (rule.id.length == 0)
-            {
-                rule.id = "trig_" ~ randomUUID().toString();
-            }
-            if (rule.createdAt.length == 0)
-            {
-                rule.createdAt = Clock.currTime.toISOString();
-            }
-
-            if (stores !is null)
-            {
-                stores.triggerRules.save(rule);
-            }
-            res.writeJsonBody(rule);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    postRoute("/triggers/delete", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string ruleId = req.json["id"].get!string;
-            bool ok = stores !is null && stores.triggerRules.remove(ruleId);
-            Json resp = Json.emptyObject;
-            resp["deleted"] = Json(ok);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
     // Projects REST API
     getRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
         try
@@ -698,270 +619,6 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         }
     });
 
-    // Generic VCS-agnostic webhook ingestion endpoint
-    postRoute("/webhooks", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            import confector.core.plugin : PluginRegistry;
-            import confector.plugin_api.vcs : VcsStateResolver;
-            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
-            import std.json : parseJSON, JSONValue;
-
-            // Collect HTTP headers
-            string[string] headers;
-            foreach (name, values; req.headers.byKeyValue())
-            {
-                string joined;
-                foreach (v; values)
-                {
-                    if (joined.length > 0) joined ~= ", ";
-                    joined ~= v;
-                }
-                headers[name] = joined;
-            }
-
-            auto payload = parseJSON(req.json.toString());
-
-            // Find a VCS resolver that can handle this webhook
-            VcsStateResolver matchedResolver = null;
-            foreach (resolver; PluginRegistry.instance.getVcsResolvers())
-            {
-                if (resolver.canHandleWebhook(headers, payload))
-                {
-                    matchedResolver = resolver;
-                    break;
-                }
-            }
-
-            if (matchedResolver is null)
-            {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json("No registered VCS plugin could handle this webhook payload");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            // Parse the webhook payload
-            VcsRepositoryState resolvedState;
-            if (!matchedResolver.parseWebhookPayload(headers, payload, resolvedState))
-            {
-                res.statusCode = HTTPStatus.badRequest;
-                Json err = Json.emptyObject;
-                err["error"] = Json("VCS plugin failed to parse webhook payload");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            // Check for revision change and persist state
-            VcsRepositoryState previousState;
-            bool changed = false;
-            string fromRevision = "";
-
-            if (stores && stores.vcsStates.getState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
-            {
-                fromRevision = previousState.revision;
-                if (previousState.revision != resolvedState.revision)
-                {
-                    changed = true;
-                }
-            }
-            else
-            {
-                changed = true;
-            }
-
-            // Save the new state
-            if (stores)
-            {
-                resolvedState.updatedAt = Clock.currTime.toISOString();
-                stores.vcsStates.saveState(resolvedState);
-
-                if (changed)
-                {
-                    VcsChangeRecord change;
-                    change.id = "change_" ~ randomUUID().toString();
-                    change.repositoryUrl = resolvedState.repositoryUrl;
-                    change.providerType = resolvedState.providerType;
-                    change.targetRef = resolvedState.targetRef;
-                    change.fromRevision = fromRevision;
-                    change.toRevision = resolvedState.revision;
-                    change.detectedAt = Clock.currTime.toISOString();
-                    change.triggerSource = "webhook";
-                    stores.vcsStates.recordChange(change);
-                }
-            }
-
-            Json resp = Json.emptyObject;
-            resp["status"] = Json("processed");
-            resp["provider"] = Json(matchedResolver.providerType());
-            resp["repository"] = Json(resolvedState.repositoryUrl);
-            resp["revision"] = Json(resolvedState.revision);
-            resp["changed"] = Json(changed);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    // Generic VCS-agnostic webhook ingestion with trigger ID routing
-    postRoute("/webhooks/:triggerId", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            import confector.core.plugin : PluginRegistry;
-            import confector.plugin_api.vcs : VcsStateResolver;
-            import confector.plugin_api.model : VcsRepositoryState, VcsChangeRecord;
-            import std.json : parseJSON, JSONValue;
-
-            string triggerId = req.params["triggerId"];
-
-            // Look up the trigger rule to find the associated repository
-            VcsRepositoryState resolvedState;
-            if (stores)
-            {
-                auto rules = stores.triggerRules.list();
-                string targetRepoUrl = "";
-                foreach (rule; rules)
-                {
-                    if (rule.id == triggerId)
-                    {
-                        // Try to find the project associated with this trigger
-                        ProjectRecord proj;
-                        if (stores.projects.get(rule.projectId).tryValue(proj))
-                        {
-                            // Repositories come from task inputs: the target task first, then the rest.
-                            string[] candidates;
-                            foreach (t; proj.tasks)
-                            {
-                                if (t.id == rule.targetTaskId) candidates = repositoryIds(t) ~ candidates;
-                                else candidates ~= repositoryIds(t);
-                            }
-                            foreach (cand; candidates)
-                            {
-                                // Candidates are repository ids; only registered repositories have an address.
-                                RepositoryRecord repoRec;
-                                if (!stores.repositories.get(cand).tryValue(repoRec)) continue;
-                                if (repoRec.address.length > 0 && PluginRegistry.instance.findVcsResolver(repoRec.address) !is null)
-                                {
-                                    targetRepoUrl = repoRec.address;
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if (targetRepoUrl.length == 0)
-                {
-                    res.statusCode = HTTPStatus.notFound;
-                    Json err = Json.emptyObject;
-                    err["error"] = Json("Trigger not found or no associated repository: " ~ triggerId);
-                    res.writeJsonBody(err);
-                    return;
-                }
-
-                // Find the VCS resolver for this repository
-                auto resolver = PluginRegistry.instance.findVcsResolver(targetRepoUrl);
-                if (resolver is null)
-                {
-                    res.statusCode = HTTPStatus.badRequest;
-                    Json err = Json.emptyObject;
-                    err["error"] = Json("No VCS plugin registered for repository: " ~ targetRepoUrl);
-                    res.writeJsonBody(err);
-                    return;
-                }
-
-                // Collect HTTP headers
-                string[string] headers;
-                foreach (name, values; req.headers.byKeyValue())
-                {
-                    string joined;
-                    foreach (v; values)
-                    {
-                        if (joined.length > 0) joined ~= ", ";
-                        joined ~= v;
-                    }
-                    headers[name] = joined;
-                }
-
-                auto payload = parseJSON(req.json.toString());
-
-                if (!resolver.parseWebhookPayload(headers, payload, resolvedState))
-                {
-                    res.statusCode = HTTPStatus.badRequest;
-                    Json err = Json.emptyObject;
-                    err["error"] = Json("VCS plugin failed to parse webhook payload");
-                    res.writeJsonBody(err);
-                    return;
-                }
-
-                // Check for revision change and persist
-                VcsRepositoryState previousState;
-                bool changed = false;
-                string fromRevision = "";
-
-                if (stores.vcsStates.getState(resolvedState.repositoryUrl, resolvedState.targetRef, previousState))
-                {
-                    fromRevision = previousState.revision;
-                    if (previousState.revision != resolvedState.revision)
-                    {
-                        changed = true;
-                    }
-                }
-                else
-                {
-                    changed = true;
-                }
-
-                resolvedState.updatedAt = Clock.currTime.toISOString();
-                stores.vcsStates.saveState(resolvedState);
-
-                if (changed)
-                {
-                    VcsChangeRecord change;
-                    change.id = "change_" ~ randomUUID().toString();
-                    change.repositoryUrl = resolvedState.repositoryUrl;
-                    change.providerType = resolvedState.providerType;
-                    change.targetRef = resolvedState.targetRef;
-                    change.fromRevision = fromRevision;
-                    change.toRevision = resolvedState.revision;
-                    change.detectedAt = Clock.currTime.toISOString();
-                    change.triggerSource = "webhook";
-                    stores.vcsStates.recordChange(change);
-                }
-            }
-            else
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("No state stores available");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            Json resp = Json.emptyObject;
-            resp["status"] = Json("processed");
-            resp["trigger_id"] = Json(triggerId);
-            resp["repository"] = Json(resolvedState.repositoryUrl);
-            resp["revision"] = Json(resolvedState.revision);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-
     // Capacity broker endpoint — called by the scheduler plugin via HTTP
     if (capacityBroker !is null)
     {
@@ -983,15 +640,12 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         });
     }
 
-
-
     return router;
 }
 
 unittest
 {
     import confector.core.plugin;
-    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
@@ -1014,12 +668,10 @@ unittest
     }
 
     PluginRegistry.instance.registerPlugin(new MockApiPlugin());
-    auto storage = new InMemoryArtifactStorage();
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto engine = new TaskEngine(storage);
     auto queue = new InMemoryDispatchQueue();
 
-    auto router = apiRouter(engine, "test-scheduler-secret", queue);
+    auto router = apiRouter("test-scheduler-secret", queue);
     assert(router !is null);
 
     // A scheduler callback without the scheduler secret is refused before its handler runs
@@ -1068,7 +720,7 @@ unittest
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryStream;
 
-    auto routerWithStores = apiRouter(engine, "test-scheduler-secret", queue, stores);
+    auto routerWithStores = apiRouter("test-scheduler-secret", queue, stores);
 
     int post(string path, string body)
     {
@@ -1155,7 +807,7 @@ unittest
     another.fingerprint = "fp_n1_again";
     const anotherId = new ExecutionDispatcher(failingStores, queue).dispatch([another])[0].executionId;
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
-    auto failingRouter = apiRouter(engine, "test-scheduler-secret", queue, failingStores);
+    auto failingRouter = apiRouter("test-scheduler-secret", queue, failingStores);
     InetHeaderMap failingHeaders;
     failingHeaders["Content-Type"] = "application/json";
     auto failingReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ anotherId ~ "/complete"),

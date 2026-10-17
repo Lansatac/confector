@@ -15,9 +15,6 @@
 		"confector:core": {
 			"path": "../.."
 		},
-		"confector:runner-core": {
-			"path": "../.."
-		},
 		"confector:mongo-helpers": {
 			"path": "../.."
 		},

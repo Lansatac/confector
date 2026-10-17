@@ -16,16 +16,6 @@ struct HttpConfig
 }
 
 /**
- * Artifact storage configuration.
- */
-struct StorageConfig
-{
-    @Required
-    @Description("Base directory for artifact storage (required)")
-    string artifactsDir = "";
-}
-
-/**
  * Where the server keeps its state: the MongoDB behind the document store. Both settings are
  * required and have no defaults; the server refuses to start without them (see
  * requireDocumentStoreConfig). The connection string is shared with the mongo-queue plugin
@@ -45,8 +35,8 @@ struct DocumentStoreConfig
 }
 
 /**
- * Scheduler callbacks. The scheduler fires HTTP requests back into the server (cron triggers,
- * VCS polling, capacity evaluation); each one must carry this secret. Required, with no default.
+ * Scheduler callbacks. The scheduler fires HTTP requests back into the server (capacity
+ * evaluation); each one must carry this secret. Required, with no default.
  * The scheduler plugin reads the same value through CONFECTOR_SCHEDULER_CALLBACK_SECRET.
  */
 struct SchedulerConfig
@@ -62,15 +52,8 @@ struct SchedulerConfig
  */
 struct PluginsConfig
 {
-    @Description("Directory for uploaded plugins")
-    string pluginsUploadDir = "";
-
     @Description("Directory for bundled plugins")
     string bundledPluginsDir = "plugins";
-
-    @Env("CONFECTOR_PLUGINS")
-    @Description("List of additional plugins to load, separated by semicolon or comma")
-    string confectorPlugins = "";
 }
 
 /**
@@ -91,7 +74,6 @@ struct ServerConfig
     string logLevel = "info";
 
     HttpConfig http;
-    StorageConfig storage;
     DocumentStoreConfig documentStore;
     SchedulerConfig scheduler;
     PluginsConfig plugins;
@@ -157,7 +139,6 @@ unittest
     assert(cfg.http.port == 8080);
     assert(cfg.http.bindAddress == "0.0.0.0");
     assert(cfg.documentStore.database == "");
-    assert(cfg.storage.artifactsDir == "");
     assert(cfg.scheduler.callbackSecret == "");
     assert(cfg.plugins.bundledPluginsDir == "plugins");
 }
