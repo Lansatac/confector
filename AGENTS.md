@@ -633,10 +633,12 @@ Be aware of these so you do not spread them:
 
 - **Nothing starts builds yet.** The legacy build coordinator was deleted (bead
   `confector-z7z.23.10`). Until request intake lands (bead `confector-z7z.23.7`) the run routes
-  answer 501 Not Implemented, and a worker's completion only finishes its execution and releases
-  the claim (`confector.core.work_orders.completeExecution`) until the fingerprint ledger lands
-  (beads `confector-z7z.49.x`). Do not add a build path outside the chain components. Nothing in
-  the project is kept for backward compatibility.
+  answer 501 Not Implemented, and a worker's completion only finishes its execution
+  (`confector.core.work_orders.completeExecution`) until the ledger fold lands (bead
+  `confector-z7z.49.4`). The chain evaluator, execution dispatcher and fingerprint claims were
+  deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
+  designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). Do not add a build path outside the
+  chain components. Nothing in the project is kept for backward compatibility.
 - **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has accumulated
   aliases: several ways to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
   build step. **Do not add another alias.** If a representation is wrong, change it and update its
@@ -654,7 +656,7 @@ Be aware of these so you do not spread them:
 Each dub package is a directory with its own `dub.json` and a `source/` folder holding the full
 module path (for example `libs/core/source/confector/core/`).
 
-- `libs/core/` — graph construction and evaluation, fingerprinting, trigger matching, plugin
+- `libs/core/` — graph construction, input resolution, fingerprinting, trigger matching, plugin
   registry.
 - `libs/plugin_api/` — data types and interfaces shared with plugins.
 - `libs/runner_core/` — executes a single task on a worker.

@@ -68,21 +68,21 @@ unittest
     auto guarded = schedulerCallback("expected-secret", inner);
 
     // Missing header
-    auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/broker/evaluate"), HTTPMethod.POST);
+    auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/p1/run"), HTTPMethod.POST);
     auto res = createTestHTTPServerResponse();
     guarded(req, res);
     assert(res.statusCode == HTTPStatus.unauthorized);
     assert(!ran);
 
     // Wrong secret, same length and different length
-    req = createTestHTTPServerRequest(URL("http://localhost/api/v1/broker/evaluate"), HTTPMethod.POST);
+    req = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/p1/run"), HTTPMethod.POST);
     req.headers[schedulerSecretHeader] = "expected-secreT";
     res = createTestHTTPServerResponse();
     guarded(req, res);
     assert(res.statusCode == HTTPStatus.unauthorized);
     assert(!ran);
 
-    req = createTestHTTPServerRequest(URL("http://localhost/api/v1/broker/evaluate"), HTTPMethod.POST);
+    req = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/p1/run"), HTTPMethod.POST);
     req.headers[schedulerSecretHeader] = "x";
     res = createTestHTTPServerResponse();
     guarded(req, res);
@@ -90,7 +90,7 @@ unittest
     assert(!ran);
 
     // Correct secret reaches the handler
-    req = createTestHTTPServerRequest(URL("http://localhost/api/v1/broker/evaluate"), HTTPMethod.POST);
+    req = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/p1/run"), HTTPMethod.POST);
     req.headers[schedulerSecretHeader] = "expected-secret";
     res = createTestHTTPServerResponse();
     guarded(req, res);

@@ -2,7 +2,6 @@ module confector.server.app;
 
 import std.conv : to;
 import std.file : exists, isDir;
-import std.format : format;
 import std.functional : toDelegate;
 import std.path : buildPath;
 import std.process : environment;
@@ -11,18 +10,13 @@ import vibe.vibe;
 
 import confector.config;
 import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireDocumentStoreConfig, requireSchedulerConfig;
-import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
 import confector.core.state_stores : StateStores;
 import confector.mongo_helpers : MongoConnection;
 import confector.plugins.document_store.mongo : MongoDocumentStore;
-import confector.plugin_api.scheduler : ScheduleEntry;
 import confector.server.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.plugin_api.dispatch_queue : DispatchQueue;
-import confector.plugin_api.model : QueueDemand;
-import confector.server.orchestrator.capacity_broker : DefaultCapacityBroker;
-import confector.core.execution_dispatcher : queuedDemand;
 
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
@@ -77,7 +71,6 @@ URLRouter createRouter(
     DispatchQueue dispatchQueue,
     StateStores stores,
     string schedulerCallbackSecret,
-    CapacityBroker capacityBroker = null,
     ConfiguredArtifactStorage configuredStorage = null)
 {
     auto router = new URLRouter();
@@ -94,7 +87,7 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API endpoints
-    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, dispatchQueue, stores, capacityBroker));
+    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, dispatchQueue, stores));
 
     // Dashboard, projects, tasks, repositories and artifacts UI. Build views wait for request intake
     // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
@@ -224,56 +217,15 @@ void main()
 
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
 
-    // Demand is the executions sent and waiting for a worker, read from the state store; the
-    // scheduler asks the broker to evaluate it (/broker/evaluate).
-    auto capacityBroker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
-
-    // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
-    foreach (plugin; PluginRegistry.instance.allPlugins())
-    {
-        if (auto provider = cast(ComputeProvider) plugin)
-        {
-            WorkerRecord record;
-            record.providerType = provider.providerType;
-            record.enabled = true;
-            record.configuration = provider.defaultConfig();
-            auto prov = provider.createProvisioner(record);
-            if (prov !is null)
-            {
-                capacityBroker.registerProvisioner(prov);
-                logInfo("[capacity_broker] Registered plugin provisioner '%s' (maxCapacity=%d)",
-                  prov.providerType, prov.maxCapacity);
-            }
-            else
-            {
-                logWarn("[capacity_broker] ComputeProvider '%s' returned null from createProvisioner(), skipping",
-                  provider.providerType);
-            }
-        }
-    }
-
-    // Warn if no provisioners were registered — builds will silently fail without them
-    if (capacityBroker.provisioners.length == 0)
-    {
-        logWarn("[capacity_broker] No compute provisioners registered. Builds will queue but never execute. " ~
-         "Ensure at least one ComputeProvider plugin (e.g., local_process) is loaded in '%s'.",
-          serverConfig.plugins.bundledPluginsDir);
-    }
-    else
-    {
-        logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
-    }
-
     // Load scheduler plugin
     auto scheduler = PluginRegistry.instance.getDefaultScheduler();
     if (scheduler is null)
-        throw new Exception("No scheduler plugin registered; capacity evaluation cannot run");
+        throw new Exception("No scheduler plugin registered: the server cannot start without one.");
 
     // Configure router and server settings
     auto router = createRouter(dispatchQueue,
       stores,
       serverConfig.scheduler.callbackSecret,
-      capacityBroker,
       configuredStorage);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
@@ -284,27 +236,8 @@ void main()
     listenHTTP(settings, router);
 
     // Start the scheduler plugin
-    if (scheduler !is null)
-    {
-        scheduler.start();
-        logInfo("[scheduler] Scheduler plugin started");
-
-        // Register capacity evaluation schedule entry
-        ScheduleEntry capacityEntry;
-        capacityEntry.id = "capacity-evaluate";
-        capacityEntry.name = "Capacity Broker Evaluation";
-        capacityEntry.uri = format("http://127.0.0.1:%d/api/v1/broker/evaluate", serverConfig.http.port);
-        capacityEntry.httpMethod = "POST";
-        int evalInterval = serverConfig.capacity.evaluationIntervalMinutes;
-        if (evalInterval < 1) evalInterval = 1;
-        if (evalInterval == 1)
-            capacityEntry.cronExpression = "* * * * *";
-        else
-            capacityEntry.cronExpression = format("*/%d * * * *", evalInterval);
-        capacityEntry.recurring = true;
-        scheduler.schedule(capacityEntry);
-        logInfo("[scheduler] Registered capacity evaluation entry (every %d min)", evalInterval);
-    }
+    scheduler.start();
+    logInfo("[scheduler] Scheduler plugin started");
 
     logInfo("Starting server on port %d", serverConfig.http.port);
     runApplication();
@@ -321,22 +254,6 @@ unittest
 
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
-    auto broker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
-
-    class TestProvisioner : ComputeProvisioner
-    {
-        @property string providerType() const { return "local"; }
-        @property size_t activeInstanceCount() const { return 0; }
-        @property size_t maxCapacity() const { return 4; }
-        bool canProvision(in QueueDemand demand) const { return true; }
-        void requestCapacity(in QueueDemand demand) {}
-    }
-
-    broker.registerProvisioner(new TestProvisioner());
-
-    auto router = createRouter(queue, stores, "test-scheduler-secret", broker);
+    auto router = createRouter(queue, stores, "test-scheduler-secret");
     assert(router !is null);
-
-    assert(broker.provisioners.length == 1);
-    assert(broker.maxCapacity >= 1);
 }

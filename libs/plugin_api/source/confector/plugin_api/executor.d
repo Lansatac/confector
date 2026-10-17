@@ -134,18 +134,6 @@ interface ComputeProvisioner
 }
 
 /**
- * Server-side broker coordinating capacity across registered provisioners.
- */
-interface CapacityBroker
-{
-    void registerProvisioner(ComputeProvisioner provisioner);
-    void evaluateDemand();
-    @property size_t activeInstanceCount() const;
-    @property size_t maxCapacity() const;
-    @property ComputeProvisioner[] provisioners();
-}
-
-/**
  * Interface for queue consumers / worker pools managing task execution lifecycle.
  */
 interface WorkerPool

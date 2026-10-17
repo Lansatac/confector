@@ -157,7 +157,7 @@ string missingUpstreamArtifactMessage(string upstreamTask, string upstreamFinger
 }
 
 /**
- * A declared input resolved to a pinned value, as frozen in a build chain.
+ * A declared input resolved to a pinned value, as a work order carries it.
  */
 struct ResolvedInput
 {
@@ -532,23 +532,6 @@ struct TaskExecutionResult
     @optional @asName("duration_ms") ulong durationMs = 0;
 }
 
-/**
- * One task as frozen in a build chain when the chain was created (design records: beads
- * confector-z7z.1, confector-z7z.14 and confector-z7z.15): its declared inputs, which fix the
- * graph's edges, and its resolved external inputs. Build configuration (steps, environment,
- * outputs) is not frozen; it is read from the project when the task is dispatched.
- * Fingerprints are not stored either; they are computed from the chain's tasks.
- */
-struct ChainTask
-{
-    @asName("id") string id;
-    /// Declared inputs, keyed by input name, as they were when the chain was created.
-    @optional @asName("inputs") InputDecl[string] inputs;
-    /// Resolved repository and value inputs, sorted by name. Task output inputs are not
-    /// stored: they pin to upstream fingerprints, which are computed from the chain.
-    @optional @asName("resolved_inputs") ResolvedInput[] resolvedInputs;
-}
-
 // The build model (design records: beads confector-z7z.14, confector-z7z.15 and confector-z7z.2;
 // AGENTS.md, "What a build is"). A request joins or creates a chain; chain state is derived from
 // the chain, its requests, the rerun generations and the executions for its fingerprints, and is
@@ -648,11 +631,9 @@ struct ChainEvent
 }
 
 /**
- * A snapshot of a project's whole DAG (beads confector-z7z.14 and confector-z7z.15); what the
- * UI calls a build. Everything but `labels` and `events` is immutable once created. The chain
- * stores every task's declared and resolved external inputs once; requests refer to it by id.
- * Fingerprints are not stored: they are computed from `tasks` and the current rerun
- * generations (`chainResolution`).
+ * A build chain: what the UI calls a build (bead confector-z7z.52). Everything but `labels` and
+ * `events` is immutable once created; requests refer to it by id. Its branch context and pinned
+ * inputs are bead confector-z7z.53.4.
  */
 struct BuildChain
 {
@@ -660,12 +641,6 @@ struct BuildChain
     @asName("project_id") string projectId;
     /// Canonical per-project number ("build #123"), allocated when the chain is created.
     ulong number;
-    /// The join key: a request whose resolution has this hash joins the chain instead of
-    /// creating one. Stored so the join can find the chain by index query.
-    @asName("snapshot_hash") string snapshotHash;
-    /// Every task of the project's DAG when the chain was created, sorted by id
-    /// (`freezeChain`).
-    ChainTask[] tasks;
     @asName("created_at") string createdAt;
     /// User-editable labels, separate from the number.
     @optional string[] labels;
@@ -727,7 +702,8 @@ struct TaskExecution
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
     /// When a message for the execution was last sent to the dispatch queue; empty while none has
     /// been. A queued execution that was never sent (its dispatcher failed or crashed between
-    /// recording and sending it) is sent by the next dispatch of its fingerprint.
+    /// recording and sending it) is sent again by the dispatcher or the sweep (bead
+    /// confector-z7z.49.3).
     @optional @asName("sent_at") string sentAt;
     /// Artifacts the execution produced.
     @optional ArtifactMetadata[] artifacts;
@@ -746,22 +722,6 @@ struct TaskExecution
     /// code: read `status` and `errorMessage`.
     @optional @asName("exit_code") int exitCode;
     @optional @asName("error_message") string errorMessage;
-}
-
-/**
- * The claim on a fingerprint (bead confector-z7z.2): at most one active (queued or running)
- * execution per fingerprint, enforced by compare-and-set on the document's version, with the
- * fingerprint as the document id. A dispatcher claims a fingerprint by setting
- * `executionId`; a loser re-reads and does nothing. A claim is released by clearing
- * `executionId`, never by removing the document, so its version only grows and a writer
- * holding an older version always loses.
- */
-struct FingerprintClaim
-{
-    /// The claimed fingerprint; mirrors the document id.
-    string fingerprint;
-    /// The fingerprint's active execution; empty when it has none.
-    @optional @asName("execution_id") string executionId;
 }
 
 /**
@@ -1090,30 +1050,17 @@ unittest
 
 unittest
 {
-    // A build chain round-trips its frozen tasks, number, join key, labels and history
+    // A build chain round-trips its number, labels and history
     BuildChain chain;
     chain.id = "c1";
     chain.projectId = "game";
     chain.number = 123;
-    chain.snapshotHash = "0123abcd";
-    ChainTask compile;
-    compile.id = "compile";
-    compile.inputs["src"] = repositoryInput("game", "main");
-    compile.resolvedInputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["branch": "main"])];
-    ChainTask release;
-    release.id = "release";
-    release.inputs["bin"] = taskOutputInput("compile", "game.zip");
-    release.inputs["flavor"] = valueInput("external");
-    release.resolvedInputs = [ResolvedInput("flavor", InputKind.value, Json("external"))];
-    chain.tasks = [compile, release];
     chain.createdAt = "2026-10-15T14:02:01Z";
     chain.labels = ["release candidate"];
     chain.events = [ChainEvent(ChainEventKind.rerun, "r2", "release", "base-fingerprint", 1)];
 
     auto json = serializeToJson(chain);
     assert(json["number"].get!long == 123);
-    assert(json["snapshot_hash"].get!string == "0123abcd");
-    assert(json["tasks"][0]["resolved_inputs"][0]["pinned"].get!string == "aaa111");
     assert(json["events"][0]["kind"].get!string == "rerun");
     assert(json["events"][0]["request_id"].get!string == "r2");
     assert(json["events"][0]["task_id"].get!string == "release");
@@ -1130,7 +1077,6 @@ unittest
     assert(freshJson["events"].type == Json.Type.array && freshJson["events"].length == 0);
     auto freshBack = roundTrip(fresh);
     assert(freshBack.labels.length == 0 && freshBack.events.length == 0);
-    assert(freshBack.tasks == chain.tasks);
 }
 
 unittest
@@ -1158,20 +1104,14 @@ unittest
     assert(pinned.trigger.payload == ["ref": "main"]);
 
     auto chain = deserializeJson!BuildChain(`{
-        "id": "c1", "project_id": "game", "number": 7, "snapshot_hash": "abc",
-        "tasks": [{"id": "compile", "inputs": {"src": {"kind": "repository", "spec": {"repository": "game", "ref": "main"}}},
-                   "resolved_inputs": [{"name": "src", "kind": "repository", "pinned": "aaa111"}]},
-                  {"id": "lint"}],
-        "created_at": "2026-10-15T14:02:01Z"
+        "id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z"
     }`);
-    assert(chain.number == 7 && chain.tasks.length == 2);
-    assert(chain.tasks[0].resolvedInputs[0].pinned == Json("aaa111") && chain.tasks[0].resolvedInputs[0].info.length == 0);
-    assert(chain.tasks[1].inputs.length == 0 && chain.tasks[1].resolvedInputs.length == 0);
+    assert(chain.number == 7);
     assert(chain.labels.length == 0 && chain.events.length == 0);
 
     // A rerun event without the optional fields of other kinds still reads
     auto withEvent = deserializeJson!BuildChain(`{
-        "id": "c1", "project_id": "game", "number": 7, "snapshot_hash": "abc", "tasks": [],
+        "id": "c1", "project_id": "game", "number": 7,
         "created_at": "2026-10-15T14:02:01Z", "labels": ["rc"],
         "events": [{"kind": "rerun", "request_id": "r2", "task_id": "compile", "base": "b", "generation": 2}]
     }`);
@@ -1254,18 +1194,6 @@ unittest
     queued.definitionHash = "def1";
     queued.createdAt = "2026-10-15T14:02:02Z";
     assert(roundTrip(queued) == queued);
-}
-
-unittest
-{
-    // A fingerprint claim round-trips with and without an active execution
-    auto claimed = FingerprintClaim("fp1", "e1");
-    assert(serializeToJson(claimed)["execution_id"].get!string == "e1");
-    assert(roundTrip(claimed) == claimed);
-
-    auto released = FingerprintClaim("fp1");
-    assert(roundTrip(released) == released);
-    assert(deserializeJson!FingerprintClaim(`{"fingerprint": "fp1"}`) == released);
 }
 
 unittest

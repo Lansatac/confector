@@ -35,8 +35,8 @@ struct DocumentStoreConfig
 }
 
 /**
- * Scheduler callbacks. The scheduler fires HTTP requests back into the server (capacity
- * evaluation); each one must carry this secret. Required, with no default.
+ * Scheduler callbacks. The scheduler fires HTTP requests back into the server (cron
+ * triggers, VCS polling); each one must carry this secret. Required, with no default.
  * The scheduler plugin reads the same value through CONFECTOR_SCHEDULER_CALLBACK_SECRET.
  */
 struct SchedulerConfig
@@ -57,15 +57,6 @@ struct PluginsConfig
 }
 
 /**
- * Capacity broker configuration.
- */
-struct CapacityConfig
-{
-    @Description("Interval in minutes between periodic capacity evaluations (default: 1)")
-    int evaluationIntervalMinutes = 1;
-}
-
-/**
  * Top-level Server configuration.
  */
 struct ServerConfig
@@ -77,7 +68,6 @@ struct ServerConfig
     DocumentStoreConfig documentStore;
     SchedulerConfig scheduler;
     PluginsConfig plugins;
-    CapacityConfig capacity;
 }
 
 /**

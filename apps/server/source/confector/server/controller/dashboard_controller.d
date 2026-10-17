@@ -850,7 +850,7 @@ URLRouter dashboardRouter(StateStores stores, PluginRegistry registry = null)
     // Run a project, or a task and its upstream tasks. Not implemented until request intake
     // (see buildsNotImplemented): the request fails loudly.
     router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        throw new HTTPStatusException(HTTPStatus.notImplemented, buildsNotImplemented);
+        throw new HTTPStatusException(HTTPStatus.notImplemented, buildsNotImplemented().msg);
     });
 
     // Task Details View (Static definition, configuration, steps and dependencies)
@@ -1032,7 +1032,7 @@ unittest
     auto runRes = createTestHTTPServerResponse();
     bool notImplemented = false;
     try router.handleRequest(runReq, runRes);
-    catch (HTTPStatusException e) notImplemented = e.status == HTTPStatus.notImplemented && e.msg == buildsNotImplemented;
+    catch (HTTPStatusException e) notImplemented = e.status == HTTPStatus.notImplemented && e.msg == buildsNotImplemented().msg;
     assert(notImplemented);
 
     import std.file : exists, rmdirRecurse;

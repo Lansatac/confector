@@ -390,7 +390,7 @@ private string captureFiredRequest(string httpMethod, string jsonBody)
 
     ScheduleEntry entry;
     entry.id = "header-check";
-    entry.uri = format("http://127.0.0.1:%d/api/v1/broker/evaluate", port);
+    entry.uri = format("http://127.0.0.1:%d/api/v1/projects/p1/run", port);
     entry.httpMethod = httpMethod;
     entry.jsonBody = jsonBody;
     entry.cronExpression = "* * * * *";
@@ -423,7 +423,7 @@ unittest
     assert(received.canFind("X-Confector-Scheduler-Secret: test-secret"), received);
 
     // A POST without a jsonBody stays a POST, with an explicit empty body rather than chunked or unframed
-    assert(received.startsWith("POST /api/v1/broker/evaluate "), received);
+    assert(received.startsWith("POST /api/v1/projects/p1/run "), received);
     assert(received.canFind("Content-Length: 0\r\n"), received);
     assert(!received.canFind("Transfer-Encoding"), received);
 }
@@ -436,7 +436,7 @@ unittest
     // A POST with a JSON body sends the body intact, framed by its byte count, as JSON
     enum body = `{"repositoryUrl": "https://example.test/repo.git"}`;
     auto received = captureFiredRequest("POST", body);
-    assert(received.startsWith("POST /api/v1/broker/evaluate "), received);
+    assert(received.startsWith("POST /api/v1/projects/p1/run "), received);
     assert(received.canFind("Content-Length: " ~ body.length.to!string ~ "\r\n"), received);
     assert(received.canFind("Content-Type: application/json\r\n"), received);
     assert(received.endsWith(body), received);

@@ -12,21 +12,57 @@ module confector.core.work_orders;
  * acknowledged and dropped. A message delivered again after its lease expired (its worker was
  * lost) starts another attempt of the same execution; the attempt limit and lease sweep are bead
  * confector-z7z.23.5.
+ *
+ * A completion finishes its execution by compare-and-set and does nothing else: folding the
+ * outcome into the fingerprint's ledger and waking the chains waiting on it is bead
+ * confector-z7z.49.4.
  */
 
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
-import confector.core.execution_dispatcher : DispatchMessage, ExecutionDispatcher, executionDemand, releaseClaim, utcNow;
 import confector.core.model;
 import confector.core.state_stores : StateStores;
 import confector.plugin_api.dispatch_queue : DispatchQueue, DispatchQueueUsageException, Lease;
 import confector.plugin_api.document_store : DocumentConflictException;
 
 import core.time : Duration;
+import std.datetime.systime : Clock;
+import std.datetime.timezone : UTC;
 import std.format : format;
+import std.json : JSONType;
 import std.typecons : Nullable;
 import vibe.core.log : logError;
 import vibe.data.json : Json, deserializeJson;
+import vibe.data.serialization : asName = name;
+
+/**
+ * The dispatch queue every execution is sent to. Until compute pools exist (bead
+ * confector-z7z.31.5) there is one pool, and so one queue.
+ */
+enum string defaultPoolQueue = "default";
+
+/**
+ * The message sent to a pool's dispatch queue: the execution to run. Everything else a worker
+ * needs is read from the execution's record when the message is received.
+ */
+struct DispatchMessage
+{
+    /// The execution to run (`TaskExecution.id`).
+    @asName("execution_id") string executionId;
+}
+
+/// How many times a write that loses a compare-and-set to a concurrent writer of the same
+/// execution re-reads and retries. Every lost attempt means another write succeeded, so this is
+/// reached only under sustained contention on one document.
+enum maxWriteAttempts = 10;
+
+/**
+ * The current time as the build model records it: ISO 8601 in UTC.
+ */
+string utcNow()
+{
+    return Clock.currTime(UTC()).toISOExtString();
+}
 
 /**
  * A work order a worker received, with its lease.
@@ -42,7 +78,9 @@ struct ReceivedWorkOrder
 
 /**
  * The work order for `execution`: its definition, fingerprint, resolved inputs and repository
- * addresses, and the compute it needs. Pure.
+ * addresses, and the compute it needs: its executor type ("local" unless the task's `executor`
+ * or `executor_type` component names another) and its requirements (the `requirements`
+ * component, an object of strings). Pure.
  */
 WorkOrder workOrderFor(in TaskExecution execution) @trusted
 {
@@ -51,9 +89,8 @@ WorkOrder workOrderFor(in TaskExecution execution) @trusted
     order.taskId = execution.taskId;
     order.taskNode = cast(TaskNode) execution.definition;
     order.fingerprint = execution.fingerprint;
-    const demand = executionDemand(execution.definition);
-    order.executorType = demand.executorType;
-    order.requirements = cast(string[string]) demand.requirements;
+    order.executorType = executorTypeOf(execution.definition);
+    order.requirements = requirementsOf(execution.definition);
     order.payload.inputs = (cast(ResolvedInput[]) execution.inputs).dup;
     foreach (name, address; execution.repositoryAddresses) order.payload.repositoryAddresses[name] = address;
     foreach (name, value; execution.definition.environment) order.payload.environment[name] = value;
@@ -61,6 +98,39 @@ WorkOrder workOrderFor(in TaskExecution execution) @trusted
     order.timeoutSeconds = execution.definition.timeoutSeconds;
     order.createdAt = execution.createdAt;
     return order;
+}
+
+private string executorTypeOf(in TaskNode definition) @trusted
+{
+    if (definition.hasCustomComponent("executor"))
+    {
+        auto comp = definition.getCustomComponent("executor");
+        if (comp.type == JSONType.string) return comp.str;
+        if (comp.type == JSONType.object && "type" in comp) return comp["type"].str;
+    }
+    else if (definition.hasCustomComponent("executor_type"))
+    {
+        auto comp = definition.getCustomComponent("executor_type");
+        if (comp.type == JSONType.string) return comp.str;
+    }
+    return "local";
+}
+
+private string[string] requirementsOf(in TaskNode definition) @trusted
+{
+    string[string] requirements;
+    if (definition.hasCustomComponent("requirements"))
+    {
+        auto comp = definition.getCustomComponent("requirements");
+        if (comp.type == JSONType.object)
+        {
+            foreach (k, v; comp.object)
+            {
+                requirements[k] = v.type == JSONType.string ? v.str : v.toString();
+            }
+        }
+    }
+    return requirements;
 }
 
 /**
@@ -134,7 +204,7 @@ ReceivedWorkOrder[] receiveWork(StateStores stores, DispatchQueue queue, string 
  */
 Nullable!TaskExecution startExecution(ExecutionStore executions, string executionId, uint receiveCount, string workerId, string now)
 {
-    foreach (attempt; 0 .. ExecutionDispatcher.maxWriteAttempts)
+    foreach (attempt; 0 .. maxWriteAttempts)
     {
         auto current = executions.get(executionId);
         if (current.isNull)
@@ -161,13 +231,13 @@ Nullable!TaskExecution startExecution(ExecutionStore executions, string executio
         }
     }
     throw new Exception(format("Could not start execution '%s': it lost %s compare-and-sets in a row",
-        executionId, ExecutionDispatcher.maxWriteAttempts));
+        executionId, maxWriteAttempts));
 }
 
 /**
  * A worker reported the outcome of an execution that has nothing left to report: it finished
- * already (a duplicate or late completion), or it was failed or replaced while the worker ran it,
- * so it no longer holds its fingerprint's claim. Its report is rejected and nothing is recorded.
+ * already (a duplicate or late completion, or it was failed while the worker ran it). Its report
+ * is rejected and nothing is recorded.
  */
 class StaleCompletionException : Exception
 {
@@ -203,13 +273,13 @@ class InvalidCompletionException : Exception
 
 /**
  * Reads execution `executionId`, which a worker reports the outcome of, and checks it is still
- * active and holds the claim on its fingerprint. The execution record is the only source of the
- * completion's fingerprint and task: a worker never names them.
+ * active. The execution record is the only source of the completion's fingerprint and task: a
+ * worker never names them.
  *
- * Throws: StaleCompletionException if it is not active or does not hold the claim;
- * UnknownExecutionException if `executionId` is empty or names no execution.
+ * Throws: StaleCompletionException if it is not active; UnknownExecutionException if
+ * `executionId` is empty or names no execution.
  */
-TaskExecution requireClaimingExecution(StateStores stores, string executionId)
+TaskExecution requireActiveExecution(StateStores stores, string executionId)
 {
     if (executionId.length == 0)
     {
@@ -220,13 +290,11 @@ TaskExecution requireClaimingExecution(StateStores stores, string executionId)
     {
         throw new UnknownExecutionException(format("A completion names execution '%s', which does not exist", executionId));
     }
-    auto claim = stores.claims.get(found.get.fingerprint);
-    const holder = claim.isNull ? null : claim.get.executionId;
-    if (holder != executionId || !ExecutionStore.isActive(found.get.status))
+    if (!ExecutionStore.isActive(found.get.status))
     {
         throw new StaleCompletionException(format(
-            "Execution '%s' (%s) no longer holds fingerprint %s (held by '%s'); its completion is rejected",
-            executionId, found.get.status, found.get.fingerprint, holder));
+            "Execution '%s' at fingerprint %s already finished %s; its completion is rejected",
+            executionId, found.get.fingerprint, found.get.status));
     }
     return found.get.value;
 }
@@ -269,16 +337,12 @@ ArtifactMetadata[] executionArtifacts(in TaskExecution execution, ArtifactMetada
 
 /**
  * Records the outcome a worker reported for execution `executionId` (`status`, which must be
- * terminal, with its exit code, error and artifacts, see `executionArtifacts`) by compare-and-set, then releases its
- * fingerprint's claim, and returns the finished execution. A terminal execution never changes:
- * a completion that loses the compare-and-set to another one is rejected, not merged.
+ * terminal, with its exit code, error and artifacts, see `executionArtifacts`) by
+ * compare-and-set, and returns the finished execution. A terminal execution never changes: a
+ * completion that loses the compare-and-set to another one is rejected, not merged.
  *
- * A crash after the outcome is recorded but before the claim is released leaves a terminal
- * execution holding the claim; the next dispatch of the fingerprint releases it.
- *
- * Throws: StaleCompletionException if the execution is not active or no longer holds its
- * fingerprint's claim (see `requireClaimingExecution`), including when a concurrent completion
- * finishes it first; ForeignArtifactException if an artifact names another fingerprint;
+ * Throws: StaleCompletionException if the execution is not active (see
+ * `requireActiveExecution`), including when a concurrent completion finishes it first; ForeignArtifactException if an artifact names another fingerprint;
  * UnknownExecutionException if `executionId` names no execution; Exception if `status` is not
  * terminal.
  */
@@ -286,7 +350,7 @@ TaskExecution finishExecution(StateStores stores, string executionId, ExecutionS
     string errorMessage, ArtifactMetadata[] artifacts, string now = null)
 {
     requireTerminal(status);
-    auto own = executionArtifacts(requireClaimingExecution(stores, executionId), artifacts);
+    auto own = executionArtifacts(requireActiveExecution(stores, executionId), artifacts);
     return recordOutcome(stores, executionId, status, exitCode, errorMessage, own, now.length > 0 ? now : utcNow());
 }
 
@@ -317,10 +381,10 @@ ExecutionStatus reportedExecutionStatus(TaskStatus status) pure @safe
  * and returns the finished execution. The execution record is the only source of the
  * fingerprint and task: a `result` naming a different task is rejected.
  *
- * This is everything a completion does until the fingerprint ledger's fold lands (beads
- * confector-z7z.49.x): the execution is finished by compare-and-set and its fingerprint's claim
- * released. Nothing is cached and no chain is re-evaluated. `result.logs` is not recorded: the
- * worker streams its log lines to the execution's log as it runs.
+ * This is everything a completion does until the fingerprint ledger's fold lands (bead
+ * confector-z7z.49.4): the execution is finished by compare-and-set. Nothing is cached and no
+ * chain is re-evaluated. `result.logs` is not recorded: the worker streams its log lines to the
+ * execution's log as it runs.
  *
  * Throws: as `finishExecution`, and InvalidCompletionException if `result.status` is not a
  * status a worker can report or `result.taskId` names another task; in every case nothing is
@@ -329,7 +393,7 @@ ExecutionStatus reportedExecutionStatus(TaskStatus status) pure @safe
 TaskExecution completeExecution(StateStores stores, string executionId, in TaskExecutionResult result, string now = null)
 {
     const status = reportedExecutionStatus(result.status);
-    const execution = requireClaimingExecution(stores, executionId);
+    const execution = requireActiveExecution(stores, executionId);
     if (result.taskId.length > 0 && result.taskId != execution.taskId)
     {
         throw new InvalidCompletionException(format("A completion of execution '%s' (task '%s') names task '%s'; it is rejected",
@@ -351,7 +415,7 @@ private void requireTerminal(ExecutionStatus status)
 private TaskExecution recordOutcome(StateStores stores, string executionId, ExecutionStatus status, int exitCode,
     string errorMessage, ArtifactMetadata[] artifacts, string now)
 {
-    foreach (attempt; 0 .. ExecutionDispatcher.maxWriteAttempts)
+    foreach (attempt; 0 .. maxWriteAttempts)
     {
         auto current = stores.executions.get(executionId);
         if (current.isNull)
@@ -370,52 +434,64 @@ private TaskExecution recordOutcome(StateStores stores, string executionId, Exec
         next.errorMessage = errorMessage;
         next.artifacts = artifacts;
         next.finishedAt = now;
-        TaskExecution finished;
         try
         {
-            finished = stores.executions.update(current.get, next).value;
+            return stores.executions.update(current.get, next).value;
         }
         catch (DocumentConflictException)
         {
             continue;
         }
-        releaseClaim(stores, finished.fingerprint, executionId);
-        return finished;
     }
     throw new Exception(format("Could not record the outcome of execution '%s': it lost %s compare-and-sets in a row",
-        executionId, ExecutionDispatcher.maxWriteAttempts));
+        executionId, maxWriteAttempts));
 }
 
 version (unittest)
 {
-    import confector.core.execution_dispatcher : PlannedExecution, defaultPoolQueue;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import core.time : hours;
     import std.algorithm.searching : canFind;
+    import std.json : JSONValue;
     import vibe.data.json : serializeToJson;
 
     private string fixedNow() { return "2026-10-16T10:00:02Z"; }
 
-    private PlannedExecution samplePlan(string fingerprint = "fp1")
+    /// A queued execution `id` of task "compile" at `fingerprint`, with a full definition.
+    private TaskExecution sampleExecution(string id, string fingerprint = "fp1")
     {
-        PlannedExecution p;
-        p.projectId = "p";
-        p.taskId = "compile";
-        p.fingerprint = fingerprint;
-        p.definition.id = "compile";
-        p.definition.inputs["src"] = repositoryInput("game", "main");
-        p.definition.steps = [BuildStep("Compile", "bash", null, "make")];
-        p.definition.environment = ["MODE": "release"];
-        p.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
-        p.definition.timeoutSeconds = 1200;
-        p.definition.setCustomComponent("executor", JSONValue("aws-ecs"));
-        p.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
-        p.repositoryAddresses = ["src": "https://example.test/game.git"];
-        return p;
+        TaskExecution execution;
+        execution.id = id;
+        execution.projectId = "p";
+        execution.taskId = "compile";
+        execution.fingerprint = fingerprint;
+        execution.status = ExecutionStatus.queued;
+        execution.definition.id = "compile";
+        execution.definition.inputs["src"] = repositoryInput("game", "main");
+        execution.definition.steps = [BuildStep("Compile", "bash", null, "make")];
+        execution.definition.environment = ["MODE": "release"];
+        execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
+        execution.definition.timeoutSeconds = 1200;
+        execution.definition.setCustomComponent("executor", JSONValue("aws-ecs"));
+        execution.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
+        execution.repositoryAddresses = ["src": "https://example.test/game.git"];
+        execution.createdAt = "2026-10-16T10:00:00Z";
+        return execution;
     }
 
-    import std.json : JSONValue;
+    /// Records `sampleExecution(id, fingerprint)` and, given a queue, sends its message to the
+    /// default pool queue, as dispatching does. Returns `id`.
+    private string queueExecution(StateStores stores, string id, DispatchQueue queue = null, string fingerprint = "fp1")
+    {
+        stores.executions.create(sampleExecution(id, fingerprint));
+        if (queue !is null)
+        {
+            queue.ensureQueue(defaultPoolQueue);
+            queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id)));
+        }
+        return id;
+    }
 }
 
 unittest
@@ -425,21 +501,21 @@ unittest
     // the lease expired starts another attempt
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
-    auto dispatcher = new ExecutionDispatcher(stores, queue, null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1", queue);
 
     auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w1", () => fixedNow());
     assert(received.length == 1 && received[0].receiveCount == 1);
     auto order = received[0].workOrder;
     assert(order.executionId == id && order.taskId == "compile" && order.fingerprint == "fp1");
     assert(order.taskNode.steps[0].script == "make" && order.timeoutSeconds == 1200 && order.executorType == "aws-ecs");
-    assert(order.payload.inputs == samplePlan().inputs);
+    assert(order.payload.inputs == sampleExecution(id).inputs);
     assert(order.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
     assert(order.payload.environment == ["MODE": "release"] && order.payload.expectedOutputs.length == 1);
     auto running = stores.executions.get(id).get;
     assert(running.status == ExecutionStatus.running && running.attempts == 1 && running.worker == "w1");
+    assert(running.startedAt == fixedNow() && running.sentAt == fixedNow(), "Receiving records the send it proves");
 
-    // A second message for the running execution (a dispatcher re-sent it) is dropped
+    // A second message for the running execution (it was sent again) is dropped
     queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id)));
     assert(receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w2").length == 0);
     assert(queue.receive(defaultPoolQueue, 10, 1.hours).length == 0, "The duplicate was acknowledged");
@@ -457,29 +533,45 @@ unittest
     catch (Exception e) threw = true;
     assert(threw && stores.executions.get(id).get.status == ExecutionStatus.running);
 
-    // The outcome is recorded and the claim released; a late message for it is dropped
+    // The outcome is recorded; a late message for it is dropped
     const finished = finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, null, fixedNow());
     assert(finished.status == ExecutionStatus.succeeded && finished.fingerprint == "fp1");
     auto done = stores.executions.get(id).get;
     assert(done.status == ExecutionStatus.succeeded && done.finishedAt == fixedNow());
-    assert(stores.claims.get("fp1").get.executionId.length == 0);
     queue.release(defaultPoolQueue, again[0].receipt);
     assert(receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w4").length == 0);
 }
 
 unittest
 {
-    // A failed or cancelled outcome records when it finished even when the caller gives no time.
-    // This pins existing behaviour (recordOutcome always stamps finishedAt), guarding the
-    // completion paths against regressions.
+    // The executor type and requirements come from the definition's components; without them a
+    // task runs on the local executor with no requirements
+    auto plain = sampleExecution("exe_1");
+    plain.definition = TaskNode.init;
+    plain.definition.id = "compile";
+    assert(workOrderFor(plain).executorType == "local" && workOrderFor(plain).requirements.length == 0);
+
+    auto typed = plain;
+    typed.definition.setCustomComponent("executor", JSONValue(["type": JSONValue("kubernetes")]));
+    typed.definition.setCustomComponent("requirements", JSONValue(["gpu": JSONValue("true"), "cores": JSONValue(8)]));
+    assert(workOrderFor(typed).executorType == "kubernetes");
+    assert(workOrderFor(typed).requirements == ["gpu": "true", "cores": "8"]);
+
+    auto legacyKey = plain;
+    legacyKey.definition.setCustomComponent("executor_type", JSONValue("ecs"));
+    assert(workOrderFor(legacyKey).executorType == "ecs");
+}
+
+unittest
+{
+    // A failed or cancelled outcome records when it finished even when the caller gives no time
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const cancelledId = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const cancelledId = queueExecution(stores, "exe_cancelled");
     finishExecution(stores, cancelledId, ExecutionStatus.cancelled, 0, "stopped", null);
     auto cancelled = stores.executions.get(cancelledId).get;
     assert(cancelled.status == ExecutionStatus.cancelled && cancelled.finishedAt.length > 0);
 
-    const failedId = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const failedId = queueExecution(stores, "exe_failed");
     finishExecution(stores, failedId, ExecutionStatus.failed, 1, "boom", null);
     auto failed = stores.executions.get(failedId).get;
     assert(failed.status == ExecutionStatus.failed && failed.finishedAt.length > 0);
@@ -491,8 +583,7 @@ unittest
     // starts it, by compare-and-set
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
-    auto queue = new InMemoryDispatchQueue();
-    const id = new ExecutionDispatcher(stores, queue, null, () => fixedNow()).dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
@@ -517,38 +608,13 @@ unittest
     catch (Exception e) threw = e.msg.canFind("'exe_missing'");
     assert(threw);
     assert(queue.receive(defaultPoolQueue, 10, 1.hours).length == 1, "The lease was released");
-}
 
-unittest
-{
-    // A completion naming its execution is recorded only while that execution holds its
-    // fingerprint's claim: a stale one (the fingerprint was re-claimed by a later execution) is
-    // rejected loudly and records nothing
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new InMemoryDispatchQueue();
-    auto dispatcher = new ExecutionDispatcher(stores, queue, null, () => fixedNow());
-    const first = dispatcher.dispatch([samplePlan()])[0].executionId;
+    queue.send(defaultPoolQueue, serializeToJson(DispatchMessage("")));
+    threw = false;
+    try receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w1");
+    catch (Exception e) threw = e.msg.canFind("names no execution");
+    assert(threw);
 
-    // The first execution is failed meanwhile and the fingerprint dispatched again
-    finishExecution(stores, first, ExecutionStatus.failed, 1, "worker lost", null, fixedNow());
-    const second = dispatcher.dispatch([samplePlan()])[0].executionId;
-    assert(second != first && stores.claims.get("fp1").get.executionId == second);
-
-    bool stale = false;
-    try finishExecution(stores, first, ExecutionStatus.succeeded, 0, null, null);
-    catch (StaleCompletionException e) stale = e.msg.canFind(first) && e.msg.canFind(second);
-    assert(stale);
-    assert(stores.executions.get(second).get.status == ExecutionStatus.queued, "The current execution is untouched");
-    assert(stores.claims.get("fp1").get.executionId == second);
-
-    finishExecution(stores, second, ExecutionStatus.succeeded, 0, null, null, fixedNow());
-    assert(stores.executions.get(second).get.status == ExecutionStatus.succeeded);
-    assert(stores.claims.get("fp1").get.executionId.length == 0);
-
-    bool missing = false;
-    try finishExecution(stores, "exe_nope", ExecutionStatus.succeeded, 0, null, null);
-    catch (Exception e) missing = e.msg.canFind("does not exist");
-    assert(missing);
     bool noWorker = false;
     try receiveWork(stores, queue, defaultPoolQueue, 1, 1.hours, "");
     catch (DispatchQueueUsageException) noWorker = true;
@@ -557,11 +623,32 @@ unittest
 
 unittest
 {
+    // A completion is recorded only while its execution is active: once it finished (it was
+    // failed meanwhile), a late completion is rejected loudly and records nothing, and a newer
+    // execution at the same fingerprint is untouched
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const first = queueExecution(stores, "exe_first");
+    finishExecution(stores, first, ExecutionStatus.failed, 1, "worker lost", null, fixedNow());
+    const second = queueExecution(stores, "exe_second");
+
+    bool stale = false;
+    try finishExecution(stores, first, ExecutionStatus.succeeded, 0, null, null);
+    catch (StaleCompletionException e) stale = e.msg.canFind(first) && e.msg.canFind("failed");
+    assert(stale);
+    auto kept = stores.executions.get(first).get;
+    assert(kept.status == ExecutionStatus.failed && kept.errorMessage == "worker lost");
+    assert(stores.executions.get(second).get.status == ExecutionStatus.queued, "The newer execution is untouched");
+
+    finishExecution(stores, second, ExecutionStatus.succeeded, 0, null, null, fixedNow());
+    assert(stores.executions.get(second).get.status == ExecutionStatus.succeeded);
+}
+
+unittest
+{
     // Bug confector-1oj: a completion is identified only by its execution id. One naming no
     // execution, or an execution that does not exist, is rejected loudly and records nothing
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
 
     bool unnamed = false;
     try finishExecution(stores, "", ExecutionStatus.succeeded, 0, null, null);
@@ -576,7 +663,6 @@ unittest
     assert(unknown);
 
     assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
-    assert(stores.claims.get("fp1").get.executionId == id);
     assert(stores.executions.get("exe_unknown").isNull);
 }
 
@@ -585,8 +671,7 @@ unittest
     // A duplicate or late completion of an execution that already finished is rejected loudly:
     // a terminal execution is never overwritten
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
     auto produced = [ArtifactMetadata("game.zip")];
     finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, produced, fixedNow());
 
@@ -609,8 +694,7 @@ unittest
     // the other is rejected loudly instead of overwriting it
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
@@ -621,32 +705,24 @@ unittest
     assert(rejected, "The loser re-reads, finds it finished, and is rejected");
     auto kept = stores.executions.get(id).get;
     assert(kept.status == ExecutionStatus.succeeded && kept.errorMessage.length == 0);
-    assert(stores.claims.get("fp1").get.executionId.length == 0, "The winner released the claim");
 }
 
 unittest
 {
-    // Crash point: the outcome is recorded but the claim is never released (the process died in
-    // between). A retried completion is rejected as late; the next dispatch of the fingerprint
-    // releases the terminal execution's claim and dispatches afresh
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new InMemoryDispatchQueue();
-    auto dispatcher = new ExecutionDispatcher(stores, queue, null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
-    auto current = stores.executions.get(id).get;
-    TaskExecution failed = current.value;
-    failed.status = ExecutionStatus.failed;
-    failed.finishedAt = fixedNow();
-    stores.executions.update(current, failed);
-    assert(stores.claims.get("fp1").get.executionId == id, "Crashed before releasing");
+    // A completion racing a worker's start: the start lands between the completion's read and
+    // its write, so the completion loses one compare-and-set, re-reads the running execution and
+    // records its outcome on top of the start. This pins today's behaviour, not the desired end
+    // state: completions are not yet fenced by attempt or worker (beads confector-z7z.23.14 and
+    // confector-z7z.49.4)
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    const id = queueExecution(stores, "exe_1");
 
-    bool rejected = false;
-    try finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, null);
-    catch (StaleCompletionException e) rejected = true;
-    assert(rejected && stores.executions.get(id).get.status == ExecutionStatus.failed);
-
-    const next = dispatcher.dispatch([samplePlan()])[0].executionId;
-    assert(next != id && stores.claims.get("fp1").get.executionId == next);
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto racing = new StateStores(interleaving);
+    interleaving.beforeNextWrite = () { assert(!startExecution(stores.executions, id, 1, "w1", fixedNow()).isNull); };
+    const done = finishExecution(racing, id, ExecutionStatus.succeeded, 0, null, null, fixedNow());
+    assert(done.status == ExecutionStatus.succeeded && done.worker == "w1" && done.attempts == 1);
 }
 
 unittest
@@ -655,8 +731,7 @@ unittest
     // other than its execution's is rejected and records nothing; unnamed ones are stamped with
     // the execution's
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
 
     ArtifactMetadata foreign;
     foreign.artifactId = "game.zip";
@@ -680,10 +755,9 @@ unittest
 {
     // A worker's completion: the reported status maps to the execution's outcome, a worker cannot
     // report a cache hit or an unfinished status, and a completion naming another task is
-    // rejected. Each rejection records nothing and keeps the claim
+    // rejected. Each rejection records nothing
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
 
     assert(reportedExecutionStatus(TaskStatus.succeeded) == ExecutionStatus.succeeded);
     assert(reportedExecutionStatus(TaskStatus.failed) == ExecutionStatus.failed);
@@ -707,11 +781,10 @@ unittest
     otherTask.status = TaskStatus.succeeded;
     assert(rejectedWith(otherTask, "names task 'link'"));
     assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
-    assert(stores.claims.get("fp1").get.executionId == id);
 
     // A completion is recorded on the execution named in the route; its outcome, exit code,
-    // error and artifacts (stamped with the execution's fingerprint) are kept and the claim is
-    // released. Nothing else is written: no cache entry, no chain re-evaluation
+    // error and artifacts (stamped with the execution's fingerprint) are kept. Nothing else is
+    // written: no cache entry, no chain re-evaluation
     TaskExecutionResult failed;
     failed.taskId = "compile";
     failed.status = TaskStatus.failed;
@@ -724,7 +797,6 @@ unittest
     assert(done.errorMessage == "make: *** [all] Error 2" && done.finishedAt == fixedNow());
     assert(done.artifacts.length == 1 && done.artifacts[0].taskFingerprint == "fp1");
     assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
-    assert(stores.claims.get("fp1").get.executionId.length == 0);
 
     // A task id is optional; a duplicate is rejected as stale, an unknown execution as unknown
     bool unknownExecution = false;
@@ -745,8 +817,7 @@ unittest
     // checks, then loses the compare-and-set to the first and is rejected without overwriting it
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
-    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
-    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+    const id = queueExecution(stores, "exe_1");
 
     TaskExecutionResult succeeded;
     succeeded.taskId = "compile";
@@ -762,5 +833,4 @@ unittest
     catch (StaleCompletionException e) rejected = e.msg.canFind("finished succeeded");
     assert(rejected);
     assert(stores.executions.get(id).get.status == ExecutionStatus.succeeded);
-    assert(stores.claims.get("fp1").get.executionId.length == 0);
 }

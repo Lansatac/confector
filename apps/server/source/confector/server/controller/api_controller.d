@@ -4,13 +4,12 @@ import vibe.vibe;
 import confector.core.model;
 import confector.core.dag;
 import confector.core.document_collection : tryValue;
+import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
 import confector.core.trigger;
-import confector.core.executor : CapacityBroker;
 import confector.plugin_api.dispatch_queue;
-import confector.core.execution_dispatcher : defaultPoolQueue;
 import confector.server.scheduler_callback : schedulerCallback;
-import confector.core.work_orders : completeExecution;
+import confector.core.work_orders : completeExecution, defaultPoolQueue;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -18,16 +17,19 @@ import std.datetime.systime : Clock;
 
 /**
  * Why the routes that start builds fail: starting a build waits for request intake (bead
- * confector-z7z.23.7), the first part of the chain path to accept a request. The legacy build
- * coordinator that used to start builds was deleted (bead confector-z7z.23.10).
+ * confector-z7z.23.7), the first part of the chain path to accept a request. The routes answer
+ * 501 Not Implemented with this exception's message.
  */
-enum string buildsNotImplemented = "Starting builds is not implemented until request intake (bead confector-z7z.23.7)";
+NotImplementedException buildsNotImplemented()
+{
+    return new NotImplementedException("Starting builds", "confector-z7z.23.7");
+}
 
 /**
  * The REST API, served under /api/v1. Every route is registered once, with the prefix; the route
  * helpers take paths relative to it.
  */
-URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, StateStores stores = null, CapacityBroker capacityBroker = null)
+URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, StateStores stores = null)
 {
     auto router = new URLRouter();
 
@@ -55,13 +57,13 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
         router.delete_(apiPrefix ~ path, handler);
     }
 
-    // The routes that start builds fail loudly until request intake lands; see
-    // buildsNotImplemented.
-    void writeBuildsNotImplemented(HTTPServerResponse res)
+    // A stub route answers 501 Not Implemented, naming the bead that implements it.
+    void writeNotImplemented(HTTPServerResponse res, NotImplementedException e)
     {
         res.statusCode = HTTPStatus.notImplemented;
         Json err = Json.emptyObject;
-        err["error"] = Json(buildsNotImplemented);
+        err["error"] = Json(e.msg);
+        err["bead"] = Json(e.bead);
         res.writeJsonBody(err);
     }
 
@@ -295,7 +297,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
     // A worker's completion of an execution. It names the execution only: the fingerprint and
     // task come from the execution record (design record: bead confector-z7z.2), and anything
     // that does not match it is rejected. Until the fingerprint ledger lands (beads
-    // confector-z7z.49.x) a completion only finishes the execution and releases its claim; see
+    // confector-z7z.49.4) a completion only finishes the execution; see
     // confector.core.work_orders.completeExecution. The worker acknowledges its own work order.
     postRoute("/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         import confector.core.work_orders : InvalidCompletionException, StaleCompletionException, UnknownExecutionException;
@@ -339,11 +341,11 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
     // Starting a build of a project fails loudly until request intake lands (see
     // buildsNotImplemented). The scheduler calls the second route for cron trigger rules.
     postRoute("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        writeBuildsNotImplemented(res);
+        writeNotImplemented(res, buildsNotImplemented());
     });
 
     schedulerRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        writeBuildsNotImplemented(res);
+        writeNotImplemented(res, buildsNotImplemented());
     });
 
     // Projects REST API
@@ -619,27 +621,6 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
         }
     });
 
-    // Capacity broker endpoint — called by the scheduler plugin via HTTP
-    if (capacityBroker !is null)
-    {
-        schedulerRoute("/broker/evaluate", (HTTPServerRequest req, HTTPServerResponse res) {
-            try
-            {
-                capacityBroker.evaluateDemand();
-                Json resp = Json.emptyObject;
-                resp["status"] = Json("ok");
-                res.writeJsonBody(resp);
-            }
-            catch (Exception e)
-            {
-                res.statusCode = HTTPStatus.internalServerError;
-                Json err = Json.emptyObject;
-                err["error"] = Json(e.msg);
-                res.writeJsonBody(err);
-            }
-        });
-    }
-
     return router;
 }
 
@@ -742,18 +723,44 @@ unittest
     }
 
     assert(post("/projects/run", `{"project_id": "proj_api_1"}`) == HTTPStatus.notImplemented);
+    {
+        import std.algorithm.searching : canFind;
+        import vibe.stream.memory : createMemoryOutputStream;
 
-    // An execution dispatched on the chain path, received by a worker
-    import confector.core.execution_dispatcher : ExecutionDispatcher, PlannedExecution, defaultPoolQueue;
-    import confector.core.work_orders : receiveWork;
+        InetHeaderMap runHeaders;
+        runHeaders["Content-Type"] = "application/json";
+        auto runReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/run"),
+            HTTPMethod.POST, runHeaders, createMemoryStream(cast(ubyte[]) `{"project_id": "proj_api_1"}`.dup, false));
+        auto sink = createMemoryOutputStream();
+        auto runRes = createTestHTTPServerResponse(sink);
+        routerWithStores.handleRequest(runReq, runRes);
+        runRes.finalize();
+        const written = cast(string) sink.data;
+        assert(written.canFind(`"bead":"confector-z7z.23.7"`), written);
+        assert(written.canFind(buildsNotImplemented().msg), written);
+    }
+
+    // An execution recorded and sent to the dispatch queue, received by a worker
+    import confector.core.work_orders : DispatchMessage, receiveWork;
     import core.time : hours;
 
-    PlannedExecution planned;
-    planned.projectId = "proj_api_1";
-    planned.taskId = "n1";
-    planned.fingerprint = "fp_n1";
-    planned.definition = node;
-    const executionId = new ExecutionDispatcher(stores, queue).dispatch([planned])[0].executionId;
+    string queueExecution(StateStores into, string id, string fingerprint)
+    {
+        TaskExecution execution;
+        execution.id = id;
+        execution.projectId = "proj_api_1";
+        execution.taskId = "n1";
+        execution.fingerprint = fingerprint;
+        execution.status = ExecutionStatus.queued;
+        execution.definition = node;
+        execution.createdAt = "2026-10-16T10:00:00Z";
+        into.executions.create(execution);
+        queue.ensureQueue(defaultPoolQueue);
+        queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id)));
+        return id;
+    }
+
+    const executionId = queueExecution(stores, "exe_n1", "fp_n1");
     auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "test-worker");
     assert(received.length == 1 && received[0].workOrder.executionId == executionId);
 
@@ -782,13 +789,11 @@ unittest
         == HTTPStatus.unprocessableEntity, "Artifacts under another fingerprint are rejected for good");
     assert(post("/executions/" ~ executionId ~ "/complete", `{"status": `) == HTTPStatus.badRequest, "Malformed JSON");
     assert(stores.executions.get(executionId).get.status == ExecutionStatus.running);
-    assert(stores.claims.get("fp_n1").get.executionId == executionId);
 
-    // The completion finishes the execution under its own fingerprint and releases the claim
+    // The completion finishes the execution under its own fingerprint
     assert(post("/executions/" ~ executionId ~ "/complete", completion) == HTTPStatus.ok);
     const finished = stores.executions.get(executionId).get;
     assert(finished.status == ExecutionStatus.succeeded && finished.fingerprint == "fp_n1");
-    assert(stores.claims.get("fp_n1").get.executionId.length == 0);
     assert(stores.executions.get("fp_chosen_by_the_worker").isNull);
     assert(post("/executions/" ~ executionId ~ "/complete", completion) == HTTPStatus.conflict, "A duplicate completion is rejected");
     assert(stores.executions.get(executionId).get.status == ExecutionStatus.succeeded);
@@ -803,9 +808,7 @@ unittest
     import confector.testing.memory_document_store : InterleavingDocumentStore;
     auto failingDocuments = new InterleavingDocumentStore(new InMemoryDocumentStore());
     auto failingStores = new StateStores(failingDocuments);
-    PlannedExecution another = planned;
-    another.fingerprint = "fp_n1_again";
-    const anotherId = new ExecutionDispatcher(failingStores, queue).dispatch([another])[0].executionId;
+    const anotherId = queueExecution(failingStores, "exe_n1_again", "fp_n1_again");
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
     auto failingRouter = apiRouter("test-scheduler-secret", queue, failingStores);
     InetHeaderMap failingHeaders;

@@ -24,7 +24,7 @@ struct ScheduleEntry
 {
     string id;                    // Unique identifier for the scheduled job
     string name;                  // Human-readable name
-    string uri;                   // HTTP URI to call (e.g., "http://localhost:8080/api/v1/scheduler/capacity-evaluate")
+    string uri;                   // HTTP URI to call (e.g., "http://localhost:8080/api/v1/projects/p1/run")
     string httpMethod;            // HTTP method (default: "POST")
     string jsonBody;              // JSON body to send with the request (e.g., `{"repositoryUrl": "..."}`)
     string cronExpression;        // Cron expression (e.g., "*/5 * * * *" for every 5 min, "* * * * *" for every minute)

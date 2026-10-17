@@ -3,8 +3,7 @@ module confector.core.build_stores;
 /**
  * State stores for the build model (design records: beads confector-z7z.4, confector-z7z.14 and
  * confector-z7z.2; AGENTS.md, "What a build is" and "Coordinating builds"): build chains, build
- * requests, task executions, fingerprint claims and artifact records, each a typed collection in
- * the DocumentStore.
+ * requests and task executions, each a typed collection in the DocumentStore.
  *
  * Correctness depends only on reads by id and compare-and-set on one document. Index queries
  * (`list...`, `find...ByNumber`) are for discovery and may lag behind writes; level-triggered
@@ -21,7 +20,7 @@ import std.algorithm.searching : canFind;
 import std.format : format;
 import std.typecons : Nullable;
 
-/// Build chains, by chain id (`chainIdFor`); indexed by project and number.
+/// Build chains, by chain id; indexed by project and number.
 enum CollectionSpec buildChainsCollection = CollectionSpec("build_chains",
     [IndexSpec("by_project", "project_id", "number_key")]);
 
@@ -36,13 +35,6 @@ enum CollectionSpec taskExecutionsCollection = CollectionSpec("task_executions",
      IndexSpec("by_task", "project_task", "created_key"),
      IndexSpec("active", "active_status", "created_key")]);
 
-/// Fingerprint claims, by fingerprint. Read by id only.
-enum CollectionSpec fingerprintClaimsCollection = CollectionSpec("fingerprint_claims", null);
-
-/// Artifact records, by `artifactRecordId`; indexed by fingerprint.
-enum CollectionSpec artifactRecordsCollection = CollectionSpec("artifact_records",
-    [IndexSpec("by_fingerprint", "task_fingerprint", "artifact_id")]);
-
 /// Page size of the queries that list everything they find.
 private enum size_t pageSize = 100;
 
@@ -54,17 +46,6 @@ class InvalidStateTransitionException : Exception
     {
         super(msg, file, line);
     }
-}
-
-/**
- * The id of a project's chain with join key `snapshotHash` (which covers the chain's resolved
- * inputs and branch context). Deriving the id from the join key makes joining a read by id, and
- * makes two requests that race to create the same chain collide on create: the loser joins the
- * winner's chain.
- */
-string chainIdFor(string projectId, string snapshotHash) @safe
-{
-    return hashedId(projectId, snapshotHash);
 }
 
 /**
@@ -99,27 +80,16 @@ final class ChainStore
         return m_chains.get(id);
     }
 
-    /// Reads the chain a request resolving to `snapshotHash` in project `projectId` joins, if it
-    /// exists. Strongly consistent.
-    Nullable!(Versioned!BuildChain) findJoinable(string projectId, string snapshotHash)
-    {
-        return m_chains.get(chainIdFor(projectId, snapshotHash));
-    }
-
     /**
-     * Creates `chain`. Its id must be `chainIdFor(projectId, snapshotHash)` and its number one
-     * from `nextNumber`.
+     * Creates `chain`. Its number must be one from `nextNumber`.
      *
-     * Throws: DocumentConflictException if the chain exists (join it instead);
-     * InvalidStateTransitionException if the chain is incomplete or its id is not derived from
-     * its join key.
+     * Throws: DocumentConflictException if a chain with its id exists;
+     * InvalidStateTransitionException if the chain is incomplete.
      */
     Versioned!BuildChain create(BuildChain chain)
     {
-        requireValid(chain.projectId.length > 0 && chain.snapshotHash.length > 0 && chain.number > 0 && chain.createdAt.length > 0,
-            format("Chain '%s' needs a project id, a snapshot hash, a number and a creation time", chain.id));
-        requireValid(chain.id == chainIdFor(chain.projectId, chain.snapshotHash),
-            format("Chain id '%s' is not chainIdFor('%s', '%s')", chain.id, chain.projectId, chain.snapshotHash));
+        requireValid(chain.id.length > 0 && chain.projectId.length > 0 && chain.number > 0 && chain.createdAt.length > 0,
+            format("Chain '%s' needs an id, a project id, a number and a creation time", chain.id));
         sortableTimestamp(chain.createdAt);
         return m_chains.create(chain.id, chain);
     }
@@ -135,7 +105,7 @@ final class ChainStore
     {
         const was = current.value;
         requireValid(next.id == was.id && next.projectId == was.projectId && next.number == was.number
-            && next.snapshotHash == was.snapshotHash && next.createdAt == was.createdAt && next.tasks == was.tasks,
+            && next.createdAt == was.createdAt,
             format("Only the labels and history of chain '%s' can change", was.id));
         requireValid(next.events.length >= was.events.length && next.events[0 .. was.events.length] == was.events,
             format("The history of chain '%s' can only be appended to", was.id));
@@ -318,18 +288,6 @@ final class ExecutionStore
         return values(m_executions.queryAll(lookup));
     }
 
-    /// The executions at each of `fingerprints`, in the form the chain evaluator takes, with an
-    /// entry (possibly empty) for every fingerprint. Discovery: may lag behind writes.
-    TaskExecution[][string] listForFingerprints(in string[] fingerprints)
-    {
-        TaskExecution[][string] result;
-        foreach (fingerprint; fingerprints)
-        {
-            result[fingerprint] = listForFingerprint(fingerprint);
-        }
-        return result;
-    }
-
     /// Lists task `taskId` of project `projectId`'s executions ("task runs"), newest first, at
     /// most `limit` of them. Discovery.
     TaskExecution[] listForTask(string projectId, string taskId, size_t limit)
@@ -355,143 +313,6 @@ final class ExecutionStore
     }
 }
 
-/// The outcome of FingerprintClaimStore.claim.
-struct ClaimResult
-{
-    /// Whether the claim is now held for the execution that asked for it.
-    bool won;
-    /// The claim as it now stands: when `won` is false, `executionId` names the holder.
-    Versioned!FingerprintClaim claim;
-}
-
-/**
- * Fingerprint claims: at most one active execution per fingerprint (bead confector-z7z.2). A
- * claim is one document per fingerprint, never removed, so its version only grows and a writer
- * holding an older version always loses.
- */
-final class FingerprintClaimStore
-{
-    private DocumentCollection!FingerprintClaim m_claims;
-
-    /// Declares `fingerprintClaimsCollection` on `store`.
-    this(DocumentStore store)
-    {
-        m_claims = new DocumentCollection!FingerprintClaim(store, fingerprintClaimsCollection);
-    }
-
-    /// Reads the claim on `fingerprint`. Null if it was never claimed.
-    Nullable!(Versioned!FingerprintClaim) get(string fingerprint)
-    {
-        return m_claims.get(fingerprint);
-    }
-
-    /**
-     * Claims `fingerprint` for execution `executionId`, if no execution holds it. Claiming a
-     * fingerprint the same execution already holds wins again without writing.
-     *
-     * Throws: DocumentConflictException if a concurrent write to the claim landed between this
-     * method's read and its write: the caller re-reads and decides again. Exception if either
-     * argument is empty.
-     */
-    ClaimResult claim(string fingerprint, string executionId)
-    {
-        requireNonEmpty(fingerprint, "A claim needs a fingerprint");
-        requireNonEmpty(executionId, "A claim needs an execution id");
-        auto current = m_claims.get(fingerprint);
-        if (current.isNull)
-        {
-            return ClaimResult(true, m_claims.create(fingerprint, FingerprintClaim(fingerprint, executionId)));
-        }
-        const holder = current.get.executionId;
-        if (holder == executionId) return ClaimResult(true, current.get);
-        if (holder.length > 0) return ClaimResult(false, current.get);
-        return ClaimResult(true, m_claims.replace(fingerprint, FingerprintClaim(fingerprint, executionId), current.get.version_));
-    }
-
-    /**
-     * Releases `fingerprint` if execution `executionId` holds it. Returns false, writing
-     * nothing, if another execution or none holds it.
-     *
-     * Throws: DocumentConflictException if a concurrent write to the claim landed between this
-     * method's read and its write. Exception if either argument is empty.
-     */
-    bool release(string fingerprint, string executionId)
-    {
-        requireNonEmpty(fingerprint, "A claim needs a fingerprint");
-        requireNonEmpty(executionId, "A claim needs an execution id");
-        auto current = m_claims.get(fingerprint);
-        if (current.isNull || current.get.executionId != executionId) return false;
-        m_claims.replace(fingerprint, FingerprintClaim(fingerprint), current.get.version_);
-        return true;
-    }
-}
-
-/// The id of the artifact record for artifact `artifactId` produced at `fingerprint`.
-string artifactRecordId(string fingerprint, string artifactId) @safe
-{
-    return hashedId(fingerprint, artifactId);
-}
-
-/**
- * Artifact records: which artifact store holds each artifact, addressed as the artifact stores
- * address bytes, by the producing task's fingerprint and the artifact's id (AGENTS.md, "Backends
- * and extensions"). An artifact's address never changes; its other details may (for example when
- * retention deletes its bytes).
- */
-final class ArtifactRecordStore
-{
-    private DocumentCollection!ArtifactMetadata m_records;
-
-    /// Declares `artifactRecordsCollection` on `store`.
-    this(DocumentStore store)
-    {
-        m_records = new DocumentCollection!ArtifactMetadata(store, artifactRecordsCollection);
-    }
-
-    /// Reads the record of artifact `artifactId` at `fingerprint`. Null if there is none.
-    Nullable!(Versioned!ArtifactMetadata) get(string fingerprint, string artifactId)
-    {
-        return m_records.get(artifactRecordId(fingerprint, artifactId));
-    }
-
-    /**
-     * Records an artifact.
-     *
-     * Throws: DocumentConflictException if it is already recorded;
-     * InvalidStateTransitionException if it has no fingerprint, artifact id or storage backend.
-     */
-    Versioned!ArtifactMetadata create(ArtifactMetadata record)
-    {
-        requireValid(record.taskFingerprint.length > 0 && record.artifactId.length > 0 && record.storageBackend.length > 0,
-            format("Artifact record '%s' needs a fingerprint, an artifact id and a storage backend", record.artifactId));
-        return m_records.create(artifactRecordId(record.taskFingerprint, record.artifactId), record);
-    }
-
-    /**
-     * Replaces the record `current` with `next`, which must keep its address.
-     *
-     * Throws: DocumentConflictException if the record changed since `current` was read;
-     * InvalidStateTransitionException if `next` changes the fingerprint or artifact id.
-     */
-    Versioned!ArtifactMetadata update(in Versioned!ArtifactMetadata current, ArtifactMetadata next)
-    {
-        const was = current.value;
-        requireValid(next.taskFingerprint == was.taskFingerprint && next.artifactId == was.artifactId,
-            format("The address of artifact record '%s' at '%s' cannot change", was.artifactId, was.taskFingerprint));
-        return m_records.replace(artifactRecordId(was.taskFingerprint, was.artifactId), next, current.version_);
-    }
-
-    /// Lists the artifacts recorded at `fingerprint`, by artifact id. Discovery.
-    ArtifactMetadata[] listForFingerprint(string fingerprint)
-    {
-        IndexQuery lookup;
-        lookup.index = "by_fingerprint";
-        lookup.partitionKey = fingerprint;
-        lookup.limit = pageSize;
-        return values(m_records.queryAll(lookup));
-    }
-}
-
 private T[] values(T)(Versioned!T[] items)
 {
     T[] result;
@@ -512,7 +333,7 @@ private void requireNonEmpty(string value, lazy string message)
 
 version (unittest)
 {
-    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
     import vibe.data.json : Json;
 
     private bool throwsA(E)(scope void delegate() action)
@@ -522,18 +343,12 @@ version (unittest)
         return false;
     }
 
-    private BuildChain sampleChain(string projectId, string snapshotHash, ulong number)
+    private BuildChain sampleChain(string projectId, ulong number)
     {
         BuildChain chain;
-        chain.id = chainIdFor(projectId, snapshotHash);
+        chain.id = format("%s-%s", projectId, number);
         chain.projectId = projectId;
         chain.number = number;
-        chain.snapshotHash = snapshotHash;
-        ChainTask compile;
-        compile.id = "compile";
-        compile.inputs["src"] = repositoryInput("game", "main");
-        compile.resolvedInputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"))];
-        chain.tasks = [compile];
         chain.createdAt = "2026-10-15T14:02:00Z";
         return chain;
     }
@@ -555,32 +370,29 @@ version (unittest)
 
 unittest
 {
-    // Chains: create once under the id derived from the join key, join by id, number per project
+    // Chains: created once, numbered per project
     auto documents = new InMemoryDocumentStore();
     auto chains = new ChainStore(documents);
     assert(chains.nextNumber("game") == 1);
     assert(chains.nextNumber("game") == 2);
     assert(chains.nextNumber("tools") == 1);
 
-    assert(chains.findJoinable("game", "snap1").isNull);
-    auto created = chains.create(sampleChain("game", "snap1", 1));
+    auto created = chains.create(sampleChain("game", 1));
     assert(created.version_ == 1);
-    auto joined = chains.findJoinable("game", "snap1");
-    assert(!joined.isNull && joined.get.value == created.value);
-    assert(chains.get(created.id).get.number == 1);
-    assert(chains.findJoinable("tools", "snap1").isNull, "Projects never share chains");
+    assert(chains.get(created.id).get.value == created.value);
+    assert(chains.get("game-9").isNull);
+    assert(throwsA!DocumentConflictException({ chains.create(sampleChain("game", 1)); }), "A chain is created once");
 
-    // A second creator of the same chain loses and joins the winner's chain
-    assert(throwsA!DocumentConflictException({ chains.create(sampleChain("game", "snap1", 2)); }));
-    assert(chains.findJoinable("game", "snap1").get.number == 1);
-
-    // Incomplete chains and ids not derived from the join key are rejected
-    auto badId = sampleChain("game", "snap2", 2);
-    badId.id = "chain-2";
-    assert(throwsA!InvalidStateTransitionException({ chains.create(badId); }));
-    auto noNumber = sampleChain("game", "snap2", 0);
+    // Incomplete chains are rejected
+    auto noId = sampleChain("game", 2);
+    noId.id = null;
+    assert(throwsA!InvalidStateTransitionException({ chains.create(noId); }));
+    auto noProject = sampleChain("game", 2);
+    noProject.projectId = null;
+    assert(throwsA!InvalidStateTransitionException({ chains.create(noProject); }));
+    auto noNumber = sampleChain("game", 0);
     assert(throwsA!InvalidStateTransitionException({ chains.create(noNumber); }));
-    auto badTime = sampleChain("game", "snap2", 2);
+    auto badTime = sampleChain("game", 2);
     badTime.createdAt = "today";
     assert(throwsA!Exception({ chains.create(badTime); }));
 
@@ -590,30 +402,9 @@ unittest
 
 unittest
 {
-    // Chains: two requests racing to create the same chain both allocate a number; the loser's
-    // create conflicts, it joins the winner's chain, and its number is a gap
-    auto documents = new InMemoryDocumentStore();
-    auto winner = new ChainStore(documents);
-    auto interleaving = new InterleavingDocumentStore(documents);
-    auto loser = new ChainStore(interleaving);
-
-    const loserNumber = loser.nextNumber("game");
-    assert(loser.findJoinable("game", "snap1").isNull, "Nothing to join yet");
-    interleaving.beforeNextWrite = () {
-        winner.create(sampleChain("game", "snap1", winner.nextNumber("game")));
-    };
-    assert(throwsA!DocumentConflictException({ loser.create(sampleChain("game", "snap1", loserNumber)); }));
-    auto joined = loser.findJoinable("game", "snap1");
-    assert(!joined.isNull && joined.get.number == 2 && loserNumber == 1, "The loser joins the winner's chain");
-    assert(loser.nextNumber("game") == 3, "The loser's number 1 is not reused");
-    assert(loser.listForProject("game", 10).length == 1);
-}
-
-unittest
-{
     // Chains: only labels change and history is only appended, by compare-and-set
     auto chains = new ChainStore(new InMemoryDocumentStore());
-    auto v1 = chains.create(sampleChain("game", "snap1", 1));
+    auto v1 = chains.create(sampleChain("game", 1));
 
     BuildChain labelled = v1.value;
     labelled.labels = ["release candidate"];
@@ -633,9 +424,9 @@ unittest
     truncated.events = null;
     assert(throwsA!InvalidStateTransitionException({ chains.update(v2, truncated); }));
 
-    BuildChain retasked = v2.value;
-    retasked.tasks = null;
-    assert(throwsA!InvalidStateTransitionException({ chains.update(v2, retasked); }), "The snapshot is immutable");
+    BuildChain moved = v2.value;
+    moved.projectId = "tools";
+    assert(throwsA!InvalidStateTransitionException({ chains.update(v2, moved); }));
     BuildChain renumbered = v2.value;
     renumbered.number = 9;
     assert(throwsA!InvalidStateTransitionException({ chains.update(v2, renumbered); }));
@@ -649,8 +440,8 @@ unittest
 {
     // Chains: listed by number per project, and found by number
     auto chains = new ChainStore(new InMemoryDocumentStore());
-    foreach (n; 1 .. 13) chains.create(sampleChain("game", format("snap%s", n), n));
-    chains.create(sampleChain("tools", "snap1", 1));
+    foreach (n; 1 .. 13) chains.create(sampleChain("game", n));
+    chains.create(sampleChain("tools", 1));
 
     auto newest = chains.listForProject("game", 3);
     assert(newest.length == 3 && newest[0].number == 12 && newest[2].number == 10, "Numbers sort numerically, not as text");
@@ -658,7 +449,7 @@ unittest
     assert(oldest.length == 12 && oldest[0].number == 1);
     assert(chains.listForProject("nobody", 10).length == 0);
 
-    assert(chains.findByNumber("game", 7).get.snapshotHash == "snap7");
+    assert(chains.findByNumber("game", 7).get.id == "game-7");
     assert(chains.findByNumber("tools", 1).get.projectId == "tools");
     assert(chains.findByNumber("game", 99).isNull);
 }
@@ -798,8 +589,7 @@ unittest
 
     auto atFp1 = executions.listForFingerprint("fp1");
     assert(atFp1.length == 2 && atFp1[0].id == "e1" && atFp1[1].id == "e2");
-    auto byFingerprint = executions.listForFingerprints(["fp1", "fp2", "none"]);
-    assert(byFingerprint["fp1"].length == 2 && byFingerprint["fp2"].length == 1 && byFingerprint["none"].length == 0);
+    assert(executions.listForFingerprint("fp2").length == 1 && executions.listForFingerprint("none").length == 0);
 
     auto history = executions.listForTask("game", "compile", 2);
     assert(history.length == 2 && history[0].id == "e3" && history[1].id == "e2");
@@ -809,88 +599,4 @@ unittest
     assert(active.length == 3 && active[0].id == "e2", "A terminal execution leaves the active index");
     assert(executions.listActive(ExecutionStatus.running, 10).length == 0);
     assert(throwsA!InvalidStateTransitionException({ executions.listActive(ExecutionStatus.failed, 10); }));
-}
-
-unittest
-{
-    // Claims: at most one holder per fingerprint; claims are released, never removed
-    auto documents = new InMemoryDocumentStore();
-    auto claims = new FingerprintClaimStore(documents);
-    assert(claims.get("fp1").isNull);
-
-    auto first = claims.claim("fp1", "e1");
-    assert(first.won && first.claim.executionId == "e1" && first.claim.version_ == 1);
-    auto again = claims.claim("fp1", "e1");
-    assert(again.won && again.claim.version_ == 1, "Claiming again for the holder writes nothing");
-    auto lost = claims.claim("fp1", "e2");
-    assert(!lost.won && lost.claim.executionId == "e1");
-
-    assert(!claims.release("fp1", "e2"), "Only the holder releases");
-    assert(!claims.release("fp9", "e1"));
-    assert(claims.release("fp1", "e1"));
-    assert(claims.get("fp1").get.executionId.length == 0 && claims.get("fp1").get.version_ == 2);
-    assert(!claims.release("fp1", "e1"));
-
-    auto next = claims.claim("fp1", "e2");
-    assert(next.won && next.claim.version_ == 3);
-
-    assert(throwsA!Exception({ claims.claim("", "e1"); }));
-    assert(throwsA!Exception({ claims.claim("fp1", ""); }));
-}
-
-unittest
-{
-    // Claims: two dispatchers racing for one fingerprint produce exactly one winner; the loser's
-    // write conflicts, and re-reading shows it lost
-    import confector.testing.memory_document_store : InMemoryDocumentStore;
-
-    auto documents = new InMemoryDocumentStore();
-    auto rival = new FingerprintClaimStore(documents);
-    auto interleaving = new InterleavingDocumentStore(documents);
-    auto claims = new FingerprintClaimStore(interleaving);
-
-    interleaving.beforeNextWrite = () { assert(rival.claim("fp1", "e1").won); };
-    assert(throwsA!DocumentConflictException({ claims.claim("fp1", "e2"); }), "Losing the create conflicts");
-    assert(!claims.claim("fp1", "e2").won && claims.get("fp1").get.executionId == "e1");
-
-    assert(rival.release("fp1", "e1"));
-    interleaving.beforeNextWrite = () { assert(rival.claim("fp1", "e3").won); };
-    assert(throwsA!DocumentConflictException({ claims.claim("fp1", "e2"); }), "Losing the replace conflicts");
-    assert(claims.get("fp1").get.executionId == "e3");
-}
-
-unittest
-{
-    // Artifact records: addressed by fingerprint and artifact id; the address never changes
-    auto records = new ArtifactRecordStore(new InMemoryDocumentStore());
-    ArtifactMetadata artifact;
-    artifact.taskFingerprint = "fp1";
-    artifact.artifactId = "game.zip";
-    artifact.sha256 = "abc";
-    artifact.sizeBytes = 1024;
-    artifact.storageBackend = "local";
-    auto created = records.create(artifact);
-    auto other = artifact;
-    other.artifactId = "tools.zip";
-    records.create(other);
-
-    assert(records.get("fp1", "game.zip").get.value == artifact);
-    assert(records.get("fp2", "game.zip").isNull);
-    auto listed = records.listForFingerprint("fp1");
-    assert(listed.length == 2 && listed[0].artifactId == "game.zip");
-
-    ArtifactMetadata moved = artifact;
-    moved.storageBackend = "s3";
-    assert(records.update(created, moved).storageBackend == "s3");
-    assert(throwsA!DocumentConflictException({ records.update(created, moved); }));
-    ArtifactMetadata readdressed = records.get("fp1", "game.zip").get.value;
-    auto current = records.get("fp1", "game.zip").get;
-    readdressed.artifactId = "other.zip";
-    assert(throwsA!InvalidStateTransitionException({ records.update(current, readdressed); }));
-
-    assert(throwsA!DocumentConflictException({ records.create(artifact); }));
-    auto unstored = artifact;
-    unstored.artifactId = "x";
-    unstored.storageBackend = null;
-    assert(throwsA!InvalidStateTransitionException({ records.create(unstored); }));
 }

@@ -8,7 +8,7 @@ module confector.core.state_stores;
  */
 
 import confector.core.api_token_store : ApiTokenStore;
-import confector.core.build_stores : ArtifactRecordStore, BuildRequestStore, ChainStore, ExecutionStore, FingerprintClaimStore;
+import confector.core.build_stores : BuildRequestStore, ChainStore, ExecutionStore;
 import confector.core.counters : CounterStore;
 import confector.core.legacy_stores : ExecutionLogStore, TriggerRuleStore, VcsStateStore, WorkerStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
@@ -24,9 +24,7 @@ final class StateStores
     ChainStore chains;
     BuildRequestStore requests;
     ExecutionStore executions;
-    FingerprintClaimStore claims;
     RerunGenerationStore rerunGenerations;
-    ArtifactRecordStore artifacts;
     CounterStore counters;
 
     // What builds are made from, and who may make them
@@ -54,9 +52,7 @@ final class StateStores
         chains = new ChainStore(store);
         requests = new BuildRequestStore(store);
         executions = new ExecutionStore(store);
-        claims = new FingerprintClaimStore(store);
         rerunGenerations = new RerunGenerationStore(store);
-        artifacts = new ArtifactRecordStore(store);
         counters = new CounterStore(store);
         projects = new ProjectStore(store);
         repositories = new RepositoryStore(store);

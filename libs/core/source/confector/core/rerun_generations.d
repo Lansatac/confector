@@ -2,8 +2,8 @@ module confector.core.rerun_generations;
 
 /**
  * Rerun generations (design record: bead confector-z7z.15; AGENTS.md, "Re-running a task"): the
- * durable record of each base fingerprint's reruns, and the shell that reads it to evaluate a
- * chain's fingerprints with the pure core (confector.core.input_resolution.chainResolution).
+ * durable record of each base fingerprint's reruns, and the shell that reads it to compute a
+ * graph's fingerprints with the pure core (confector.core.input_resolution.graphResolution).
  *
  * The record lives in the state store as one document per base fingerprint, with the base as
  * its id:
@@ -17,8 +17,9 @@ module confector.core.rerun_generations;
  * declares no index.
  */
 
-import confector.core.input_resolution : GraphResolution, RerunGenerations, chainResolution, unreadRerunBases;
-import confector.core.model : ChainTask;
+import confector.core.dag : TaskGraph;
+import confector.core.input_resolution : GraphResolution, RerunGenerations, graphResolution;
+import confector.core.model : InputDecl, InputPin;
 import confector.plugin_api.document_store;
 
 import vibe.data.json : Json;
@@ -175,22 +176,31 @@ final class RerunGenerationStore
 }
 
 /**
- * Evaluates `chain` at the current rerun generations: reads, with `read`, the generations of
- * the bases `unreadRerunBases` reports until none are left, then returns `chainResolution`.
- * Bases depend on upstream fingerprints, so each round reads one more level of the graph; a
- * chain needs at most as many reads as its longest path has tasks.
+ * Computes the fingerprints of `graph` over `pins` at the current rerun generations: reads, with
+ * `read`, the generations of the bases `graphResolution` reports unread until none are left.
+ * Bases depend on upstream fingerprints, so each round reads one more level of the graph; a graph
+ * needs at most as many reads as its longest path has tasks.
  *
  * Throws: Exception if `read` returns no generation for a base it was asked for; whatever
- * `read` and `chainResolution` throw.
+ * `read` and `graphResolution` throw.
  */
-GraphResolution readChainResolution(string projectId, in ChainTask[] chain, scope RerunGenerationReader read)
+GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in InputPin[InputDecl] pins,
+    scope RerunGenerationReader read)
 {
+    import std.algorithm.sorting : sort;
+
     RerunGenerations generations;
-    for (auto unread = unreadRerunBases(projectId, chain, generations); unread.length > 0;
-        unread = unreadRerunBases(projectId, chain, generations))
+    for (;;)
     {
-        auto readGenerations = read(unread);
-        foreach (base; unread)
+        string[string] unread;
+        auto resolution = graphResolution(projectId, graph, pins, generations, unread);
+        if (unread.length == 0) return resolution;
+
+        bool[string] distinct;
+        foreach (base; unread.byValue) distinct[base] = true;
+        auto bases = distinct.keys.sort().release;
+        auto readGenerations = read(bases);
+        foreach (base; bases)
         {
             auto generation = base in readGenerations;
             if (generation is null)
@@ -200,30 +210,30 @@ GraphResolution readChainResolution(string projectId, in ChainTask[] chain, scop
             generations[base] = *generation;
         }
     }
-    return chainResolution(projectId, chain, generations);
 }
 
 version (unittest)
 {
-    import confector.core.dag : TaskGraph;
-    import confector.core.input_resolution : freezeChain, resolveGraphInputs;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import confector.core.model;
 
     import std.algorithm.searching : canFind;
     import std.typecons : Nullable;
 
-    /// A chain of compile -> test -> report plus an independent lint, at revision `sha`.
-    private ChainTask[] sampleChain(string sha)
+    /// compile -> test -> report plus an independent lint.
+    private TaskGraph sampleGraph()
     {
         TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game", "main");
         TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
         TaskNode report; report.id = "report"; report.inputs["results"] = taskOutputInput("test");
         TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game", "main");
-        auto graph = new TaskGraph([compile, test, report, lint]);
-        InputPin[InputDecl] none;
-        InputPin[InputDecl] pins = [repositoryInput("game", "main"): InputPin(Json(sha))];
-        return freezeChain(graph, resolveGraphInputs(graph, none, pins));
+        return new TaskGraph([compile, test, report, lint]);
+    }
+
+    /// The sample graph's repository pinned at revision `sha`.
+    private InputPin[InputDecl] pinsAt(string sha)
+    {
+        return [repositoryInput("game", "main"): InputPin(Json(sha))];
     }
 }
 
@@ -351,34 +361,33 @@ unittest
 
 unittest
 {
-    // readChainResolution reads generations a level at a time, and bumping a task's generation
-    // in the store changes its fingerprint and every downstream one, in every chain sharing the
-    // task's base
+    // readGraphResolution reads generations a level at a time, and bumping a task's generation
+    // in the store changes its fingerprint and every downstream one, wherever the task's base is
+    // used
     auto store = new RerunGenerationStore(new InMemoryDocumentStore());
     size_t reads;
     RerunGenerationReader reader = (in string[] bases) { ++reads; return store.read(bases); };
 
-    auto chain = sampleChain("aaa111");
-    auto sameInputs = sampleChain("aaa111"); // another chain (say, another branch) at the same revision
-    auto otherRevision = sampleChain("bbb222");
+    auto graph = sampleGraph();
+    auto sameInputs = sampleGraph(); // another definition (say, on another branch) at the same revision
 
-    auto before = readChainResolution("p", chain, reader);
+    auto before = readGraphResolution("p", graph, pinsAt("aaa111"), reader);
     assert(reads == 3, "compile and lint, then test, then report");
-    assert(readChainResolution("p", sameInputs, reader).fingerprints == before.fingerprints);
-    auto otherBefore = readChainResolution("p", otherRevision, reader);
+    assert(readGraphResolution("p", sameInputs, pinsAt("aaa111"), reader).fingerprints == before.fingerprints);
+    auto otherBefore = readGraphResolution("p", graph, pinsAt("bbb222"), reader);
 
     assert(store.bump(before.bases["compile"]) == 1);
 
-    auto after = readChainResolution("p", chain, reader);
+    auto after = readGraphResolution("p", graph, pinsAt("aaa111"), reader);
     foreach (id; ["compile", "test", "report"]) assert(after.fingerprints[id] != before.fingerprints[id], id);
     assert(after.fingerprints["lint"] == before.fingerprints["lint"]);
-    assert(readChainResolution("p", sameInputs, reader).fingerprints == after.fingerprints);
-    assert(readChainResolution("p", otherRevision, reader).fingerprints == otherBefore.fingerprints);
+    assert(readGraphResolution("p", sameInputs, pinsAt("aaa111"), reader).fingerprints == after.fingerprints);
+    assert(readGraphResolution("p", graph, pinsAt("bbb222"), reader).fingerprints == otherBefore.fingerprints);
 
     // A downstream task's new base starts at generation 0 and can be rerun on its own
     assert(store.read([after.bases["test"]]) == [after.bases["test"]: 0UL]);
     store.bump(after.bases["test"]);
-    auto testRerun = readChainResolution("p", chain, reader);
+    auto testRerun = readGraphResolution("p", graph, pinsAt("aaa111"), reader);
     assert(testRerun.fingerprints["compile"] == after.fingerprints["compile"]);
     assert(testRerun.fingerprints["test"] != after.fingerprints["test"]);
     assert(testRerun.fingerprints["report"] != after.fingerprints["report"]);
@@ -389,7 +398,16 @@ unittest
     // A reader that leaves out a base it was asked for fails loudly rather than defaulting
     RerunGenerationReader forgetful = (in string[] bases) { RerunGenerations none; return none; };
     bool threw = false;
-    try readChainResolution("p", sampleChain("aaa111"), forgetful);
+    try readGraphResolution("p", sampleGraph(), pinsAt("aaa111"), forgetful);
     catch (Exception ex) threw = ex.msg.canFind("returned none");
     assert(threw);
+
+    // Unpinned inputs fail loudly before any generation is read
+    size_t reads;
+    RerunGenerationReader counting = (in string[] bases) { ++reads; return new RerunGenerationStore(new InMemoryDocumentStore()).read(bases); };
+    InputPin[InputDecl] unpinned;
+    threw = false;
+    try readGraphResolution("p", sampleGraph(), unpinned, counting);
+    catch (Exception ex) threw = ex.msg.canFind("'game'");
+    assert(threw && reads == 0);
 }
