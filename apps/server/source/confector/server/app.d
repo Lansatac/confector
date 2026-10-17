@@ -35,7 +35,7 @@ import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
 import confector.server.controller.dashboard_controller : dashboardRouter;
 import confector.server.controller.executor_controller : executorRouter;
-import confector.server.controller.repositorycontroller : repositoryRouter;
+import confector.server.controller.repositorycontroller : repositoryRouter, vcsPollUrl;
 
 /// Renders the default error page.
 void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInfo error)
@@ -400,7 +400,7 @@ void main()
                 ScheduleEntry pollEntry;
                 pollEntry.id = "vcs-poll-" ~ repo.name;
                 pollEntry.name = format("VCS Poll: %s", repo.name);
-                pollEntry.uri = format("http://127.0.0.1:%d/api/v1/repositories/%s/poll", serverConfig.http.port, encodeComponent(repo.name));
+                pollEntry.uri = vcsPollUrl(serverConfig.http.port, repo.name);
                 pollEntry.httpMethod = "POST";
                 pollEntry.cronExpression = "*/5 * * * *";  // Every 5 minutes
                 pollEntry.recurring = true;
@@ -410,7 +410,7 @@ void main()
         }
 
         // Register schedule entries for each cron trigger rule
-        // Each cron rule points directly to /projects/run with the project ID
+        // Each cron rule posts to /api/v1/projects/<id>/run (served by schedulerRoute in apiRouter)
         import confector.plugin_api.model : TriggerRuleRecord;
         auto cronRules = stores.triggerRules.list();
         foreach (rule; cronRules)

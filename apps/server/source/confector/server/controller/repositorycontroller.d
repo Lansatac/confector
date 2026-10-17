@@ -5,7 +5,7 @@ import std.algorithm : canFind, count, filter;
 import std.array : array;
 import std.datetime.systime : Clock;
 import std.format : format;
-import std.string : strip;
+import std.string : replace, strip;
 import std.typecons : Tuple, tuple;
 import std.uri : encodeComponent;
 
@@ -43,6 +43,22 @@ struct ConnectedProjectViewModel
     string[] matchingTasks;
 }
 
+/// The VCS poll callback route. repositoryRouter serves it, and vcsPollPath fills in its parameter,
+/// so the scheduled poll URL and the route are built from the same pattern and cannot drift apart.
+enum string vcsPollRoutePattern = "/repositories/:repoName/poll";
+
+/// The path a scheduled poll of this repository is sent to.
+string vcsPollPath(string repositoryName)
+{
+    return vcsPollRoutePattern.replace(":repoName", encodeComponent(repositoryName));
+}
+
+/// The absolute URL the scheduler calls to poll this repository on the local server.
+string vcsPollUrl(ushort serverPort, string repositoryName)
+{
+    return format("http://127.0.0.1:%d%s", serverPort, vcsPollPath(repositoryName));
+}
+
 /// Registers or unregisters a VCS polling schedule entry for a repository.
 void updateVcsPollingSchedule(Scheduler scheduler, ushort serverPort, string repositoryName, string repositoryAddress, string refreshPolicy)
 {
@@ -55,7 +71,7 @@ void updateVcsPollingSchedule(Scheduler scheduler, ushort serverPort, string rep
         ScheduleEntry entry;
         entry.id = entryId;
         entry.name = format("VCS Poll: %s", repositoryName);
-        entry.uri = format("http://127.0.0.1:%d/api/v1/repositories/%s/poll", serverPort, encodeComponent(repositoryName));
+        entry.uri = vcsPollUrl(serverPort, repositoryName);
         entry.httpMethod = "POST";
         entry.cronExpression = "*/5 * * * *";  // Every 5 minutes
         entry.recurring = true;
@@ -212,7 +228,7 @@ URLRouter repositoryRouter(StateStores stores, string schedulerCallbackSecret,
     // 4. Per-repository VCS polling endpoint (called by scheduler)
     if (stores !is null)
     {
-        router.post("/repositories/:repoName/poll", schedulerCallback(schedulerCallbackSecret, (HTTPServerRequest req, HTTPServerResponse res) {
+        router.post(vcsPollRoutePattern, schedulerCallback(schedulerCallbackSecret, (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 import confector.core.plugin : PluginRegistry;
@@ -412,4 +428,18 @@ unittest
     pollRes = createTestHTTPServerResponse();
     router.handleRequest(pollReq, pollRes);
     assert(pollRes.statusCode == HTTPStatus.unauthorized);
+
+    // The URL a scheduled poll is sent to reaches the protected handler (401), not an unserved path (404)
+    assert(vcsPollPath("Confector") == "/repositories/Confector/poll");
+    auto scheduledReq = createTestHTTPServerRequest(URL(vcsPollUrl(8080, "Confector")), HTTPMethod.POST);
+    auto scheduledRes = createTestHTTPServerResponse();
+    router.handleRequest(scheduledReq, scheduledRes);
+    assert(scheduledRes.statusCode == HTTPStatus.unauthorized);
+
+    // A name that needs encoding is encoded in the scheduled path and still reaches the protected handler
+    assert(vcsPollPath("a b") == "/repositories/a%20b/poll");
+    auto encodedReq = createTestHTTPServerRequest(URL(vcsPollUrl(8080, "a b")), HTTPMethod.POST);
+    auto encodedRes = createTestHTTPServerResponse();
+    router.handleRequest(encodedReq, encodedRes);
+    assert(encodedRes.statusCode == HTTPStatus.unauthorized);
 }

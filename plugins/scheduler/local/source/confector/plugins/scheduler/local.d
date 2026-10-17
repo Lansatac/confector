@@ -275,7 +275,9 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
     private void fireEntry(ScheduleEntry entry)
     {
         auto httpMethod = entry.httpMethod.length > 0 ? entry.httpMethod : "POST";
-        string body = entry.jsonBody;
+        // Phobos sends a request body only for a non-null slice, so a null jsonBody (no body) is
+        // passed as an empty non-null slice; without it a POST goes out with no Content-Length.
+        string body = entry.jsonBody is null ? "" : entry.jsonBody;
 
         auto http = HTTP();  // A bare `HTTP http;` has no libcurl handle and every call on it fails
         http.addRequestHeader("Content-Type", "application/json");
@@ -285,11 +287,10 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
 
         try
         {
-            if (httpMethod == "POST" && body.length > 0)
+            // A POST stays a POST even without a body: the server's callback routes are POST-only
+            if (httpMethod == "POST")
             {
-                http.setPostData(body, "application/json");
-                auto data = cast(const(void[])[]) [body.dup];
-                responseBody = post(entry.uri, data, http);
+                responseBody = post(entry.uri, body, http);
             }
             else if (httpMethod == "GET")
             {
@@ -297,9 +298,7 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
             }
             else if (body.length > 0)
             {
-                http.setPostData(body, "application/json");
-                auto data = cast(const(void[])[]) [body.dup];
-                responseBody = post(entry.uri, data, http);
+                responseBody = post(entry.uri, body, http);
             }
             else
             {
@@ -344,13 +343,13 @@ unittest
     assertThrown!Exception(plugin.initialize(null));
 }
 
-unittest
+/// Fires one entry at a loopback listener and returns the raw request it received. Every wait is
+/// bounded so that a regression (no connection, or a stalled read) fails instead of hanging.
+private string captureFiredRequest(string httpMethod, string jsonBody)
 {
-    import std.algorithm.searching : canFind;
-    import std.socket : TcpSocket, InternetAddress;
+    import std.socket : TcpSocket, InternetAddress, Socket, SocketSet, SocketOption, SocketOptionLevel;
+    import core.time : seconds;
 
-    // The plugin sends the configured secret in the scheduler header. A raw loopback listener
-    // records the request headers the plugin sends and answers 200.
     auto listener = new TcpSocket();
     listener.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
     listener.listen(1);
@@ -358,15 +357,27 @@ unittest
 
     string received;
     auto acceptor = new Thread(() {
+        auto waitSet = new SocketSet();
+        waitSet.add(listener);
+        if (Socket.select(waitSet, null, null, 5.seconds) <= 0)
+            return;  // Nothing connected: `received` stays empty and the caller's assertions report it
         auto client = listener.accept();
-        char[8192] buf;
+        client.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
+        char[16384] buf;
         size_t total = 0;
+        size_t expected = size_t.max;  // Bytes wanted: headers plus the declared Content-Length
         while (total < buf.length)
         {
             auto n = client.receive(buf[total .. $]);
             if (n <= 0) break;
             total += cast(size_t) n;
-            if (indexOf(buf[0 .. total], "\r\n\r\n") >= 0) break;
+            if (expected == size_t.max)
+            {
+                auto headerEnd = indexOf(buf[0 .. total], "\r\n\r\n");
+                if (headerEnd >= 0)
+                    expected = headerEnd + 4 + declaredContentLength(buf[0 .. headerEnd]);
+            }
+            if (total >= expected) break;
         }
         received = buf[0 .. total].idup;
         client.send("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -377,17 +388,58 @@ unittest
     auto plugin = new LocalSchedulerPlugin();
     plugin.initialize(schedulerTestContext("test-secret"));
 
-    // A GET carries no body, so the loopback listener can answer and close without unread data
     ScheduleEntry entry;
     entry.id = "header-check";
     entry.uri = format("http://127.0.0.1:%d/api/v1/broker/evaluate", port);
-    entry.httpMethod = "GET";
+    entry.httpMethod = httpMethod;
+    entry.jsonBody = jsonBody;
     entry.cronExpression = "* * * * *";
     plugin.fireEntry(entry);
 
     acceptor.join();
     listener.close();
+    return received;
+}
+
+/// The Content-Length value in a raw header block, or 0 when the header is absent.
+private size_t declaredContentLength(const(char)[] headers)
+{
+    import std.conv : to;
+    enum key = "Content-Length: ";
+    auto at = indexOf(headers, key);
+    if (at < 0) return 0;
+    auto rest = headers[at + key.length .. $];
+    auto lineEnd = indexOf(rest, "\r\n");  // The last header line has no terminator in this block
+    if (lineEnd >= 0) rest = rest[0 .. lineEnd];
+    return rest.to!size_t;
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind, startsWith;
+
+    // The plugin sends the configured secret in the scheduler header
+    auto received = captureFiredRequest("POST", null);
     assert(received.canFind("X-Confector-Scheduler-Secret: test-secret"), received);
+
+    // A POST without a jsonBody stays a POST, with an explicit empty body rather than chunked or unframed
+    assert(received.startsWith("POST /api/v1/broker/evaluate "), received);
+    assert(received.canFind("Content-Length: 0\r\n"), received);
+    assert(!received.canFind("Transfer-Encoding"), received);
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind, endsWith, startsWith;
+    import std.conv : to;
+
+    // A POST with a JSON body sends the body intact, framed by its byte count, as JSON
+    enum body = `{"repositoryUrl": "https://example.test/repo.git"}`;
+    auto received = captureFiredRequest("POST", body);
+    assert(received.startsWith("POST /api/v1/broker/evaluate "), received);
+    assert(received.canFind("Content-Length: " ~ body.length.to!string ~ "\r\n"), received);
+    assert(received.canFind("Content-Type: application/json\r\n"), received);
+    assert(received.endsWith(body), received);
 }
 
 unittest
