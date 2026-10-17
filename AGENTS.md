@@ -228,34 +228,42 @@ Decided October 2026 (design record: bead `confector-z7z.1`).
   different: that fails loudly.)
 - **Each result records the full task definition it ran with**, so it can be inspected and the UI
   can show when a result predates a configuration change.
-- **A build chain freezes** its set of tasks and their declared and resolved inputs. It does
-  **not** freeze fingerprints, which are computed from the chain plus the current rerun
-  generations (see "Re-running a task"), or build configuration, which is read when a task is
-  dispatched. A task deleted from the project after the chain was created fails loudly if asked to
-  build; a task added later is not part of the chain.
+- **A build chain fixes only its pinned inputs.** It does not freeze tasks, edges or build
+  configuration: each request runs with the project definition as it was when the request was
+  made (see "Pipeline definitions"). Fingerprints are computed from that definition, the chain's
+  pins and the current rerun generations (see "Re-running a task").
 
 ## What a build is
 
-Decided October 2026 (design record: bead `confector-z7z.14`). A "build" used to conflate three
-things; they are now distinct:
+Decided October 2026 (design record: bead `confector-z7z.14`), amended October 2026 so that chains
+pin inputs only (bead `confector-z7z.52`). A "build" used to conflate three things; they are now
+distinct:
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
-  its payload, optional pins. Immutable.
-- **Build chain** — a snapshot of the whole project DAG: every task's declared inputs, resolved
-  inputs, and fingerprint. Immutable once created. This is what the UI calls a *build*; it has a
-  canonical per-project number (#123) and, separately, user-editable labels.
+  its payload, optional pins, and the project definition it runs with. Immutable.
+- **Build chain** — the pinned inputs of one branch context: the pinned value of every external
+  input its requests have needed (for a repository input, the revision of that repository at
+  that ref selector). It holds no tasks or edges. Pins only grow and never change once set. This is what the UI calls a *build*;
+  it has a canonical per-project number (#123) and, separately, user-editable labels.
 - **Task execution** — one run of one task at one fingerprint ("task run" in the UI).
   Append-only and shared across chains; a cache hit is a chain using an execution another chain
   produced.
 
 How they fit together:
 
-- **A request joins or creates a chain.** Resolve the whole DAG and fingerprint it. If the project
-  already has a chain with the same branch context and the same resolved inputs, the request
-  joins it; otherwise a new chain is created. The request runs its targets and their upstream
-  tasks, never downstream ones.
-- **Any task in a chain can be built later** against the chain's pinned inputs, without
-  re-resolving. This is how an external build is made from exactly what was tested.
+- **A request joins or creates a chain.** Read the current definition and resolve the inputs it
+  needs. If the project already has a chain with the same branch context whose pins agree with
+  every value the request resolved, the request joins it, adding any pins the chain lacks;
+  otherwise a new chain is created. The request runs its targets and their upstream tasks, never
+  downstream ones.
+- **Any task in today's definition can be built later for a chain**, against the chain's pins.
+  This is how an external build is made from exactly the source that was tested, including with
+  a task added after the chain was created. A pin the chain lacks is resolved when first needed
+  and then kept. A task no longer in the definition is simply not offered; its history stays.
+- **What a chain shows is derived**: the graphs of its requests' definitions over its pins, joined
+  with the executions for those fingerprints (with no request open, today's definition). An old
+  chain's view can change when the definition changes; what actually ran stays in the execution
+  records.
 - **Chain state is derived from authoritative inputs**: the chain, its requests, the executions
   for its fingerprints, and the rerun generations. A small mutable *chain state* document per
   chain holds demand and a dirty marker so signals have somewhere durable to land; it can always
@@ -300,9 +308,10 @@ and chain state (bead `confector-z7z.48`).
 
 - **Three components, split along what-versus-how.** An *input resolver* turns a request into a
   chain (resolving inputs, finding or creating the chain). A pure *chain evaluator* takes a chain's
-  state, the rerun generations, and the ledgers of its fingerprints, and returns each task's state
-  plus the fingerprints that need an execution. An *execution dispatcher* claims each
-  needed fingerprint, records the execution, and enqueues it.
+  state and pins, its requests' definitions, the rerun generations, and the ledgers of its
+  fingerprints, and returns each task's state plus the fingerprints that need an execution. An
+  *execution dispatcher* claims each needed fingerprint, records the execution with the
+  definition of the request it runs for, and enqueues it.
 - **All state is persisted; nothing lives only in memory.** Each fingerprint has a *ledger*
   document, read by id, holding its active execution (at most one), its latest success, its latest
   stopped execution with a sequence number, and the chains waiting on the active execution. At
@@ -363,6 +372,29 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
 - **A chain carries the trust level of its request.** See "Authentication and trust".
 - **Deferred:** cancelling superseded builds when a newer push arrives, and reporting build status
   back to the hosting service.
+
+## Cross-project dependencies
+
+Decided October 2026 (design record: bead `confector-z7z.55`); implementation deferred (bead
+`confector-z7z.21`).
+
+- **Projects organize; they do not change how the graph works.** A task may take another
+  project's task output as an input, and it behaves like any upstream task: fingerprints and
+  reruns flow through it, and a missing result is built.
+- **A chain is a snapshot of inputs, across projects.** Creating or joining a chain also joins or
+  creates a chain of each project it depends on, recursively — one per upstream project and
+  selector. The upstream chain belongs to its own project, which numbers it, and shows in that
+  project's history as a build used by the depender. Upstream inputs are resolved in the same pass,
+  so inputs both projects use agree.
+- **Selection chooses the upstream chain.** By default, the upstream project's matching branch at
+  current heads. A dependency or a request can instead choose another branch, an existing chain by
+  number or label, or the latest chain where the task succeeded. Choosing revisions or "that
+  build" fills pins before evaluation; nothing after evaluation changes.
+- **A request targets tasks in its own project.** To build several projects together, make a task
+  that depends on all of them.
+- **Cycles between projects fail loudly** when definitions are loaded.
+- **Deferred:** which projects may see and depend on each other (per-project permissions), and
+  views deeper than a chain's tasks grouped by project with links between linked chains.
 
 ## Authentication and trust
 
@@ -462,7 +494,8 @@ Decided October 2026 (design record: bead `confector-z7z.43`).
 
 ## Pipeline definitions
 
-Decided October 2026 (design record: bead `confector-z7z.9`).
+Decided October 2026 (design record: bead `confector-z7z.9`), amended October 2026 so that each
+request runs with the definition it was made with (bead `confector-z7z.52`).
 
 - **A project's definition is one document** — tasks, inputs, steps, triggers, outputs — with one
   schema, whether it is a YAML file or edited in the UI.
@@ -473,12 +506,17 @@ Decided October 2026 (design record: bead `confector-z7z.9`).
   through the *same name with a fallback* ref selector.
 - **Some things are never in a definition:** repository records and credentials, secrets, compute
   pools, permissions, admin settings. Definitions refer to them by name.
-- **One rule for every storage location:** a chain freezes *structure* (tasks, inputs, edges)
-  from the definition as it was when the chain was created; *build configuration* (steps,
-  environment, outputs) is read from the current definition when a task is dispatched. Each
-  execution records the full definition it ran with and the commit it came from. So fixing a
-  configuration and rerunning works the same whether you edit in the UI or commit — and an
+- **One rule for every storage location:** a request reads the definition once, when it is made,
+  and every task it runs uses that definition — structure and build configuration alike. A
+  running build finishes with the configuration it started with; to apply a change to it, cancel
+  and request again, reusing every result already finished. A later request — another target, a
+  retry, a rerun — uses the definition current when it is made, against the chain's same pins.
+  Each execution records the full definition it ran with and the revision it came from. So fixing
+  a configuration and retrying works the same whether you edit in the UI or commit — and an
   external build of an old, tested commit uses today's release configuration.
+- **An execution runs with the definition of the request that dispatched it.** A request that
+  finds its fingerprint already running waits for that execution, whatever definition it runs
+  with: build configuration is not part of the fingerprint (see "The caching contract").
 - **An invalid definition fails loudly,** with file and line.
 
 ## Backend interfaces
@@ -582,9 +620,10 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   the task's inputs. For a widely shared task that rebuilds the history of every branch. Whether
   a rerun reaches only the requested chain, the chains confirmed in the prompt and open chains, or
   all of them is undecided (design record: bead `confector-z7z.48`; decision bead below it).
-- **Cross-project dependencies.** Deferred, but wanted eventually (bead `confector-z7z.21`).
-  Preferred shape: an input kind that pins to another project's chain, not chains that span
-  projects.
+- **Extensible input kinds.** Any external source (a package feed, an asset server, a network
+  folder) should be able to be an input, pinned like a repository. Whether and how
+  extensions add input kinds is undecided (design record: bead `confector-z7z.54`); until then the
+  kinds are repository, value and task output.
 
 ---
 
