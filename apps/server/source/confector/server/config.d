@@ -45,6 +45,19 @@ struct DocumentStoreConfig
 }
 
 /**
+ * Scheduler callbacks. The scheduler fires HTTP requests back into the server (cron triggers,
+ * VCS polling, capacity evaluation); each one must carry this secret. Required, with no default.
+ * The scheduler plugin reads the same value through CONFECTOR_SCHEDULER_CALLBACK_SECRET.
+ */
+struct SchedulerConfig
+{
+    @Required
+    @Env("CONFECTOR_SCHEDULER_CALLBACK_SECRET")
+    @Description("Secret the scheduler sends in the X-Confector-Scheduler-Secret header on every callback (required)")
+    string callbackSecret = "";
+}
+
+/**
  * Plugins subsystem configuration.
  */
 struct PluginsConfig
@@ -80,6 +93,7 @@ struct ServerConfig
     HttpConfig http;
     StorageConfig storage;
     DocumentStoreConfig documentStore;
+    SchedulerConfig scheduler;
     PluginsConfig plugins;
     CapacityConfig capacity;
 }
@@ -108,6 +122,18 @@ void requireDocumentStoreConfig(in DocumentStoreConfig config)
 }
 
 /**
+ * Throws, naming the missing setting, unless the scheduler callback secret is configured. The
+ * scheduler calls back into the server on every schedule, so the server cannot run without it.
+ */
+void requireSchedulerConfig(in SchedulerConfig config)
+{
+    if (config.callbackSecret.length == 0)
+        throw new Exception("[config] Required setting 'server.scheduler.callbackSecret' is missing "
+            ~ "(server.scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): the server cannot start "
+            ~ "without it, because scheduler callbacks would be unauthenticated.");
+}
+
+/**
  * Loads and binds ServerConfig from the ConfigRegistry.
  */
 ServerConfig loadServerConfig(ConfigRegistry registry)
@@ -132,7 +158,22 @@ unittest
     assert(cfg.http.bindAddress == "0.0.0.0");
     assert(cfg.documentStore.database == "");
     assert(cfg.storage.artifactsDir == "");
+    assert(cfg.scheduler.callbackSecret == "");
     assert(cfg.plugins.bundledPluginsDir == "plugins");
+}
+
+unittest
+{
+    import std.exception : assertThrown, collectException;
+    import std.algorithm.searching : canFind;
+
+    SchedulerConfig config;
+    assertThrown!Exception(requireSchedulerConfig(config));
+    auto message = collectException(requireSchedulerConfig(config));
+    assert(message.msg.canFind("server.scheduler.callbackSecret"));
+
+    config.callbackSecret = "s3cret";
+    requireSchedulerConfig(config);
 }
 
 unittest

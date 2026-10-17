@@ -13,7 +13,7 @@ import std.uri : encodeComponent;
 import vibe.vibe;
 
 import confector.config;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireDocumentStoreConfig;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireDocumentStoreConfig, requireSchedulerConfig;
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
 import confector.core.git_resolver : GitRepositoryResolver;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
@@ -134,6 +134,7 @@ URLRouter createRouter(
     DispatchQueue dispatchQueue,
     BuildCoordinator buildCoordinator,
     StateStores stores,
+    string schedulerCallbackSecret,
     CapacityBroker capacityBroker = null,
     ConfiguredArtifactStorage configuredStorage = null,
     Scheduler scheduler = null,
@@ -153,7 +154,7 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, dispatchQueue, buildCoordinator, stores, capacityBroker);
+    auto api = apiRouter(taskEngine, schedulerCallbackSecret, dispatchQueue, buildCoordinator, stores, capacityBroker);
     router.any("/api/v1/*", api);
     router.any("/api/*", api);
 
@@ -175,7 +176,7 @@ URLRouter createRouter(
 
     router.get("/", dashboardRouter(taskEngine, stores, null, buildCoordinator));
 
-    router.any("/repositories/*", repositoryRouter(stores, buildCoordinator, scheduler, serverPort));
+    router.any("/repositories/*", repositoryRouter(stores, schedulerCallbackSecret, buildCoordinator, scheduler, serverPort));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
     router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
@@ -248,6 +249,10 @@ void main()
 
     // Load typed server configuration
     ServerConfig serverConfig = loadServerConfig(configRegistry);
+
+    // Scheduler callbacks are authenticated by a shared secret; without one the server cannot
+    // start, because the scheduler always calls back into it.
+    requireSchedulerConfig(serverConfig.scheduler);
 
     // Configure log level
     LogLevel configuredLogLevel = LogLevel.info;
@@ -349,6 +354,7 @@ void main()
       dispatchQueue,
       buildCoordinator,
       stores,
+      serverConfig.scheduler.callbackSecret,
       capacityBroker,
       configuredStorage,
       scheduler,
@@ -462,7 +468,7 @@ unittest
 
     broker.registerProvisioner(new TestProvisioner());
 
-    auto router = createRouter(engine, queue, coordinator, stores, broker);
+    auto router = createRouter(engine, queue, coordinator, stores, "test-scheduler-secret", broker);
     assert(router !is null);
 
     assert(broker.provisioners.length == 1);

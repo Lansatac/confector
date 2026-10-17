@@ -58,6 +58,8 @@ Execution runtimes, version control providers, and storage backends are decouple
 
    The server keeps all state in MongoDB and will not start without it: set `server.documentStore.connectionString` (or `CONFECTOR_MONGO_URI`) and `server.documentStore.database` in `confector.json` (see `deployments/confector-development/config/confector.json`). A missing setting or an unreachable MongoDB stops startup with an error.
 
+   The scheduler calls back into the server (cron triggers, VCS polling, capacity evaluation), and every callback must carry a shared secret in the `X-Confector-Scheduler-Secret` header. Set `server.scheduler.callbackSecret` (or `CONFECTOR_SCHEDULER_CALLBACK_SECRET`); the local scheduler plugin reads the same value as `plugins.local-scheduler.callbackSecret`, which the same environment variable also provides. There is no default: the server will not start without it, and callbacks without the correct secret are refused with 401.
+
 2. **Generate build files & compile:**
    ```bash
    mkdir build && cd build

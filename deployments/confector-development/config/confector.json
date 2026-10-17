@@ -12,6 +12,9 @@
       "connectionString": "mongodb://mongo:27017",
       "database": "confector"
     },
+    "scheduler": {
+      "callbackSecret": "dev-scheduler-secret"
+    },
     "plugins": {
       "pluginsUploadDir": "",
       "bundledPluginsDir": "./plugins",
@@ -22,6 +25,9 @@
     "mongo-queue": {
       "connectionString": "mongodb://mongo:27017",
       "dbName": "confector"
+    },
+    "local-scheduler": {
+      "callbackSecret": "dev-scheduler-secret"
     },
     "local-process": {
       "runnerBinary": "/code/build/out/runner/confector-runner",

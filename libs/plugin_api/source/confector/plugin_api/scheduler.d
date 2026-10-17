@@ -1,6 +1,13 @@
 module confector.plugin_api.scheduler;
 
 /**
+ * Header that carries the scheduler secret on every callback the scheduler fires. The server
+ * rejects a callback whose header does not match its configured secret, and the scheduler plugin
+ * sends the configured secret in this header.
+ */
+enum string schedulerSecretHeader = "X-Confector-Scheduler-Secret";
+
+/**
  * Represents a scheduled job entry. The server registers these with the scheduler
  * to define WHAT to run and WHEN. The scheduler plugin decides HOW to fire them
  * (thread loop making HTTP requests, CloudWatch Events, Kubernetes CronJob, etc.).

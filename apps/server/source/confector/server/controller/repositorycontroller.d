@@ -13,6 +13,7 @@ import confector.core.model : ProjectRecord, RepositoryRecord, projectUsesReposi
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.server.orchestrator.coordinator : BuildCoordinator;
+import confector.server.scheduler_callback : schedulerCallback;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 
 /// Refresh policy options for repository change detection.
@@ -69,8 +70,8 @@ void updateVcsPollingSchedule(Scheduler scheduler, ushort serverPort, string rep
 /**
  * Creates the URL router for the /repositories endpoints.
  */
-URLRouter repositoryRouter(StateStores stores, BuildCoordinator coordinator = null,
-    Scheduler scheduler = null, ushort serverPort = 8080)
+URLRouter repositoryRouter(StateStores stores, string schedulerCallbackSecret,
+    BuildCoordinator coordinator = null, Scheduler scheduler = null, ushort serverPort = 8080)
 {
     auto router = new URLRouter();
 
@@ -211,7 +212,7 @@ URLRouter repositoryRouter(StateStores stores, BuildCoordinator coordinator = nu
     // 4. Per-repository VCS polling endpoint (called by scheduler)
     if (stores !is null)
     {
-        router.post("/repositories/:repoName/poll", (HTTPServerRequest req, HTTPServerResponse res) {
+        router.post("/repositories/:repoName/poll", schedulerCallback(schedulerCallbackSecret, (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 import confector.core.plugin : PluginRegistry;
@@ -310,7 +311,7 @@ URLRouter repositoryRouter(StateStores stores, BuildCoordinator coordinator = nu
                 err["error"] = Json(e.msg);
                 res.writeJsonBody(err);
             }
-        });
+        }));
     }
 
     // 5. Repository details view
@@ -396,7 +397,19 @@ unittest
     p1.name = "Confector";
     stores.projects.put(p1);
 
-    auto router = repositoryRouter(stores);
+    auto router = repositoryRouter(stores, "test-scheduler-secret");
     assert(router !is null);
     assert(stores.repositories.list().length == 1);
+
+    // The VCS poll callback is a scheduler callback: refused without the scheduler secret
+    auto pollReq = createTestHTTPServerRequest(URL("http://localhost/repositories/Confector/poll"), HTTPMethod.POST);
+    auto pollRes = createTestHTTPServerResponse();
+    router.handleRequest(pollReq, pollRes);
+    assert(pollRes.statusCode == HTTPStatus.unauthorized);
+
+    pollReq = createTestHTTPServerRequest(URL("http://localhost/repositories/Confector/poll"), HTTPMethod.POST);
+    pollReq.headers["X-Confector-Scheduler-Secret"] = "wrong-secret";
+    pollRes = createTestHTTPServerResponse();
+    router.handleRequest(pollReq, pollRes);
+    assert(pollRes.statusCode == HTTPStatus.unauthorized);
 }

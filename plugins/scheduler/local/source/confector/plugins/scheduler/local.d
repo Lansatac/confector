@@ -8,9 +8,10 @@ import std.format;
 import std.string : indexOf;
 import std.datetime : Clock, DateTime;
 
-import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, SchedulerPlugin, ConfigDefinition;
-import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
+import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, SchedulerPlugin, ConfigDefinition, ScopedConfigAccessor, ResolutionEngine;
+import confector.plugin_api.scheduler : Scheduler, ScheduleEntry, schedulerSecretHeader;
 
+import vibe.data.json : Json;
 import std.net.curl : HTTP, get, post;
 import std.stdio : writeln;
 import nova.cron : CronExpr;
@@ -33,6 +34,7 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
     private Thread m_thread;
     private Event* m_stopEvent;
     private bool m_running;
+    private string m_callbackSecret;  // Sent in schedulerSecretHeader on every fired request
 
     this()
     {
@@ -48,15 +50,26 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
     @property string description() const { return "Local thread-based scheduler that fires HTTP POST requests to registered URIs"; }
     @property PluginCategory category() const { return PluginCategory.scheduler; }
 
-    ConfigDefinition[] configDefinitions() const { return []; }
+    ConfigDefinition[] configDefinitions() const
+    {
+        return [
+            ConfigDefinition("callbackSecret", "CONFECTOR_SCHEDULER_CALLBACK_SECRET", Json.undefined,
+                "Secret sent in the X-Confector-Scheduler-Secret header on every callback (required)", true)
+        ];
+    }
 
     void initialize(PluginContext context = null)
     {
+        if (context is null)
+            throw new Exception("[local-scheduler] PluginContext must not be null; the host failed to provide configuration.");
         m_context = context;
-        if (m_context !is null)
-        {
-            m_context.info("LocalSchedulerPlugin initialized");
-        }
+
+        // Never logged: the value is only held here and written into the callback headers.
+        m_callbackSecret = m_context.config.getString("callbackSecret");
+        if (m_callbackSecret.length == 0)
+            throw new Exception("[local-scheduler] Required setting 'callbackSecret' is missing (plugins.local-scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): scheduled callbacks cannot be authenticated.");
+
+        m_context.info("LocalSchedulerPlugin initialized");
     }
 
     void shutdown()
@@ -264,8 +277,9 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
         auto httpMethod = entry.httpMethod.length > 0 ? entry.httpMethod : "POST";
         string body = entry.jsonBody;
 
-        HTTP http;
+        auto http = HTTP();  // A bare `HTTP http;` has no libcurl handle and every call on it fails
         http.addRequestHeader("Content-Type", "application/json");
+        http.addRequestHeader(schedulerSecretHeader, m_callbackSecret);
 
         char[] responseBody;
 
@@ -308,10 +322,78 @@ extern(C) export Plugin confector_create_plugin()
     return new LocalSchedulerPlugin();
 }
 
+/// A context whose plugins.local-scheduler scope holds the given callback secret (empty = unset).
+private PluginContext schedulerTestContext(string callbackSecret)
+{
+    Json fileConfig = Json.emptyObject;
+    fileConfig["plugins"] = Json.emptyObject;
+    fileConfig["plugins"]["local-scheduler"] = Json.emptyObject;
+    if (callbackSecret.length > 0)
+        fileConfig["plugins"]["local-scheduler"]["callbackSecret"] = Json(callbackSecret);
+    auto scope_ = new ScopedConfigAccessor(new ResolutionEngine(fileConfig), "plugins.local-scheduler");
+    return new NullPluginContext("local-scheduler", scope_);
+}
+
+unittest
+{
+    import std.exception : assertThrown;
+
+    // The callback secret is required: initialization fails loudly when it is unset
+    auto plugin = new LocalSchedulerPlugin();
+    assertThrown!Exception(plugin.initialize(schedulerTestContext("")));
+    assertThrown!Exception(plugin.initialize(null));
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.socket : TcpSocket, InternetAddress;
+
+    // The plugin sends the configured secret in the scheduler header. A raw loopback listener
+    // records the request headers the plugin sends and answers 200.
+    auto listener = new TcpSocket();
+    listener.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
+    listener.listen(1);
+    ushort port = (cast(InternetAddress) listener.localAddress).port;
+
+    string received;
+    auto acceptor = new Thread(() {
+        auto client = listener.accept();
+        char[8192] buf;
+        size_t total = 0;
+        while (total < buf.length)
+        {
+            auto n = client.receive(buf[total .. $]);
+            if (n <= 0) break;
+            total += cast(size_t) n;
+            if (indexOf(buf[0 .. total], "\r\n\r\n") >= 0) break;
+        }
+        received = buf[0 .. total].idup;
+        client.send("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        client.close();
+    });
+    acceptor.start();
+
+    auto plugin = new LocalSchedulerPlugin();
+    plugin.initialize(schedulerTestContext("test-secret"));
+
+    // A GET carries no body, so the loopback listener can answer and close without unread data
+    ScheduleEntry entry;
+    entry.id = "header-check";
+    entry.uri = format("http://127.0.0.1:%d/api/v1/broker/evaluate", port);
+    entry.httpMethod = "GET";
+    entry.cronExpression = "* * * * *";
+    plugin.fireEntry(entry);
+
+    acceptor.join();
+    listener.close();
+    assert(received.canFind("X-Confector-Scheduler-Secret: test-secret"), received);
+}
+
 unittest
 {
     auto plugin = new LocalSchedulerPlugin();
-    plugin.initialize(new NullPluginContext("local-scheduler"));
+    plugin.initialize(schedulerTestContext("test-secret"));
     assert(plugin.name == "local-scheduler");
     assert(plugin.category == PluginCategory.scheduler);
     assert(!plugin.isRunning);

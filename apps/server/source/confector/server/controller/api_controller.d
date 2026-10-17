@@ -11,12 +11,13 @@ import confector.runner_core.engine;
 import confector.server.orchestrator.coordinator;
 import confector.plugin_api.dispatch_queue;
 import confector.core.execution_dispatcher : defaultPoolQueue;
+import confector.server.scheduler_callback : schedulerCallback;
 
 import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordinator coordinator = null, StateStores stores = null, CapacityBroker capacityBroker = null)
+URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQueue queue = null, BuildCoordinator coordinator = null, StateStores stores = null, CapacityBroker capacityBroker = null)
 {
     import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
@@ -28,6 +29,13 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
         {
             router.post("/api/v1" ~ (path.startsWith("/") ? path : "/" ~ path), handler);
         }
+    }
+
+    // Routes the scheduler calls back into. Each one requires the scheduler secret; see
+    // scheduler_callback.d. Add every new scheduler callback through this helper.
+    void schedulerRoute(H)(string path, H handler)
+    {
+        postRoute(path, schedulerCallback(schedulerCallbackSecret, handler));
     }
 
     void getRoute(H)(string path, H handler)
@@ -434,7 +442,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
     });
 
     // Run Project by ID (path parameter) — used by scheduler for cron triggers
-    postRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
+    schedulerRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projectId = req.params["id"];
@@ -1357,7 +1365,7 @@ URLRouter apiRouter(TaskEngine engine, DispatchQueue queue = null, BuildCoordina
     // Capacity broker endpoint — called by the scheduler plugin via HTTP
     if (capacityBroker !is null)
     {
-        postRoute("/broker/evaluate", (HTTPServerRequest req, HTTPServerResponse res) {
+        schedulerRoute("/broker/evaluate", (HTTPServerRequest req, HTTPServerResponse res) {
             try
             {
                 capacityBroker.evaluateDemand();
@@ -1411,8 +1419,21 @@ unittest
     auto engine = new TaskEngine(storage);
     auto queue = new InMemoryDispatchQueue();
 
-    auto router = apiRouter(engine, queue);
+    auto router = apiRouter(engine, "test-scheduler-secret", queue);
     assert(router !is null);
+
+    // A scheduler callback without the scheduler secret is refused before the project is looked up
+    auto unauthReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
+    auto unauthRes = createTestHTTPServerResponse();
+    router.handleRequest(unauthReq, unauthRes);
+    assert(unauthRes.statusCode == HTTPStatus.unauthorized);
+
+    // With the secret the callback reaches its handler (no stores are wired, so the project is not found)
+    auto authReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
+    authReq.headers["X-Confector-Scheduler-Secret"] = "test-scheduler-secret";
+    auto authRes = createTestHTTPServerResponse();
+    router.handleRequest(authReq, authRes);
+    assert(authRes.statusCode == HTTPStatus.notFound);
 
     // Test Trigger Rules state via repo
     TriggerRuleRecord rule;
@@ -1457,7 +1478,7 @@ unittest
 
     // Test BuildCoordinator integration with apiRouter
     auto coordinator = new BuildCoordinator(storage, stores, queue);
-    auto routerWithCoord = apiRouter(engine, queue, coordinator);
+    auto routerWithCoord = apiRouter(engine, "test-scheduler-secret", queue, coordinator);
     assert(routerWithCoord !is null);
 
     string bldId = coordinator.startBuild(proj, null, true);
