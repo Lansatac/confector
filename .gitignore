@@ -51,3 +51,6 @@ confector-test-library
 .beads-credential-key
 .beads/proxieddb/
 .beads/interactions.jsonl
+
+# Claude Code agent worktrees
+.claude/worktrees/
