@@ -81,8 +81,8 @@ a different concern from executing tasks. Keep them in separate components with 
 between them: evaluation produces data describing the work; execution consumes it.
 
 *Why:* conflating these two was the most damaging mistake in the project's history. It took a long
-time to separate graph evaluation from execution, and the build coordinator is still tangled as a
-result. If a change makes an executor decide what to build, or makes graph evaluation run or wait
+time to separate graph evaluation from execution, and the legacy build coordinator had to be
+deleted outright because of it. If a change makes an executor decide what to build, or makes graph evaluation run or wait
 on work, stop and reconsider.
 
 ### Separate data from behavior
@@ -491,7 +491,7 @@ Decided October 2026 (design record: bead `confector-z7z.4`).
   interface small so a new backend (DynamoDB, Postgres, SQLite) stays small.
 - **Correctness depends only on reads by id and compare-and-set on a single document.** Queries
   are for finding things and may lag behind writes. There are no multi-document transactions;
-  the coordinator's next evaluation repairs anything left half-done.
+  the next chain evaluation (or the sweep) repairs anything left half-done.
 - **Documents stay under 256 KB.** Larger data belongs in the artifact or log store.
 - **The build queue and the dispatch queue are different things.** The *build queue* is what
   users see — every queued or waiting task and why — and is computed from the state store. The
@@ -592,12 +592,12 @@ your task depends on one, stop and ask the project owner. When one is decided, u
 
 Be aware of these so you do not spread them:
 
-- **The build coordinator** (`apps/server/source/confector/server/orchestrator/coordinator.d`) mixes graph
-  evaluation with dispatch, splits state between memory and the database, and contains silent
-  fallbacks. It is being replaced (see "Coordinating builds"; beads `confector-z7z.23` and
-  `confector-z7z.48`). It is to be deleted outright, not patched: do not fix bugs in it, extend
-  it, or implement a feature on both the old and the new path. Nothing in the project is kept for
-  backward compatibility.
+- **Nothing starts builds yet.** The legacy build coordinator was deleted (bead
+  `confector-z7z.23.10`). Until request intake lands (bead `confector-z7z.23.7`) the run routes
+  answer 501 Not Implemented, and a worker's completion only finishes its execution and releases
+  the claim (`confector.core.work_orders.completeExecution`) until the fingerprint ledger lands
+  (beads `confector-z7z.49.x`). Do not add a build path outside the chain components. Nothing in
+  the project is kept for backward compatibility.
 - **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has accumulated
   aliases: several ways to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
   build step. **Do not add another alias.** If a representation is wrong, change it and update its
@@ -623,7 +623,7 @@ module path (for example `libs/core/source/confector/core/`).
 - `libs/mongo_helpers/` — MongoDB connection and BSON helpers.
 - `libs/testing/` — in-memory fakes and backend conformance suites (test-only).
 - `apps/runner/` — the runner command-line program.
-- `apps/server/` — web server, API, dashboard, and build coordinator, with its web UI templates
+- `apps/server/` — web server, API and dashboard, with its web UI templates
   (`views/`) and static assets (`public/`).
 - `plugins/<category>/<name>/` — plugins by category (step definitions and executors, workers,
   artifact storage, document store, queue, scheduler).

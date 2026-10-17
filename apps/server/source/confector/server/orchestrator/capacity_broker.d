@@ -168,14 +168,6 @@ class DefaultCapacityBroker : CapacityBroker
 
 unittest
 {
-    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
-    import confector.core.state_stores : StateStores;
-    import confector.testing.memory_document_store : InMemoryDocumentStore;
-    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
-    import confector.plugin_api.dispatch_queue : DispatchQueue;
-    import confector.server.orchestrator.coordinator : BuildCoordinator, countReceivable, receiveWorkOrders;
-    import confector.core.execution_dispatcher : defaultPoolQueue, queuedDemand;
-
     // Test Mock Provisioner
     class MockProvisioner : ComputeProvisioner
     {
@@ -251,87 +243,4 @@ unittest
 
     // Total active across broker
     assert(broker.activeInstanceCount == 3);
-
-    // 2. End-to-end integration: BuildCoordinator + DispatchQueue + DefaultCapacityBroker
-    auto storage = new InMemoryArtifactStorage();
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    auto e2eQueue = new InMemoryDispatchQueue();
-    auto coord = new BuildCoordinator(storage, stores, e2eQueue);
-    auto e2eBroker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
-
-    // Provisioner that acts as an automated executor worker
-    class AutoExecutingProvisioner : ComputeProvisioner
-    {
-        private DispatchQueue m_q;
-        private BuildCoordinator m_coord;
-        private size_t m_active = 0;
-
-        this(DispatchQueue q, BuildCoordinator c)
-        {
-            m_q = q;
-            m_coord = c;
-        }
-
-        @property string providerType() const { return "local"; }
-        @property size_t activeInstanceCount() const { return m_active; }
-        @property size_t maxCapacity() const { return 4; }
-
-        bool canProvision(in QueueDemand demand) const
-        {
-            return demand.executorType == "local" || demand.executorType == "local_process" || demand.executorType == "";
-        }
-
-        void requestCapacity(in QueueDemand demand)
-        {
-            foreach (received; receiveWorkOrders(stores, m_q, demand.pendingWorkOrderCount))
-            {
-                auto order = received.workOrder;
-                TaskExecutionResult res;
-                res.taskId = order.taskId;
-                res.buildId = order.buildId;
-                res.status = TaskStatus.succeeded;
-                m_coord.onExecutionCompleted(order.executionId, res);
-                m_q.ack(defaultPoolQueue, received.receipt);
-            }
-        }
-    }
-
-    auto autoProv = new AutoExecutingProvisioner(e2eQueue, coord);
-    e2eBroker.registerProvisioner(autoProv);
-
-    // Build DAG: Step1 -> (Step2A, Step2B) -> Step3
-    TaskNode step1; step1.id = "step1";
-    step1.steps = [BuildStep("Step1", "bash", null, "echo step 1")];
-    TaskNode step2A; step2A.id = "step2A"; step2A.inputs["step1"] = taskOutputInput("step1");
-    step2A.steps = [BuildStep("Step2A", "bash", null, "echo step 2A")];
-    TaskNode step2B; step2B.id = "step2B"; step2B.inputs["step1"] = taskOutputInput("step1");
-    step2B.steps = [BuildStep("Step2B", "bash", null, "echo step 2B")];
-    TaskNode step3; step3.id = "step3"; step3.inputs["step2A"] = taskOutputInput("step2A"); step3.inputs["step2B"] = taskOutputInput("step2B");
-    step3.steps = [BuildStep("Step3", "bash", null, "echo step 3")] ;
-
-    ProjectRecord dagProj;
-    dagProj.id = "dag_proj";
-    dagProj.tasks = [step1, step2A, step2B, step3];
-
-    string buildId = coord.startBuild(dagProj, null, true);
-    assert(buildId.length > 0);
-
-    // Initial demand: step1
-    assert(countReceivable(e2eQueue) == 1);
-    e2eBroker.evaluateDemand();
-
-    // After step1 completes, step2A and step2B are unblocked and enqueued
-    assert(countReceivable(e2eQueue) == 2);
-    e2eBroker.evaluateDemand();
-
-    // After step2A & step2B complete, step3 is unblocked and enqueued
-    assert(countReceivable(e2eQueue) == 1);
-    e2eBroker.evaluateDemand();
-
-    // All steps done
-    assert(countReceivable(e2eQueue) == 0);
-    BuildRecord finalBuild;
-    assert(stores.legacyBuilds.getBuild(buildId, finalBuild));
-    assert(finalBuild.status == "succeeded");
-    assert(finalBuild.executedTasks.length == 4);
 }

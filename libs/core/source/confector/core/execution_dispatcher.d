@@ -30,7 +30,7 @@ module confector.core.execution_dispatcher;
  *   ExecutionDispatchException after dispatching everything else, so the failure reaches the
  *   caller.
  *
- * Messages are tiny (an execution id and routing; never the task definition), so they stay far
+ * Messages are tiny (an execution id; never the task definition), so they stay far
  * below the queue's message limit. Workers receive work orders built from the execution's record
  * (confector.core.work_orders.receiveWork).
  *
@@ -56,7 +56,7 @@ import std.json : JSONType;
 import std.uuid : randomUUID;
 import vibe.core.log : logError;
 import vibe.data.json : serializeToJson;
-import vibe.data.serialization : asName = name, optional;
+import vibe.data.serialization : asName = name;
 
 /**
  * The dispatch queue every execution is sent to. Until compute pools exist (bead
@@ -65,22 +65,18 @@ import vibe.data.serialization : asName = name, optional;
 enum string defaultPoolQueue = "default";
 
 /**
- * The message sent to a pool's dispatch queue: the execution to run, and routing. Everything else
- * a worker needs is read from the execution's record when the message is received.
+ * The message sent to a pool's dispatch queue: the execution to run. Everything else a worker
+ * needs is read from the execution's record when the message is received.
  */
 struct DispatchMessage
 {
     /// The execution to run (`TaskExecution.id`).
     @asName("execution_id") string executionId;
-    /// The BuildCoordinator build that dispatched the execution, which the worker reports its
-    /// completion against until completions name the execution (bead confector-z7z.23.4).
-    /// Removed with the BuildCoordinator (bead confector-z7z.23.10).
-    @optional @asName("build_id") string legacyBuildId;
 }
 
 /**
  * One fingerprint to dispatch, with everything needed to record its execution. Plain data: built
- * by `planExecutions` from a chain evaluation, or by the BuildCoordinator from its build.
+ * by `planExecutions` from a chain evaluation.
  */
 struct PlannedExecution
 {
@@ -98,8 +94,6 @@ struct PlannedExecution
     /// that cannot be checked out); empty when it can. The dispatcher records the execution as
     /// failed with this reason instead of sending it, so the failure shows on the task.
     string unavailable;
-    /// Routing for the BuildCoordinator; see `DispatchMessage.legacyBuildId`.
-    string legacyBuildId;
 }
 
 /**
@@ -390,7 +384,7 @@ final class ExecutionDispatcher
                     outcome.result = DispatchResult.attached;
                     return;
                 }
-                send(existing.get.value, p.legacyBuildId, outcome);
+                send(existing.get.value, outcome);
                 return;
             }
             // Finished, but its completion did not release the claim
@@ -459,12 +453,12 @@ final class ExecutionDispatcher
             fail(id, p.fingerprint, p.unavailable, outcome);
             return;
         }
-        send(execution, p.legacyBuildId, outcome);
+        send(execution, outcome);
     }
 
-    private void send(in TaskExecution execution, string legacyBuildId, ref DispatchOutcome outcome)
+    private void send(in TaskExecution execution, ref DispatchOutcome outcome)
     {
-        auto message = serializeToJson(DispatchMessage(execution.id, legacyBuildId));
+        auto message = serializeToJson(DispatchMessage(execution.id));
         try
         {
             m_queue.send(defaultPoolQueue, message);

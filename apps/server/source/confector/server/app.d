@@ -15,7 +15,6 @@ import vibe.vibe;
 import confector.config;
 import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireDocumentStoreConfig, requireSchedulerConfig;
 import confector.core.executor : CapacityBroker, ComputeProvisioner, ComputeProvider, WorkerRecord;
-import confector.core.git_resolver : GitRepositoryResolver;
 import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
 import confector.core.plugin_loader : PluginLoader;
 import confector.core.state_stores : StateStores;
@@ -26,7 +25,6 @@ import confector.server.storage.configured_storage : ConfiguredArtifactStorage;
 import confector.plugin_api.dispatch_queue : DispatchQueue;
 import confector.plugin_api.model : QueueDemand;
 import confector.server.orchestrator.capacity_broker : DefaultCapacityBroker;
-import confector.server.orchestrator.coordinator : BuildCoordinator;
 import confector.core.execution_dispatcher : queuedDemand;
 import confector.runner_core.engine : TaskEngine;
 
@@ -132,7 +130,6 @@ void initPlugins(string bundledPluginsDir = "", string extraPlugins = "")
 URLRouter createRouter(
     TaskEngine taskEngine,
     DispatchQueue dispatchQueue,
-    BuildCoordinator buildCoordinator,
     StateStores stores,
     string schedulerCallbackSecret,
     CapacityBroker capacityBroker = null,
@@ -154,19 +151,16 @@ URLRouter createRouter(
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API & serverless execution endpoints
-    auto api = apiRouter(taskEngine, schedulerCallbackSecret, dispatchQueue, buildCoordinator, stores, capacityBroker);
+    auto api = apiRouter(taskEngine, schedulerCallbackSecret, dispatchQueue, stores, capacityBroker);
     router.any("/api/v1/*", api);
     router.any("/api/*", api);
 
-    // Dashboard, builds, projects, executors, and admin UI
-    router.any("/projects/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
+    // Dashboard, projects, tasks, executors, and admin UI. Build views wait for request intake
+    // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
+    router.any("/projects/*", dashboardRouter(taskEngine, stores));
     router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
 
-    router.any("/builds/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
-    router.get("/builds", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/builds/"); });
-
-    router.any("/tasks/*", dashboardRouter(taskEngine, stores, null, buildCoordinator));
-    router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/tasks/"); });
+    router.any("/tasks/*", dashboardRouter(taskEngine, stores));
 
     router.any("/executors/*", executorRouter(stores, PluginRegistry.instance, capacityBroker));
     router.get("/executors", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/executors/"); });
@@ -174,9 +168,9 @@ URLRouter createRouter(
     router.any("/admin/*", adminRouter(PluginRegistry.instance, PluginLoader.instance));
     router.get("/admin", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/admin/plugins"); });
 
-    router.get("/", dashboardRouter(taskEngine, stores, null, buildCoordinator));
+    router.get("/", dashboardRouter(taskEngine, stores));
 
-    router.any("/repositories/*", repositoryRouter(stores, schedulerCallbackSecret, buildCoordinator, scheduler, serverPort));
+    router.any("/repositories/*", repositoryRouter(stores, schedulerCallbackSecret, scheduler, serverPort));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
 
     router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
@@ -294,13 +288,13 @@ void main()
         throw new Exception("No artifact storage plugin registered: the server cannot start without one.");
     }
 
-    // Use ConfiguredArtifactStorage so that TaskEngine and BuildCoordinator always forward
+    // Use ConfiguredArtifactStorage so that TaskEngine always forwards
     // to the currently configured storage, allowing runtime changes via the Artifacts UI.
     auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
     auto taskEngine = new TaskEngine(configuredStorage);
 
     // Demand is the executions sent and waiting for a worker, read from the state store; the
-    // coordinator asks the broker to evaluate it after dispatching.
+    // scheduler asks the broker to evaluate it (/broker/evaluate).
     auto capacityBroker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
 
     // Register any provisioners from loaded plugins via ComputeProvider.createProvisioner()
@@ -339,10 +333,9 @@ void main()
         logInfo("[capacity_broker] %d provisioner(s) registered, total capacity: %d", capacityBroker.provisioners.length, capacityBroker.maxCapacity);
     }
 
-    // Git is the only built-in version control provider, so every repository input resolves
-    // through it (bead confector-z7z.20.7).
-    auto buildCoordinator = new BuildCoordinator(configuredStorage, stores, dispatchQueue, capacityBroker, new GitRepositoryResolver());
-    logInfo("Initialized Confector execution engine and build coordinator.");
+    // Nothing starts builds until request intake lands (bead confector-z7z.23.7): the routes that
+    // would start one fail loudly (see buildsNotImplemented).
+    logInfo("Initialized Confector execution engine.");
 
     // Load scheduler plugin
     auto scheduler = PluginRegistry.instance.getDefaultScheduler();
@@ -352,7 +345,6 @@ void main()
     // Configure router and server settings
     auto router = createRouter(taskEngine,
       dispatchQueue,
-      buildCoordinator,
       stores,
       serverConfig.scheduler.callbackSecret,
       capacityBroker,
@@ -454,7 +446,6 @@ unittest
     auto queue = new InMemoryDispatchQueue();
     auto storage = new InMemoryArtifactStorage();
     auto engine = new TaskEngine(storage);
-    auto coordinator = new BuildCoordinator(storage, stores, queue);
     auto broker = new DefaultCapacityBroker(() => queuedDemand(stores.executions));
 
     class TestProvisioner : ComputeProvisioner
@@ -468,7 +459,7 @@ unittest
 
     broker.registerProvisioner(new TestProvisioner());
 
-    auto router = createRouter(engine, queue, coordinator, stores, "test-scheduler-secret", broker);
+    auto router = createRouter(engine, queue, stores, "test-scheduler-secret", broker);
     assert(router !is null);
 
     assert(broker.provisioners.length == 1);

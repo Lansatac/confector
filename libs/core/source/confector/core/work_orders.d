@@ -42,14 +42,12 @@ struct ReceivedWorkOrder
 
 /**
  * The work order for `execution`: its definition, fingerprint, resolved inputs and repository
- * addresses, the compute it needs, and `legacyBuildId` as routing (see
- * DispatchMessage.legacyBuildId). Pure.
+ * addresses, and the compute it needs. Pure.
  */
-WorkOrder workOrderFor(in TaskExecution execution, string legacyBuildId) @trusted
+WorkOrder workOrderFor(in TaskExecution execution) @trusted
 {
     WorkOrder order;
     order.executionId = execution.id;
-    order.buildId = legacyBuildId;
     order.taskId = execution.taskId;
     order.taskNode = cast(TaskNode) execution.definition;
     order.fingerprint = execution.fingerprint;
@@ -103,7 +101,7 @@ ReceivedWorkOrder[] receiveWork(StateStores stores, DispatchQueue queue, string 
                 queue.ack(queueName, lease.receipt);
                 continue;
             }
-            received ~= ReceivedWorkOrder(lease.receipt, lease.receiveCount, workOrderFor(started.get, message.legacyBuildId));
+            received ~= ReceivedWorkOrder(lease.receipt, lease.receiveCount, workOrderFor(started.get));
         }
     }
     catch (Exception e)
@@ -180,23 +178,47 @@ class StaleCompletionException : Exception
 }
 
 /**
+ * A completion names an execution that does not exist (or none at all). Nothing is recorded.
+ */
+class UnknownExecutionException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * A completion that can never be recorded as reported: a status a worker cannot report, another
+ * task than the execution's, or artifacts under another fingerprint (ForeignArtifactException).
+ * Reporting it again would be rejected the same way. Nothing is recorded.
+ */
+class InvalidCompletionException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
  * Reads execution `executionId`, which a worker reports the outcome of, and checks it is still
  * active and holds the claim on its fingerprint. The execution record is the only source of the
  * completion's fingerprint and task: a worker never names them.
  *
- * Throws: StaleCompletionException if it is not active or does not hold the claim; Exception if
- * `executionId` is empty or names no execution.
+ * Throws: StaleCompletionException if it is not active or does not hold the claim;
+ * UnknownExecutionException if `executionId` is empty or names no execution.
  */
 TaskExecution requireClaimingExecution(StateStores stores, string executionId)
 {
     if (executionId.length == 0)
     {
-        throw new Exception("A completion must name the execution it completes");
+        throw new UnknownExecutionException("A completion must name the execution it completes");
     }
     auto found = stores.executions.get(executionId);
     if (found.isNull)
     {
-        throw new Exception(format("A completion names execution '%s', which does not exist", executionId));
+        throw new UnknownExecutionException(format("A completion names execution '%s', which does not exist", executionId));
     }
     auto claim = stores.claims.get(found.get.fingerprint);
     const holder = claim.isNull ? null : claim.get.executionId;
@@ -212,7 +234,7 @@ TaskExecution requireClaimingExecution(StateStores stores, string executionId)
 /**
  * A completion reported artifacts that do not belong to its execution.
  */
-class ForeignArtifactException : Exception
+class ForeignArtifactException : InvalidCompletionException
 {
     this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
     {
@@ -257,7 +279,8 @@ ArtifactMetadata[] executionArtifacts(in TaskExecution execution, ArtifactMetada
  * Throws: StaleCompletionException if the execution is not active or no longer holds its
  * fingerprint's claim (see `requireClaimingExecution`), including when a concurrent completion
  * finishes it first; ForeignArtifactException if an artifact names another fingerprint;
- * Exception if `status` is not terminal or `executionId` names no execution.
+ * UnknownExecutionException if `executionId` names no execution; Exception if `status` is not
+ * terminal.
  */
 TaskExecution finishExecution(StateStores stores, string executionId, ExecutionStatus status, int exitCode,
     string errorMessage, ArtifactMetadata[] artifacts, string now = null)
@@ -265,6 +288,56 @@ TaskExecution finishExecution(StateStores stores, string executionId, ExecutionS
     requireTerminal(status);
     auto own = executionArtifacts(requireClaimingExecution(stores, executionId), artifacts);
     return recordOutcome(stores, executionId, status, exitCode, errorMessage, own, now.length > 0 ? now : utcNow());
+}
+
+/**
+ * The execution status a worker's reported task status records: succeeded, failed or cancelled.
+ * A worker ran the execution, so it can never report a cache hit.
+ *
+ * Throws: InvalidCompletionException if `status` is not one of those three.
+ */
+ExecutionStatus reportedExecutionStatus(TaskStatus status) pure @safe
+{
+    switch (status)
+    {
+        case TaskStatus.succeeded:
+            return ExecutionStatus.succeeded;
+        case TaskStatus.failed:
+            return ExecutionStatus.failed;
+        case TaskStatus.cancelled:
+            return ExecutionStatus.cancelled;
+        default:
+            throw new InvalidCompletionException(format("A completion reported status '%s'; a worker can report only succeeded, failed or cancelled",
+                cast(string) status));
+    }
+}
+
+/**
+ * Records the completion a worker reported for execution `executionId` (see `finishExecution`)
+ * and returns the finished execution. The execution record is the only source of the
+ * fingerprint and task: a `result` naming a different task is rejected.
+ *
+ * This is everything a completion does until the fingerprint ledger's fold lands (beads
+ * confector-z7z.49.x): the execution is finished by compare-and-set and its fingerprint's claim
+ * released. Nothing is cached and no chain is re-evaluated. `result.logs` is not recorded: the
+ * worker streams its log lines to the execution's log as it runs.
+ *
+ * Throws: as `finishExecution`, and InvalidCompletionException if `result.status` is not a
+ * status a worker can report or `result.taskId` names another task; in every case nothing is
+ * recorded.
+ */
+TaskExecution completeExecution(StateStores stores, string executionId, in TaskExecutionResult result, string now = null)
+{
+    const status = reportedExecutionStatus(result.status);
+    const execution = requireClaimingExecution(stores, executionId);
+    if (result.taskId.length > 0 && result.taskId != execution.taskId)
+    {
+        throw new InvalidCompletionException(format("A completion of execution '%s' (task '%s') names task '%s'; it is rejected",
+            executionId, execution.taskId, result.taskId));
+    }
+    auto own = executionArtifacts(execution, (cast(ArtifactMetadata[]) result.producedArtifacts).dup);
+    return recordOutcome(stores, executionId, status, result.exitCode, result.errorMessage, own,
+        now.length > 0 ? now : utcNow());
 }
 
 private void requireTerminal(ExecutionStatus status)
@@ -339,7 +412,6 @@ version (unittest)
         p.definition.setCustomComponent("executor", JSONValue("aws-ecs"));
         p.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
         p.repositoryAddresses = ["src": "https://example.test/game.git"];
-        p.legacyBuildId = "bld_1";
         return p;
     }
 
@@ -359,7 +431,7 @@ unittest
     auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w1", () => fixedNow());
     assert(received.length == 1 && received[0].receiveCount == 1);
     auto order = received[0].workOrder;
-    assert(order.executionId == id && order.buildId == "bld_1" && order.taskId == "compile" && order.fingerprint == "fp1");
+    assert(order.executionId == id && order.taskId == "compile" && order.fingerprint == "fp1");
     assert(order.taskNode.steps[0].script == "make" && order.timeoutSeconds == 1200 && order.executorType == "aws-ecs");
     assert(order.payload.inputs == samplePlan().inputs);
     assert(order.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
@@ -368,7 +440,7 @@ unittest
     assert(running.status == ExecutionStatus.running && running.attempts == 1 && running.worker == "w1");
 
     // A second message for the running execution (a dispatcher re-sent it) is dropped
-    queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id, "bld_2")));
+    queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id)));
     assert(receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w2").length == 0);
     assert(queue.receive(defaultPoolQueue, 10, 1.hours).length == 0, "The duplicate was acknowledged");
     assert(stores.executions.get(id).get.attempts == 1);
@@ -494,13 +566,13 @@ unittest
     bool unnamed = false;
     try finishExecution(stores, "", ExecutionStatus.succeeded, 0, null, null);
     catch (StaleCompletionException e) assert(false, "Not stale: unnamed");
-    catch (Exception e) unnamed = e.msg.canFind("must name the execution");
+    catch (UnknownExecutionException e) unnamed = e.msg.canFind("must name the execution");
     assert(unnamed);
 
     bool unknown = false;
     try finishExecution(stores, "exe_unknown", ExecutionStatus.succeeded, 0, null, null);
     catch (StaleCompletionException e) assert(false, "Not stale: unknown");
-    catch (Exception e) unknown = e.msg.canFind("'exe_unknown'") && e.msg.canFind("does not exist");
+    catch (UnknownExecutionException e) unknown = e.msg.canFind("'exe_unknown'") && e.msg.canFind("does not exist");
     assert(unknown);
 
     assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
@@ -602,4 +674,93 @@ unittest
     own.taskFingerprint = "fp1";
     const done = finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, [unnamed, own]);
     assert(done.artifacts.length == 2 && done.artifacts[0].taskFingerprint == "fp1" && done.artifacts[1].taskFingerprint == "fp1");
+}
+
+unittest
+{
+    // A worker's completion: the reported status maps to the execution's outcome, a worker cannot
+    // report a cache hit or an unfinished status, and a completion naming another task is
+    // rejected. Each rejection records nothing and keeps the claim
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
+    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+
+    assert(reportedExecutionStatus(TaskStatus.succeeded) == ExecutionStatus.succeeded);
+    assert(reportedExecutionStatus(TaskStatus.failed) == ExecutionStatus.failed);
+    assert(reportedExecutionStatus(TaskStatus.cancelled) == ExecutionStatus.cancelled);
+
+    bool rejectedWith(TaskExecutionResult result, string text)
+    {
+        try completeExecution(stores, id, result);
+        catch (InvalidCompletionException e) return e.msg.canFind(text);
+        return false;
+    }
+
+    foreach (status; [TaskStatus.cached, TaskStatus.running, TaskStatus.pending, TaskStatus.queued])
+    {
+        TaskExecutionResult result;
+        result.status = status;
+        assert(rejectedWith(result, "can report only succeeded, failed or cancelled"));
+    }
+    TaskExecutionResult otherTask;
+    otherTask.taskId = "link";
+    otherTask.status = TaskStatus.succeeded;
+    assert(rejectedWith(otherTask, "names task 'link'"));
+    assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
+    assert(stores.claims.get("fp1").get.executionId == id);
+
+    // A completion is recorded on the execution named in the route; its outcome, exit code,
+    // error and artifacts (stamped with the execution's fingerprint) are kept and the claim is
+    // released. Nothing else is written: no cache entry, no chain re-evaluation
+    TaskExecutionResult failed;
+    failed.taskId = "compile";
+    failed.status = TaskStatus.failed;
+    failed.exitCode = 2;
+    failed.errorMessage = "make: *** [all] Error 2";
+    failed.producedArtifacts = [ArtifactMetadata("partial.log")];
+    failed.logs = ["not recorded here"];
+    const done = completeExecution(stores, id, failed, fixedNow());
+    assert(done.id == id && done.status == ExecutionStatus.failed && done.exitCode == 2);
+    assert(done.errorMessage == "make: *** [all] Error 2" && done.finishedAt == fixedNow());
+    assert(done.artifacts.length == 1 && done.artifacts[0].taskFingerprint == "fp1");
+    assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
+    assert(stores.claims.get("fp1").get.executionId.length == 0);
+
+    // A task id is optional; a duplicate is rejected as stale, an unknown execution as unknown
+    bool unknownExecution = false;
+    try completeExecution(stores, "exe_nope", failed);
+    catch (UnknownExecutionException e) unknownExecution = e.msg.canFind("exe_nope");
+    assert(unknownExecution);
+    TaskExecutionResult again;
+    again.status = TaskStatus.succeeded;
+    bool stale = false;
+    try completeExecution(stores, id, again);
+    catch (StaleCompletionException e) stale = e.msg.canFind(id);
+    assert(stale && stores.executions.get(id).get.status == ExecutionStatus.failed);
+}
+
+unittest
+{
+    // Two completions of one execution race through completeExecution: the second passes its
+    // checks, then loses the compare-and-set to the first and is rejected without overwriting it
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
+    const id = dispatcher.dispatch([samplePlan()])[0].executionId;
+
+    TaskExecutionResult succeeded;
+    succeeded.taskId = "compile";
+    succeeded.status = TaskStatus.succeeded;
+    TaskExecutionResult cancelled = succeeded;
+    cancelled.status = TaskStatus.cancelled;
+
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto racing = new StateStores(interleaving);
+    interleaving.beforeNextWrite = () { completeExecution(stores, id, succeeded, fixedNow()); };
+    bool rejected = false;
+    try completeExecution(racing, id, cancelled, fixedNow());
+    catch (StaleCompletionException e) rejected = e.msg.canFind("finished succeeded");
+    assert(rejected);
+    assert(stores.executions.get(id).get.status == ExecutionStatus.succeeded);
+    assert(stores.claims.get("fp1").get.executionId.length == 0);
 }

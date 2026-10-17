@@ -12,7 +12,7 @@ import std.uri : encodeComponent;
 import confector.core.model : ProjectRecord, RepositoryRecord, projectUsesRepository, repositoryIds;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
-import confector.server.orchestrator.coordinator : BuildCoordinator;
+import confector.server.controller.api_controller : buildsNotImplemented;
 import confector.server.scheduler_callback : schedulerCallback;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry;
 
@@ -87,7 +87,7 @@ void updateVcsPollingSchedule(Scheduler scheduler, ushort serverPort, string rep
  * Creates the URL router for the /repositories endpoints.
  */
 URLRouter repositoryRouter(StateStores stores, string schedulerCallbackSecret,
-    BuildCoordinator coordinator = null, Scheduler scheduler = null, ushort serverPort = 8080)
+    Scheduler scheduler = null, ushort serverPort = 8080)
 {
     auto router = new URLRouter();
 
@@ -290,7 +290,7 @@ URLRouter repositoryRouter(StateStores stores, string schedulerCallbackSecret,
                 newState.updatedAt = Clock.currTime.toISOString();
                 stores.vcsStates.saveState(newState);
 
-                if (changed && coordinator !is null)
+                if (changed)
                 {
                     VcsChangeRecord change;
                     change.id = "change_" ~ randomUUID().toString();
@@ -303,13 +303,21 @@ URLRouter repositoryRouter(StateStores stores, string schedulerCallbackSecret,
                     change.triggerSource = "polling";
                     stores.vcsStates.recordChange(change);
 
-                    // Find projects that use this repository and start builds
+                    // The change is recorded, but building the projects that use the repository
+                    // fails loudly until request intake lands (see buildsNotImplemented)
+                    string[] affected;
                     foreach (proj; stores.projects.list())
                     {
-                        if (projectUsesRepository(proj, repoRecord))
-                        {
-                            coordinator.startBuild(proj, null, false, "polling");
-                        }
+                        if (projectUsesRepository(proj, repoRecord)) affected ~= proj.id;
+                    }
+                    if (affected.length > 0)
+                    {
+                        res.statusCode = HTTPStatus.notImplemented;
+                        Json err = Json.emptyObject;
+                        err["error"] = Json(format("Repository '%s' changed to revision %s, but projects %s were not built: %s",
+                            repoName, newState.revision, affected, buildsNotImplemented));
+                        res.writeJsonBody(err);
+                        return;
                     }
                 }
 
@@ -442,4 +450,89 @@ unittest
     auto encodedRes = createTestHTTPServerResponse();
     router.handleRequest(encodedReq, encodedRes);
     assert(encodedRes.statusCode == HTTPStatus.unauthorized);
+}
+
+unittest
+{
+    // A poll that finds a new revision records it, then fails loudly when a project uses the
+    // repository: starting builds waits for request intake. A poll that finds nothing new, or a
+    // change no project uses, succeeds
+    import confector.core.plugin : PluginRegistry;
+    import confector.plugin_api.model : TaskNode, VcsRepositoryState, repositoryInput;
+    import confector.plugin_api.plugin : BasePlugin, PluginCategory;
+    import confector.plugin_api.vcs : VcsStateResolver;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import std.json : JSONValue;
+    import vibe.stream.memory : createMemoryOutputStream;
+
+    static class PollTestResolver : BasePlugin, VcsStateResolver
+    {
+        string revision = "rev1";
+        @property string name() const { return "poll-test-vcs"; }
+        @property string versionString() const { return "1.0.0"; }
+        @property string description() const { return "Poll test VCS"; }
+        @property PluginCategory category() const { return PluginCategory.definition; }
+        @property string providerType() const { return "poll-test"; }
+        bool canHandle(string repositoryUrl) const { import std.algorithm.searching : startsWith; return repositoryUrl.startsWith("polltest://"); }
+        VcsRepositoryState fetchLatestState(string repositoryUrl, string targetRef = null)
+        {
+            VcsRepositoryState state;
+            state.repositoryUrl = repositoryUrl;
+            state.providerType = "poll-test";
+            state.targetRef = "main";
+            state.revision = revision;
+            return state;
+        }
+        bool canHandleWebhook(in string[string] headers, in JSONValue payload) const { return false; }
+        bool parseWebhookPayload(in string[string] headers, in JSONValue payload, out VcsRepositoryState resolvedState) { return false; }
+    }
+
+    auto resolver = new PollTestResolver();
+    PluginRegistry.instance.registerPlugin(resolver);
+    scope(exit) PluginRegistry.instance.unregisterPlugin(resolver.name);
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    foreach (name; ["game", "unused"])
+    {
+        RepositoryRecord repo;
+        repo.name = name;
+        repo.address = "polltest://" ~ name;
+        stores.repositories.put(repo);
+    }
+    ProjectRecord project;
+    project.id = "game-project";
+    TaskNode compile;
+    compile.id = "compile";
+    compile.inputs["src"] = repositoryInput("game", "main");
+    project.tasks = [compile];
+    stores.projects.put(project);
+    auto router = repositoryRouter(stores, "test-scheduler-secret");
+
+    int poll(string repository, out string error)
+    {
+        auto req = createTestHTTPServerRequest(URL(vcsPollUrl(8080, repository)), HTTPMethod.POST);
+        req.headers["X-Confector-Scheduler-Secret"] = "test-scheduler-secret";
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+        router.handleRequest(req, res);
+        auto body = cast(string) sink.data;
+        if (body.length > 0)
+        {
+            auto json = parseJsonString(body);
+            if ("error" in json) error = json["error"].get!string;
+        }
+        return res.statusCode;
+    }
+
+    string error;
+    assert(poll("game", error) == HTTPStatus.notImplemented);
+    assert(error.canFind("game-project") && error.canFind(buildsNotImplemented), error);
+    assert(stores.vcsStates.listChanges("polltest://game").length == 1, "The change is recorded first");
+
+    assert(poll("game", error) == HTTPStatus.ok, "Nothing new");
+    resolver.revision = "rev2";
+    assert(poll("game", error) == HTTPStatus.notImplemented);
+    assert(stores.vcsStates.listChanges("polltest://game").length == 2);
+
+    assert(poll("unused", error) == HTTPStatus.ok, "No project uses it");
+    assert(stores.vcsStates.listChanges("polltest://unused").length == 1);
 }

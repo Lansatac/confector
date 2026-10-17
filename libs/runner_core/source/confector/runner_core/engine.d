@@ -163,7 +163,6 @@ class TaskEngine
         auto sw = StopWatch(AutoStart.yes);
         TaskExecutionResult result;
         result.taskId = task.id;
-        result.buildId = buildId;
 
         logInfo("[engine] Starting executeTask for task '%s' (build '%s', workspace '%s', manageArtifacts=%s)",
             task.id, buildId, workspaceDir, manageArtifacts);

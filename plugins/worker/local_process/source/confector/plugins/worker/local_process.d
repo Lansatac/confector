@@ -168,7 +168,6 @@ class LocalProcessInstance : ComputeInstance
         // Build structured TaskNode payload JSON for confector-runner
         string scriptToRun = request.effectiveScript;
         string taskId = request.taskId.length > 0 ? request.taskId : "task_1";
-        string buildId = request.buildId.length > 0 ? request.buildId : "build_local";
 
         JSONValue stepObj = JSONValue([
             "name": JSONValue(taskId),
@@ -184,10 +183,9 @@ class LocalProcessInstance : ComputeInstance
         ]);
 
         // confector-runner `run` takes a work order. An ExecutionRequest carries no fingerprint,
-        // which only the control plane computes and the runner requires, so the runner refuses
-        // this order until ExecutionRequest is given one.
+        // which only the control plane computes, and no execution id; the runner requires both,
+        // so it refuses this order until ExecutionRequest is given them.
         JSONValue payloadObj = JSONValue([
-            "build_id": JSONValue(buildId),
             "task_id": JSONValue(taskId),
             "task_node": taskObj,
             "payload": JSONValue(["workspace_dir": JSONValue(effectiveWorkDir)])

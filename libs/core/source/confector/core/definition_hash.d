@@ -51,12 +51,11 @@ string computeDefinitionHash(in TaskNode task) @trusted
 }
 
 /**
- * Records on `record` (a TaskExecution, or the TaskExecutionRecord it replaces) the definition
- * `task` that an execution ran with, and its hash. The record gets its own copy of the steps,
- * environment and outputs, so editing `task` afterwards cannot change what was recorded.
+ * Records on `record` the definition `task` that the execution ran with, and its hash. The
+ * record gets its own copy of the steps, environment and outputs, so editing `task` afterwards
+ * cannot change what was recorded.
  */
-void recordDefinition(Record)(ref Record record, in TaskNode task) @trusted
-    if (is(typeof(record.definition) == TaskNode) && is(typeof(record.definitionHash) == string))
+void recordDefinition(ref TaskExecution record, in TaskNode task) @trusted
 {
     TaskNode copy = cast(TaskNode) task;
     copy.steps = copy.steps.dup;
@@ -202,7 +201,7 @@ unittest
     task.environment = ["A": "1"];
     task.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
 
-    TaskExecutionRecord record;
+    TaskExecution record;
     recordDefinition(record, task);
     assert(record.definitionHash == computeDefinitionHash(task));
     assert(record.definition.steps[0].script == "dub build");
@@ -220,17 +219,9 @@ unittest
     task.environment["A"] = "1";
     task.outputs.artifacts[0].path = "out/*";
 
-    auto restored = deserializeJson!TaskExecutionRecord(serializeToJson(record));
+    // Survives a serialization round trip, as when stored in and loaded from the state store
+    auto restored = deserializeJson!TaskExecution(serializeToJson(record).toString());
     assert(restored.definitionHash == record.definitionHash);
     assert(computeDefinitionHash(restored.definition) == record.definitionHash);
     assert(restored.definition.name == "Build" && restored.definition.inputs["flavor"].spec.value == "internal");
-
-    // A TaskExecution records its definition the same way
-    TaskExecution execution;
-    recordDefinition(execution, task);
-    task.steps[0].script = "edited";
-    assert(execution.definition.steps[0].script == "dub build");
-    auto restoredExecution = deserializeJson!TaskExecution(serializeToJson(execution).toString());
-    assert(restoredExecution.definitionHash == computeDefinitionHash(restoredExecution.definition));
-    assert(restoredExecution.definitionHash == record.definitionHash);
 }

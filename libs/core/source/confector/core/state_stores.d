@@ -10,7 +10,7 @@ module confector.core.state_stores;
 import confector.core.api_token_store : ApiTokenStore;
 import confector.core.build_stores : ArtifactRecordStore, BuildRequestStore, ChainStore, ExecutionStore, FingerprintClaimStore;
 import confector.core.counters : CounterStore;
-import confector.core.legacy_stores : BuildLogStore, LegacyBuildStore, ResultCacheStore, TriggerRuleStore, VcsStateStore, WorkerStore;
+import confector.core.legacy_stores : ExecutionLogStore, TriggerRuleStore, VcsStateStore, WorkerStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
 import confector.core.rerun_generations : RerunGenerationStore;
 import confector.plugin_api.document_store : DocumentStore;
@@ -35,10 +35,8 @@ final class StateStores
     TrackedBranchStore trackedBranches;
     ApiTokenStore apiTokens;
 
-    // The BuildCoordinator's records; see confector.core.legacy_stores for when each goes
-    LegacyBuildStore legacyBuilds;
-    ResultCacheStore resultCache;
-    BuildLogStore logs;
+    // Records being replaced; see confector.core.legacy_stores for when each goes
+    ExecutionLogStore logs;
     TriggerRuleStore triggerRules;
     WorkerStore workers;
     VcsStateStore vcsStates;
@@ -64,9 +62,7 @@ final class StateStores
         repositories = new RepositoryStore(store);
         trackedBranches = new TrackedBranchStore(store);
         apiTokens = new ApiTokenStore(store);
-        legacyBuilds = new LegacyBuildStore(store);
-        resultCache = new ResultCacheStore(store);
-        logs = new BuildLogStore(store);
+        logs = new ExecutionLogStore(store);
         triggerRules = new TriggerRuleStore(store);
         workers = new WorkerStore(store);
         vcsStates = new VcsStateStore(store);

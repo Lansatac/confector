@@ -25,6 +25,36 @@ import core.thread : Thread;
 import core.time : Duration, seconds, msecs;
 
 /**
+ * The server answered a request with a status other than 2xx. `statusCode` is that status.
+ */
+class ServerResponseException : Exception
+{
+    const ushort statusCode;
+
+    this(ushort statusCode, string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+        this.statusCode = statusCode;
+    }
+}
+
+/**
+ * What became of a reported completion.
+ */
+enum CompletionReport
+{
+    /// The server recorded it.
+    recorded,
+    /// The server rejected it for good: the execution already finished (409), the completion is
+    /// invalid (400, 422), or the execution does not exist (404). Running the work order again
+    /// would be rejected the same way, so its lease is acknowledged.
+    rejected,
+    /// It did not reach the server, or the server failed (5xx, or any other status): the lease is
+    /// left unacknowledged so the work order is delivered again.
+    notRecorded
+}
+
+/**
  * Configuration options for the HTTP-based remote worker daemon.
  */
 struct HttpWorkerConfig
@@ -171,7 +201,8 @@ class HttpWorkerClient
                 }
             }
             if (errMsg.length == 0) errMsg = format("HTTP %d %s", http.statusLine.code, http.statusLine.reason);
-            throw new Exception(format("Server request to '%s' failed: %s", fullUrl, errMsg));
+            throw new ServerResponseException(http.statusLine.code,
+                format("Server request to '%s' failed (HTTP %d): %s", fullUrl, http.statusLine.code, errMsg));
         }
     }
 
@@ -236,7 +267,9 @@ class HttpWorkerClient
         }
     }
 
-    bool streamLogs(string buildId, string taskId, string[] lines)
+    /// Appends `lines` to execution `executionId`'s log. Returns false, logging why, if the
+    /// server did not take them.
+    bool streamLogs(string executionId, string[] lines)
     {
         if (lines.length == 0) return true;
         try
@@ -244,37 +277,42 @@ class HttpWorkerClient
             Json req = Json.emptyObject;
             req["lines"] = serializeToJson(lines);
             req["worker_id"] = Json(m_workerId);
-            string endpoint = format("/builds/%s/tasks/%s/logs", buildId, taskId);
+            string endpoint = format("/executions/%s/logs", executionId);
             sendJson(endpoint, "POST", req);
             return true;
         }
         catch (Exception e)
         {
-            logWarn("[HttpWorkerClient] Failed to stream logs for build '%s' task '%s': %s", buildId, taskId, e.msg);
+            logWarn("[HttpWorkerClient] Failed to stream logs for execution '%s': %s", executionId, e.msg);
             return false;
         }
     }
 
     /// Reports the completion of execution `executionId` (`WorkOrder.executionId`). The result
-    /// names no fingerprint: the server reads it from the execution. Returns false, logging why,
-    /// if the server did not record it.
-    bool reportCompletion(string executionId, in TaskExecutionResult result)
+    /// names no fingerprint: the server reads it from the execution. Logs why it was not
+    /// recorded; see CompletionReport for which outcomes are permanent.
+    CompletionReport reportCompletion(string executionId, in TaskExecutionResult result)
     {
-        bool success = false;
         try
         {
             Json bodyJson = serializeToJson(result);
             string endpoint = format("/executions/%s/complete", executionId);
             sendJson(endpoint, "POST", bodyJson);
-            success = true;
+            return CompletionReport.recorded;
+        }
+        catch (ServerResponseException e)
+        {
+            const permanent = e.statusCode == 400 || e.statusCode == 404 || e.statusCode == 409 || e.statusCode == 422;
+            logError("[HttpWorkerClient] The server %s the completion of execution '%s' (task: %s): %s",
+                permanent ? "rejected" : "did not record", executionId, result.taskId, e.msg);
+            return permanent ? CompletionReport.rejected : CompletionReport.notRecorded;
         }
         catch (Exception e)
         {
             logError("[HttpWorkerClient] Failed to report the completion of execution '%s' (task: %s) to the server: %s",
                 executionId, result.taskId, e.msg);
+            return CompletionReport.notRecorded;
         }
-
-        return success;
     }
 }
 
@@ -362,15 +400,15 @@ class HttpWorkerDaemon
             throw new Exception(format("Work order for task '%s' (receipt '%s') names no execution; it cannot be run or completed",
                 msg.taskId, lease.receipt));
         }
-        string buildId = msg.buildId.length > 0 ? msg.buildId : "build_anon";
+        const string executionId = msg.executionId;
         string taskId = msg.taskId;
-        string taskWsDir = buildPath(m_config.workspaceDir, buildId, taskId);
+        string taskWsDir = buildPath(m_config.workspaceDir, executionId);
         if (!exists(taskWsDir))
         {
             mkdirRecurse(taskWsDir);
         }
 
-        logInfo("[worker] Processing task '%s' for build '%s' (receipt: %s)", taskId, buildId, lease.receipt);
+        logInfo("[worker] Processing task '%s' for execution '%s' (receipt: %s)", taskId, executionId, lease.receipt);
 
         // Heartbeat periodic timer
         Thread heartbeatThread;
@@ -453,7 +491,7 @@ class HttpWorkerDaemon
                     flushLines = logBuffer.dup;
                     logBuffer.length = 0;
                 }
-                m_client.streamLogs(buildId, taskId, flushLines);
+                m_client.streamLogs(executionId, flushLines);
             }
         }
 
@@ -465,7 +503,7 @@ class HttpWorkerDaemon
         try
         {
             result = m_engine.executeTask(
-                buildId,
+                executionId,
                 taskNode,
                 taskWsDir,
                 msg.fingerprint,
@@ -491,20 +529,25 @@ class HttpWorkerDaemon
         }
         if (finalLogs.length > 0)
         {
-            m_client.streamLogs(buildId, taskId, finalLogs);
+            m_client.streamLogs(executionId, finalLogs);
         }
 
-        // Report the execution's completion over HTTP
-        if (!m_client.reportCompletion(msg.executionId, result))
+        // Report the execution's completion over HTTP, after its last log lines (flushed above),
+        // since the server refuses log lines for a finished execution
+        final switch (m_client.reportCompletion(msg.executionId, result))
         {
-            // Not acknowledged: the lease expires and the work order is delivered again, rather
-            // than the work order disappearing with its completion never recorded.
-            logError("[worker] Completion of task '%s' (execution '%s') was not recorded; leaving receipt '%s' unacknowledged so it is delivered again",
-                taskId, msg.executionId, lease.receipt);
-        }
-        else if (lease.receipt.length > 0)
-        {
-            m_client.ackTask(lease.receipt);
+            case CompletionReport.recorded:
+            case CompletionReport.rejected:
+                // A rejection is permanent: delivering the work order again would only run the
+                // task again and be rejected again
+                if (lease.receipt.length > 0) m_client.ackTask(lease.receipt);
+                break;
+            case CompletionReport.notRecorded:
+                // Not acknowledged: the lease expires and the work order is delivered again,
+                // rather than the work order disappearing with its completion never recorded.
+                logError("[worker] Completion of task '%s' (execution '%s') was not recorded; leaving receipt '%s' unacknowledged so it is delivered again",
+                    taskId, msg.executionId, lease.receipt);
+                break;
         }
 
         m_tasksProcessed++;
@@ -635,7 +678,6 @@ unittest
 
     WorkOrder mockOrder;
     mockOrder.executionId = "exe_mock_1";
-    mockOrder.buildId = "build_test_1";
     mockOrder.taskId = "task_test_1";
     mockOrder.fingerprint = "fp_mock_123";
     mockOrder.taskNode.id = "task_test_1";
@@ -659,12 +701,12 @@ unittest
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
 
-    router.post("/api/v1/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        logsCalled = true;
+    router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        logsCalled = req.params["execution_id"] == "exe_mock_1";
         res.writeJsonBody(["status": "ok"]);
     });
 
-    bool rejectCompletion = false;
+    int rejectCompletion = 0;
     string reportedExecution;
     bool reportedFingerprint;
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -674,10 +716,10 @@ unittest
         // These tests cover the control-plane protocol.
         reportedExecution = req.params["execution_id"];
         reportedFingerprint = ("fingerprint" in req.json) !is null;
-        if (rejectCompletion)
+        if (rejectCompletion != 0)
         {
-            res.statusCode = 400;
-            res.writeJsonBody(["error": "Execution 'exe_mock_1' no longer holds fingerprint fp_mock_123"]);
+            res.statusCode = rejectCompletion;
+            res.writeJsonBody(["error": format("Completion of 'exe_mock_1' answered with HTTP %s", rejectCompletion)]);
             return;
         }
         res.writeJsonBody(["status": "recorded"]);
@@ -724,20 +766,30 @@ unittest
     assert(reportedExecution == "exe_mock_1", "The completion names the work order's execution");
     assert(!reportedFingerprint, "The completion carries no fingerprint");
 
-    // A completion the server does not record leaves the lease unacknowledged, so the work order
-    // is delivered again instead of disappearing
-    rejectCompletion = true;
-    ackCalled = false;
-    completeCalled = false;
+    // The workspace is the execution's own directory
+    assert(exists(buildPath(config.workspaceDir, "exe_mock_1")));
+
+    // A completion the server failed to record (5xx) leaves the lease unacknowledged, so the work
+    // order is delivered again instead of disappearing. One the server rejected for good (a
+    // duplicate or late completion, 409; an invalid one, 422) is acknowledged: running the work
+    // order again would only be rejected again
     auto lease = Lease("receipt_xyz", 1, serializeToJson(mockOrder));
-    auto retryThread = new Thread({ workerRunner.processOneMessage(lease); });
-    retryThread.start();
-    while (retryThread.isRunning)
+    foreach (status, acked; [500: false, 503: false, 409: true, 422: true])
     {
-        sleep(50.msecs);
+        rejectCompletion = status;
+        ackCalled = false;
+        completeCalled = false;
+        auto retryThread = new Thread({ workerRunner.processOneMessage(lease); });
+        retryThread.start();
+        while (retryThread.isRunning)
+        {
+            sleep(50.msecs);
+        }
+        retryThread.join();
+        assert(completeCalled && ackCalled == acked, format("HTTP %s", status));
     }
-    retryThread.join();
-    assert(completeCalled && !ackCalled);
+    rejectCompletion = 0;
+    ackCalled = false;
 
     // A work order naming no execution is refused before anything runs: its completion could
     // not say what it completes
@@ -813,7 +865,6 @@ unittest
 
     WorkOrder orderStep1;
     orderStep1.executionId = "exe_step_1";
-    orderStep1.buildId = "build_multistep_1";
     orderStep1.taskId = "task_step_1";
     orderStep1.fingerprint = "fp_step_1";
     orderStep1.taskNode.id = "task_step_1";
@@ -822,7 +873,6 @@ unittest
 
     WorkOrder orderStep2;
     orderStep2.executionId = "exe_step_2";
-    orderStep2.buildId = "build_multistep_1";
     orderStep2.taskId = "task_step_2";
     orderStep2.fingerprint = "fp_step_2";
     orderStep2.taskNode.id = "task_step_2";
@@ -849,12 +899,22 @@ unittest
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
 
-    router.post("/api/v1/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+    string[] loggedExecutions;
+    string[][string] streamedByExecution;
+    string[][string] completionLogs;
+    bool logAfterCompletion = false;
+    router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        const execution = req.params["execution_id"];
+        loggedExecutions ~= execution;
+        // The server refuses log lines for a finished execution: the worker must send its last
+        // lines before its completion
+        if (completedTasks.canFind(execution)) logAfterCompletion = true;
         if ("lines" in req.json)
         {
             foreach (line; req.json["lines"])
             {
                 streamedLogs ~= line.get!string;
+                streamedByExecution[execution] ~= line.get!string;
             }
         }
         res.writeJsonBody(["status": "ok"]);
@@ -862,6 +922,7 @@ unittest
 
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         completedTasks ~= req.params["execution_id"];
+        completionLogs[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json).logs;
         // Status not checked; see the previous test
         res.writeJsonBody(["status": "recorded"]);
     });
@@ -907,4 +968,20 @@ unittest
     assert(acknowledgedReceipts[0] == "receipt_step_1");
     assert(acknowledgedReceipts[1] == "receipt_step_2");
     assert(streamedLogs.length > 0);
+    foreach (logged; loggedExecutions) assert(logged == "exe_step_1" || logged == "exe_step_2", logged);
+
+    // Every line of a run reaches its execution's log, in order, before its completion
+    assert(!logAfterCompletion, "A log batch was sent after the completion");
+    foreach (execution; ["exe_step_1", "exe_step_2"])
+    {
+        auto streamed = streamedByExecution.get(execution, null);
+        auto reported = completionLogs[execution];
+        assert(reported.length > 0, execution);
+        size_t next = 0;
+        foreach (line; streamed)
+        {
+            if (next < reported.length && line == reported[next]) ++next;
+        }
+        assert(next == reported.length, format("%s: streamed %s, reported %s", execution, streamed, reported));
+    }
 }

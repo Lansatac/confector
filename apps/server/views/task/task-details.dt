@@ -13,13 +13,6 @@ block maincontent
         div
           h1 Task: #{taskNode.name.length > 0 ? taskNode.name : taskNode.id}
           p.text-muted(style="margin: 4px 0 0 0;") Discrete DAG node definition in project #[a(href="/projects/details?id=#{project.id}") #{project.name.length > 0 ? project.name : project.id}] (#[code #{taskNode.id}])
-        div.status-container
-          - if (changeStatus == "up_to_date")
-            span.badge.badge-lg.badge-success UP TO DATE
-          - else if (changeStatus == "pending_changes")
-            span.badge.badge-lg.badge-warning PENDING CHANGES
-          - else
-            span.badge.badge-lg.badge-secondary NEVER RUN
 
     div.toolbar-actions(style="margin-bottom: 24px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;")
       form(action="/projects/run", method="POST", style="display:inline;")
@@ -109,15 +102,6 @@ block maincontent
                     span.badge.badge-primary #{trig.type}
               - else
                 span.text-muted Manual dispatch only
-          tr
-            th Change Status
-            td
-              - if (changeStatus == "up_to_date")
-                span.badge.badge-success UP TO DATE
-              - else if (changeStatus == "pending_changes")
-                span.badge.badge-warning PENDING CHANGES
-              - else
-                span.badge.badge-secondary NEVER RUN
 
     div.section-title-bar(style="margin-top: 20px;")
       h2 Build Step Breakdown
@@ -155,55 +139,3 @@ block maincontent
                 - else
                   span.text-muted -
               td #{step.workingDirectory.length > 0 ? step.workingDirectory : "."}
-
-    div.section-title-bar(style="margin-top: 30px;")
-      h2 Chronological Execution History
-      div
-        span.badge.badge-primary #{history.length} past run(s)
-
-    - if (history.length == 0)
-      div.empty-state(style="padding: 24px; margin-bottom: 20px;")
-        p No historical executions recorded for this task.
-        form(action="/projects/run", method="POST", style="margin-top: 10px; display:inline;")
-          input(type="hidden", name="id", value="#{project.id}")
-          input(type="hidden", name="target_task_id", value="#{taskNode.id}")
-          button.btn.btn-primary(type="submit") ⚡ Run Task Now
-    - else
-      table.data-table(style="margin-bottom: 30px;")
-        thead
-          tr
-            th Parent Build
-            th Status
-            th Started
-            th Duration
-            th Fingerprint
-            th Exit Code
-            th Actions
-        tbody
-          - foreach(h; history)
-            tr
-              td
-                a.build-link(href="/builds/details?id=#{h.buildId}") #{h.buildId}
-              td
-                - if (h.status == "succeeded")
-                  span.badge.badge-success SUCCESS
-                - else if (h.status == "cached")
-                  span.badge.badge-cached CACHED
-                - else if (h.status == "failed")
-                  span.badge.badge-danger FAILED
-                - else if (h.status == "running")
-                  span.badge.badge-warning RUNNING
-                - else
-                  span.badge.badge-secondary #{h.status}
-              td #{h.startedAt.length > 0 ? h.startedAt : "-"}
-              td #{h.durationMs} ms
-              td
-                - if (h.fingerprint.length >= 8)
-                  code #{h.fingerprint[0 .. 8]}...
-                - else if (h.fingerprint.length > 0)
-                  code #{h.fingerprint}
-                - else
-                  span.text-muted -
-              td #{h.exitCode}
-              td
-                a.btn.btn-sm.btn-primary(href="/tasks/execution?build_id=#{h.buildId}&task_id=#{taskNode.id}") View Execution &rarr;

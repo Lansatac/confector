@@ -8,16 +8,23 @@ import confector.core.state_stores : StateStores;
 import confector.core.trigger;
 import confector.core.executor : CapacityBroker;
 import confector.runner_core.engine;
-import confector.server.orchestrator.coordinator;
 import confector.plugin_api.dispatch_queue;
 import confector.core.execution_dispatcher : defaultPoolQueue;
 import confector.server.scheduler_callback : schedulerCallback;
+import confector.core.work_orders : completeExecution;
 
 import std.format : format;
 import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
-URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQueue queue = null, BuildCoordinator coordinator = null, StateStores stores = null, CapacityBroker capacityBroker = null)
+/**
+ * Why the routes that start builds fail: starting a build waits for request intake (bead
+ * confector-z7z.23.7), the first part of the chain path to accept a request. The legacy build
+ * coordinator that used to start builds was deleted (bead confector-z7z.23.10).
+ */
+enum string buildsNotImplemented = "Starting builds is not implemented until request intake (bead confector-z7z.23.7)";
+
+URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQueue queue = null, StateStores stores = null, CapacityBroker capacityBroker = null)
 {
     import std.algorithm.searching : startsWith;
     auto router = new URLRouter();
@@ -65,6 +72,27 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         }
     }
 
+    // The routes that start builds fail loudly until request intake lands; see
+    // buildsNotImplemented.
+    void writeBuildsNotImplemented(HTTPServerResponse res)
+    {
+        res.statusCode = HTTPStatus.notImplemented;
+        Json err = Json.emptyObject;
+        err["error"] = Json(buildsNotImplemented);
+        res.writeJsonBody(err);
+    }
+
+    // The routes that read or write executions need the state stores.
+    bool requireStores(HTTPServerResponse res)
+    {
+        if (stores !is null) return true;
+        res.statusCode = HTTPStatus.internalServerError;
+        Json err = Json.emptyObject;
+        err["error"] = Json("This route needs the state stores, which are not configured");
+        res.writeJsonBody(err);
+        return false;
+    }
+
     // Dispatch queue endpoints, for workers that receive work through the control plane. The
     // dispatch queue is internal delivery only; it is never listed or counted for display.
     if (queue !is null)
@@ -110,14 +138,6 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
                     Json leases = Json.emptyArray;
                     foreach (ref item; received)
                     {
-                        // Mark the task running in the build that dispatched it
-                        TaskStatus status;
-                        const order = item.workOrder;
-                        if (order.buildId.length > 0 && stores.legacyBuilds.getTaskStatus(order.buildId, order.taskId, status)
-                            && status == TaskStatus.queued)
-                        {
-                            stores.legacyBuilds.setTaskStatus(order.buildId, order.taskId, TaskStatus.running);
-                        }
                         Json lease = Json.emptyObject;
                         lease["receipt"] = Json(item.receipt);
                         lease["receive_count"] = Json(item.receiveCount);
@@ -199,410 +219,148 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         });
     }
 
-    // Task Execution Query and Log Endpoints
-    getRoute("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+    // The execution routes answer with a status that tells a worker what to do: 400 for a
+    // malformed request, 404 for an unknown execution, 409 for a report that came too late (the
+    // execution already finished), 422 for a completion that can never be recorded as reported,
+    // and 500 for anything else (a store failure), which the worker may retry. A worker
+    // acknowledges its work order on 409 and 422, since running it again would be rejected again.
+    void writeError(HTTPServerResponse res, HTTPStatus status, string message)
+    {
+        res.statusCode = status;
+        Json err = Json.emptyObject;
+        err["error"] = Json(message);
+        res.writeJsonBody(err);
+    }
+
+    // An execution's log, as its worker streams it (`ExecutionLogStore`). Lines are appended only
+    // while the execution is active: the worker sends its last lines before its completion. (A
+    // completion landing between the check and the append can let one batch in after it.) A
+    // finished execution's log stays readable.
+    getRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        string executionId = req.params["execution_id"];
         try
         {
-            string statusFilter = req.query.get("status", "");
-            string projectFilter = req.query.get("project_id", "");
-            string limitStr = req.query.get("limit", "50");
-            size_t limit = 50;
-            try { import std.conv : to; limit = limitStr.to!size_t; } catch (Exception) {}
-
-            auto tasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(limit, statusFilter, projectFilter) : [];
-            res.writeJsonBody(tasks);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    getRoute("/builds/:build_id/tasks/:task_id", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string buildId = req.params["build_id"];
-            string taskId = req.params["task_id"];
-
-            TaskExecutionRecord record;
-            if (stores !is null && stores.legacyBuilds.getTaskExecution(buildId, taskId, record))
+            if (!requireStores(res)) return;
+            if (stores.executions.get(executionId).isNull)
             {
-                res.writeJsonBody(record);
+                writeError(res, HTTPStatus.notFound, format("Execution '%s' does not exist", executionId));
+                return;
             }
-            else
-            {
-                res.statusCode = HTTPStatus.notFound;
-                Json err = Json.emptyObject;
-                err["error"] = Json(format("Task execution not found for build '%s', task '%s'", buildId, taskId));
-                res.writeJsonBody(err);
-            }
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    getRoute("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string buildId = req.params["build_id"];
-            string taskId = req.params["task_id"];
-
-            string[] logs = stores !is null ? stores.logs.getTaskLogs(buildId, taskId) : [];
             Json resp = Json.emptyObject;
-            resp["build_id"] = Json(buildId);
-            resp["task_id"] = Json(taskId);
-            resp["logs"] = serializeToJson(logs);
+            resp["execution_id"] = Json(executionId);
+            resp["logs"] = serializeToJson(stores.logs.read(executionId));
             res.writeJsonBody(resp);
         }
         catch (Exception e)
         {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
+            writeError(res, HTTPStatus.internalServerError, format("Could not read the log of execution '%s': %s", executionId, e.msg));
+        }
+    });
+
+    postRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        import confector.core.build_stores : ExecutionStore;
+
+        string executionId = req.params["execution_id"];
+        string[] lines;
+        try
+        {
+            Json bodyJson = req.json;
+            if (bodyJson.type != Json.Type.object || "lines" !in bodyJson || bodyJson["lines"].type != Json.Type.array)
+            {
+                writeError(res, HTTPStatus.badRequest, "A log upload needs a 'lines' array");
+                return;
+            }
+            lines = deserializeJson!(string[])(bodyJson["lines"]);
+        }
+        catch (Exception e)
+        {
+            writeError(res, HTTPStatus.badRequest, format("Malformed log upload for execution '%s': %s", executionId, e.msg));
+            return;
+        }
+        try
+        {
+            if (!requireStores(res)) return;
+            auto execution = stores.executions.get(executionId);
+            if (execution.isNull)
+            {
+                writeError(res, HTTPStatus.notFound, format("Execution '%s' does not exist; its log lines are rejected", executionId));
+                return;
+            }
+            if (!ExecutionStore.isActive(execution.get.status))
+            {
+                writeError(res, HTTPStatus.conflict, format("Execution '%s' already finished (%s); its log lines are rejected",
+                    executionId, execution.get.status));
+                return;
+            }
+            foreach (line; lines)
+            {
+                stores.logs.append(executionId, line);
+            }
+
+            Json resp = Json.emptyObject;
+            resp["status"] = Json("ok");
+            resp["execution_id"] = Json(executionId);
+            resp["appended"] = Json(lines.length);
+            res.writeJsonBody(resp);
+        }
+        catch (Exception e)
+        {
+            writeError(res, HTTPStatus.internalServerError, format("Could not append to the log of execution '%s': %s", executionId, e.msg));
         }
     });
 
     // A worker's completion of an execution. It names the execution only: the fingerprint and
     // task come from the execution record (design record: bead confector-z7z.2), and anything
-    // that does not match it is rejected
+    // that does not match it is rejected. Until the fingerprint ledger lands (beads
+    // confector-z7z.49.x) a completion only finishes the execution and releases its claim; see
+    // confector.core.work_orders.completeExecution. The worker acknowledges its own work order.
     postRoute("/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        import confector.core.work_orders : InvalidCompletionException, StaleCompletionException, UnknownExecutionException;
+
+        string executionId = req.params["execution_id"];
+        void reject(HTTPStatus status, string message)
+        {
+            logWarn("[api] Rejected the completion of execution '%s' (HTTP %d): %s", executionId, cast(int) status, message);
+            writeError(res, status, message);
+        }
+
+        TaskExecutionResult result;
+        try result = deserializeJson!TaskExecutionResult(req.json);
+        catch (Exception e)
+        {
+            reject(HTTPStatus.badRequest, format("Malformed completion: %s", e.msg));
+            return;
+        }
         try
         {
-            string executionId = req.params["execution_id"];
-            if (coordinator is null)
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build coordinator is required to record completions");
-                res.writeJsonBody(err);
-                return;
-            }
-            TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
-            if (result.receiptHandle.length == 0 && "receipt_handle" in req.query)
-            {
-                result.receiptHandle = req.query["receipt_handle"];
-            }
-            coordinator.onExecutionCompleted(executionId, result);
+            if (!requireStores(res)) return;
+            const finished = completeExecution(stores, executionId, result);
+            logInfo("[api] Execution '%s' (task '%s', fingerprint %s) finished %s (exit code %d, %d ms)",
+                executionId, finished.taskId, finished.fingerprint, finished.status, finished.exitCode, result.durationMs);
 
             Json resp = Json.emptyObject;
             resp["status"] = Json("recorded");
             resp["execution_id"] = Json(executionId);
             res.writeJsonBody(resp);
         }
+        catch (StaleCompletionException e) reject(HTTPStatus.conflict, e.msg);
+        catch (UnknownExecutionException e) reject(HTTPStatus.notFound, e.msg);
+        catch (InvalidCompletionException e) reject(HTTPStatus.unprocessableEntity, e.msg);
         catch (Exception e)
         {
-            logWarn("[api] Rejected the completion of execution '%s': %s", req.params.get("execution_id", ""), e.msg);
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
+            logError("[api] Could not record the completion of execution '%s': %s", executionId, e.msg);
+            writeError(res, HTTPStatus.internalServerError, format("Could not record the completion of execution '%s': %s", executionId, e.msg));
         }
     });
 
-    postRoute("/builds/:build_id/tasks/:task_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string buildId = req.params["build_id"];
-            string taskId = req.params["task_id"];
-            Json bodyJson = req.json;
-            string[] lines;
-            if ("lines" in bodyJson && bodyJson["lines"].type == Json.Type.array)
-            {
-                lines = deserializeJson!(string[])(bodyJson["lines"]);
-            }
-            else if ("logs" in bodyJson && bodyJson["logs"].type == Json.Type.array)
-            {
-                lines = deserializeJson!(string[])(bodyJson["logs"]);
-            }
-            else if ("line" in bodyJson && bodyJson["line"].type == Json.Type.string)
-            {
-                lines = [bodyJson["line"].get!string];
-            }
-
-            if (stores !is null)
-            {
-                foreach (line; lines)
-                {
-                    stores.logs.appendBuildLog(buildId, format("[%s] %s", taskId, line));
-                    stores.logs.appendTaskLog(buildId, taskId, line);
-                }
-            }
-
-            Json resp = Json.emptyObject;
-            resp["status"] = Json("ok");
-            resp["build_id"] = Json(buildId);
-            resp["task_id"] = Json(taskId);
-            resp["appended"] = Json(lines.length);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    // Run Project via the queue-backed coordinator (JSON body)
+    // Starting a build of a project fails loudly until request intake lands (see
+    // buildsNotImplemented). The scheduler calls the second route for cron trigger rules.
     postRoute("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string projectId = req.json["project_id"].get!string;
-            auto pTarget = "target_task_id" in req.json;
-            auto pForce = "force" in req.json;
-            auto pWorkspace = "workspace_dir" in req.json;
-            string targetTaskId = pTarget !is null ? pTarget.get!string : "";
-            bool force = pForce !is null ? pForce.get!bool : false;
-            string workspaceDir = pWorkspace !is null ? pWorkspace.get!string : "";
-
-            ProjectRecord proj;
-            if (stores is null || !stores.projects.get(projectId).tryValue(proj))
-            {
-                res.statusCode = HTTPStatus.notFound;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Project not found: " ~ projectId);
-                res.writeJsonBody(err);
-                return;
-            }
-
-            if (coordinator is null)
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build coordinator is required for task execution");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            string buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, force, "api", workspaceDir);
-            Json resp = Json.emptyObject;
-            resp["build_id"] = Json(buildId);
-            resp["status"] = Json("queued");
-            resp["project_id"] = Json(projectId);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
+        writeBuildsNotImplemented(res);
     });
 
-    // Run Project by ID (path parameter) — used by scheduler for cron triggers
     schedulerRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string projectId = req.params["id"];
-            ProjectRecord proj;
-            if (stores is null || !stores.projects.get(projectId).tryValue(proj))
-            {
-                res.statusCode = HTTPStatus.notFound;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Project not found: " ~ projectId);
-                res.writeJsonBody(err);
-                return;
-            }
-
-            if (coordinator is null)
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build coordinator is required for task execution");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            string buildId = coordinator.startBuild(proj, null, false, "cron", "");
-            Json resp = Json.emptyObject;
-            resp["build_id"] = Json(buildId);
-            resp["status"] = Json("queued");
-            resp["project_id"] = Json(projectId);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    // Task Graph Trigger & Execution endpoint
-    postRoute("/tasks/execute", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            Json bodyJson = req.json;
-            TaskNode[] tasks = deserializeJson!(TaskNode[])(bodyJson["tasks"]);
-            TriggerEvent event = deserializeJson!TriggerEvent(bodyJson["event"]);
-            string workspaceDir = bodyJson["workspace_dir"].get!string;
-            string buildId = "build_id" in bodyJson ? bodyJson["build_id"].get!string : "build_" ~ Clock.currTime.toISOString();
-            string projectId = "project_id" in bodyJson ? bodyJson["project_id"].get!string : "";
-            string projectName = "project_name" in bodyJson ? bodyJson["project_name"].get!string : "default";
-
-            // Resolve triggering
-            string[] matchingTasks = TriggerMatcher.findMatchingTasks(tasks, event);
-            if (matchingTasks.length == 0)
-            {
-                Json noop = Json.emptyObject;
-                noop["build_id"] = Json(buildId);
-                noop["message"] = Json("No tasks matched trigger event criteria");
-                noop["executed"] = Json.emptyArray;
-                res.writeJsonBody(noop);
-                return;
-            }
-
-            // Resolve subgraph and topological sort
-            auto fullGraph = new TaskGraph(tasks);
-            string[] targetSubgraphs;
-            foreach (taskId; matchingTasks)
-            {
-                auto sub = fullGraph.resolveSubgraph(taskId);
-                foreach (s; sub)
-                {
-                    bool already = false;
-                    foreach (t; targetSubgraphs) if (t == s) { already = true; break; }
-                    if (!already) targetSubgraphs ~= s;
-                }
-            }
-
-            // Create sub-tasks list
-            TaskNode[] subTasks;
-            foreach (task; tasks)
-            {
-                foreach (targetId; targetSubgraphs)
-                {
-                    if (task.id == targetId)
-                    {
-                        subTasks ~= task;
-                        break;
-                    }
-                }
-            }
-
-            if (coordinator is null)
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build coordinator is required for task execution");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            ProjectRecord triggerProject;
-            triggerProject.id = projectId;
-            triggerProject.name = projectName;
-            triggerProject.tasks = subTasks;
-            string queuedBuildId = coordinator.startBuild(
-                triggerProject,
-                null,
-                event.force,
-                "trigger",
-                workspaceDir);
-
-            Json result = Json.emptyObject;
-            result["build_id"] = Json(queuedBuildId);
-            result["status"] = Json("queued");
-            result["task_ids"] = serializeToJson(targetSubgraphs);
-            res.writeJsonBody(result);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    // Builds API
-    getRoute("/builds", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            if (stores is null)
-            {
-                res.writeJsonBody(Json.emptyArray);
-                return;
-            }
-            auto builds = stores.legacyBuilds.listBuilds(50);
-            res.writeJsonBody(builds);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    getRoute("/builds/details", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string buildId = req.query.get("id", "");
-            if (stores is null)
-            {
-                res.statusCode = HTTPStatus.notFound;
-                res.writeJsonBody(["error": "No state stores configured"]);
-                return;
-            }
-
-            BuildRecord buildRec;
-            if (stores.legacyBuilds.getBuild(buildId, buildRec))
-            {
-                auto taskRecs = stores.legacyBuilds.getTaskExecutionsForBuild(buildId);
-                foreach (rec; taskRecs)
-                {
-                    buildRec.taskRecords[rec.taskId] = rec;
-                }
-                res.writeJsonBody(buildRec);
-            }
-            else
-            {
-                res.statusCode = HTTPStatus.notFound;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build not found: " ~ buildId);
-                res.writeJsonBody(err);
-            }
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    getRoute("/builds/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string buildId = req.query.get("id", "");
-            string[] logs = stores !is null ? stores.logs.getBuildLogs(buildId) : [];
-            Json resp = Json.emptyObject;
-            resp["build_id"] = Json(buildId);
-            resp["logs"] = serializeToJson(logs);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
+        writeBuildsNotImplemented(res);
     });
 
     // Trigger Rules API
@@ -940,123 +698,6 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         }
     });
 
-    // Project Task Graph Execution endpoint
-    postRoute("/projects/:id/execute", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string projId = req.params["id"];
-            ProjectRecord proj;
-            if (stores is null || !stores.projects.get(projId).tryValue(proj))
-            {
-                res.statusCode = HTTPStatus.notFound;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Project not found: " ~ projId);
-                res.writeJsonBody(err);
-                return;
-            }
-
-            Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
-            string targetTaskId = "";
-            bool force = false;
-            string workspaceDir = ".";
-
-            if ("target_task_id" in bodyJson && bodyJson["target_task_id"].type == Json.Type.string)
-            {
-                targetTaskId = bodyJson["target_task_id"].get!string;
-            }
-            if ("force" in bodyJson && bodyJson["force"].type == Json.Type.bool_)
-            {
-                force = bodyJson["force"].get!bool;
-            }
-            if ("workspace_dir" in bodyJson && bodyJson["workspace_dir"].type == Json.Type.string)
-            {
-                workspaceDir = bodyJson["workspace_dir"].get!string;
-            }
-
-            if (coordinator is null)
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build coordinator is required for task execution");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            string buildId = coordinator.startBuild(
-                proj,
-                targetTaskId.length > 0 ? targetTaskId : null,
-                force,
-                "api",
-                workspaceDir);
-            Json response = Json.emptyObject;
-            response["build_id"] = Json(buildId);
-            response["status"] = Json("queued");
-            response["project_id"] = Json(proj.id);
-            res.writeJsonBody(response);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    postRoute("/projects/:id/tasks/:taskId/execute", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string projId = req.params["id"];
-            string targetTaskId = req.params["taskId"];
-            ProjectRecord proj;
-            if (stores is null || !stores.projects.get(projId).tryValue(proj))
-            {
-                res.statusCode = HTTPStatus.notFound;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Project not found: " ~ projId);
-                res.writeJsonBody(err);
-                return;
-            }
-
-            Json bodyJson = req.json.type == Json.Type.object ? req.json : Json.emptyObject;
-            bool force = false;
-            string workspaceDir = ".";
-
-            if ("force" in bodyJson && bodyJson["force"].type == Json.Type.bool_)
-            {
-                force = bodyJson["force"].get!bool;
-            }
-            if ("workspace_dir" in bodyJson && bodyJson["workspace_dir"].type == Json.Type.string)
-            {
-                workspaceDir = bodyJson["workspace_dir"].get!string;
-            }
-
-            if (coordinator is null)
-            {
-                res.statusCode = HTTPStatus.serviceUnavailable;
-                Json err = Json.emptyObject;
-                err["error"] = Json("Build coordinator is required for task execution");
-                res.writeJsonBody(err);
-                return;
-            }
-
-            string buildId = coordinator.startBuild(proj, targetTaskId, force, "api", workspaceDir);
-            Json response = Json.emptyObject;
-            response["build_id"] = Json(buildId);
-            response["status"] = Json("queued");
-            response["project_id"] = Json(proj.id);
-            response["task_id"] = Json(targetTaskId);
-            res.writeJsonBody(response);
-        }
-        catch (Exception e)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
     // Generic VCS-agnostic webhook ingestion endpoint
     postRoute("/webhooks", (HTTPServerRequest req, HTTPServerResponse res) {
         try
@@ -1381,18 +1022,19 @@ unittest
     auto router = apiRouter(engine, "test-scheduler-secret", queue);
     assert(router !is null);
 
-    // A scheduler callback without the scheduler secret is refused before the project is looked up
+    // A scheduler callback without the scheduler secret is refused before its handler runs
     auto unauthReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
     auto unauthRes = createTestHTTPServerResponse();
     router.handleRequest(unauthReq, unauthRes);
     assert(unauthRes.statusCode == HTTPStatus.unauthorized);
 
-    // With the secret the callback reaches its handler (no stores are wired, so the project is not found)
+    // With the secret the callback reaches its handler, which fails loudly: starting builds waits
+    // for request intake
     auto authReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
     authReq.headers["X-Confector-Scheduler-Secret"] = "test-scheduler-secret";
     auto authRes = createTestHTTPServerResponse();
     router.handleRequest(authReq, authRes);
-    assert(authRes.statusCode == HTTPStatus.notFound);
+    assert(authRes.statusCode == HTTPStatus.notImplemented);
 
     // Test Trigger Rules state via repo
     TriggerRuleRecord rule;
@@ -1404,19 +1046,6 @@ unittest
 
     assert(stores.triggerRules.list().length == 1);
     assert(stores.triggerRules.list()[0].name == "CI Build");
-
-    // Test Build record tracking
-    BuildRecord bRec;
-    bRec.buildId = "build_test_1";
-    bRec.status = "succeeded";
-    bRec.startedAt = "2026-10-15T14:02:00Z";
-    stores.legacyBuilds.createBuild(bRec);
-    stores.logs.appendBuildLog("build_test_1", "Test log line");
-
-    BuildRecord fetched;
-    assert(stores.legacyBuilds.getBuild("build_test_1", fetched));
-    assert(fetched.status == "succeeded");
-    assert(stores.logs.getBuildLogs("build_test_1").length == 1);
 
     // Test Projects and Tasks via repo
     ProjectRecord proj;
@@ -1435,52 +1064,114 @@ unittest
     assert(fetchedProj.tasks.length == 1);
     assert(fetchedProj.tasks[0].id == "n1");
 
-    // Test BuildCoordinator integration with apiRouter
-    auto coordinator = new BuildCoordinator(storage, stores, queue);
-    auto routerWithCoord = apiRouter(engine, "test-scheduler-secret", queue, coordinator);
-    assert(routerWithCoord !is null);
-
-    string bldId = coordinator.startBuild(proj, null, true);
-    assert(bldId.length > 0);
-    auto received = receiveWorkOrders(stores, queue, 10);
-    assert(received.length == 1);
-    assert(received[0].workOrder.taskId == "n1");
-    assert(received[0].workOrder.buildId == bldId);
-
-    // A worker's completion names its execution in the route. A fingerprint in the body is not
-    // part of the completion and cannot choose the cache key (bug confector-1oj): the result is
-    // cached under the execution's own fingerprint
+    // Starting a build fails loudly with the reason, through the API as through the scheduler
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryStream;
 
-    int postCompletion(string executionId, string body)
+    auto routerWithStores = apiRouter(engine, "test-scheduler-secret", queue, stores);
+
+    int post(string path, string body)
     {
         InetHeaderMap headers;
         headers["Content-Type"] = "application/json";
-        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ executionId ~ "/complete"),
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path),
             HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) body.dup, false));
         auto res = createTestHTTPServerResponse();
-        routerWithCoord.handleRequest(req, res);
+        routerWithStores.handleRequest(req, res);
         return res.statusCode;
     }
 
-    const order = received[0].workOrder;
-    const completion = `{"build_id": "` ~ bldId ~ `", "task_id": "n1", "status": "succeeded", "exit_code": 0, "duration_ms": 85,`
+    int get(string path)
+    {
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path), HTTPMethod.GET);
+        auto res = createTestHTTPServerResponse();
+        routerWithStores.handleRequest(req, res);
+        return res.statusCode;
+    }
+
+    assert(post("/projects/run", `{"project_id": "proj_api_1"}`) == HTTPStatus.notImplemented);
+
+    // An execution dispatched on the chain path, received by a worker
+    import confector.core.execution_dispatcher : ExecutionDispatcher, PlannedExecution, defaultPoolQueue;
+    import confector.core.work_orders : receiveWork;
+    import core.time : hours;
+
+    PlannedExecution planned;
+    planned.projectId = "proj_api_1";
+    planned.taskId = "n1";
+    planned.fingerprint = "fp_n1";
+    planned.definition = node;
+    const executionId = new ExecutionDispatcher(stores, queue).dispatch([planned])[0].executionId;
+    auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "test-worker");
+    assert(received.length == 1 && received[0].workOrder.executionId == executionId);
+
+    // The worker streams its log lines to the execution's log; lines for an execution that does
+    // not exist, or without a lines array, are rejected
+    assert(post("/executions/" ~ executionId ~ "/logs", `{"lines": ["compiling", "linking"]}`) == HTTPStatus.ok);
+    assert(stores.logs.read(executionId) == ["compiling", "linking"]);
+    assert(get("/executions/" ~ executionId ~ "/logs") == HTTPStatus.ok);
+    assert(post("/executions/exe_unknown/logs", `{"lines": ["lost"]}`) == HTTPStatus.notFound);
+    assert(get("/executions/exe_unknown/logs") == HTTPStatus.notFound);
+    assert(post("/executions/" ~ executionId ~ "/logs", `{"line": "old shape"}`) == HTTPStatus.badRequest);
+    assert(post("/executions/" ~ executionId ~ "/logs", `not json`) == HTTPStatus.badRequest);
+    assert(stores.logs.read("exe_unknown").length == 0 && stores.logs.read(executionId).length == 2);
+
+    // A worker's completion names its execution in the route. An unknown execution, a cache hit
+    // or a completion naming another task is rejected and records nothing. A fingerprint in the
+    // body is not part of the completion and cannot choose the cache key (bug confector-1oj)
+    const completion = `{"task_id": "n1", "status": "succeeded", "exit_code": 0, "duration_ms": 85,`
         ~ ` "fingerprint": "fp_chosen_by_the_worker"}`;
-    assert(postCompletion("exe_unknown", completion) == HTTPStatus.badRequest, "An unknown execution is rejected");
-    assert(stores.executions.get(order.executionId).get.status == ExecutionStatus.running);
-    assert(postCompletion(order.executionId, completion) == HTTPStatus.ok);
-    CachedResult cached;
-    assert(stores.resultCache.get(order.fingerprint, cached));
-    assert(!stores.resultCache.get("fp_chosen_by_the_worker", cached));
-    assert(postCompletion(order.executionId, completion) == HTTPStatus.badRequest, "A duplicate completion is rejected");
+    assert(post("/executions/exe_unknown/complete", completion) == HTTPStatus.notFound, "An unknown execution is rejected");
+    assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1", "status": "cached"}`) == HTTPStatus.unprocessableEntity);
+    assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1", "status": "running"}`) == HTTPStatus.unprocessableEntity);
+    assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n2", "status": "succeeded"}`) == HTTPStatus.unprocessableEntity);
+    assert(post("/executions/" ~ executionId ~ "/complete",
+        `{"task_id": "n1", "status": "succeeded", "produced_artifacts": [{"artifact_id": "a", "task_fingerprint": "fp_other"}]}`)
+        == HTTPStatus.unprocessableEntity, "Artifacts under another fingerprint are rejected for good");
+    assert(post("/executions/" ~ executionId ~ "/complete", `{"status": `) == HTTPStatus.badRequest, "Malformed JSON");
+    assert(stores.executions.get(executionId).get.status == ExecutionStatus.running);
+    assert(stores.claims.get("fp_n1").get.executionId == executionId);
 
-    BuildRecord bldDetails;
-    assert(stores.legacyBuilds.getBuild(bldId, bldDetails));
-    assert(bldDetails.status == "succeeded");
+    // The completion finishes the execution under its own fingerprint and releases the claim
+    assert(post("/executions/" ~ executionId ~ "/complete", completion) == HTTPStatus.ok);
+    const finished = stores.executions.get(executionId).get;
+    assert(finished.status == ExecutionStatus.succeeded && finished.fingerprint == "fp_n1");
+    assert(stores.claims.get("fp_n1").get.executionId.length == 0);
+    assert(stores.executions.get("fp_chosen_by_the_worker").isNull);
+    assert(post("/executions/" ~ executionId ~ "/complete", completion) == HTTPStatus.conflict, "A duplicate completion is rejected");
+    assert(stores.executions.get(executionId).get.status == ExecutionStatus.succeeded);
 
-    TaskExecutionRecord taskRec;
-    assert(stores.legacyBuilds.getTaskExecution(bldId, "n1", taskRec));
-    assert(taskRec.status == "succeeded");
-    assert(taskRec.durationMs == 85);
+    // A finished execution's log takes no more lines but stays readable
+    assert(post("/executions/" ~ executionId ~ "/logs", `{"lines": ["too late"]}`) == HTTPStatus.conflict);
+    assert(stores.logs.read(executionId) == ["compiling", "linking"]);
+    assert(get("/executions/" ~ executionId ~ "/logs") == HTTPStatus.ok);
+
+    // A store failure is a server error, not a rejection: the worker keeps its lease and the
+    // work order is delivered again
+    import confector.testing.memory_document_store : InterleavingDocumentStore;
+    auto failingDocuments = new InterleavingDocumentStore(new InMemoryDocumentStore());
+    auto failingStores = new StateStores(failingDocuments);
+    PlannedExecution another = planned;
+    another.fingerprint = "fp_n1_again";
+    const anotherId = new ExecutionDispatcher(failingStores, queue).dispatch([another])[0].executionId;
+    failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
+    auto failingRouter = apiRouter(engine, "test-scheduler-secret", queue, failingStores);
+    InetHeaderMap failingHeaders;
+    failingHeaders["Content-Type"] = "application/json";
+    auto failingReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ anotherId ~ "/complete"),
+        HTTPMethod.POST, failingHeaders, createMemoryStream(cast(ubyte[]) completion.dup, false));
+    auto failingRes = createTestHTTPServerResponse();
+    failingRouter.handleRequest(failingReq, failingRes);
+    assert(failingRes.statusCode == HTTPStatus.internalServerError);
+    failingDocuments.beforeNextWrite = null;
+    assert(failingStores.executions.get(anotherId).get.status == ExecutionStatus.queued);
+
+    // Without the state stores the execution routes fail loudly rather than drop the report
+    InetHeaderMap headers;
+    headers["Content-Type"] = "application/json";
+    auto noStoresReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ executionId ~ "/complete"),
+        HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) completion.dup, false));
+    auto noStoresRes = createTestHTTPServerResponse();
+    router.handleRequest(noStoresReq, noStoresRes);
+    assert(noStoresRes.statusCode == HTTPStatus.internalServerError);
 }

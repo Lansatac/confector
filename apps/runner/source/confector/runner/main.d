@@ -158,7 +158,12 @@ int handleRun(string[] args)
     }
     TaskNode task = order.taskNode;
     if (task.id.length == 0) task.id = order.taskId;
-    string buildId = order.buildId.length > 0 ? order.buildId : "single_run";
+    if (order.executionId.length == 0)
+    {
+        stderr.writeln("Error: the work order names no execution; the control plane dispatches every work order for an execution");
+        return 1;
+    }
+    string buildId = order.executionId;
 
     if (!exists(workspaceDir))
     {

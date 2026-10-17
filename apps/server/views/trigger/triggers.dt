@@ -31,10 +31,6 @@ block maincontent
             label(for="criteria") Matching Criteria:
             input.form-control#criteria(type="text", name="criteria", placeholder="e.g. main, v*.*, 0 0 * * *")
 
-          div.form-group.checkbox-group
-            input#force_execution(type="checkbox", name="force_execution", value="true")
-            label(for="force_execution") Force Re-execution (Ignore Cached Artifacts)
-
           button.btn.btn-primary(type="submit") Save Trigger Rule
 
       div.card
@@ -46,8 +42,7 @@ block maincontent
           |
           | {
           |   "branch": "main",
-          |   "target_task_id": "deploy",
-          |   "force": false
+          |   "target_task_id": "deploy"
           | }
         p When a trigger matches a target node, ancestors are verified in cache and only invalid or dependent nodes run.
 
@@ -66,7 +61,6 @@ block maincontent
             th Target Node
             th Type
             th Criteria
-            th Force Cache Bypass
             th Created
             th Actions
         tbody
@@ -80,7 +74,6 @@ block maincontent
                 span.badge.badge-info #{t.triggerType}
               td
                 code #{t.criteria}
-              td #{t.forceExecution ? "Yes" : "No"}
               td #{t.createdAt}
               td
                 form(action="/triggers/delete", method="POST", style="display:inline;")

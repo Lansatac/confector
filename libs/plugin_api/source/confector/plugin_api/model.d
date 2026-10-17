@@ -43,16 +43,14 @@ struct TriggerRule
     @optional string endpoint;
     @optional @asName("cron_schedule") string cronSchedule;
     @optional string[string] parameters;
-    @optional @asName("force_execution") bool forceExecution = false;
 
-    this(TriggerType type, string[] branches = null, string[] tags = null, string endpoint = null, string cronSchedule = null, bool forceExecution = false) pure nothrow @safe
+    this(TriggerType type, string[] branches = null, string[] tags = null, string endpoint = null, string cronSchedule = null) pure nothrow @safe
     {
         this.type = type;
         this.branches = branches;
         this.tags = tags;
         this.endpoint = endpoint;
         this.cronSchedule = cronSchedule;
-        this.forceExecution = forceExecution;
     }
 }
 
@@ -66,7 +64,6 @@ struct TriggerEvent
     @optional string tag;
     @optional string endpoint;
     @optional string[string] parameters;
-    @optional bool force = false;
     @optional @asName("target_task_id") string targetTaskId;
 }
 
@@ -513,42 +510,6 @@ interface ArtifactStorage
 import vibe.data.json;
 
 /**
- * Persisted record of an individual task execution within a build.
- */
-struct TaskExecutionRecord
-{
-    @optional @asName("task_id") string taskId;
-    @optional @asName("build_id") string buildId;
-    @optional @asName("project_id") string projectId;
-    @optional @asName("project_name") string projectName;
-    @optional @asName("status") string status = "pending"; // pending, queued, running, succeeded, failed, cached, skipped, cancelled
-    @optional @asName("fingerprint") string fingerprint;
-    @optional @asName("exit_code") int exitCode = 0;
-    @optional @asName("error_message") string errorMessage;
-    @optional @asName("started_at") string startedAt;
-    @optional @asName("finished_at") string finishedAt;
-    @optional @asName("duration_ms") ulong durationMs = 0;
-    @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
-    @optional @asName("upstream_artifact_hashes") string[string] upstreamArtifactHashes;
-    /// The task definition the execution ran with, and its hash (`computeDefinitionHash`), so a
-    /// result that predates a configuration change can be recognized. Not part of the fingerprint.
-    @optional @asName("definition") TaskNode definition;
-    @optional @asName("definition_hash") string definitionHash;
-}
-
-/**
- * What a cache hit reuses: the artifacts a successful execution produced and the task
- * definition (with its hash) that execution ran with, so a result resolved from the cache
- * still shows the configuration it was built with.
- */
-struct CachedResult
-{
-    @optional ArtifactMetadata[] artifacts;
-    @optional @asName("definition") TaskNode definition;
-    @optional @asName("definition_hash") string definitionHash;
-}
-
-/**
  * Result of a single task execution: what a worker reports when it completes an execution.
  *
  * A completion names its execution by id (the worker posts it to
@@ -561,27 +522,14 @@ struct TaskExecutionResult
     /// The task that ran, for logs. The control plane takes the task from the execution record
     /// and rejects a completion naming a different one.
     @optional @asName("task_id") string taskId;
-    /// The legacy build that dispatched the work order (`WorkOrder.buildId`), echoed as routing
-    /// for the BuildCoordinator; removed with it (bead confector-z7z.23.10).
-    @optional @asName("build_id") string buildId;
     @optional @asName("status") TaskStatus status = TaskStatus.pending;
     @optional @asName("exit_code") int exitCode = 0;
+    /// The task's log lines. A worker streams them to the execution's log as it runs
+    /// (`/executions/<execution id>/logs`); a completion does not record them again.
     @optional @asName("logs") string[] logs;
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("duration_ms") ulong durationMs = 0;
-    @optional @asName("receipt_handle") string receiptHandle;
-}
-
-/**
- * Result of a task graph or build execution.
- */
-struct GraphExecutionResult
-{
-    string buildId;
-    bool success;
-    TaskExecutionResult[string] taskResults;
-    string[] executedOrder;
 }
 
 /**
@@ -599,37 +547,6 @@ struct ChainTask
     /// Resolved repository and value inputs, sorted by name. Task output inputs are not
     /// stored: they pin to upstream fingerprints, which are computed from the chain.
     @optional @asName("resolved_inputs") ResolvedInput[] resolvedInputs;
-}
-
-/**
- * Persisted record of a build execution, in the build model that BuildRequest, BuildChain,
- * TaskExecution and FingerprintClaim replace. It is removed with the BuildCoordinator (bead
- * confector-z7z.23.10).
- *
- * A build record is both a request and the chain it runs on: `chainTasks` is the chain
- * snapshot and `chainId` names the build that created it. A later request to build another
- * task of the same chain is a new record carrying the same `chainId` and `chainTasks`, never a
- * re-resolution.
- */
-struct BuildRecord
-{
-    @optional @asName("build_id") string buildId;
-    /// The build that created this build's chain; equal to `buildId` for that build.
-    @optional @asName("chain_id") string chainId;
-    /// The chain snapshot: every task of the project DAG with its declared and resolved inputs.
-    @optional @asName("chain_tasks") ChainTask[] chainTasks;
-    @optional @asName("project_id") string projectId;
-    @optional @asName("project_name") string projectName = "default";
-    @optional @asName("status") string status = "pending"; // pending, queued, running, succeeded, failed, cached, cancelled
-    @optional @asName("trigger_source") string triggerSource = "manual";
-    @optional @asName("target_task_id") string targetTaskId;
-    @optional @asName("workspace_dir") string workspaceDir;
-    @optional @asName("started_at") string startedAt;
-    @optional @asName("finished_at") string finishedAt;
-    @optional @asName("duration_ms") ulong durationMs = 0;
-    @optional @asName("executed_tasks") string[] executedTasks;
-    @optional @asName("task_records") TaskExecutionRecord[string] taskRecords;
-    @optional @asName("error_message") string errorMessage;
 }
 
 // The build model (design records: beads confector-z7z.14, confector-z7z.15 and confector-z7z.2;
@@ -931,7 +848,6 @@ struct TriggerRuleRecord
     @optional @asName("target_task_id") string targetTaskId;
     @optional @asName("trigger_type") string triggerType; // manual, git_push, git_tag, webhook, cron
     @optional @asName("criteria") string criteria; // e.g. branch pattern, cron expression, webhook token
-    @optional @asName("force_execution") bool forceExecution = false;
     @optional @asName("enabled") bool enabled = true;
     @optional @asName("created_at") string createdAt;
 }
@@ -1049,7 +965,6 @@ struct WorkOrder
     /// The execution to run (`TaskExecution.id`). The worker's completion names it; a work order
     /// without one cannot be completed.
     @optional @asName("execution_id") string executionId;
-    @optional @asName("build_id") string buildId;
     @optional @asName("task_id") string taskId;
     /// The task definition to execute.
     @optional @asName("task_node") TaskNode taskNode;

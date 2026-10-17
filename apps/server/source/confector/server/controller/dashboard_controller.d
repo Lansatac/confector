@@ -6,13 +6,12 @@ import confector.core.model;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;
-import confector.core.input_resolution : InputResolutionException;
 import confector.core.plugin : PluginRegistry;
 import confector.core.system : BuildStepProvider;
 import confector.runner_core.engine;
-import confector.server.orchestrator.coordinator;
+import confector.server.controller.api_controller : buildsNotImplemented;
 
-import std.algorithm : filter, count, canFind;
+import std.algorithm : canFind;
 import std.datetime.systime : Clock;
 import std.format : format;
 import std.string : split, strip;
@@ -32,12 +31,6 @@ struct DashboardTaskViewModel
     string id;
     string name;
     string[] upstreamTasks;
-    string lastStatus;          // "succeeded", "cached", "failed", "running", "never_run"
-    string changeStatus;        // "up_to_date", "pending_changes", "never_run" (stubbed)
-    string lastFingerprint;
-    string lastStartedAt;
-    ulong lastDurationMs;
-    string lastBuildId;
 }
 
 // View model for collapsible project panel on dashboard
@@ -46,36 +39,6 @@ struct DashboardProjectViewModel
     ProjectRecord project;
     DashboardTaskViewModel[] tasks;
     ulong totalTasks;
-    ulong successfulTasks;
-    ulong failedTasks;
-}
-
-// View model for task execution history item
-struct TaskExecutionHistoryItem
-{
-    TaskExecutionRecord execution;
-    string buildId;
-    string projectName;
-}
-
-/**
- * Stubbed change detection helper function.
- * Evaluates whether a task was never run, has latest execution failures, or succeeded/cached.
- * Returns: "up_to_date", "pending_changes", or "never_run".
- */
-string computeStubTaskChangeStatus(const TaskNode task, const TaskExecutionRecord latestExec) pure nothrow @safe
-{
-    if (latestExec.buildId.length == 0 || latestExec.status.length == 0 || latestExec.status == "never_run")
-    {
-        return "never_run";
-    }
-
-    if (latestExec.status == "succeeded" || latestExec.status == "cached")
-    {
-        return "up_to_date";
-    }
-
-    return "pending_changes";
 }
 
 /**
@@ -358,7 +321,7 @@ unittest
     assert(formatStepIssues([checkout, bash, legacy], issues).canFind("Step 3"));
 }
 
-URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry registry = null, BuildCoordinator coordinator = null)
+URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry registry = null)
 {
     if (registry is null)
     {
@@ -419,18 +382,10 @@ URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry 
     // Home / Dashboard
     router.get("/", (HTTPServerRequest req, HTTPServerResponse res) {
         auto projects = stores !is null ? stores.projects.list() : [];
-        auto builds = stores !is null ? stores.legacyBuilds.listBuilds(10) : [];
-        auto recentTasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(10) : [];
-
-        ulong totalBuilds = builds.length;
-        ulong successfulBuilds = builds.filter!(b => b.status == "succeeded" || b.status == "cached").count;
-        ulong failedBuilds = builds.filter!(b => b.status == "failed").count;
 
         DashboardProjectViewModel[] dashboardProjects;
         ulong totalProjects = projects.length;
         ulong totalTasksAll = 0;
-        ulong successfulTasksAll = 0;
-        ulong failedTasksAll = 0;
 
         foreach (proj; projects)
         {
@@ -445,50 +400,13 @@ URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry 
                 tvm.id = task.id;
                 tvm.name = task.name.length > 0 ? task.name : task.id;
                 tvm.upstreamTasks = upstreamTaskIds(task);
-
-                TaskExecutionRecord latestExec;
-                if (stores !is null)
-                {
-                    auto execs = stores.legacyBuilds.listTaskExecutionsForTask(proj.id, task.id, 1);
-                    if (execs.length > 0)
-                    {
-                        latestExec = execs[0];
-                    }
-                }
-
-                if (latestExec.status.length > 0)
-                {
-                    tvm.lastStatus = latestExec.status;
-                    tvm.lastFingerprint = latestExec.fingerprint;
-                    tvm.lastStartedAt = latestExec.startedAt;
-                    tvm.lastDurationMs = latestExec.durationMs;
-                    tvm.lastBuildId = latestExec.buildId;
-                }
-                else
-                {
-                    tvm.lastStatus = "never_run";
-                }
-
-                tvm.changeStatus = computeStubTaskChangeStatus(task, latestExec);
-
-                if (tvm.lastStatus == "succeeded" || tvm.lastStatus == "cached")
-                {
-                    pvm.successfulTasks++;
-                    successfulTasksAll++;
-                }
-                else if (tvm.lastStatus == "failed")
-                {
-                    pvm.failedTasks++;
-                    failedTasksAll++;
-                }
-
                 pvm.tasks ~= tvm;
             }
 
             dashboardProjects ~= pvm;
         }
 
-        res.render!("dashboard/home.dt", dashboardProjects, builds, recentTasks, totalBuilds, successfulBuilds, failedBuilds, totalProjects, totalTasksAll, successfulTasksAll, failedTasksAll);
+        res.render!("dashboard/home.dt", dashboardProjects, totalProjects, totalTasksAll);
     });
 
     // Projects Management
@@ -930,70 +848,18 @@ URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry 
         res.redirect("/projects/details?id=" ~ projId);
     });
 
-    // Execute Project Task Graph. A build that cannot be started (for example an input that
-    // cannot be resolved) is reported on the error page rather than logged and ignored.
+    // Run a project, or a task and its upstream tasks. Not implemented until request intake
+    // (see buildsNotImplemented): the request fails loudly.
     router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        string projId = req.form.get("id", "");
-        if (projId.length == 0) projId = req.form.get("project_id", "");
-        string targetTaskId = req.form.get("target_task_id", "");
-        if (targetTaskId.length == 0) targetTaskId = req.form.get("taskId", "");
-        if (targetTaskId.length == 0) targetTaskId = req.form.get("task_id", "");
-
-        ProjectRecord proj;
-        if (stores is null || !stores.projects.get(projId).tryValue(proj))
-        {
-            throw new HTTPStatusException(HTTPStatus.notFound, format("Cannot run project '%s': it does not exist", projId));
-        }
-        if (coordinator is null)
-        {
-            throw new HTTPStatusException(HTTPStatus.internalServerError,
-                format("Cannot run project '%s': the build coordinator is not configured", proj.id));
-        }
-
-        string buildId;
-        try
-        {
-            buildId = coordinator.startBuild(proj, targetTaskId.length > 0 ? targetTaskId : null, false, "dashboard", ".");
-        }
-        catch (Exception e)
-        {
-            logError("Failed to start build of project '%s': %s", proj.id, e.msg);
-            throw new HTTPStatusException(
-                cast(InputResolutionException) e !is null ? HTTPStatus.badRequest : HTTPStatus.internalServerError,
-                format("Could not start a build of project '%s': %s", proj.id, e.msg));
-        }
-        res.redirect("/builds/details?id=" ~ buildId);
+        throw new HTTPStatusException(HTTPStatus.notImplemented, buildsNotImplemented);
     });
 
-    // Tasks List (Task-Centric View). Queued tasks will be shown by the build queue view (bead
-    // confector-z7z.31.21); the dispatch queue is never read for display.
-    router.get("/tasks/", (HTTPServerRequest req, HTTPServerResponse res) {
-        string statusFilter = req.query.get("status", "");
-        string projectFilter = req.query.get("project_id", "");
-        auto recentTasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(50, statusFilter, projectFilter) : [];
-        res.render!("task/tasks.dt", recentTasks, statusFilter, projectFilter);
-    });
-
-    router.get("/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
-        res.redirect("/tasks/");
-    });
-
-    // Task Details View (Static definition, configuration, steps, dependencies, and execution history)
+    // Task Details View (Static definition, configuration, steps and dependencies)
     router.get("/tasks/details", (HTTPServerRequest req, HTTPServerResponse res) {
-        string buildId = req.query.get("build_id", "");
-        if (buildId.length == 0) buildId = req.query.get("build", "");
         string projectId = req.query.get("project_id", "");
         if (projectId.length == 0) projectId = req.query.get("project", "");
         string taskId = req.query.get("task_id", "");
         if (taskId.length == 0) taskId = req.query.get("id", "");
-
-        // Legacy redirect: if build_id is explicitly passed and no project_id is given,
-        // redirect to dedicated execution instance page.
-        if (buildId.length > 0 && projectId.length == 0)
-        {
-            res.redirect(format("/tasks/execution?build_id=%s&task_id=%s", buildId, taskId));
-            return;
-        }
 
         ProjectRecord project;
         TaskNode taskNode;
@@ -1042,172 +908,7 @@ URLRouter dashboardRouter(TaskEngine engine, StateStores stores, PluginRegistry 
             if (project.name.length == 0) project.name = project.id;
         }
 
-        TaskExecutionRecord[] history = stores !is null ? stores.legacyBuilds.listTaskExecutionsForTask(projectId, taskId, 50) : [];
-        TaskExecutionRecord latestExec = history.length > 0 ? history[0] : TaskExecutionRecord.init;
-        string changeStatus = computeStubTaskChangeStatus(taskNode, latestExec);
-
-        res.render!("task/task-details.dt", project, taskNode, history, changeStatus);
-    });
-
-    // Dedicated Task Execution View (Runtime metrics, fingerprint, duration, exit code, produced artifacts, live logs)
-    router.get("/tasks/execution", (HTTPServerRequest req, HTTPServerResponse res) {
-        string buildId = req.query.get("build_id", "");
-        if (buildId.length == 0) buildId = req.query.get("build", "");
-        string taskId = req.query.get("task_id", "");
-        if (taskId.length == 0) taskId = req.query.get("id", "");
-
-        TaskExecutionRecord taskRecord;
-        bool foundRecord = stores !is null && stores.legacyBuilds.getTaskExecution(buildId, taskId, taskRecord);
-        if (!foundRecord)
-        {
-            taskRecord.buildId = buildId;
-            taskRecord.taskId = taskId;
-            taskRecord.status = "unknown";
-        }
-
-        string[] logs = stores !is null ? stores.logs.getTaskLogs(buildId, taskId) : [];
-        if (logs.length == 0 && stores !is null && buildId.length > 0)
-        {
-            auto bLogs = stores.logs.getBuildLogs(buildId);
-            string prefix = format("[%s]", taskId);
-            foreach (line; bLogs)
-            {
-                if (line.length >= prefix.length && line[0 .. prefix.length] == prefix)
-                {
-                    logs ~= line[prefix.length .. $].strip();
-                }
-            }
-            if (logs.length == 0) logs = bLogs;
-        }
-
-        BuildRecord build;
-        if (stores !is null && buildId.length > 0)
-        {
-            stores.legacyBuilds.getBuild(buildId, build);
-        }
-
-        string projectId = taskRecord.projectId.length > 0 ? taskRecord.projectId : build.projectId;
-        ProjectRecord project;
-        TaskNode taskNode;
-        bool foundTask = false;
-
-        if (stores !is null)
-        {
-            if (projectId.length > 0 && stores.projects.get(projectId).tryValue(project))
-            {
-                foreach (t; project.tasks)
-                {
-                    if (t.id == taskId)
-                    {
-                        taskNode = t;
-                        foundTask = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!foundTask)
-            {
-                foreach (p; stores.projects.list())
-                {
-                    foreach (t; p.tasks)
-                    {
-                        if (t.id == taskId)
-                        {
-                            project = p;
-                            taskNode = t;
-                            foundTask = true;
-                            break;
-                        }
-                    }
-                    if (foundTask) break;
-                }
-            }
-        }
-
-        if (!foundTask)
-        {
-            taskNode.id = taskId;
-            taskNode.name = taskId;
-        }
-
-        res.render!("task/task-execution.dt", taskRecord, logs, build, taskNode, project);
-    });
-
-    // Builds List. Queued tasks will be shown by the build queue view (bead confector-z7z.31.21);
-    // the dispatch queue is never read for display.
-    router.get("/builds/", (HTTPServerRequest req, HTTPServerResponse res) {
-        auto builds = stores !is null ? stores.legacyBuilds.listBuilds(50) : [];
-        auto recentTasks = stores !is null ? stores.legacyBuilds.listRecentTaskExecutions(25) : [];
-        res.render!("build/builds.dt", builds, recentTasks);
-    });
-
-    // Build Details & Task Graph Visualization
-    router.get("/builds/details", (HTTPServerRequest req, HTTPServerResponse res) {
-        string buildId = req.query.get("id", "");
-        BuildRecord build;
-        bool found = stores !is null && stores.legacyBuilds.getBuild(buildId, build);
-        string[] logs = stores !is null ? stores.logs.getBuildLogs(buildId) : [];
-
-        if (!found)
-        {
-            build.buildId = buildId;
-            build.status = "unknown";
-            build.projectName = "default";
-        }
-
-        TaskNode[] tasks;
-        ProjectRecord project;
-        if (stores !is null && build.projectId.length > 0 && stores.projects.get(build.projectId).tryValue(project))
-        {
-            tasks = project.tasks;
-        }
-
-        if (tasks.length == 0 && build.executedTasks.length > 0)
-        {
-            foreach (taskId; build.executedTasks)
-            {
-                TaskNode tn;
-                tn.id = taskId;
-                tn.name = taskId;
-                tasks ~= tn;
-            }
-        }
-
-        string[string] taskStatuses;
-        auto recordedStatuses = stores !is null ? stores.legacyBuilds.getTaskStatusesForBuild(build.buildId) : (TaskStatus[string]).init;
-        foreach (t; tasks)
-        {
-            if (auto p = t.id in recordedStatuses)
-            {
-                taskStatuses[t.id] = cast(string)*p;
-            }
-            else
-            {
-                bool wasExecuted = false;
-                foreach (exId; build.executedTasks)
-                {
-                    if (exId == t.id)
-                    {
-                        wasExecuted = true;
-                        break;
-                    }
-                }
-                if (wasExecuted)
-                {
-                    taskStatuses[t.id] = build.status == "cached" ? "cached" : (build.status == "failed" ? "failed" : "succeeded");
-                }
-                else
-                {
-                    taskStatuses[t.id] = "pending";
-                }
-            }
-        }
-
-        string tasksJson = serializeToJson(tasks).toString();
-        string taskStatusesJson = serializeToJson(taskStatuses).toString();
-
-        res.render!("build/build-details.dt", build, logs, tasksJson, taskStatusesJson, taskStatuses);
+        res.render!("task/task-details.dt", project, taskNode);
     });
 
     return router;
@@ -1225,14 +926,7 @@ unittest
     auto router = dashboardRouter(engine, stores);
     assert(router !is null);
 
-    // Populate dummy build & trigger
-    BuildRecord b;
-    b.buildId = "b_dash_1";
-    b.projectName = "main_project";
-    b.status = "succeeded";
-    b.startedAt = "2026-10-15T14:02:00Z";
-    stores.legacyBuilds.createBuild(b);
-
+    // Populate a trigger rule
     TriggerRuleRecord t;
     t.id = "t_dash_1";
     t.name = "Weekly Nightly";
@@ -1240,7 +934,6 @@ unittest
     t.criteria = "0 0 * * 0";
     stores.triggerRules.save(t);
 
-    assert(stores.legacyBuilds.listBuilds().length == 1);
     assert(stores.triggerRules.list().length == 1);
 
     // Populate and verify Project & Task state
@@ -1280,82 +973,18 @@ unittest
     assert(fetchedProj.tasks[1].triggers[0].type == TriggerType.webhook);
     assert(fetchedProj.tasks[1].triggers[0].endpoint == "/api/v1/deploy");
 
-    // Test Build linked to project and task statuses
-    BuildRecord b2;
-    b2.buildId = "b_dash_2";
-    b2.projectId = "proj_dash_1";
-    b2.projectName = "Dashboard Project";
-    b2.executedTasks = ["test_node_1", "test_node_2"];
-    b2.status = "succeeded";
-    b2.startedAt = "2026-10-15T15:00:00Z";
-    stores.legacyBuilds.createBuild(b2);
-    stores.legacyBuilds.setTaskStatus("b_dash_2", "test_node_1", TaskStatus.cached);
-    stores.legacyBuilds.setTaskStatus("b_dash_2", "test_node_2", TaskStatus.succeeded);
-
-    TaskStatus st1, st2;
-    assert(stores.legacyBuilds.getTaskStatus("b_dash_2", "test_node_1", st1) && st1 == TaskStatus.cached);
-    assert(stores.legacyBuilds.getTaskStatus("b_dash_2", "test_node_2", st2) && st2 == TaskStatus.succeeded);
-
-    // Test task execution record and task-scoped log queries
-    stores.legacyBuilds.updateTaskExecution("b_dash_2", "test_node_2", (ref TaskExecutionRecord taskRec) {
-        taskRec.durationMs = 45;
-        taskRec.fingerprint = "0123456789abcdef";
-    });
-    stores.logs.appendTaskLog("b_dash_2", "test_node_2", "Task step log line 1");
-
-    auto recentTasks = stores.legacyBuilds.listRecentTaskExecutions();
-    assert(recentTasks.length >= 1);
-    assert(stores.logs.getTaskLogs("b_dash_2", "test_node_2") == ["Task step log line 1"]);
-
-    // Test listTaskExecutionsForTask
-    auto taskExecs = stores.legacyBuilds.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
-    assert(taskExecs.length >= 1);
-    assert(taskExecs[0].taskId == "test_node_2");
-
-    // Test computeStubTaskChangeStatus
-    TaskNode sampleNode;
-    sampleNode.id = "sample_task";
-
-    TaskExecutionRecord emptyExec;
-    assert(computeStubTaskChangeStatus(sampleNode, emptyExec) == "never_run");
-
-    TaskExecutionRecord succExec;
-    succExec.buildId = "b1";
-    succExec.taskId = "sample_task";
-    succExec.status = "succeeded";
-    assert(computeStubTaskChangeStatus(sampleNode, succExec) == "up_to_date");
-
-    TaskExecutionRecord cachedExec;
-    cachedExec.buildId = "b2";
-    cachedExec.taskId = "sample_task";
-    cachedExec.status = "cached";
-    assert(computeStubTaskChangeStatus(sampleNode, cachedExec) == "up_to_date");
-
-    TaskExecutionRecord failedExec;
-    failedExec.buildId = "b3";
-    failedExec.taskId = "sample_task";
-    failedExec.status = "failed";
-    assert(computeStubTaskChangeStatus(sampleNode, failedExec) == "pending_changes");
-
     // Test Dashboard ViewModels
     DashboardTaskViewModel taskVm;
     taskVm.id = "test_node_1";
     taskVm.name = "Test Node 1";
-    taskVm.lastStatus = "succeeded";
-    taskVm.changeStatus = "up_to_date";
-    taskVm.lastDurationMs = 120;
-    taskVm.lastBuildId = "b_dash_2";
 
     DashboardProjectViewModel projVm;
     projVm.project = fetchedProj;
     projVm.tasks = [taskVm];
     projVm.totalTasks = 1;
-    projVm.successfulTasks = 1;
-    projVm.failedTasks = 0;
 
     assert(projVm.tasks.length == 1);
     assert(projVm.tasks[0].id == "test_node_1");
-    assert(projVm.tasks[0].changeStatus == "up_to_date");
 
     // Test dashboard project assembly loop logic
     DashboardProjectViewModel[] testDashboardProjects;
@@ -1371,37 +1000,6 @@ unittest
             tvm.id = task.id;
             tvm.name = task.name.length > 0 ? task.name : task.id;
             tvm.upstreamTasks = upstreamTaskIds(task);
-
-            TaskExecutionRecord latestExec;
-            auto execs = stores.legacyBuilds.listTaskExecutionsForTask(proj.id, task.id, 1);
-            if (execs.length > 0)
-            {
-                latestExec = execs[0];
-            }
-
-            if (latestExec.status.length > 0)
-            {
-                tvm.lastStatus = latestExec.status;
-                tvm.lastFingerprint = latestExec.fingerprint;
-                tvm.lastStartedAt = latestExec.startedAt;
-                tvm.lastDurationMs = latestExec.durationMs;
-                tvm.lastBuildId = latestExec.buildId;
-            }
-            else
-            {
-                tvm.lastStatus = "never_run";
-            }
-
-            tvm.changeStatus = computeStubTaskChangeStatus(task, latestExec);
-            if (tvm.lastStatus == "succeeded" || tvm.lastStatus == "cached")
-            {
-                pvm.successfulTasks++;
-            }
-            else if (tvm.lastStatus == "failed")
-            {
-                pvm.failedTasks++;
-            }
-
             pvm.tasks ~= tvm;
         }
 
@@ -1411,15 +1009,10 @@ unittest
     assert(testDashboardProjects.length == 1);
     assert(testDashboardProjects[0].tasks.length == 2);
     assert(testDashboardProjects[0].tasks[0].id == "test_node_1");
-    // A status set on a build's task records it under the build's project
-    assert(testDashboardProjects[0].tasks[0].changeStatus == "up_to_date");
-    assert(testDashboardProjects[0].tasks[0].lastStatus == "cached");
     assert(testDashboardProjects[0].tasks[1].id == "test_node_2");
-    assert(testDashboardProjects[0].tasks[1].changeStatus == "up_to_date");
-    assert(testDashboardProjects[0].tasks[1].lastStatus == "succeeded");
-    assert(testDashboardProjects[0].successfulTasks == 2);
+    assert(testDashboardProjects[0].tasks[1].upstreamTasks == ["test_node_1"]);
 
-    // Test Task Details definition resolution and execution history retrieval
+    // Test Task Details definition resolution
     ProjectRecord detailProj;
     TaskNode detailTask;
     bool foundDetailTask = false;
@@ -1438,21 +1031,13 @@ unittest
     assert(detailTask.steps.length == 1);
     assert(upstreamTaskIds(detailTask) == ["test_node_1"]);
 
-    auto node2History = stores.legacyBuilds.listTaskExecutionsForTask("proj_dash_1", "test_node_2");
-    assert(node2History.length == 1);
-    assert(node2History[0].buildId == "b_dash_2");
-    assert(node2History[0].status == "succeeded");
-    assert(node2History[0].durationMs == 45);
-    assert(node2History[0].fingerprint == "0123456789abcdef");
-
-    // Test Task Execution instance lookup and log retrieval
-    TaskExecutionRecord execRec;
-    assert(stores.legacyBuilds.getTaskExecution("b_dash_2", "test_node_2", execRec));
-    assert(execRec.status == "succeeded");
-    assert(execRec.durationMs == 45);
-    auto execLogs = stores.logs.getTaskLogs("b_dash_2", "test_node_2");
-    assert(execLogs.length == 1);
-    assert(execLogs[0] == "Task step log line 1");
+    // Running a project fails loudly until request intake lands
+    auto runReq = createTestHTTPServerRequest(URL("http://localhost/projects/run"), HTTPMethod.POST);
+    auto runRes = createTestHTTPServerResponse();
+    bool notImplemented = false;
+    try router.handleRequest(runReq, runRes);
+    catch (HTTPStatusException e) notImplemented = e.status == HTTPStatus.notImplemented && e.msg == buildsNotImplemented;
+    assert(notImplemented);
 
     import std.file : exists, rmdirRecurse;
     if (exists("test_dashboard_storage")) rmdirRecurse("test_dashboard_storage");

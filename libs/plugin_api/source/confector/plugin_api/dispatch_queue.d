@@ -17,7 +17,8 @@ module confector.plugin_api.dispatch_queue;
  * - Each delivery has its own receipt. Once a message has been delivered again, receipts from
  *   earlier deliveries are stale: extend() and release() reject them, and ack() with them never
  *   removes the message.
- * - receiveCount counts deliveries; the coordinator uses it to count execution attempts.
+ * - receiveCount counts deliveries; receiving work (confector.core.work_orders) uses it to count
+ *   execution attempts.
  */
 
 import core.time : Duration, hours, minutes, seconds;

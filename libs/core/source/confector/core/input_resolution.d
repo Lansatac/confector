@@ -743,14 +743,14 @@ unittest
 
     // Survives a serialization round trip, as when stored in and loaded from the state store
     import vibe.data.json : deserializeJson, serializeToJson;
-    BuildRecord record;
-    record.buildId = "b1";
-    record.chainId = "b1";
-    record.chainTasks = chain;
-    auto loaded = deserializeJson!BuildRecord(serializeToJson(record).toString());
-    assert(loaded.chainId == "b1" && loaded.chainTasks.length == 3);
-    assert(loaded.chainTasks[0].inputs["src"] == repositoryInput("game", "main"));
-    assert(atGenerations("p", loaded.chainTasks).fingerprints == resolution.fingerprints);
+    BuildChain record;
+    record.id = "c1";
+    record.projectId = "p";
+    record.tasks = chain;
+    auto loaded = deserializeJson!BuildChain(serializeToJson(record).toString());
+    assert(loaded.id == "c1" && loaded.tasks.length == 3);
+    assert(loaded.tasks[0].inputs["src"] == repositoryInput("game", "main"));
+    assert(atGenerations("p", loaded.tasks).fingerprints == resolution.fingerprints);
 }
 
 unittest

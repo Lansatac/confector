@@ -9,7 +9,6 @@ block maincontent
           p Cloud-native DAG CI/CD engine with deterministic content caching and decoupled workers.
         div.header-actions
           a.btn.btn-primary(href="/projects/add") + New Project
-          a.btn.btn-outline(href="/builds/", style="margin-left: 8px;") Build History
 
     div.stats-grid
       div.stat-card
@@ -18,15 +17,6 @@ block maincontent
       div.stat-card
         div.stat-label Total Tasks
         div.stat-value #{totalTasksAll}
-      div.stat-card
-        div.stat-label Tasks Passed / Cached
-        div.stat-value.text-success #{successfulTasksAll}
-      div.stat-card
-        div.stat-label Tasks Failed
-        div.stat-value.text-danger #{failedTasksAll}
-      div.stat-card
-        div.stat-label Total Builds
-        div.stat-value #{totalBuilds}
 
     div.section-title-bar
       div(style="display: flex; align-items: center; gap: 10px;")
@@ -55,10 +45,6 @@ block maincontent
                     div.accordion-meta #{p.project.description}
               div.accordion-actions(onclick="event.stopPropagation();")
                 span.badge.badge-outline #{p.totalTasks} #{p.totalTasks == 1 ? "task" : "tasks"}
-                - if (p.successfulTasks > 0)
-                  span.badge.badge-success #{p.successfulTasks} passed
-                - if (p.failedTasks > 0)
-                  span.badge.badge-danger #{p.failedTasks} failed
                 a.btn.btn-sm.btn-outline(href="/projects/tasks/edit?project_id=#{p.project.id}", title="Add new task to this project") + Add Task
                 a.btn.btn-sm.btn-outline(href="/projects/details?id=#{p.project.id}", title="View DAG graph and details") View DAG
                 form(method="POST", action="/projects/run", style="display: inline-block; margin: 0;")
@@ -74,12 +60,9 @@ block maincontent
                 table.data-table(style="margin: 0;")
                   thead
                     tr
-                      th(style="width: 25%;") Task
-                      th(style="width: 20%;") Dependencies
-                      th(style="width: 15%;") Change Status
-                      th(style="width: 15%;") Last Run Status
-                      th(style="width: 15%;") Last Execution
-                      th(style="width: 10%; text-align: right;") Actions
+                      th(style="width: 40%;") Task
+                      th(style="width: 40%;") Dependencies
+                      th(style="width: 20%; text-align: right;") Actions
                   tbody
                     - foreach(t; p.tasks)
                       tr
@@ -94,79 +77,10 @@ block maincontent
                           - else
                             - foreach(dep; t.upstreamTasks)
                               span.badge.badge-secondary(style="margin-right: 4px; font-size: 11px;") #{dep}
-                        td
-                          - if (t.changeStatus == "up_to_date")
-                            span.badge.badge-uptodate UP TO DATE
-                          - else if (t.changeStatus == "pending_changes")
-                            span.badge.badge-pending PENDING CHANGES
-                          - else
-                            span.badge.badge-neverrun NEVER RUN
-                        td
-                          - if (t.lastStatus == "succeeded")
-                            span.badge.badge-success SUCCESS
-                          - else if (t.lastStatus == "cached")
-                            span.badge.badge-cached CACHED
-                          - else if (t.lastStatus == "failed")
-                            span.badge.badge-danger FAILED
-                          - else if (t.lastStatus == "running")
-                            span.badge.badge-running RUNNING
-                          - else
-                            span.badge.badge-secondary NEVER RUN
-                        td
-                          - if (t.lastBuildId.length > 0)
-                            div(style="font-size: 12px;")
-                              a.build-link(href="/tasks/execution?build_id=#{t.lastBuildId}&task_id=#{t.id}") #{t.lastBuildId}
-                              - if (t.lastDurationMs > 0)
-                                span.text-muted(style="margin-left: 6px;") (#{t.lastDurationMs} ms)
-                            - if (t.lastStartedAt.length > 0)
-                              div.text-muted(style="font-size: 11px;") #{t.lastStartedAt}
-                          - else
-                            span.text-muted -
                         td(style="text-align: right;")
                           div.btn-group(style="display: inline-flex; gap: 6px; align-items: center; justify-content: flex-end;")
                             form(method="POST", action="/projects/run", style="display: inline-block; margin: 0;")
                               input(type="hidden", name="id", value="#{p.project.id}")
                               input(type="hidden", name="target_task_id", value="#{t.id}")
                               button.btn.btn-sm.btn-primary(type="submit", title="Execute task subgraph") ⚡ Run
-                            a.btn.btn-sm.btn-outline(href="/tasks/details?project_id=#{p.project.id}&task_id=#{t.id}", title="View task configuration and history") Details
-
-    div.section-title-bar(style="margin-top: 36px;")
-      h2 Recent Builds
-      a.btn.btn-outline(href="/builds/") View All Builds
-
-    - if (builds.length == 0)
-      div.empty-state
-        p No builds executed yet.
-    - else
-      table.data-table
-        thead
-          tr
-            th Build ID
-            th Project
-            th Status
-            th Trigger Source
-            th Started
-            th Duration
-            th Actions
-        tbody
-          - foreach(b; builds)
-            tr
-              td
-                a.build-link(href="/builds/details?id=#{b.buildId}", style="font-weight: 600;") #{b.buildId}
-              td #{b.projectName.length > 0 ? b.projectName : (b.projectId.length > 0 ? b.projectId : "-")}
-              td
-                - if (b.status == "succeeded")
-                  span.badge.badge-success SUCCESS
-                - else if (b.status == "cached")
-                  span.badge.badge-cached CACHED
-                - else if (b.status == "failed")
-                  span.badge.badge-danger FAILED
-                - else if (b.status == "running")
-                  span.badge.badge-running RUNNING
-                - else
-                  span.badge.badge-secondary #{b.status}
-              td #{b.triggerSource.length > 0 ? b.triggerSource : "manual"}
-              td #{b.startedAt}
-              td #{b.durationMs} ms
-              td
-                a.btn.btn-sm(href="/builds/details?id=#{b.buildId}") View Graph & Logs
+                            a.btn.btn-sm.btn-outline(href="/tasks/details?project_id=#{p.project.id}&task_id=#{t.id}", title="View task configuration") Details
