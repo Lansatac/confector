@@ -365,6 +365,24 @@ unittest
 
 unittest
 {
+    // A failed or cancelled outcome records when it finished even when the caller gives no time.
+    // This pins existing behaviour (recordOutcome always stamps finishedAt), guarding the
+    // completion paths against regressions.
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto dispatcher = new ExecutionDispatcher(stores, new InMemoryDispatchQueue(), null, () => fixedNow());
+    const cancelledId = dispatcher.dispatch([samplePlan()])[0].executionId;
+    finishExecution(stores, cancelledId, ExecutionStatus.cancelled, 0, "stopped", null);
+    auto cancelled = stores.executions.get(cancelledId).get;
+    assert(cancelled.status == ExecutionStatus.cancelled && cancelled.finishedAt.length > 0);
+
+    const failedId = dispatcher.dispatch([samplePlan()])[0].executionId;
+    assert(finishClaimedExecution(stores, "fp1", ExecutionStatus.failed, 1, "boom", null));
+    auto failed = stores.executions.get(failedId).get;
+    assert(failed.status == ExecutionStatus.failed && failed.finishedAt.length > 0);
+}
+
+unittest
+{
     // Two workers receiving duplicate messages for one queued execution at once: exactly one
     // starts it, by compare-and-set
     auto documents = new InMemoryDocumentStore();

@@ -288,7 +288,8 @@ final class ExecutionStore
      *
      * Throws: DocumentConflictException if the execution changed since `current` was read;
      * InvalidStateTransitionException if `current` is terminal or `next` changes its identity,
-     * or the definition (and its hash), inputs or repository addresses it was dispatched with.
+     * or the definition (and its hash), inputs or repository addresses it was dispatched with, or
+     * `next` is terminal without recording when it finished.
      */
     Versioned!TaskExecution update(in Versioned!TaskExecution current, TaskExecution next)
     {
@@ -301,6 +302,8 @@ final class ExecutionStore
         requireValid(next.definitionHash == was.definitionHash && next.definition == cast(TaskNode) was.definition
             && next.inputs == was.inputs && next.repositoryAddresses == cast(string[string]) was.repositoryAddresses,
             format("Execution '%s' runs with the definition and inputs it was dispatched with; they cannot change", was.id));
+        requireValid(isActive(next.status) || next.finishedAt.length > 0,
+            format("Execution '%s' is %s, and must record when it finished", was.id, next.status));
         return m_executions.replace(was.id, next, current.version_);
     }
 
@@ -717,6 +720,7 @@ unittest
     // A stale writer (another worker's lost update) loses the compare-and-set
     TaskExecution stale = queued.value;
     stale.status = ExecutionStatus.cancelled;
+    stale.finishedAt = "2026-10-15T14:03:00Z";
     assert(throwsA!DocumentConflictException({ executions.update(queued, stale); }));
 
     // A lost worker puts it back in the queue; the identity cannot change
@@ -757,6 +761,25 @@ unittest
     assert(throwsA!InvalidStateTransitionException({ executions.create(premature); }));
     assert(throwsA!InvalidStateTransitionException({ executions.create(sampleExecution("e2", "", "2026-10-15T14:02:00Z")); }));
     assert(throwsA!DocumentConflictException({ executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z")); }));
+}
+
+unittest
+{
+    // A terminal execution records when it finished: one that finishes without a time is refused
+    auto executions = new ExecutionStore(new InMemoryDocumentStore());
+    auto queued = executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z"));
+    foreach (status; [ExecutionStatus.failed, ExecutionStatus.cancelled, ExecutionStatus.succeeded])
+    {
+        TaskExecution unfinished = queued.value;
+        unfinished.status = status;
+        assert(throwsA!InvalidStateTransitionException({ executions.update(queued, unfinished); }),
+            "A terminal execution without finished_at is refused");
+    }
+
+    TaskExecution cancelled = queued.value;
+    cancelled.status = ExecutionStatus.cancelled;
+    cancelled.finishedAt = "2026-10-15T14:04:00Z";
+    assert(executions.update(queued, cancelled).value.finishedAt == "2026-10-15T14:04:00Z");
 }
 
 unittest

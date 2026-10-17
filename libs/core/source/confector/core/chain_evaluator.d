@@ -15,16 +15,24 @@ module confector.core.chain_evaluator;
  * - **Requested** means the task is a target of one of the chain's requests or upstream of one.
  *   A request never covers tasks downstream of its targets.
  * - **A success is always reused** (a cache hit), whichever chain produced it, and whether or not
- *   the task is requested. With several successes at one fingerprint, the latest is used.
+ *   the task is requested. With several successes at one fingerprint, the latest is used. A
+ *   success whose artifacts retention removed (`TaskExecution.artifactsExpiredAt`) is a miss, not
+ *   a cache hit (AGENTS.md, "The caching contract").
  * - **An active execution is attached to**, never duplicated: at most one execution per
  *   fingerprint is queued or running.
  * - **Failures and cancellations are never cache hits, and are never retried automatically.** A
  *   failed or cancelled execution settles every request made before it finished, including
  *   requests that attached to it in flight; a request made after it finished (a retry, or any
  *   later request covering the task) asks for the task again, at the same fingerprint.
- * - **A task needs an execution** when it is requested, has no success and no active execution,
- *   no failure or cancellation settles its latest request, and every upstream task has
- *   succeeded. A task whose upstream task failed or was cancelled is blocked.
+ * - **A task must run** when it is a target of a request, or a dependent of a task that must run,
+ *   and it has no valid success, no active execution, and no failure or cancellation settling its
+ *   latest request. A requested task that is none of these, and that no dependent needs to run,
+ *   is `notNeeded`: it never ran or its artifacts expired, and every dependent is already
+ *   satisfied, so a downstream cache hit never forces a rerun. This is a behaviour change: a
+ *   requested upstream task with no success used to run whatever its dependents' state, and now
+ *   runs only when a dependent must run.
+ * - **A task needs an execution** when it must run and every upstream task has succeeded. A task
+ *   whose upstream task failed or was cancelled is blocked.
  * - **A requested task whose active execution was never sent** (`TaskExecution.sentAt` is empty)
  *   is needed too, so the dispatcher sends it: this is how a dispatcher that failed or crashed
  *   between recording an execution and sending it is repaired by the next evaluation.
@@ -68,6 +76,11 @@ enum ChainTaskStatus : string
 {
     /// No request on the chain covers the task, and no execution at its fingerprint succeeded.
     notRequested = "not_requested",
+    /// Requested, with no valid success of its own (it never ran, or its only success's artifacts
+    /// expired), and no requested task that depends on it must run: each such dependent already
+    /// succeeded, is active, or was settled by a failure. It need not run. Only tasks that must run
+    /// cause their upstream tasks to run again.
+    notNeeded = "not_needed",
     /// Requested and not finished: see `ChainTaskState.waitingFor`.
     waiting = "waiting",
     /// Its active execution is held by a worker.
@@ -164,9 +177,10 @@ struct ChainEvaluation
  * Throws: ChainEvaluationException if a request belongs to another chain or project, has no
  * targets (or, for a rerun, more than one), targets a task the chain does not have, or has a
  * timestamp that is not an ISO 8601 UTC time; if an execution is filed under another
- * fingerprint, task or project, has no id or a bad timestamp, or is failed or cancelled without a
- * `finishedAt`; or if a fingerprint has more than one active execution. InputResolutionException
- * if a generation is missing or the chain is inconsistent (see `chainResolution`).
+ * fingerprint, task or project, has no id or a bad timestamp, is failed or cancelled without a
+ * `finishedAt`, or has an `artifactsExpiredAt` without being succeeded; or if a fingerprint has
+ * more than one active execution. InputResolutionException if a generation is missing or the
+ * chain is inconsistent (see `chainResolution`).
  */
 ChainEvaluation evaluateChain(
     in BuildChain chain,
@@ -184,8 +198,33 @@ ChainEvaluation evaluateChain(
     result.resolution = chainResolution(chain.projectId, chain.tasks, generations);
     auto graph = chainGraph(chain.tasks);
     const demandedAt = latestDemands(chain, graph, requests);
+    const targets = targetsOf(requests);
+    const order = graph.topologicalSort();
 
-    foreach (taskId; graph.topologicalSort())
+    // Decided from the downstream end: a task must run when it is a target or a dependent of a
+    // task that must run, and it is not already satisfied by its own executions.
+    ExecutionSummary[string] summaries;
+    bool[string] mustRun;
+    foreach_reverse (taskId; order)
+    {
+        const fingerprint = result.resolution.fingerprints[taskId];
+        const summary = summarize(chain.projectId, taskId, fingerprint, executionsByFingerprint.get(fingerprint, null));
+        summaries[taskId] = summary;
+        auto demand = taskId in demandedAt;
+        if (demand is null || summary.success !is null || summary.active !is null
+            || (summary.stopped !is null && summary.stoppedAt >= *demand))
+        {
+            continue;
+        }
+        bool must = (taskId in targets) !is null;
+        foreach (dependent; graph.getDependents(taskId))
+        {
+            must = must || mustRun.get(dependent, false);
+        }
+        if (must) mustRun[taskId] = true;
+    }
+
+    foreach (taskId; order)
     {
         ChainTaskState state;
         state.taskId = taskId;
@@ -193,9 +232,8 @@ ChainEvaluation evaluateChain(
         state.base = result.resolution.bases[taskId];
         state.generation = generations[state.base];
 
-        const executions = executionsByFingerprint.get(state.fingerprint, null);
-        const summary = summarize(chain.projectId, taskId, state.fingerprint, executions);
-        state.executionCount = executions.length;
+        const summary = summaries[taskId];
+        state.executionCount = executionsByFingerprint.get(state.fingerprint, null).length;
         auto demand = taskId in demandedAt;
         state.requested = demand !is null;
 
@@ -245,6 +283,13 @@ ChainEvaluation evaluateChain(
             state.status = summary.stopped.status == ExecutionStatus.failed
                 ? ChainTaskStatus.failed : ChainTaskStatus.cancelled;
         }
+        else if (taskId !in mustRun)
+        {
+            // Requested only for a downstream task that is already satisfied: its expired success
+            // is not worth running again
+            state.status = ChainTaskStatus.notNeeded;
+            use(summary.expired);
+        }
         else
         {
             bool upstreamPending = false;
@@ -268,8 +313,9 @@ ChainEvaluation evaluateChain(
                         upstreamPending = true;
                         break;
                     case ChainTaskStatus.notRequested:
+                    case ChainTaskStatus.notNeeded:
                         throw new ChainEvaluationException(format(
-                            "Task '%s' of chain '%s' is requested but its upstream task '%s' is not", taskId, chain.id, upstream));
+                            "Task '%s' of chain '%s' must run but its upstream task '%s' is not needed", taskId, chain.id, upstream));
                 }
             }
 
@@ -294,6 +340,17 @@ ChainEvaluation evaluateChain(
         result.tasks[taskId] = state;
     }
     return result;
+}
+
+/// The tasks some request targets (not their upstream tasks).
+private bool[string] targetsOf(in BuildRequest[] requests)
+{
+    bool[string] targets;
+    foreach (ref request; requests)
+    {
+        foreach (target; request.targets) targets[target] = true;
+    }
+    return targets;
 }
 
 /// For every task some request covers, the time of the latest request covering it: each
@@ -349,6 +406,8 @@ private struct ExecutionSummary
     /// The failed or cancelled execution that finished last, and when it finished.
     const(TaskExecution)* stopped;
     SysTime stoppedAt;
+    /// The latest succeeded execution whose artifacts expired: not a success, kept to name it.
+    const(TaskExecution)* expired;
 }
 
 /// Validates the executions recorded at `fingerprint` for task `taskId` and summarizes them.
@@ -358,11 +417,18 @@ private ExecutionSummary summarize(string projectId, string taskId, string finge
 {
     ExecutionSummary summary;
     SysTime successCreatedAt;
+    SysTime expiredCreatedAt;
     foreach (ref execution; executions)
     {
         if (execution.id.length == 0)
         {
             throw new ChainEvaluationException(format("An execution recorded at fingerprint %s has no id", fingerprint));
+        }
+        if (execution.artifactsExpiredAt.length > 0 && execution.status != ExecutionStatus.succeeded)
+        {
+            throw new ChainEvaluationException(format(
+                "Execution '%s' is %s but has artifacts_expired_at set; only a succeeded execution has artifacts to expire",
+                execution.id, execution.status));
         }
         if (execution.fingerprint != fingerprint || execution.taskId != taskId || execution.projectId != projectId)
         {
@@ -390,6 +456,18 @@ private ExecutionSummary summarize(string projectId, string taskId, string finge
                 summary.active = &execution;
                 break;
             case ExecutionStatus.succeeded:
+                if (execution.artifactsExpiredAt.length > 0)
+                {
+                    // Retention removed its artifacts: a miss, not a success
+                    parseTimestamp(execution.artifactsExpiredAt,
+                        format("execution '%s' artifacts_expired_at", execution.id));
+                    if (later(summary.expired, expiredCreatedAt, createdAt))
+                    {
+                        summary.expired = &execution;
+                        expiredCreatedAt = createdAt;
+                    }
+                    break;
+                }
                 if (later(summary.success, successCreatedAt, createdAt))
                 {
                     summary.success = &execution;
@@ -523,6 +601,21 @@ version (unittest)
             ids ~= n.taskId;
         }
         return ids;
+    }
+
+    /// A chain of `nodes`, whose inputs are task outputs only (no repositories), as chain "c1".
+    private BuildChain chainOf(TaskNode[] nodes)
+    {
+        auto graph = new TaskGraph(nodes);
+        InputPin[InputDecl] none;
+        BuildChain chain;
+        chain.id = "c1";
+        chain.projectId = "p";
+        chain.number = 1;
+        chain.snapshotHash = "snapshot-nodes";
+        chain.tasks = freezeChain(graph, resolveGraphInputs(graph, none, none));
+        chain.createdAt = "2026-10-15T10:00:00Z";
+        return chain;
     }
 
     private bool throwsEvaluation(void delegate() run, string fragment)
@@ -987,4 +1080,221 @@ unittest
     assert(forward.needed == backward.needed && neededTasks(forward) == ["compile"]);
     foreach (id, state; forward.tasks) assert(backward.tasks[id] == state, id);
     assert(evaluate(chain, [a, b], executions).tasks == forward.tasks);
+}
+
+unittest
+{
+    // Expired artifacts are a cache miss: an expired upstream success does not force a rerun when
+    // the downstream task is a valid cache hit, and only the downstream task that must run is needed
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    executions.add("e-test", "test", fp["test"], ExecutionStatus.succeeded, "2026-10-15T10:01:00Z");
+
+    auto hit = evaluate(chain, [request("r1", ["test"], "2026-10-15T10:00:01Z")], executions);
+    assert(hit.needed.length == 0, "A valid downstream cache hit needs nothing");
+    assert(hit.tasks["test"].status == ChainTaskStatus.succeeded && hit.tasks["test"].executionId == "e-test");
+    assert(hit.tasks["compile"].requested && hit.tasks["compile"].status == ChainTaskStatus.notNeeded);
+    assert(hit.tasks["compile"].executionId == "e-compile" && hit.tasks["compile"].executionCount == 1);
+
+    auto onReport = evaluate(chain, [request("r1", ["report"], "2026-10-15T10:00:01Z")], executions);
+    assert(neededTasks(onReport) == ["report"], "Only the task that must run is needed");
+    assert(onReport.tasks["compile"].status == ChainTaskStatus.notNeeded);
+    assert(onReport.tasks["report"].status == ChainTaskStatus.waiting && onReport.tasks["report"].waitingFor == WaitReason.dispatch);
+}
+
+unittest
+{
+    // An expired upstream success is needed again when a downstream task must run: it is not
+    // reused, the downstream task waits for it, and its next success at the fingerprint is used
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    auto requests = [request("r1", ["test"], "2026-10-15T10:00:01Z")];
+
+    auto e = evaluate(chain, requests, executions);
+    assert(neededTasks(e) == ["compile"]);
+    assert(e.tasks["compile"].status == ChainTaskStatus.waiting && e.tasks["compile"].waitingFor == WaitReason.dispatch);
+    assert(e.tasks["compile"].executionId.length == 0 && e.tasks["compile"].executionCount == 1,
+        "The expired execution is not reused");
+    assert(e.tasks["test"].status == ChainTaskStatus.waiting && e.tasks["test"].waitingFor == WaitReason.upstream);
+
+    executions.add("e-compile-2", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T13:00:00Z");
+    auto again = evaluate(chain, requests, executions);
+    assert(again.tasks["compile"].status == ChainTaskStatus.succeeded && again.tasks["compile"].executionId == "e-compile-2");
+    assert(neededTasks(again) == ["test"]);
+}
+
+unittest
+{
+    // An expired execution on a requested target is needed again; expired artifacts never make a
+    // success, and a new success at the fingerprint is the one used
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    auto targeted = [request("r1", ["compile"], "2026-10-15T10:00:01Z")];
+
+    auto e = evaluate(chain, targeted, executions);
+    assert(neededTasks(e) == ["compile"], "A requested target with only an expired success runs again");
+    assert(e.tasks["compile"].status == ChainTaskStatus.waiting && e.tasks["compile"].waitingFor == WaitReason.dispatch);
+
+    executions.add("e-compile-2", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T13:00:00Z");
+    auto done = evaluate(chain, targeted, executions);
+    assert(done.needed.length == 0 && done.tasks["compile"].executionId == "e-compile-2");
+
+    // Only a succeeded execution has artifacts to expire, and the marker is a time like any other
+    Executions failed;
+    failed.add("e1", "compile", fp["compile"], ExecutionStatus.failed, "2026-10-15T10:00:02Z");
+    failed.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    assert(throwsEvaluation(() { evaluate(chain, targeted, failed); }, "artifacts_expired_at"));
+
+    Executions badTime;
+    badTime.add("e1", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T10:00:02Z");
+    badTime.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "yesterday";
+    assert(throwsEvaluation(() { evaluate(chain, targeted, badTime); }, "artifacts_expired_at"));
+}
+
+unittest
+{
+    // A never-run upstream task is notNeeded when a downstream success from an earlier request or
+    // another chain is a valid cache hit
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-test", "test", fp["test"], ExecutionStatus.succeeded, "2026-10-14T09:00:00Z");
+
+    auto e = evaluate(chain, [request("r1", ["test"], "2026-10-15T10:00:01Z")], executions);
+    assert(e.needed.length == 0);
+    assert(e.tasks["test"].status == ChainTaskStatus.succeeded);
+    assert(e.tasks["compile"].requested && e.tasks["compile"].status == ChainTaskStatus.notNeeded);
+    assert(e.tasks["compile"].executionId.length == 0 && e.tasks["compile"].executionCount == 0);
+}
+
+unittest
+{
+    // A diamond: one upstream task feeds two dependents. While only one is satisfied, the upstream
+    // task is still needed through the other; once both are satisfied it is notNeeded
+    TaskNode upstream; upstream.id = "u";
+    TaskNode left; left.id = "left"; left.inputs["u"] = taskOutputInput("u");
+    TaskNode right; right.id = "right"; right.inputs["u"] = taskOutputInput("u");
+    auto chain = chainOf([upstream, left, right]);
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    auto requests = [request("r1", ["left", "right"], "2026-10-15T10:00:01Z")];
+
+    Executions executions;
+    executions.add("e-u", "u", fp["u"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["u"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    executions.add("e-left", "left", fp["left"], ExecutionStatus.succeeded, "2026-10-15T10:00:00Z");
+
+    auto partial = evaluate(chain, requests, executions);
+    assert(neededTasks(partial) == ["u"], "The unsatisfied branch needs the upstream task again");
+    assert(partial.tasks["u"].status == ChainTaskStatus.waiting && partial.tasks["u"].waitingFor == WaitReason.dispatch);
+    assert(partial.tasks["right"].waitingFor == WaitReason.upstream);
+
+    executions.add("e-right", "right", fp["right"], ExecutionStatus.succeeded, "2026-10-15T10:00:00Z");
+    auto both = evaluate(chain, requests, executions);
+    assert(both.needed.length == 0);
+    assert(both.tasks["u"].status == ChainTaskStatus.notNeeded);
+}
+
+unittest
+{
+    // Several targets, one upstream of the other: the upstream target is needed on its own account
+    // even though the downstream target is a valid cache hit
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    executions.add("e-test", "test", fp["test"], ExecutionStatus.succeeded, "2026-10-15T10:01:00Z");
+
+    auto e = evaluate(chain, [request("r1", ["compile", "test"], "2026-10-15T10:00:01Z")], executions);
+    assert(neededTasks(e) == ["compile"]);
+    assert(e.tasks["compile"].status == ChainTaskStatus.waiting && e.tasks["compile"].waitingFor == WaitReason.dispatch);
+    assert(e.tasks["test"].status == ChainTaskStatus.succeeded && e.tasks["test"].executionId == "e-test");
+}
+
+unittest
+{
+    // A downstream task already running is attached to, so its expired upstream success is not run again
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    executions.add("e-test", "test", fp["test"], ExecutionStatus.running, "2026-10-15T10:00:02Z");
+
+    auto e = evaluate(chain, [request("r1", ["test"], "2026-10-15T10:00:01Z")], executions);
+    assert(e.needed.length == 0, "Nothing is dispatched for an upstream task whose dependent is running");
+    assert(e.tasks["test"].status == ChainTaskStatus.running && e.tasks["test"].executionId == "e-test");
+    assert(e.tasks["compile"].status == ChainTaskStatus.notNeeded);
+}
+
+unittest
+{
+    // A downstream task that failed after the request settles it: the expired upstream success is
+    // notNeeded, and a later retry of the downstream task makes the upstream needed again
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    executions.add("e-test", "test", fp["test"], ExecutionStatus.failed, "2026-10-15T10:00:02Z");
+    auto requests = [request("r1", ["test"], "2026-10-15T10:00:01Z")];
+
+    auto settled = evaluate(chain, requests, executions);
+    assert(settled.needed.length == 0);
+    assert(settled.tasks["test"].status == ChainTaskStatus.failed);
+    assert(settled.tasks["compile"].status == ChainTaskStatus.notNeeded);
+
+    auto retried = requests ~ request("r2", ["test"], "2026-10-15T11:00:00Z", BuildIntent.retry);
+    auto again = evaluate(chain, retried, executions);
+    assert(neededTasks(again) == ["compile"], "A retry asks for the upstream task again");
+    assert(again.tasks["compile"].status == ChainTaskStatus.waiting && again.tasks["compile"].waitingFor == WaitReason.dispatch);
+}
+
+unittest
+{
+    // With a valid success and an expired one at one fingerprint, the valid success is used
+    // whichever is newer
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    auto requests = [request("r1", ["compile"], "2026-10-15T10:00:01Z")];
+
+    Executions expiredNewer;
+    expiredNewer.add("e-valid", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T08:00:00Z");
+    expiredNewer.add("e-expired", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    expiredNewer.byFingerprint[fp["compile"]][1].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+    auto a = evaluate(chain, requests, expiredNewer);
+    assert(a.needed.length == 0 && a.tasks["compile"].executionId == "e-valid", "An expired newer success is not used");
+
+    Executions expiredOlder;
+    expiredOlder.add("e-expired", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T08:00:00Z");
+    expiredOlder.byFingerprint[fp["compile"]][0].artifactsExpiredAt = "2026-10-15T09:00:00Z";
+    expiredOlder.add("e-valid", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    auto b = evaluate(chain, requests, expiredOlder);
+    assert(b.needed.length == 0 && b.tasks["compile"].executionId == "e-valid", "A newer valid success is used");
+}
+
+unittest
+{
+    // An expired downstream success with a valid upstream: the downstream task is a miss and runs,
+    // and its upstream task is a cache hit
+    auto chain = sampleChain();
+    auto fp = evaluate(chain, [], Executions.init).resolution.fingerprints;
+    Executions executions;
+    executions.add("e-compile", "compile", fp["compile"], ExecutionStatus.succeeded, "2026-10-15T09:00:00Z");
+    executions.add("e-test", "test", fp["test"], ExecutionStatus.succeeded, "2026-10-15T10:00:00Z");
+    executions.byFingerprint[fp["test"]][0].artifactsExpiredAt = "2026-10-15T12:00:00Z";
+
+    auto e = evaluate(chain, [request("r1", ["test"], "2026-10-15T10:00:01Z")], executions);
+    assert(neededTasks(e) == ["test"]);
+    assert(e.tasks["test"].status == ChainTaskStatus.waiting && e.tasks["test"].waitingFor == WaitReason.dispatch);
+    assert(e.tasks["compile"].status == ChainTaskStatus.succeeded && e.tasks["compile"].executionId == "e-compile");
 }

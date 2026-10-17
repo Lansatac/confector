@@ -809,6 +809,10 @@ struct TaskExecution
     @optional @asName("sent_at") string sentAt;
     /// Artifacts the execution produced.
     @optional ArtifactMetadata[] artifacts;
+    /// When retention deleted the execution's artifacts (ISO 8601 UTC); empty while they exist. A
+    /// succeeded execution with this set is a cache miss, not a cache hit (AGENTS.md, "The caching
+    /// contract"). Only a succeeded execution has artifacts to expire.
+    @optional @asName("artifacts_expired_at") string artifactsExpiredAt;
     /// The worker that holds or last held it (`WorkerRecord.id`); empty until claimed.
     @optional string worker;
     @asName("created_at") string createdAt;
@@ -1304,6 +1308,12 @@ unittest
     assert(json["definition_hash"].get!string == "def1");
     assert(json["definition"]["steps"][1]["script"].get!string == "make");
     assert(roundTrip(execution) == execution);
+
+    // Retention keeps the record and marks when the artifacts went
+    TaskExecution expired = execution;
+    expired.artifactsExpiredAt = "2026-10-16T09:00:00Z";
+    assert(serializeToJson(expired)["artifacts_expired_at"].get!string == "2026-10-16T09:00:00Z");
+    assert(roundTrip(expired) == expired);
 
     // A failed execution keeps its exit code and error; a queued one has no worker or times yet
     TaskExecution failed = execution;
