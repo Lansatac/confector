@@ -271,77 +271,36 @@ URLRouter apiRouter(TaskEngine engine, string schedulerCallbackSecret, DispatchQ
         }
     });
 
-    // Remote Worker Task Completion Callback endpoints
-    postRoute("/tasks/:fingerprint/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+    // A worker's completion of an execution. It names the execution only: the fingerprint and
+    // task come from the execution record (design record: bead confector-z7z.2), and anything
+    // that does not match it is rejected
+    postRoute("/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            string fingerprint = req.params["fingerprint"];
-            TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
-            if (result.fingerprint.length == 0)
+            string executionId = req.params["execution_id"];
+            if (coordinator is null)
             {
-                result.fingerprint = fingerprint;
+                res.statusCode = HTTPStatus.serviceUnavailable;
+                Json err = Json.emptyObject;
+                err["error"] = Json("Build coordinator is required to record completions");
+                res.writeJsonBody(err);
+                return;
             }
+            TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
             if (result.receiptHandle.length == 0 && "receipt_handle" in req.query)
             {
                 result.receiptHandle = req.query["receipt_handle"];
             }
-
-            if (coordinator !is null)
-            {
-                coordinator.onTaskCompleted(fingerprint, result);
-            }
-            else if (stores !is null)
-            {
-                if (result.buildId.length > 0 && result.taskId.length > 0)
-                {
-                    stores.legacyBuilds.setTaskStatus(result.buildId, result.taskId, result.status, result.errorMessage);
-                }
-            }
+            coordinator.onExecutionCompleted(executionId, result);
 
             Json resp = Json.emptyObject;
             resp["status"] = Json("recorded");
-            resp["fingerprint"] = Json(fingerprint);
+            resp["execution_id"] = Json(executionId);
             res.writeJsonBody(resp);
         }
         catch (Exception e)
         {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
-        }
-    });
-
-    postRoute("/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
-        try
-        {
-            string buildId = req.params["build_id"];
-            string taskId = req.params["task_id"];
-            TaskExecutionResult result = deserializeJson!TaskExecutionResult(req.json);
-            result.buildId = buildId;
-            result.taskId = taskId;
-            if (result.receiptHandle.length == 0 && "receipt_handle" in req.query)
-            {
-                result.receiptHandle = req.query["receipt_handle"];
-            }
-
-            if (coordinator !is null)
-            {
-                coordinator.onTaskCompleted(buildId, taskId, result);
-            }
-            else if (stores !is null)
-            {
-                stores.legacyBuilds.setTaskStatus(buildId, taskId, result.status, result.errorMessage);
-            }
-
-            Json resp = Json.emptyObject;
-            resp["status"] = Json("recorded");
-            resp["build_id"] = Json(buildId);
-            resp["task_id"] = Json(taskId);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
+            logWarn("[api] Rejected the completion of execution '%s': %s", req.params.get("execution_id", ""), e.msg);
             res.statusCode = HTTPStatus.badRequest;
             Json err = Json.emptyObject;
             err["error"] = Json(e.msg);
@@ -1488,14 +1447,33 @@ unittest
     assert(received[0].workOrder.taskId == "n1");
     assert(received[0].workOrder.buildId == bldId);
 
-    // Simulate remote worker callback
-    TaskExecutionResult workerRes;
-    workerRes.buildId = bldId;
-    workerRes.taskId = "n1";
-    workerRes.status = TaskStatus.succeeded;
-    workerRes.exitCode = 0;
-    workerRes.durationMs = 85;
-    coordinator.onTaskCompleted(bldId, "n1", workerRes);
+    // A worker's completion names its execution in the route. A fingerprint in the body is not
+    // part of the completion and cannot choose the cache key (bug confector-1oj): the result is
+    // cached under the execution's own fingerprint
+    import vibe.inet.message : InetHeaderMap;
+    import vibe.stream.memory : createMemoryStream;
+
+    int postCompletion(string executionId, string body)
+    {
+        InetHeaderMap headers;
+        headers["Content-Type"] = "application/json";
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ executionId ~ "/complete"),
+            HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) body.dup, false));
+        auto res = createTestHTTPServerResponse();
+        routerWithCoord.handleRequest(req, res);
+        return res.statusCode;
+    }
+
+    const order = received[0].workOrder;
+    const completion = `{"build_id": "` ~ bldId ~ `", "task_id": "n1", "status": "succeeded", "exit_code": 0, "duration_ms": 85,`
+        ~ ` "fingerprint": "fp_chosen_by_the_worker"}`;
+    assert(postCompletion("exe_unknown", completion) == HTTPStatus.badRequest, "An unknown execution is rejected");
+    assert(stores.executions.get(order.executionId).get.status == ExecutionStatus.running);
+    assert(postCompletion(order.executionId, completion) == HTTPStatus.ok);
+    CachedResult cached;
+    assert(stores.resultCache.get(order.fingerprint, cached));
+    assert(!stores.resultCache.get("fp_chosen_by_the_worker", cached));
+    assert(postCompletion(order.executionId, completion) == HTTPStatus.badRequest, "A duplicate completion is rejected");
 
     BuildRecord bldDetails;
     assert(stores.legacyBuilds.getBuild(bldId, bldDetails));

@@ -9,7 +9,7 @@ import confector.core.definition_hash : recordDefinition;
 import confector.core.executor : CapacityBroker;
 import confector.core.execution_dispatcher : DispatchOutcome, DispatchResult, ExecutionDispatchException, ExecutionDispatcher,
     PlannedExecution, defaultPoolQueue;
-import confector.core.work_orders : finishClaimedExecution, finishExecution, requireClaimingExecution;
+import confector.core.work_orders : executionArtifacts, finishExecution, requireClaimingExecution;
 import confector.core.input_resolution : GraphResolution, RerunGenerations, chainGraph;
 import confector.core.rerun_generations : readChainResolution;
 import confector.plugin_api.dispatch_queue;
@@ -99,12 +99,6 @@ struct InFlightSubscription
 class InFlightTaskRegistry
 {
     private InFlightSubscription[][string] m_inFlight; // fingerprint -> subscriptions
-    private string[string] m_taskToFingerprint;         // "buildId:taskId" -> fingerprint
-
-    private static string taskKey(string buildId, string taskId) pure nothrow @safe
-    {
-        return buildId ~ ":" ~ taskId;
-    }
 
     /**
      * Checks whether a task with the given fingerprint is currently in flight.
@@ -123,8 +117,6 @@ class InFlightTaskRegistry
      */
     bool registerOrSubscribe(string fingerprint, string buildId, string taskId)
     {
-        m_taskToFingerprint[taskKey(buildId, taskId)] = fingerprint;
-
         if (fingerprint.length == 0)
         {
             m_inFlight[fingerprint] ~= InFlightSubscription(buildId, taskId);
@@ -168,19 +160,6 @@ class InFlightTaskRegistry
     }
 
     /**
-     * Looks up the registered fingerprint for a specific build task.
-     */
-    bool getFingerprintForTask(string buildId, string taskId, out string fingerprint) const
-    {
-        if (auto p = taskKey(buildId, taskId) in m_taskToFingerprint)
-        {
-            fingerprint = *p;
-            return true;
-        }
-        return false;
-    }
-
-    /**
      * Completes and removes an in-flight execution, returning all subscribed builds and tasks.
      */
     InFlightSubscription[] completeTask(string fingerprint)
@@ -190,10 +169,6 @@ class InFlightTaskRegistry
         {
             subs = *p;
             m_inFlight.remove(fingerprint);
-            foreach (sub; subs)
-            {
-                m_taskToFingerprint.remove(taskKey(sub.buildId, sub.taskId));
-            }
         }
         return subs;
     }
@@ -209,11 +184,7 @@ class InFlightTaskRegistry
             InFlightSubscription[] remaining;
             foreach (sub; subs)
             {
-                if (sub.buildId == buildId)
-                {
-                    m_taskToFingerprint.remove(taskKey(sub.buildId, sub.taskId));
-                }
-                else
+                if (sub.buildId != buildId)
                 {
                     remaining ~= sub;
                 }
@@ -808,98 +779,79 @@ class BuildCoordinator
     }
 
     /**
-     * Handles task completion results from local or remote workers.
-     * Updates task and build status, saves cached fingerprints, and advances downstream dependents
-     * for all builds subscribed to the completed task execution.
-     */
-    void onTaskCompleted(string fingerprint, TaskExecutionResult result, string receiptHandle = null)
-    {
-        if (result.fingerprint.length == 0)
-        {
-            result.fingerprint = fingerprint;
-        }
-        if (receiptHandle.length > 0 && result.receiptHandle.length == 0)
-        {
-            result.receiptHandle = receiptHandle;
-        }
-        onTaskCompleted(result.buildId, result.taskId, result, receiptHandle);
-    }
-
-    void onTaskCompleted(TaskExecutionResult result, string receiptHandle = null)
-    {
-        if (receiptHandle.length > 0 && result.receiptHandle.length == 0)
-        {
-            result.receiptHandle = receiptHandle;
-        }
-        onTaskCompleted(result.buildId, result.taskId, result, receiptHandle);
-    }
-
-    /**
-     * Records a worker's completion of task `taskId` of build `buildId`. A result naming its
-     * execution (`result.executionId`) is recorded only if that execution still holds its
-     * fingerprint's claim, and its fingerprint is the execution record's; one that does not name
-     * it falls back to the fingerprint this process knows, or the worker's.
+     * Records a worker's completion of execution `executionId`. The completion is identified
+     * only by its execution: the fingerprint, and so the cache key, and the task come from the
+     * execution record, never from the worker (bug confector-1oj). It is recorded only while
+     * that execution is active and holds its fingerprint's claim.
      *
      * Everything is recorded (every attached build's result, then the execution's outcome)
      * before the in-flight registration is dropped and the receipt acknowledged, so a failure
      * part-way leaves nothing forgotten: the report is rejected, the worker does not acknowledge
      * its lease, and the work order is delivered again (another attempt of the execution).
      *
-     * Throws: StaleCompletionException if the result's execution no longer holds its
-     * fingerprint's claim; Exception if recording fails, or `result.status` is not a finished
-     * status.
+     * Throws: StaleCompletionException if the execution already finished (a duplicate or late
+     * completion) or no longer holds its fingerprint's claim; ForeignArtifactException if the
+     * result reports an artifact under another fingerprint; Exception if `executionId` is empty
+     * or names no execution, the result names another task, the legacy build it names belongs
+     * to another project, `result.status` is not a finished status, or recording fails.
      */
-    void onTaskCompleted(string buildId, string taskId, TaskExecutionResult result, string receiptHandle = null)
+    void onExecutionCompleted(string executionId, TaskExecutionResult result, string receiptHandle = null)
     {
         synchronized (m_mutex)
         {
-            logInfo("[coordinator] Build '%s': Task '%s' completion received with status '%s' (exit code: %d, duration: %d ms, error: '%s')", buildId, taskId, result.status, result.exitCode, result.durationMs, result.errorMessage);
             const executionStatus = finishedExecutionStatus(result.status);
 
-            // Which execution this is, and its fingerprint: the execution record's when the
-            // result names it (never the worker's); otherwise the one this process knows for the
-            // task, or the worker's only after a restart.
-            string fingerprint;
-            if (result.executionId.length > 0)
+            // The execution, its fingerprint and its task: the control plane's own record
+            const execution = requireClaimingExecution(m_stores, executionId);
+            const fingerprint = execution.fingerprint;
+            const taskId = execution.taskId;
+            if (result.taskId.length > 0 && result.taskId != taskId)
             {
-                fingerprint = requireClaimingExecution(m_stores, result.executionId).fingerprint;
+                throw new Exception(format("A completion of execution '%s' (task '%s') names task '%s'; it is rejected",
+                    executionId, taskId, result.taskId));
             }
-            else
-            {
-                m_inFlightRegistry.getFingerprintForTask(buildId, taskId, fingerprint);
-                if (fingerprint.length == 0)
-                {
-                    if (auto active = buildId in m_activeBuilds)
-                    {
-                        fingerprint = active.resolution.fingerprints.get(taskId, null);
-                    }
-                }
-                if (fingerprint.length == 0)
-                {
-                    fingerprint = result.fingerprint;
-                }
-            }
+            result.producedArtifacts = executionArtifacts(execution, result.producedArtifacts);
+            const buildId = result.buildId;
+            logInfo("[coordinator] Execution '%s' (build '%s', task '%s') completion received with status '%s' (exit code: %d, duration: %d ms, error: '%s')",
+                executionId, buildId, taskId, result.status, result.exitCode, result.durationMs, result.errorMessage);
 
             // The builds attached to it; nothing is dropped until all are recorded
-            InFlightSubscription[] subscribers;
-            if (fingerprint.length > 0)
-            {
-                subscribers = m_inFlightRegistry.getSubscribers(fingerprint);
-            }
+            InFlightSubscription[] subscribers = m_inFlightRegistry.getSubscribers(fingerprint);
 
-            // Only use fallback for legacy/unknown-fingerprint completions if the original build is still non-terminal
-            if (subscribers.length == 0)
+            // After a restart this process has no subscriptions: the legacy build that dispatched
+            // the work order (its routing, echoed by the worker) is attached if still running.
+            // Removed with the BuildCoordinator (bead confector-z7z.23.10).
+            if (subscribers.length == 0 && buildId.length > 0)
             {
                 BuildRecord origBuild;
-                bool origBuildExists = (m_stores !is null && m_stores.legacyBuilds.getBuild(buildId, origBuild));
-                bool origBuildNonTerminal = origBuildExists &&
-                    (origBuild.status != "cancelled" && origBuild.status != "failed" && origBuild.status != "succeeded");
-
-                if (origBuildNonTerminal)
+                if (m_stores.legacyBuilds.getBuild(buildId, origBuild))
                 {
-                    subscribers = [InFlightSubscription(buildId, taskId)];
+                    if (origBuild.projectId != execution.projectId)
+                    {
+                        throw new Exception(format("A completion of execution '%s' (project '%s') names build '%s' of project '%s'; it is rejected",
+                            executionId, execution.projectId, buildId, origBuild.projectId));
+                    }
+                    const chainFingerprint = chainResolutionBeforeReruns(origBuild.projectId, origBuild.chainTasks)
+                        .fingerprints.get(taskId, null);
+                    if (chainFingerprint != fingerprint)
+                    {
+                        throw new Exception(format("A completion of execution '%s' (task '%s', fingerprint %s) names build '%s', whose chain has fingerprint '%s' for that task; it is rejected",
+                            executionId, taskId, fingerprint, buildId, chainFingerprint));
+                    }
+                    if (origBuild.status != "cancelled" && origBuild.status != "failed" && origBuild.status != "succeeded")
+                    {
+                        subscribers = [InFlightSubscription(buildId, taskId)];
+                    }
                 }
             }
+
+            // The execution's outcome first, by compare-and-set: only the completion that wins it
+            // records anything (a concurrent or duplicate one throws here, having written
+            // nothing), and everything below is derived from the execution it recorded, never
+            // from the request. Its fingerprint's claim is released so the fingerprint can be
+            // dispatched again (a forced build, a retry)
+            const finished = finishExecution(m_stores, executionId, executionStatus, result.exitCode,
+                result.errorMessage, result.producedArtifacts);
 
             // The definition the execution was dispatched with, if this process dispatched it
             TaskNode dispatched;
@@ -910,6 +862,24 @@ class BuildCoordinator
                 haveDispatched = true;
             }
 
+            // The execution is finished: forget it as in flight even if recording the legacy
+            // builds below fails, so a later build of the fingerprint is not attached to it
+            m_inFlightRegistry.completeTask(fingerprint);
+            m_dispatchedDefinitions.remove(fingerprint);
+
+            // A success is cached once, under the execution's fingerprint, whether or not a build
+            // is attached. A crash before this loses the entry: a cache miss, so a rebuild.
+            if (finished.status == ExecutionStatus.succeeded)
+            {
+                m_stores.resultCache.save(finished.fingerprint,
+                    CachedResult(finished.artifacts.dup, cast(TaskNode) finished.definition, finished.definitionHash));
+            }
+
+            // The legacy builds attached to it. A failure here is reported loudly; the execution
+            // stays as recorded and a retried completion is rejected as late (the BuildCoordinator
+            // and its records go in bead confector-z7z.23.10)
+            const finishedTaskStatus = finished.status == ExecutionStatus.succeeded ? TaskStatus.succeeded
+                : finished.status == ExecutionStatus.failed ? TaskStatus.failed : TaskStatus.cancelled;
             string[] buildsToEvaluate;
             foreach (sub; subscribers)
             {
@@ -927,24 +897,15 @@ class BuildCoordinator
                 {
                     logError("[coordinator] Build '%s': recording task '%s' without its definition: %s", subBuildId, subTaskId, e.msg);
                 }
-                rec.status = cast(string)result.status;
-                rec.fingerprint = fingerprint.length > 0 ? fingerprint : result.fingerprint;
-                rec.exitCode = result.exitCode;
-                rec.errorMessage = result.errorMessage;
+                rec.status = cast(string) finishedTaskStatus;
+                rec.fingerprint = finished.fingerprint;
+                rec.exitCode = finished.exitCode;
+                rec.errorMessage = finished.errorMessage;
                 rec.durationMs = result.durationMs;
-                rec.producedArtifacts = result.producedArtifacts;
-                rec.finishedAt = Clock.currTime.toISOString();
+                rec.producedArtifacts = finished.artifacts.dup;
+                rec.finishedAt = finished.finishedAt;
 
                 recordTaskResult(subBuildId, subTaskId, rec);
-
-                // If fingerprint is valid and artifacts exist/succeeded, save to cache
-                if ((result.status == TaskStatus.succeeded || result.status == TaskStatus.cached)
-                    && rec.fingerprint.length > 0)
-                {
-                    m_stores.resultCache.save(rec.fingerprint,
-                        CachedResult(result.producedArtifacts, rec.definition, rec.definitionHash));
-                }
-
                 recordExecutedTask(subBuildId, subTaskId);
 
                 // Logs last, after the state they describe is recorded
@@ -957,26 +918,6 @@ class BuildCoordinator
                 {
                     buildsToEvaluate ~= subBuildId;
                 }
-            }
-
-            // Then the execution's outcome, releasing its fingerprint's claim so the fingerprint
-            // can be dispatched again (a forced build, a retry)
-            if (result.executionId.length > 0)
-            {
-                finishExecution(m_stores, result.executionId, executionStatus, result.exitCode,
-                    result.errorMessage, result.producedArtifacts);
-            }
-            else if (fingerprint.length > 0)
-            {
-                finishClaimedExecution(m_stores, fingerprint, executionStatus, result.exitCode,
-                    result.errorMessage, result.producedArtifacts);
-            }
-
-            // Everything is recorded: forget the in-flight execution
-            if (fingerprint.length > 0)
-            {
-                m_inFlightRegistry.completeTask(fingerprint);
-                m_dispatchedDefinitions.remove(fingerprint);
             }
 
             // Advance DAG progression for all subscribed builds
@@ -1401,6 +1342,16 @@ version (unittest)
         return receiveWork(stores, queue, defaultPoolQueue, maxMessages, 1.hours, "test-worker");
     }
 
+    /// The execution id of the work order for `taskId` among `received`, for tests.
+    string executionOf(ReceivedWorkOrder[] received, string taskId)
+    {
+        foreach (item; received)
+        {
+            if (item.workOrder.taskId == taskId) return item.workOrder.executionId;
+        }
+        assert(false, "no work order for " ~ taskId);
+    }
+
     /// Counts the receivable work orders on the default pool queue by receiving and then
     /// releasing them all, for tests. (The dispatch queue offers no way to inspect it.)
     size_t countReceivable(DispatchQueue queue)
@@ -1460,8 +1411,7 @@ unittest
     res1.taskId = "lint";
     res1.buildId = b1;
     res1.status = TaskStatus.succeeded;
-    res1.fingerprint = "fp_lint_1";
-    coordinator.onTaskCompleted(b1, "lint", res1);
+    coordinator.onExecutionCompleted(dequeued[0].workOrder.executionId, res1);
 
     BuildRecord b1Rec;
     assert(stores.legacyBuilds.getBuild(b1, b1Rec));
@@ -1498,7 +1448,7 @@ unittest
     resA.taskId = "A";
     resA.buildId = bLinear;
     resA.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bLinear, "A", resA);
+    coordinator.onExecutionCompleted(deqA[0].workOrder.executionId, resA);
 
     assert(countReceivable(queue) == 1); // B is now unblocked
     auto deqB = receiveWorkOrders(stores, queue, 1);
@@ -1508,7 +1458,7 @@ unittest
     resB.taskId = "B";
     resB.buildId = bLinear;
     resB.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bLinear, "B", resB);
+    coordinator.onExecutionCompleted(deqB[0].workOrder.executionId, resB);
 
     assert(countReceivable(queue) == 1); // C is now unblocked
     auto deqC = receiveWorkOrders(stores, queue, 1);
@@ -1518,7 +1468,7 @@ unittest
     resC.taskId = "C";
     resC.buildId = bLinear;
     resC.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bLinear, "C", resC);
+    coordinator.onExecutionCompleted(deqC[0].workOrder.executionId, resC);
 
     BuildRecord bLinearRec;
     assert(stores.legacyBuilds.getBuild(bLinear, bLinearRec));
@@ -1555,7 +1505,7 @@ unittest
     resRoot.taskId = "root";
     resRoot.buildId = bDiamond;
     resRoot.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bDiamond, "root", resRoot);
+    coordinator.onExecutionCompleted(deqRoot[0].workOrder.executionId, resRoot);
 
     // Fan-out: both branch1 and branch2 should be enqueued simultaneously
     assert(countReceivable(queue) == 2);
@@ -1567,7 +1517,7 @@ unittest
     resBr1.taskId = "branch1";
     resBr1.buildId = bDiamond;
     resBr1.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bDiamond, "branch1", resBr1);
+    coordinator.onExecutionCompleted(executionOf(deqBranches, "branch1"), resBr1);
 
     // Merge must NOT be enqueued yet because branch2 is still pending
     assert(countReceivable(queue) == 0);
@@ -1577,7 +1527,7 @@ unittest
     resBr2.taskId = "branch2";
     resBr2.buildId = bDiamond;
     resBr2.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bDiamond, "branch2", resBr2);
+    coordinator.onExecutionCompleted(executionOf(deqBranches, "branch2"), resBr2);
 
     // Fan-in: merge is now enqueued
     assert(countReceivable(queue) == 1);
@@ -1588,7 +1538,7 @@ unittest
     resMerge.taskId = "merge";
     resMerge.buildId = bDiamond;
     resMerge.status = TaskStatus.succeeded;
-    coordinator.onTaskCompleted(bDiamond, "merge", resMerge);
+    coordinator.onExecutionCompleted(deqMerge[0].workOrder.executionId, resMerge);
 
     BuildRecord bDiamondRec;
     assert(stores.legacyBuilds.getBuild(bDiamond, bDiamondRec));
@@ -1604,7 +1554,7 @@ unittest
     resFailA.buildId = bFail;
     resFailA.status = TaskStatus.failed;
     resFailA.errorMessage = "Compiler syntax error";
-    coordinator.onTaskCompleted(bFail, "A", resFailA);
+    coordinator.onExecutionCompleted(deqFailA[0].workOrder.executionId, resFailA);
 
     // Downstream tasks B and C must not be enqueued
     assert(countReceivable(queue) == 0);
@@ -1653,8 +1603,7 @@ unittest
         resFetch.taskId = "fetch";
         resFetch.buildId = deqFetch[0].workOrder.buildId;
         resFetch.status = TaskStatus.succeeded;
-        resFetch.fingerprint = deqFetch[0].workOrder.fingerprint;
-        coord5.onTaskCompleted(deqFetch[0].workOrder.buildId, "fetch", resFetch);
+        coord5.onExecutionCompleted(deqFetch[0].workOrder.executionId, resFetch);
 
         // Build 2 (targeting only "fetch") should now be completed!
         BuildRecord b2Rec;
@@ -1672,8 +1621,7 @@ unittest
         resProc.taskId = "process";
         resProc.buildId = b1_coalesce;
         resProc.status = TaskStatus.succeeded;
-        resProc.fingerprint = deqProc[0].workOrder.fingerprint;
-        coord5.onTaskCompleted(b1_coalesce, "process", resProc);
+        coord5.onExecutionCompleted(deqProc[0].workOrder.executionId, resProc);
 
         BuildRecord b1Rec_c;
         assert(stores.legacyBuilds.getBuild(b1_coalesce, b1Rec_c));
@@ -1708,8 +1656,7 @@ unittest
         resAlpha.taskId = "alpha";
         resAlpha.buildId = bFirst;
         resAlpha.status = TaskStatus.succeeded;
-        resAlpha.fingerprint = deqAlpha[0].workOrder.fingerprint;
-        coord6.onTaskCompleted(bFirst, "alpha", resAlpha);
+        coord6.onExecutionCompleted(deqAlpha[0].workOrder.executionId, resAlpha);
 
         assert(countReceivable(queue) == 1);
         auto deqBeta = receiveWorkOrders(stores, queue, 1);
@@ -1718,8 +1665,7 @@ unittest
         resBeta.taskId = "beta";
         resBeta.buildId = bFirst;
         resBeta.status = TaskStatus.succeeded;
-        resBeta.fingerprint = deqBeta[0].workOrder.fingerprint;
-        coord6.onTaskCompleted(bFirst, "beta", resBeta);
+        coord6.onExecutionCompleted(deqBeta[0].workOrder.executionId, resBeta);
 
         BuildRecord bFirstRec;
         assert(stores.legacyBuilds.getBuild(bFirst, bFirstRec));
@@ -1771,8 +1717,7 @@ unittest
         resShared.taskId = "shared_task";
         resShared.buildId = deqShared[0].workOrder.buildId;
         resShared.status = TaskStatus.succeeded;
-        resShared.fingerprint = deqShared[0].workOrder.fingerprint;
-        coord7.onTaskCompleted(deqShared[0].workOrder.buildId, "shared_task", resShared);
+        coord7.onExecutionCompleted(deqShared[0].workOrder.executionId, resShared);
 
         // Build 1 was NOT cancelled and should receive completion successfully
         BuildRecord bCancel2Rec;
@@ -1814,8 +1759,7 @@ unittest
         resSolo.taskId = "solo_task";
         resSolo.buildId = deqSolo[0].workOrder.buildId;
         resSolo.status = TaskStatus.succeeded;
-        resSolo.fingerprint = deqSolo[0].workOrder.fingerprint;
-        coord8.onTaskCompleted(deqSolo[0].workOrder.buildId, "solo_task", resSolo);
+        coord8.onExecutionCompleted(deqSolo[0].workOrder.executionId, resSolo);
 
         // Build must remain cancelled, not be overwritten to succeeded
         BuildRecord bSoloRecAfter;
@@ -1870,8 +1814,7 @@ unittest
         resGpu.taskId = "train_model";
         resGpu.buildId = bWorkOrder;
         resGpu.status = TaskStatus.succeeded;
-        resGpu.fingerprint = wo.fingerprint;
-        coord9.onTaskCompleted(bWorkOrder, "train_model", resGpu);
+        coord9.onExecutionCompleted(wo.executionId, resGpu);
 
         BuildRecord bWorkOrderRec;
         assert(stores.legacyBuilds.getBuild(bWorkOrder, bWorkOrderRec));
@@ -1909,9 +1852,8 @@ unittest
         resStep1.taskId = "step1";
         resStep1.buildId = bAck;
         resStep1.status = TaskStatus.succeeded;
-        resStep1.fingerprint = deqStep1[0].workOrder.fingerprint;
         resStep1.receiptHandle = rHandle;
-        coord10.onTaskCompleted(bAck, "step1", resStep1);
+        coord10.onExecutionCompleted(deqStep1[0].workOrder.executionId, resStep1);
 
         // Downstream step2 is now ready in queue
         assert(countReceivable(queue) == 1);
@@ -1928,8 +1870,7 @@ unittest
         resStep2.taskId = "step2";
         resStep2.buildId = bAck;
         resStep2.status = TaskStatus.succeeded;
-        resStep2.fingerprint = deqStep2[0].workOrder.fingerprint;
-        coord10.onTaskCompleted(bAck, "step2", resStep2, deqStep2[0].receipt);
+        coord10.onExecutionCompleted(deqStep2[0].workOrder.executionId, resStep2, deqStep2[0].receipt);
 
         BuildRecord bAckRec;
         assert(stores.legacyBuilds.getBuild(bAck, bAckRec));
@@ -1969,9 +1910,7 @@ version (unittest)
         res.taskId = wo.taskId;
         res.buildId = wo.buildId;
         res.status = TaskStatus.succeeded;
-        res.fingerprint = wo.fingerprint;
-        res.executionId = wo.executionId;
-        coordinator.onTaskCompleted(wo.buildId, wo.taskId, res, received[0].receipt);
+        coordinator.onExecutionCompleted(wo.executionId, res, received[0].receipt);
         return wo;
     }
 
@@ -2144,8 +2083,7 @@ unittest
     done.taskId = "compile";
     done.buildId = buildId;
     done.status = TaskStatus.succeeded;
-    done.fingerprint = compileOrder.workOrder.fingerprint;
-    after.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+    after.onExecutionCompleted(compileOrder.workOrder.executionId, done, compileOrder.receipt);
 
     auto internal = completeNext(after, queue, "internal");
     assert(resolverAfter.calls == 0, "Resuming a build must not resolve");
@@ -2262,8 +2200,7 @@ unittest
     done.taskId = "compile";
     done.buildId = buildId;
     done.status = TaskStatus.succeeded;
-    done.fingerprint = compileOrder.workOrder.fingerprint;
-    after.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+    after.onExecutionCompleted(compileOrder.workOrder.executionId, done, compileOrder.receipt);
 
     TaskStatus internalStatus;
     assert(stores.legacyBuilds.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.failed);
@@ -2303,9 +2240,8 @@ unittest
     done.taskId = "compile";
     done.buildId = buildId;
     done.status = TaskStatus.succeeded;
-    done.fingerprint = compileOrder.workOrder.fingerprint;
     done.producedArtifacts = [produced];
-    coordinator.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+    coordinator.onExecutionCompleted(compileOrder.workOrder.executionId, done, compileOrder.receipt);
 
     // internal wants game.zip, which compile produced
     auto internalOrder = receiveWorkOrders(stores, queue, 1);
@@ -2347,8 +2283,7 @@ unittest
     done.taskId = "compile";
     done.buildId = buildId;
     done.status = TaskStatus.succeeded;
-    done.fingerprint = compileOrder.workOrder.fingerprint;
-    coordinator.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+    coordinator.onExecutionCompleted(compileOrder.workOrder.executionId, done, compileOrder.receipt);
 
     TaskExecutionRecord compileRec;
     assert(stores.legacyBuilds.getTaskExecution(buildId, "compile", compileRec));
@@ -2360,8 +2295,7 @@ unittest
     failed.taskId = "internal";
     failed.buildId = buildId;
     failed.status = TaskStatus.failed;
-    failed.fingerprint = internalOrder.workOrder.fingerprint;
-    coordinator.onTaskCompleted(buildId, "internal", failed, internalOrder.receipt);
+    coordinator.onExecutionCompleted(internalOrder.workOrder.executionId, failed, internalOrder.receipt);
     TaskExecutionRecord internalRec;
     assert(stores.legacyBuilds.getTaskExecution(buildId, "internal", internalRec));
     assert(internalRec.status == "failed" && internalRec.definitionHash == computeDefinitionHash(project.tasks[1]));
@@ -2409,8 +2343,7 @@ unittest
     done.taskId = "compile";
     done.buildId = buildId;
     done.status = TaskStatus.succeeded;
-    done.fingerprint = compileOrder.workOrder.fingerprint;
-    first.onTaskCompleted(buildId, "compile", done, compileOrder.receipt);
+    first.onExecutionCompleted(compileOrder.workOrder.executionId, done, compileOrder.receipt);
     TaskExecutionRecord compileRec;
     assert(stores.legacyBuilds.getTaskExecution(buildId, "compile", compileRec));
     assert(compileRec.definitionHash == computeDefinitionHash(project.tasks[0]), "Recorded as dispatched, not as edited since");
@@ -2425,8 +2358,7 @@ unittest
     internalDone.taskId = "internal";
     internalDone.buildId = buildId;
     internalDone.status = TaskStatus.succeeded;
-    internalDone.fingerprint = internalOrder.workOrder.fingerprint;
-    second.onTaskCompleted(buildId, "internal", internalDone, internalOrder.receipt);
+    second.onExecutionCompleted(internalOrder.workOrder.executionId, internalDone, internalOrder.receipt);
 
     TaskStatus internalStatus;
     assert(stores.legacyBuilds.getTaskStatus(buildId, "internal", internalStatus) && internalStatus == TaskStatus.succeeded);
@@ -2661,7 +2593,7 @@ unittest
     {
         TaskExecutionResult done;
         done.status = TaskStatus.succeeded;
-        coordinator.onTaskCompleted(buildId, item.workOrder.taskId, done, item.receipt);
+        coordinator.onExecutionCompleted(item.workOrder.executionId, done, item.receipt);
     }
     assert(broker.evaluations == 2 && broker.mutexWasFree && broker.demandSeen == 1);
     foreach (ref execution; stores.executions.listForTask("proj_sit", "a", 10)) assert(execution.status == ExecutionStatus.succeeded);
@@ -2669,9 +2601,12 @@ unittest
 
 unittest
 {
-    // A completion that cannot be recorded is rejected without forgetting anything: the
-    // execution stays running with its claim, the build stays attached, and the receipt is not
-    // acknowledged, so the redelivered work order completes it later
+    // The execution's outcome is recorded first, by compare-and-set; a legacy build record that
+    // then cannot be written is reported loudly and the receipt is not acknowledged, but the
+    // execution stays as recorded (with its cache entry) and is forgotten as in flight, and a
+    // retried report is rejected as late. (The stuck legacy build goes with the BuildCoordinator,
+    // bead confector-z7z.23.10.)
+    import confector.core.work_orders : StaleCompletionException;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
@@ -2699,33 +2634,32 @@ unittest
 
     TaskExecutionResult done;
     done.status = TaskStatus.succeeded;
-    done.executionId = order.workOrder.executionId;
     bool threw = false;
-    try broken.onTaskCompleted(buildId, "compile", done, order.receipt);
-    catch (Exception e) threw = true;
+    try broken.onExecutionCompleted(order.workOrder.executionId, done, order.receipt);
+    catch (StaleCompletionException e) assert(false, "Not stale: the legacy record failed");
+    catch (Exception e) threw = e.msg.canFind("store unavailable");
     assert(threw, "The report is rejected");
     assert(queue.acks == 0, "The receipt is not acknowledged");
-    assert(stores.executions.get(order.workOrder.executionId).get.status == ExecutionStatus.running);
-    assert(stores.claims.get(order.workOrder.fingerprint).get.executionId == order.workOrder.executionId);
-    assert(broken.inFlightRegistry.getSubscribers(order.workOrder.fingerprint).length == 1, "The build stays attached");
-
-    // Reported again once the store recovers: recorded, finished, acknowledged
-    failing.failReplaces = false;
-    broken.onTaskCompleted(buildId, "compile", done, order.receipt);
-    assert(queue.acks == 1);
     assert(stores.executions.get(order.workOrder.executionId).get.status == ExecutionStatus.succeeded);
-    assert(broken.inFlightRegistry.inFlightCount() == 0);
-    BuildRecord record;
-    assert(stores.legacyBuilds.getBuild(buildId, record) && record.status == "succeeded");
+    assert(stores.claims.get(order.workOrder.fingerprint).get.executionId.length == 0);
+    CachedResult cached;
+    assert(stores.resultCache.get(order.workOrder.fingerprint, cached));
+    assert(broken.inFlightRegistry.inFlightCount() == 0, "A later build is not attached to a finished execution");
+
+    failing.failReplaces = false;
+    bool late = false;
+    try broken.onExecutionCompleted(order.workOrder.executionId, done, order.receipt);
+    catch (StaleCompletionException e) late = true;
+    assert(late && queue.acks == 0);
 }
 
 unittest
 {
     // Stale completion guard: a completion naming an execution that no longer holds its
     // fingerprint (here failed and the fingerprint re-claimed by a later execution) is rejected
-    // loudly and records nothing; a completion naming the current execution is recorded against
-    // the execution's own fingerprint, whatever fingerprint the worker reports
-    import confector.core.work_orders : StaleCompletionException;
+    // loudly and records nothing; a completion naming the current execution, which carries no
+    // fingerprint at all, is recorded against the execution's own fingerprint
+    import confector.core.work_orders : StaleCompletionException, finishExecution;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
@@ -2742,14 +2676,13 @@ unittest
     string buildId = coordinator.startBuild(project, null, true);
     auto order = receiveWorkOrders(stores, queue, 1)[0].workOrder;
     const fingerprint = order.fingerprint;
-    assert(finishClaimedExecution(stores, fingerprint, ExecutionStatus.failed, 1, "lease expired", null));
+    finishExecution(stores, order.executionId, ExecutionStatus.failed, 1, "lease expired", null);
     assert(stores.claims.claim(fingerprint, "exe_later").won);
 
     TaskExecutionResult stale;
     stale.status = TaskStatus.succeeded;
-    stale.executionId = order.executionId;
     bool rejected = false;
-    try coordinator.onTaskCompleted(buildId, "compile", stale);
+    try coordinator.onExecutionCompleted(order.executionId, stale);
     catch (StaleCompletionException e) rejected = true;
     assert(rejected);
     TaskStatus status;
@@ -2758,23 +2691,180 @@ unittest
     CachedResult cached;
     assert(!stores.resultCache.get(fingerprint, cached), "Nothing was recorded");
 
-    // A current execution with a wrong worker-reported fingerprint finishes the right one
-    // (another coordinator: this one still holds the first build attached to the fingerprint)
+    // The current execution finishes under its own fingerprint (another coordinator: this one
+    // still holds the first build attached to the fingerprint)
     stores.claims.release(fingerprint, "exe_later");
     auto other = new BuildCoordinator(new InMemoryArtifactStorage(), stores, queue);
     string again = other.startBuild(project, null, true);
     auto current = receiveWorkOrders(stores, queue, 1)[0].workOrder;
     TaskExecutionResult done;
     done.status = TaskStatus.succeeded;
-    done.executionId = current.executionId;
-    done.fingerprint = "worker-made-this-up";
-    other.onTaskCompleted(again, "compile", done);
+    other.onExecutionCompleted(current.executionId, done);
     assert(stores.executions.get(current.executionId).get.status == ExecutionStatus.succeeded);
-    assert(stores.resultCache.get(fingerprint, cached) && !stores.resultCache.get("worker-made-this-up", cached));
+    assert(stores.resultCache.get(fingerprint, cached));
     BuildRecord record;
     assert(stores.legacyBuilds.getBuild(again, record) && record.status == "succeeded");
 }
 
+version (unittest)
+{
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+
+    /// A coordinator over in-memory stores with one single-task project ("compile") whose
+    /// build has been started and its work order received, for completion tests.
+    struct CompletionFixture
+    {
+        InMemoryDocumentStore documents;
+        StateStores stores;
+        DispatchQueue queue;
+        BuildCoordinator coordinator;
+        ProjectRecord project;
+        string buildId;
+        ReceivedWorkOrder received;
+
+        @property WorkOrder order() { return received.workOrder; }
+
+        static CompletionFixture start(string projectId)
+        {
+            import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+            import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+
+            CompletionFixture f;
+            f.documents = new InMemoryDocumentStore();
+            f.stores = new StateStores(f.documents);
+            f.queue = new InMemoryDispatchQueue();
+            f.coordinator = new BuildCoordinator(new InMemoryArtifactStorage(), f.stores, f.queue);
+            TaskNode task;
+            task.id = "compile";
+            f.project.id = projectId;
+            f.project.tasks = [task];
+            f.buildId = f.coordinator.startBuild(f.project, null, true);
+            f.received = receiveWorkOrders(f.stores, f.queue, 1)[0];
+            return f;
+        }
+
+        /// Whether nothing about the completion was recorded: the execution is still running
+        /// with its claim, the build's task is not finished and no cache entry exists.
+        bool nothingRecorded()
+        {
+            TaskStatus status;
+            CachedResult cached;
+            return stores.executions.get(order.executionId).get.status == ExecutionStatus.running
+                && stores.claims.get(order.fingerprint).get.executionId == order.executionId
+                && stores.legacyBuilds.getTaskStatus(buildId, "compile", status) && status == TaskStatus.running
+                && !stores.resultCache.get(order.fingerprint, cached);
+        }
+    }
+
+    /// Whether `report` throws `E`.
+    bool rejects(E : Exception = Exception)(void delegate() report)
+    {
+        try report();
+        catch (E) return true;
+        return false;
+    }
+}
+
+unittest
+{
+    // Bug confector-1oj: a completion is identified by its execution id alone. One naming no
+    // execution, or an execution that does not exist, is rejected loudly and records nothing
+    auto f = CompletionFixture.start("proj_unknown_execution");
+    // The work order was received through the queue route in production, which marks the task
+    // running; do the same here
+    f.stores.legacyBuilds.setTaskStatus(f.buildId, "compile", TaskStatus.running);
+    TaskExecutionResult done;
+    done.status = TaskStatus.succeeded;
+    done.buildId = f.buildId;
+    done.taskId = "compile";
+
+    assert(rejects({ f.coordinator.onExecutionCompleted("", done); }));
+    assert(rejects({ f.coordinator.onExecutionCompleted("exe_unknown", done); }));
+    assert(f.nothingRecorded());
+
+    // The real execution still completes
+    f.coordinator.onExecutionCompleted(f.order.executionId, done, f.received.receipt);
+    assert(f.stores.executions.get(f.order.executionId).get.status == ExecutionStatus.succeeded);
+}
+
+unittest
+{
+    // A duplicate or late completion of an execution that already finished is rejected loudly
+    // and changes nothing: not the execution, the build's result or the cache entry
+    import confector.core.work_orders : StaleCompletionException;
+
+    auto f = CompletionFixture.start("proj_duplicate_completion");
+    TaskExecutionResult done;
+    done.status = TaskStatus.succeeded;
+    done.buildId = f.buildId;
+    done.durationMs = 5;
+    ArtifactMetadata zip;
+    zip.artifactId = "game.zip";
+    done.producedArtifacts = [zip];
+    f.coordinator.onExecutionCompleted(f.order.executionId, done, f.received.receipt);
+
+    TaskExecutionResult late;
+    late.status = TaskStatus.failed;
+    late.buildId = f.buildId;
+    late.exitCode = 9;
+    late.errorMessage = "late report";
+    assert(rejects!StaleCompletionException({ f.coordinator.onExecutionCompleted(f.order.executionId, late); }));
+    assert(rejects!StaleCompletionException({ f.coordinator.onExecutionCompleted(f.order.executionId, done); }));
+
+    auto execution = f.stores.executions.get(f.order.executionId).get;
+    assert(execution.status == ExecutionStatus.succeeded && execution.errorMessage.length == 0);
+    TaskExecutionRecord rec;
+    assert(f.stores.legacyBuilds.getTaskExecution(f.buildId, "compile", rec));
+    assert(rec.status == "succeeded" && rec.durationMs == 5 && rec.errorMessage.length == 0);
+    CachedResult cached;
+    assert(f.stores.resultCache.get(f.order.fingerprint, cached) && cached.artifacts.length == 1);
+    assert(cached.artifacts[0].taskFingerprint == f.order.fingerprint);
+    BuildRecord record;
+    assert(f.stores.legacyBuilds.getBuild(f.buildId, record) && record.status == "succeeded");
+}
+
+unittest
+{
+    // A completion whose report does not match its execution writes no cache entry: one naming
+    // another task, one reporting artifacts under another fingerprint, and one naming a legacy
+    // build of another project are rejected loudly and record nothing
+    import confector.core.work_orders : ForeignArtifactException;
+
+    auto f = CompletionFixture.start("proj_mismatch");
+    f.stores.legacyBuilds.setTaskStatus(f.buildId, "compile", TaskStatus.running);
+
+    TaskExecutionResult otherTask;
+    otherTask.status = TaskStatus.succeeded;
+    otherTask.taskId = "deploy";
+    assert(rejects({ f.coordinator.onExecutionCompleted(f.order.executionId, otherTask); }));
+
+    TaskExecutionResult foreign;
+    foreign.status = TaskStatus.succeeded;
+    ArtifactMetadata zip;
+    zip.artifactId = "game.zip";
+    zip.taskFingerprint = "fp_chosen_by_the_worker";
+    foreign.producedArtifacts = [zip];
+    assert(rejects!ForeignArtifactException({ f.coordinator.onExecutionCompleted(f.order.executionId, foreign); }));
+    CachedResult cached;
+    assert(!f.stores.resultCache.get("fp_chosen_by_the_worker", cached));
+
+    // After a restart (no subscriptions), the legacy build the worker names must be the
+    // execution's project's
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    auto restarted = new BuildCoordinator(new InMemoryArtifactStorage(), f.stores, f.queue);
+    ProjectRecord elsewhere;
+    elsewhere.id = "proj_elsewhere";
+    TaskNode task;
+    task.id = "compile";
+    elsewhere.tasks = [task];
+    auto foreignBuild = restarted.startBuild(elsewhere, null, true);
+    TaskExecutionResult wrongBuild;
+    wrongBuild.status = TaskStatus.succeeded;
+    wrongBuild.buildId = foreignBuild;
+    assert(rejects({ restarted.onExecutionCompleted(f.order.executionId, wrongBuild); }));
+
+    assert(f.nothingRecorded());
+}
 unittest
 {
     // Recording sentAt failing after the send succeeded does not fail the build: the work order
@@ -2802,4 +2892,89 @@ unittest
     completeNext(coordinator, queue, "compile");
     BuildRecord record;
     assert(stores.legacyBuilds.getBuild(buildId, record) && record.status == "succeeded");
+}
+
+unittest
+{
+    // Two completions of one execution racing on two coordinators (a failure and a success):
+    // only the completion that wins the execution's compare-and-set records anything, so the
+    // cache holds only what the winning execution record justifies. Here the failure wins, and
+    // the success, which passed every check first, writes no cache entry and is rejected
+    import confector.core.work_orders : StaleCompletionException;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.memory_document_store : InterleavingDocumentStore;
+
+    auto f = CompletionFixture.start("proj_completion_race");
+    auto interleaving = new InterleavingDocumentStore(f.documents);
+    auto other = new BuildCoordinator(new InMemoryArtifactStorage(), new StateStores(interleaving), f.queue);
+
+    TaskExecutionResult failed;
+    failed.status = TaskStatus.failed;
+    failed.exitCode = 2;
+    failed.errorMessage = "compile error";
+    failed.buildId = f.buildId;
+    TaskExecutionResult succeeded;
+    succeeded.status = TaskStatus.succeeded;
+    succeeded.buildId = f.buildId;
+    ArtifactMetadata zip;
+    zip.artifactId = "game.zip";
+    succeeded.producedArtifacts = [zip];
+
+    interleaving.beforeNextWrite = () { f.coordinator.onExecutionCompleted(f.order.executionId, failed); };
+    assert(rejects!StaleCompletionException({ other.onExecutionCompleted(f.order.executionId, succeeded); }));
+
+    auto execution = f.stores.executions.get(f.order.executionId).get;
+    assert(execution.status == ExecutionStatus.failed && execution.errorMessage == "compile error");
+    CachedResult cached;
+    assert(!f.stores.resultCache.get(f.order.fingerprint, cached), "A failure is never cached");
+    TaskExecutionRecord rec;
+    assert(f.stores.legacyBuilds.getTaskExecution(f.buildId, "compile", rec) && rec.status == "failed" && rec.exitCode == 2);
+    BuildRecord record;
+    assert(f.stores.legacyBuilds.getBuild(f.buildId, record) && record.status == "failed");
+}
+
+unittest
+{
+    // A success is cached under its execution's fingerprint even when no build is attached to
+    // it any more (here its only build was cancelled)
+    auto f = CompletionFixture.start("proj_unattached_success");
+    f.coordinator.cancelBuild(f.buildId);
+    TaskExecutionResult done;
+    done.status = TaskStatus.succeeded;
+    f.coordinator.onExecutionCompleted(f.order.executionId, done);
+    CachedResult cached;
+    assert(f.stores.resultCache.get(f.order.fingerprint, cached));
+    BuildRecord record;
+    assert(f.stores.legacyBuilds.getBuild(f.buildId, record) && record.status == "cancelled");
+}
+
+unittest
+{
+    // After a restart, the legacy build a completion names must be one whose chain has the
+    // execution's fingerprint for its task: a build of the same project on another chain is
+    // rejected loudly and records nothing
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+
+    auto f = CompletionFixture.start("proj_other_chain");
+    f.stores.legacyBuilds.setTaskStatus(f.buildId, "compile", TaskStatus.running);
+    // The same project with another declared value: a new chain, another fingerprint
+    ProjectRecord edited = f.project;
+    edited.tasks[0].inputs["flavor"] = valueInput("external");
+    auto restarted = new BuildCoordinator(new InMemoryArtifactStorage(), f.stores, f.queue);
+    auto otherChain = restarted.startBuild(edited, null, true);
+
+    TaskExecutionResult done;
+    done.status = TaskStatus.succeeded;
+    done.buildId = otherChain;
+    bool rejected = false;
+    try restarted.onExecutionCompleted(f.order.executionId, done);
+    catch (Exception e) rejected = e.msg.canFind("whose chain has fingerprint");
+    assert(rejected);
+    assert(f.nothingRecorded());
+
+    // Naming its own build, it is recorded
+    done.buildId = f.buildId;
+    restarted.onExecutionCompleted(f.order.executionId, done);
+    BuildRecord record;
+    assert(f.stores.legacyBuilds.getBuild(f.buildId, record) && record.status == "succeeded");
 }

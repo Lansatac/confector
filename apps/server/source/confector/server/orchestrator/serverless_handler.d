@@ -94,7 +94,7 @@ ServerlessTaskResponse executeServerlessTask(
     response.taskId = res.taskId;
     response.buildId = res.buildId;
     response.status = res.status;
-    response.fingerprint = res.fingerprint;
+    response.fingerprint = request.fingerprint;
     response.exitCode = res.exitCode;
     response.logs = res.logs;
     response.errorMessage = res.errorMessage;

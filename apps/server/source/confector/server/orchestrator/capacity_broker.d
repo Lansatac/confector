@@ -290,8 +290,7 @@ unittest
                 res.taskId = order.taskId;
                 res.buildId = order.buildId;
                 res.status = TaskStatus.succeeded;
-                res.fingerprint = order.fingerprint.length > 0 ? order.fingerprint : "fp_" ~ order.taskId;
-                m_coord.onTaskCompleted(order.buildId, order.taskId, res);
+                m_coord.onExecutionCompleted(order.executionId, res);
                 m_q.ack(defaultPoolQueue, received.receipt);
             }
         }

@@ -255,20 +255,23 @@ class HttpWorkerClient
         }
     }
 
-    /// Reports a task's completion. Returns false, logging why, if the server did not record it.
-    bool reportCompletion(string buildId, string taskId, in TaskExecutionResult result)
+    /// Reports the completion of execution `executionId` (`WorkOrder.executionId`). The result
+    /// names no fingerprint: the server reads it from the execution. Returns false, logging why,
+    /// if the server did not record it.
+    bool reportCompletion(string executionId, in TaskExecutionResult result)
     {
         bool success = false;
         try
         {
             Json bodyJson = serializeToJson(result);
-            string endpoint = format("/builds/%s/tasks/%s/complete", buildId, taskId);
+            string endpoint = format("/executions/%s/complete", executionId);
             sendJson(endpoint, "POST", bodyJson);
             success = true;
         }
         catch (Exception e)
         {
-            logError("[HttpWorkerClient] Failed to report task completion to server (build: %s, task: %s): %s", buildId, taskId, e.msg);
+            logError("[HttpWorkerClient] Failed to report the completion of execution '%s' (task: %s) to the server: %s",
+                executionId, result.taskId, e.msg);
         }
 
         return success;
@@ -353,6 +356,12 @@ class HttpWorkerDaemon
     TaskExecutionResult processOneMessage(in Lease lease)
     {
         const WorkOrder msg = deserializeJson!WorkOrder(lease.message);
+        if (msg.executionId.length == 0)
+        {
+            // Its completion could not name what it completes: refuse it before running anything
+            throw new Exception(format("Work order for task '%s' (receipt '%s') names no execution; it cannot be run or completed",
+                msg.taskId, lease.receipt));
+        }
         string buildId = msg.buildId.length > 0 ? msg.buildId : "build_anon";
         string taskId = msg.taskId;
         string taskWsDir = buildPath(m_config.workspaceDir, buildId, taskId);
@@ -485,9 +494,8 @@ class HttpWorkerDaemon
             m_client.streamLogs(buildId, taskId, finalLogs);
         }
 
-        // Report task completion over HTTP, naming the execution the work order is for
-        result.executionId = msg.executionId;
-        if (!m_client.reportCompletion(buildId, taskId, result))
+        // Report the execution's completion over HTTP
+        if (!m_client.reportCompletion(msg.executionId, result))
         {
             // Not acknowledged: the lease expires and the work order is delivered again, rather
             // than the work order disappearing with its completion never recorded.
@@ -658,13 +666,14 @@ unittest
 
     bool rejectCompletion = false;
     string reportedExecution;
-    router.post("/api/v1/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+    bool reportedFingerprint;
+    router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         completeCalled = true;
         // The result's status is not checked: the worker runs on its own thread, whose
         // (thread-local) plugin registry lacks the mock step system, so the task fails there.
         // These tests cover the control-plane protocol.
-        auto result = deserializeJson!TaskExecutionResult(req.json);
-        reportedExecution = result.executionId;
+        reportedExecution = req.params["execution_id"];
+        reportedFingerprint = ("fingerprint" in req.json) !is null;
         if (rejectCompletion)
         {
             res.statusCode = 400;
@@ -712,7 +721,8 @@ unittest
     assert(dequeueCalled);
     assert(completeCalled);
     assert(ackCalled);
-    assert(reportedExecution == "exe_mock_1", "The result names the work order's execution");
+    assert(reportedExecution == "exe_mock_1", "The completion names the work order's execution");
+    assert(!reportedFingerprint, "The completion carries no fingerprint");
 
     // A completion the server does not record leaves the lease unacknowledged, so the work order
     // is delivered again instead of disappearing
@@ -728,6 +738,25 @@ unittest
     }
     retryThread.join();
     assert(completeCalled && !ackCalled);
+
+    // A work order naming no execution is refused before anything runs: its completion could
+    // not say what it completes
+    completeCalled = false;
+    WorkOrder anonymous = mockOrder;
+    anonymous.executionId = null;
+    auto anonymousLease = Lease("receipt_anon", 1, serializeToJson(anonymous));
+    bool refused = false;
+    auto anonymousThread = new Thread({
+        try workerRunner.processOneMessage(anonymousLease);
+        catch (Exception e) refused = e.msg.canFind("names no execution");
+    });
+    anonymousThread.start();
+    while (anonymousThread.isRunning)
+    {
+        sleep(50.msecs);
+    }
+    anonymousThread.join();
+    assert(refused && !completeCalled && !ackCalled);
 }
 
 unittest
@@ -783,6 +812,7 @@ unittest
     string[] streamedLogs;
 
     WorkOrder orderStep1;
+    orderStep1.executionId = "exe_step_1";
     orderStep1.buildId = "build_multistep_1";
     orderStep1.taskId = "task_step_1";
     orderStep1.fingerprint = "fp_step_1";
@@ -791,6 +821,7 @@ unittest
     Json msgStep1 = testLeases("receipt_step_1", orderStep1);
 
     WorkOrder orderStep2;
+    orderStep2.executionId = "exe_step_2";
     orderStep2.buildId = "build_multistep_1";
     orderStep2.taskId = "task_step_2";
     orderStep2.fingerprint = "fp_step_2";
@@ -829,9 +860,8 @@ unittest
         res.writeJsonBody(["status": "ok"]);
     });
 
-    router.post("/api/v1/builds/:build_id/tasks/:task_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
-        string tId = req.params["task_id"];
-        completedTasks ~= tId;
+    router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        completedTasks ~= req.params["execution_id"];
         // Status not checked; see the previous test
         res.writeJsonBody(["status": "recorded"]);
     });
@@ -871,8 +901,8 @@ unittest
 
     assert(workerRunner.tasksProcessed == 2);
     assert(completedTasks.length == 2);
-    assert(completedTasks[0] == "task_step_1");
-    assert(completedTasks[1] == "task_step_2");
+    assert(completedTasks[0] == "exe_step_1");
+    assert(completedTasks[1] == "exe_step_2");
     assert(acknowledgedReceipts.length == 2);
     assert(acknowledgedReceipts[0] == "receipt_step_1");
     assert(acknowledgedReceipts[1] == "receipt_step_2");

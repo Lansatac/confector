@@ -549,23 +549,28 @@ struct CachedResult
 }
 
 /**
- * Result of a single task execution.
+ * Result of a single task execution: what a worker reports when it completes an execution.
+ *
+ * A completion names its execution by id (the worker posts it to
+ * `/executions/<execution id>/complete`), and the control plane reads the fingerprint and task
+ * from its own execution record (design record: bead confector-z7z.2). The result deliberately
+ * has no fingerprint: a worker cannot name the cache key its result is stored under.
  */
 struct TaskExecutionResult
 {
+    /// The task that ran, for logs. The control plane takes the task from the execution record
+    /// and rejects a completion naming a different one.
     @optional @asName("task_id") string taskId;
+    /// The legacy build that dispatched the work order (`WorkOrder.buildId`), echoed as routing
+    /// for the BuildCoordinator; removed with it (bead confector-z7z.23.10).
     @optional @asName("build_id") string buildId;
     @optional @asName("status") TaskStatus status = TaskStatus.pending;
-    @optional @asName("fingerprint") string fingerprint;
     @optional @asName("exit_code") int exitCode = 0;
     @optional @asName("logs") string[] logs;
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("duration_ms") ulong durationMs = 0;
     @optional @asName("receipt_handle") string receiptHandle;
-    /// The execution the result is for (`WorkOrder.executionId`), echoed by the worker. The
-    /// control plane rejects a result for an execution that no longer holds its fingerprint.
-    @optional @asName("execution_id") string executionId;
 }
 
 /**
@@ -1041,7 +1046,8 @@ struct TaskExecutionPayload
  */
 struct WorkOrder
 {
-    /// The execution to run (`TaskExecution.id`).
+    /// The execution to run (`TaskExecution.id`). The worker's completion names it; a work order
+    /// without one cannot be completed.
     @optional @asName("execution_id") string executionId;
     @optional @asName("build_id") string buildId;
     @optional @asName("task_id") string taskId;

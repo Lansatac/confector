@@ -174,7 +174,6 @@ class TaskEngine
             throw new Exception(format("Task '%s' of build '%s' has no fingerprint; the work order must carry the one the control plane computed",
                 task.id, buildId));
         }
-        result.fingerprint = fingerprint;
 
         // 2. Bind the work order's resolved inputs to the task's declared inputs
         ResolvedInput[string] boundInputs = bindInputs(task, inputs, repositoryAddresses);
@@ -426,9 +425,9 @@ unittest
     node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 
     auto res1 = engine.executeTask("build_1", node1, testDir, "fp_step1", []);
-    assert(res1.fingerprint == "fp_step1", "Outputs are stored under the work order's fingerprint");
     assert(res1.status == TaskStatus.succeeded);
     assert(res1.producedArtifacts.length == 1);
+    assert(res1.producedArtifacts[0].taskFingerprint == "fp_step1", "Outputs are stored under the work order's fingerprint");
     assert(storage.artifactExists("fp_step1", "output.txt"));
 
     // The runner never computes a fingerprint of its own
