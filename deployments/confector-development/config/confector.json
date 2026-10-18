@@ -28,8 +28,6 @@
       "runnerBinary": "/code/build/out/runner/confector-runner",
       "serverUrl": "http://development:8080",
       "workspaceDir": "/runner/workspace",
-      "storageDir": "/runner/artifacts",
-      "pluginsDir": "/code/out/runner/plugins",
       "maxConcurrency": 0,
       "supportedExecutorTypes": ["local", "local_process", ""]
     }

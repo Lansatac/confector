@@ -399,7 +399,7 @@ struct ArtifactMetadata
 {
     @optional @asName("artifact_id") string artifactId;
     @optional @asName("task_fingerprint") string taskFingerprint;
-    @optional @asName("build_id") string buildId;
+    @optional @asName("execution_id") string executionId;
     @optional @asName("task_id") string taskId;
     @optional @asName("file_path") string filePath;
     @optional string sha256;
@@ -524,9 +524,6 @@ struct TaskExecutionResult
     @optional @asName("task_id") string taskId;
     @optional @asName("status") TaskStatus status = TaskStatus.pending;
     @optional @asName("exit_code") int exitCode = 0;
-    /// The task's log lines. A worker streams them to the execution's log as it runs
-    /// (`/executions/<execution id>/logs`); a completion does not record them again.
-    @optional @asName("logs") string[] logs;
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
     @optional @asName("duration_ms") ulong durationMs = 0;

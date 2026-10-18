@@ -42,8 +42,7 @@ void initPlugins(string bundledPluginsDir = "")
         {
             bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(
               pluginDir,
-              [PluginCategory.definition,
-               PluginCategory.worker,
+              [PluginCategory.worker,
                PluginCategory.artifact,
                PluginCategory.queue,
                PluginCategory.scheduler]

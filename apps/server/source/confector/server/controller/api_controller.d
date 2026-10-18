@@ -637,18 +637,6 @@ unittest
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    class MockApiPlugin : Plugin
-    {
-        @property string name() const { return "mock-api-plugin"; }
-        @property string versionString() const { return "1.0.0"; }
-        @property string description() const { return "Mock api plugin"; }
-        @property PluginCategory category() const { return PluginCategory.definition; }
-        ConfigDefinition[] configDefinitions() const { return null; }
-        void initialize(PluginContext context = null) {}
-        void shutdown() {}
-    }
-
-    PluginRegistry.instance.registerPlugin(new MockApiPlugin());
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
 

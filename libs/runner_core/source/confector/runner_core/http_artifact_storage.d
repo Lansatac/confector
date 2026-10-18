@@ -20,23 +20,20 @@ import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
 class HttpArtifactStorage : ArtifactStorage
 {
     private string m_serverUrl;
-    private string m_workerToken;
 
     /**
      * Creates an HttpArtifactStorage that communicates with the specified server.
      *
      * Params:
      *   serverUrl = Base URL of the Confector server (e.g., "http://localhost:8080")
-     *   workerToken = Optional worker authorization token
      */
-    this(string serverUrl, string workerToken = "")
+    this(string serverUrl)
     {
         import std.string : endsWith;
         string url = serverUrl;
         while (url.length > 0 && url.endsWith("/"))
             url = url[0 .. $ - 1];
         this.m_serverUrl = url;
-        this.m_workerToken = workerToken;
     }
 
     private string apiPath(string subPath) const
@@ -55,12 +52,6 @@ class HttpArtifactStorage : ArtifactStorage
     {
         auto http = HTTP(url);
         http.method = method;
-
-        if (m_workerToken.length > 0)
-        {
-            http.addRequestHeader("X-Worker-Token", m_workerToken);
-            http.addRequestHeader("Authorization", "Bearer " ~ m_workerToken);
-        }
         http.addRequestHeader("Accept", "application/json");
 
         char[] responseData;
@@ -103,13 +94,6 @@ class HttpArtifactStorage : ArtifactStorage
     {
         auto http = HTTP(url);
         http.method = HTTP.Method.head;
-
-        if (m_workerToken.length > 0)
-        {
-            http.addRequestHeader("X-Worker-Token", m_workerToken);
-            http.addRequestHeader("Authorization", "Bearer " ~ m_workerToken);
-        }
-
         http.perform();
         return http.statusLine.code;
     }

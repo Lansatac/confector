@@ -36,7 +36,7 @@ Events (commits, webhooks, cron, or manual actions) can trigger any specific nod
 Run workloads anywhere—from local development environments and serverless runtimes to ephemeral container clusters—without changing pipeline definitions.
 
 ### 5. Modular Plugin & Build Step Architecture
-Execution runtimes, version control providers, and storage backends are decoupled from the core graph engine. Tasks can compose arbitrary ordered build steps (e.g. Git clone repository, process runner steps) provided by pluggable systems.
+Execution runtimes, version control providers, and storage backends are decoupled from the core graph engine. Tasks compose ordered build steps; checking out a repository input at its pinned revision is built into the runner.
 
 ---
 

@@ -4,7 +4,6 @@ public import confector.plugin_api.logging;
 public import confector.plugin_api.plugin;
 public import confector.plugin_api.model;
 public import confector.plugin_api.executor;
-public import confector.plugin_api.system;
 public import confector.plugin_api.vcs;
 public import confector.plugin_api.scheduler;
 public import confector.config;
@@ -103,9 +102,6 @@ final class PluginRegistry
 {
     private static PluginRegistry _instance;
     private Plugin[string] _plugins;
-    private ArtifactPublishingSystem[] _artifactPublishers;
-    private BuildStepSystem[] _stepSystems;
-    private BuildStepProvider[] _stepProviders;
     private ComputeProvider[] _computeProviders;
     private ArtifactStorage[] _artifactStorages;
     private ArtifactStorage[string] _artifactStoragesByType;
@@ -176,18 +172,6 @@ final class PluginRegistry
         logDebug("[plugin_registry] initialize() returned for '%s'", plugin.name);
 
         // Automatically register implemented system interfaces
-        if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
-        {
-            registerArtifactPublisher(pubSystem);
-        }
-        if (auto stepSystem = cast(BuildStepSystem) plugin)
-        {
-            registerStepSystem(stepSystem);
-        }
-        if (auto stepProvider = cast(BuildStepProvider) plugin)
-        {
-            registerStepProvider(stepProvider);
-        }
         if (auto provider = cast(ComputeProvider) plugin)
         {
             registerComputeProvider(provider);
@@ -209,33 +193,6 @@ final class PluginRegistry
             registerScheduler(sched);
         }
         logDebug("[plugin_registry] registerPlugin: completed for '%s'", plugin.name);
-    }
-
-    public void registerArtifactPublisher(ArtifactPublishingSystem system)
-    {
-        import std.algorithm : canFind;
-        if (!_artifactPublishers.canFind(system))
-        {
-            _artifactPublishers ~= system;
-        }
-    }
-
-    public void registerStepSystem(BuildStepSystem system)
-    {
-        import std.algorithm : canFind;
-        if (!_stepSystems.canFind(system))
-        {
-            _stepSystems ~= system;
-        }
-    }
-
-    public void registerStepProvider(BuildStepProvider provider)
-    {
-        import std.algorithm : canFind;
-        if (!_stepProviders.canFind(provider))
-        {
-            _stepProviders ~= provider;
-        }
     }
 
     public void registerComputeProvider(ComputeProvider provider)
@@ -289,30 +246,6 @@ final class PluginRegistry
             plugin.shutdown();
 
             import std.algorithm.mutation : remove;
-            if (auto pubSystem = cast(ArtifactPublishingSystem) plugin)
-            {
-                for (size_t i = 0; i < _artifactPublishers.length; )
-                {
-                    if (_artifactPublishers[i] is pubSystem) _artifactPublishers = _artifactPublishers.remove(i);
-                    else i++;
-                }
-            }
-            if (auto stepSystem = cast(BuildStepSystem) plugin)
-            {
-                for (size_t i = 0; i < _stepSystems.length; )
-                {
-                    if (_stepSystems[i] is stepSystem) _stepSystems = _stepSystems.remove(i);
-                    else i++;
-                }
-            }
-            if (auto stepProvider = cast(BuildStepProvider) plugin)
-            {
-                for (size_t i = 0; i < _stepProviders.length; )
-                {
-                    if (_stepProviders[i] is stepProvider) _stepProviders = _stepProviders.remove(i);
-                    else i++;
-                }
-            }
             if (auto provider = cast(ComputeProvider) plugin)
             {
                 for (size_t i = 0; i < _computeProviders.length; )
@@ -361,33 +294,6 @@ final class PluginRegistry
                 }
             }
         }
-    }
-
-    public ArtifactPublishingSystem[] getArtifactPublishers()
-    {
-        return _artifactPublishers;
-    }
-
-    public BuildStepSystem[] getStepSystems()
-    {
-        return _stepSystems;
-    }
-
-    public BuildStepProvider[] getStepProviders()
-    {
-        return _stepProviders;
-    }
-
-    public BuildStepProvider getStepProvider(string stepType)
-    {
-        foreach (p; _stepProviders)
-        {
-            if (p.stepType == stepType)
-            {
-                return p;
-            }
-        }
-        return null;
     }
 
     public ComputeProvider[] getComputeProviders()
@@ -488,18 +394,6 @@ final class PluginRegistry
         _scheduler = scheduler;
     }
 
-    public BuildStepSystem findStepSystem(in BuildStep step)
-    {
-        foreach (sys; _stepSystems)
-        {
-            if (sys.canExecuteStep(step))
-            {
-                return sys;
-            }
-        }
-        return null;
-    }
-
     public Plugin getPlugin(string name)
     {
         if (auto p = name in _plugins)
@@ -532,9 +426,6 @@ final class PluginRegistry
             plugin.shutdown();
         }
         _plugins.clear();
-        _artifactPublishers.length = 0;
-        _stepSystems.length = 0;
-        _stepProviders.length = 0;
         _computeProviders.length = 0;
         _artifactStorages.length = 0;
         _artifactStoragesByType.clear();
@@ -555,7 +446,7 @@ unittest
         @property string name() const { return "mock-plugin"; }
         @property string versionString() const { return "0.1.0"; }
         @property string description() const { return "Mock plugin for testing"; }
-        @property PluginCategory category() const { return PluginCategory.step_executor; }
+        @property PluginCategory category() const { return PluginCategory.worker; }
 
         ConfigDefinition[] configDefinitions() const { return null; }
 
@@ -576,52 +467,6 @@ unittest
     assert(mock.shutdownCalled);
     assert(registry.getPlugin("mock-plugin") is null);
 
-    class IntegratedPlugin : Plugin, BuildStepSystem, BuildStepProvider
-    {
-        @property string name() const { return "integrated-plugin"; }
-        @property string versionString() const { return "1.0.0"; }
-        @property string description() const { return "Integrated test plugin"; }
-        @property PluginCategory category() const { return PluginCategory.step_executor; }
-        @property string systemName() const { return "integrated-system"; }
-        @property string stepType() const { return "test-step"; }
-        @property string displayName() const { return "Test Step"; }
-
-        ConfigDefinition[] configDefinitions() const { return null; }
-
-        void initialize(PluginContext context = null) {}
-        void shutdown() {}
-
-        bool canExecuteStep(in BuildStep step) const { return step.type == "test-step"; }
-        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
-        {
-            StepExecutionResult res;
-            res.success = true;
-            return res;
-        }
-
-        JSONValue defaultParameters() const { return JSONValue(string[string].init); }
-        string[] validateParameters(in JSONValue parameters) const { return null; }
-        string renderStepFormHtml(in JSONValue currentParameters) const { return "<div>Test Step UI</div>"; }
-    }
-
-    auto integrated = new IntegratedPlugin();
-    registry.registerPlugin(integrated);
-
-    assert(registry.getStepSystems().length == 1);
-    assert(registry.getStepProviders().length == 1);
-    assert(registry.getStepProvider("test-step") is integrated);
-    assert(registry.getStepProvider("non-existent") is null);
-
-    BuildStep step;
-    step.type = "test-step";
-    assert(registry.findStepSystem(step) is integrated);
-
-    // Test unregistering
-    registry.unregisterPlugin("integrated-plugin");
-    assert(registry.getStepSystems().length == 0);
-    assert(registry.getStepProviders().length == 0);
-    assert(registry.getStepProvider("test-step") is null);
-
     // Test ComputeProvider registration
     class MockComputeProvider : Plugin, ComputeProvider
     {
@@ -641,7 +486,6 @@ unittest
         JSONValue defaultConfig() const { return JSONValue(["poolSize": JSONValue(2)]); }
         string[] validateConfig(in JSONValue config) const { return null; }
         string renderConfigFormHtml(in JSONValue currentConfig) const { return "<div>Config</div>"; }
-        ComputeInstance createExecutor(in WorkerRecord record) { return null; }
         ComputeProvisioner createProvisioner(in WorkerRecord record) { return null; }
     }
 
@@ -670,7 +514,7 @@ unittest
         @property string name() const { return "configurable_plugin"; }
         @property string versionString() const { return "1.0.0"; }
         @property string description() const { return "Plugin with config"; }
-        @property PluginCategory category() const { return PluginCategory.step_executor; }
+        @property PluginCategory category() const { return PluginCategory.worker; }
 
         ConfigDefinition[] configDefinitions() const
         {

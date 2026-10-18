@@ -6,8 +6,6 @@ import confector.core.model;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;
-import confector.core.plugin : PluginRegistry;
-import confector.core.system : BuildStepProvider;
 import confector.server.controller.api_controller : buildsNotImplemented;
 
 import std.algorithm : canFind;
@@ -15,14 +13,6 @@ import std.datetime.systime : Clock;
 import std.format : format;
 import std.string : split, strip;
 import std.uuid : randomUUID;
-
-struct StepProviderViewModel
-{
-    string stepType;
-    string displayName;
-    string description;
-    string defaultHtml;
-}
 
 // View model for task summary on dashboard
 struct DashboardTaskViewModel
@@ -203,36 +193,30 @@ InputDecl[string] parseTaskInputRows(
 }
 
 /// The step type of the built-in checkout step, whose `input` parameter names a repository input.
-enum checkoutStepType = "clone_repository";
+enum checkoutStepType = "checkout";
 
 /**
  * Problems with the checkout steps in `steps`, aligned with `steps` (empty for steps without
- * problems and for steps of other types). A checkout step's parameters are validated with
- * `validateParameters` (when given), which flags parameters it no longer supports, such as an
- * old `repository` or `branch`; and its `input` must name one of the task's repository inputs.
+ * problems and for steps of other types): a checkout step's `input` must name one of the task's
+ * repository inputs.
  */
-string[][] checkoutStepIssues(
-    in BuildStep[] steps,
-    in InputDecl[string] inputs,
-    string[] delegate(in string[string] parameters) @safe validateParameters
-) @safe
+string[][] checkoutStepIssues(in BuildStep[] steps, in InputDecl[string] inputs) @safe
 {
     string[][] issues;
     issues.length = steps.length;
     foreach (i, step; steps)
     {
         if (step.type != checkoutStepType) continue;
-        if (validateParameters !is null) issues[i] ~= validateParameters(step.parameters);
-        if (auto name = "input" in step.parameters)
+        const name = step.parameters.get("input", "");
+        if (name.length == 0)
         {
-            if (name.length > 0)
-            {
-                auto decl = *name in inputs;
-                if (decl is null || decl.kind != InputKind.repository)
-                {
-                    issues[i] ~= format("Input '%s' is not a repository input declared on this task", *name);
-                }
-            }
+            issues[i] ~= "A checkout step must name the repository input to check out ('input')";
+            continue;
+        }
+        auto decl = name in inputs;
+        if (decl is null || decl.kind != InputKind.repository)
+        {
+            issues[i] ~= format("Input '%s' is not a repository input declared on this task", name);
         }
     }
     return issues;
@@ -303,68 +287,37 @@ unittest
         assert(many.canFind(fragment), fragment);
     }
 
-    // Checkout steps must name a declared repository input, and old parameters are flagged.
+    // Checkout steps must name a declared repository input.
     BuildStep checkout;
     checkout.type = checkoutStepType;
     checkout.parameters = ["input": "src"];
     BuildStep bash;
     bash.type = "bash";
     bash.parameters = ["input": "ignored"];
-    BuildStep legacy;
-    legacy.type = checkoutStepType;
-    legacy.parameters = ["input": "flavor", "repository": "x"];
-    string[] validator(in string[string] p) @safe { return "repository" in p ? ["Parameter 'repository' is not supported"] : null; }
-    auto issues = checkoutStepIssues([checkout, bash, legacy], existing, &validator);
-    assert(issues.length == 3 && issues[0].length == 0 && issues[1].length == 0);
-    assert(issues[2].length == 2 && issues[2][1].canFind("flavor"));
-    assert(formatStepIssues([checkout, bash, legacy], issues).canFind("Step 3"));
+    BuildStep wrongInput;
+    wrongInput.type = checkoutStepType;
+    wrongInput.parameters = ["input": "flavor"];
+    BuildStep noInput;
+    noInput.type = checkoutStepType;
+    auto issues = checkoutStepIssues([checkout, bash, wrongInput, noInput], existing);
+    assert(issues.length == 4 && issues[0].length == 0 && issues[1].length == 0);
+    assert(issues[2].length == 1 && issues[2][0].canFind("flavor"));
+    assert(issues[3].length == 1 && issues[3][0].canFind("must name the repository input"));
+    assert(formatStepIssues([checkout, bash, wrongInput, noInput], issues).canFind("Step 3"));
 }
 
-URLRouter dashboardRouter(StateStores stores, PluginRegistry registry = null)
+URLRouter dashboardRouter(StateStores stores)
 {
-    if (registry is null)
-    {
-        registry = PluginRegistry.instance;
-    }
     auto router = new URLRouter();
-
-    // Validates a checkout step's parameters with the checkout step provider's own rules.
-    string[] validateCheckoutParameters(in string[string] parameters) @trusted
-    {
-        import std.json : JSONValue, parseJSON;
-
-        if (registry is null) return null;
-        foreach (p; registry.getStepProviders())
-        {
-            if (p.stepType != checkoutStepType) continue;
-            JSONValue json = parseJSON("{}");
-            foreach (key, value; parameters) json[key] = value;
-            return p.validateParameters(json);
-        }
-        return null;
-    }
 
     // Renders the task editor. `inputRows` are the Inputs tab rows to show: the task's declared
     // inputs, or the submitted rows when the editor is shown again after a rejected save.
-    // `formError` is shown at the top of the editor; checkout steps with problems (including old
-    // parameters the step no longer supports) are flagged in the Steps tab.
+    // `formError` is shown at the top of the editor; checkout steps with problems are flagged in
+    // the Steps tab.
     void renderTaskEditor(HTTPServerResponse res, ProjectRecord project, TaskNode task,
         TaskInputRow[] inputRows, string formError)
     {
         auto repositories = stores !is null ? stores.repositories.list() : [];
-        StepProviderViewModel[] stepProvidersView;
-        if (registry !is null)
-        {
-            foreach (p; registry.getStepProviders())
-            {
-                StepProviderViewModel vm;
-                vm.stepType = p.stepType;
-                vm.displayName = p.displayName;
-                vm.description = p.description;
-                vm.defaultHtml = p.renderStepFormHtml(p.defaultParameters());
-                stepProvidersView ~= vm;
-            }
-        }
         // Checked against the rows being shown, which may include edits that were not saved.
         InputDecl[string] shownInputs;
         foreach (row; inputRows)
@@ -374,8 +327,8 @@ URLRouter dashboardRouter(StateStores stores, PluginRegistry registry = null)
                 shownInputs[row.name.strip()] = repositoryInput(row.repository, row.refSelector);
             }
         }
-        string[][] stepIssues = checkoutStepIssues(task.steps, shownInputs, &validateCheckoutParameters);
-        res.render!("project/task-editor.dt", project, task, repositories, stepProvidersView, inputRows, stepIssues, formError);
+        string[][] stepIssues = checkoutStepIssues(task.steps, shownInputs);
+        res.render!("project/task-editor.dt", project, task, repositories, inputRows, stepIssues, formError);
     }
 
     // Home / Dashboard
@@ -769,7 +722,7 @@ URLRouter dashboardRouter(StateStores stores, PluginRegistry registry = null)
             }
             task.inputs = parseTaskInputRows(task.id, inputRows, registeredRepositories, otherTaskIds);
 
-            auto stepIssues = checkoutStepIssues(task.steps, task.inputs, &validateCheckoutParameters);
+            auto stepIssues = checkoutStepIssues(task.steps, task.inputs);
             string stepProblems = formatStepIssues(task.steps, stepIssues);
             if (stepProblems.length > 0)
             {

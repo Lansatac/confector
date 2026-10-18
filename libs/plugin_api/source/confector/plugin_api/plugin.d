@@ -7,8 +7,6 @@ public import confector.plugin_api.logging;
  */
 enum PluginCategory : string
 {
-    definition = "definition",     // Step Definition Plugins (BuildStepProvider, UI templates, validation schemas)
-    step_executor = "step_executor", // Step Execution Plugins (BuildStepSystem)
     worker = "worker",              // Worker / Compute Provider Plugins (fleet, provisioning, credentials)
     artifact = "artifact",          // Artifact Storage Plugins (content-addressed artifact backend)
     queue = "queue",                // Dispatch Queue Plugins (DispatchQueue - delivery of work to workers)
@@ -40,22 +38,6 @@ abstract class BasePlugin : Plugin
     ConfigDefinition[] configDefinitions() const { return null; }
     void initialize(PluginContext context = null) {}
     void shutdown() {}
-}
-
-/**
- * Interface for Step Definition Plugins.
- * Loaded by the server/control plane to provide step UI forms, default parameters, and validation.
- */
-interface StepDefinitionPlugin : Plugin
-{
-}
-
-/**
- * Interface for Step Execution Plugins.
- * Loaded exclusively by confector-runner to execute build steps and resolve task inputs.
- */
-interface StepExecutionPlugin : Plugin
-{
 }
 
 /**

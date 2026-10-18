@@ -4,7 +4,6 @@ block maincontent
   - import vibe.data.json : serializeToJson;
   - import std.array : replace;
   - import confector.core.model : TriggerType, BuildStep;
-  - import confector.server.controller.dashboard_controller : StepProviderViewModel;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
@@ -14,7 +13,6 @@ block maincontent
   - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
   - string availableReposJson = serializeToJson(availableReposList).toString().replace("<", "\\u003c");
   - string initialStepsJson = serializeToJson(task.steps).toString().replace("<", "\\u003c");
-  - string stepProvidersJson = serializeToJson(stepProvidersView).toString().replace("<", "\\u003c");
   - string initialInputsJson = serializeToJson(inputRows).toString().replace("<", "\\u003c");
   - string stepIssuesJson = serializeToJson(stepIssues).toString().replace("<", "\\u003c");
 
@@ -23,7 +21,7 @@ block maincontent
       div(style="display: flex; justify-content: space-between; align-items: center;")
         div
           h1 #{task.id.length > 0 ? "Edit Task: " ~ task.id : "Add New Task"}
-          p Configure the task's named inputs, plugin build steps, and output declarations for project #{project.name}.
+          p Configure the task's named inputs, build steps, and output declarations for project #{project.name}.
         div(style="display: flex; gap: 8px;")
           - if (task.id.length > 0)
             a.btn.btn-outline(href="/tasks/details?project_id=#{project.id}&task_id=#{task.id}") Back to Task Details
@@ -65,11 +63,9 @@ block maincontent
 
         div#tab-steps.tab-pane
           h3 Ordered Build Steps
-          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Configure plugin-defined build steps executed sequentially in order. Sub-templates and configurations are provided directly by plugins.
+          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Build steps run sequentially in order.
           div#steps-container.step-list
           div(style="margin-top: 15px; display: flex; flex-wrap: wrap; gap: 8px;")
-            - foreach(p; stepProvidersView)
-              button.btn.btn-outline.btn-sm(type="button", onclick="addBuildStep('" ~ p.stepType ~ "')") + Add #{p.displayName}
             button.btn.btn-outline.btn-sm#add-custom-step-btn(type="button", onclick="addBuildStep('custom')") + Add Custom Step
 
         div#tab-outputs.tab-pane
@@ -127,14 +123,8 @@ block maincontent
     var availableRepos = !{availableReposJson};
     var projectId = "#{project.id}";
     var initialSteps = !{initialStepsJson} || [];
-    var stepProviders = !{stepProvidersJson} || [];
     var initialInputs = !{initialInputsJson} || [];
     var stepIssues = !{stepIssuesJson} || [];
-
-    var stepProviderMap = {};
-    for (var i = 0; i < stepProviders.length; i++) {
-      stepProviderMap[stepProviders[i].stepType] = stepProviders[i];
-    }
 
     function escapeHtml(str) {
       if (!str) return '';
@@ -397,11 +387,7 @@ block maincontent
       var wElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
       if (wElem) prevWorkDir = wElem.value;
 
-      if (stepProviderMap[newType]) {
-        subformContainer.innerHTML = stepProviderMap[newType].defaultHtml;
-      } else {
-        subformContainer.innerHTML = getCustomStepHtml(newType !== 'custom' ? newType : '', prevScript, '');
-      }
+      subformContainer.innerHTML = getCustomStepHtml(newType !== 'custom' ? newType : '', prevScript, '');
 
       if (prevScript.length > 0) {
         var newScriptElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]') || row.querySelector('[name="step_custom_script"]');
@@ -420,29 +406,8 @@ block maincontent
       if (!container) return;
 
       var data = stepData || {};
-      var type = data.type || defaultType || (stepProviders.length > 0 ? stepProviders[0].stepType : 'process');
-
-      // Normalize alias types if any
-      var normalizedType = type;
-      if (!stepProviderMap[normalizedType]) {
-        if (normalizedType === 'git_clone' || normalizedType === 'checkout_repository' || normalizedType === 'git') {
-          if (stepProviderMap['clone_repository']) normalizedType = 'clone_repository';
-        } else if (normalizedType === 'script' || normalizedType === 'command' || normalizedType === 'shell') {
-          if (stepProviderMap['process']) normalizedType = 'process';
-        } else if (normalizedType === 'sh') {
-          if (stepProviderMap['bash']) normalizedType = 'bash';
-        } else if (normalizedType === 'pwsh' || normalizedType === 'ps1') {
-          if (stepProviderMap['powershell']) normalizedType = 'powershell';
-        }
-      }
-
-      var defaultLabel = 'Step';
-      if (stepProviderMap[normalizedType]) {
-        defaultLabel = stepProviderMap[normalizedType].displayName;
-      } else if (normalizedType === 'custom') {
-        defaultLabel = 'Custom Step';
-      }
-      var name = data.name || defaultLabel;
+      var type = data.type || defaultType || 'custom';
+      var name = data.name || (type === 'custom' ? 'Custom Step' : 'Step');
 
       var row = document.createElement('div');
       row.className = 'step-row';
@@ -464,24 +429,10 @@ block maincontent
       typeSelect.style.cssText = 'width: 220px; font-weight: bold;';
       typeSelect.onchange = function() { onStepTypeChange(this); };
 
-      var isKnownProvider = false;
-      for (var p = 0; p < stepProviders.length; p++) {
-        var opt = document.createElement('option');
-        opt.value = stepProviders[p].stepType;
-        opt.textContent = stepProviders[p].displayName;
-        if (normalizedType === stepProviders[p].stepType) {
-          opt.selected = true;
-          isKnownProvider = true;
-        }
-        typeSelect.appendChild(opt);
-      }
-
       var optCustom = document.createElement('option');
       optCustom.value = 'custom';
-      optCustom.textContent = 'Custom Plugin Step';
-      if (!isKnownProvider || normalizedType === 'custom') {
-        optCustom.selected = true;
-      }
+      optCustom.textContent = 'Custom Step';
+      optCustom.selected = true;
       typeSelect.appendChild(optCustom);
 
       leftControls.appendChild(typeSelect);
@@ -537,11 +488,7 @@ block maincontent
       var params = data.parameters || {};
       var propsStr = data.properties ? JSON.stringify(data.properties, null, 2) : '';
 
-      if (stepProviderMap[normalizedType]) {
-        subformContainer.innerHTML = stepProviderMap[normalizedType].defaultHtml;
-      } else {
-        subformContainer.innerHTML = getCustomStepHtml(type !== 'custom' ? type : '', scriptVal, propsStr);
-      }
+      subformContainer.innerHTML = getCustomStepHtml(type !== 'custom' ? type : '', scriptVal, propsStr);
 
       // Populate values from stepData
       if (scriptVal.length > 0) {

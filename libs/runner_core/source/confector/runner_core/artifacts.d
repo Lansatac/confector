@@ -90,7 +90,7 @@ final class ArtifactStager
     static ArtifactMetadata packOutputArtifact(
         ArtifactStorage storage,
         string taskFingerprint,
-        string buildId,
+        string executionId,
         string taskId,
         string workspaceDir,
         in OutputArtifactDecl decl,
@@ -127,7 +127,7 @@ final class ArtifactStager
         ArtifactMetadata meta;
         meta.artifactId = artId;
         meta.taskFingerprint = taskFingerprint;
-        meta.buildId = buildId;
+        meta.executionId = executionId;
         meta.taskId = taskId;
         meta.filePath = artPath;
         meta.sha256 = sha256Hex;
@@ -166,7 +166,7 @@ unittest
 
     auto storage = new InMemoryArtifactStorage();
     auto decl = OutputArtifactDecl("my_art", "out.txt");
-    auto meta = ArtifactStager.packOutputArtifact(storage, "fp123", "build1", "task1", wsDir, decl);
+    auto meta = ArtifactStager.packOutputArtifact(storage, "fp123", "exe1", "task1", wsDir, decl);
 
     assert(meta.sha256.length == 64);
     assert(meta.sizeBytes > 0);
@@ -184,11 +184,11 @@ unittest
 
     // A missing fingerprint or storage is an error, never a silent skip
     bool noFp = false;
-    try ArtifactStager.packOutputArtifact(storage, "", "build1", "task1", wsDir, decl);
+    try ArtifactStager.packOutputArtifact(storage, "", "exe1", "task1", wsDir, decl);
     catch (Exception ex) noFp = ex.msg.canFind("no fingerprint");
     assert(noFp);
     bool noStorage = false;
-    try ArtifactStager.packOutputArtifact(null, "fp123", "build1", "task1", wsDir, decl);
+    try ArtifactStager.packOutputArtifact(null, "fp123", "exe1", "task1", wsDir, decl);
     catch (Exception ex) noStorage = ex.msg.canFind("no artifact storage");
     assert(noStorage);
 }

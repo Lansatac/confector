@@ -639,6 +639,11 @@ Be aware of these so you do not spread them:
   deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). Do not add a build path outside the
   chain components. Nothing in the project is kept for backward compatibility.
+- **Steps run in-process.** The runner's only working step is the built-in checkout
+  (`libs/runner_core` `steps/checkout.d`); bash and PowerShell throw `NotImplementedException`
+  (bead `confector-z7z.35.6`), and any other step type fails the task (bead
+  `confector-z7z.35.1`). Workers send no credential until per-execution tokens land (bead
+  `confector-z7z.30.1`).
 - **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has accumulated
   aliases: several ways to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
   build step. **Do not add another alias.** If a representation is wrong, change it and update its
@@ -659,15 +664,16 @@ module path (for example `libs/core/source/confector/core/`).
 - `libs/core/` — graph construction, input resolution, fingerprinting, trigger matching, plugin
   registry.
 - `libs/plugin_api/` — data types and interfaces shared with plugins.
-- `libs/runner_core/` — executes a single task on a worker.
+- `libs/runner_core/` — executes a single task on a worker, including the built-in checkout step.
 - `libs/config/` — configuration types.
 - `libs/mongo_helpers/` — MongoDB connection and BSON helpers.
 - `libs/testing/` — in-memory fakes and backend conformance suites (test-only).
 - `apps/runner/` — the runner command-line program.
 - `apps/server/` — web server, API and dashboard, with its web UI templates
   (`views/`) and static assets (`public/`).
-- `plugins/<category>/<name>/` — plugins by category (step definitions and executors, workers,
-  artifact storage, document store, queue, scheduler).
+- `plugins/<category>/<name>/` — plugins by category (workers, artifact storage, document store,
+  queue, scheduler). Build steps are not plugins: the runner's built-in steps live in
+  `libs/runner_core` (`steps/`).
 
 Explore the code for anything more specific; file-level details change too often to list here.
 
@@ -712,8 +718,8 @@ cd build && reggae -b ninja .. && ninja
 
 Targets: `server`, `runner`, `plugins` (plain `ninja` builds all three).
 
-Outputs land in `build/out/server/` and `build/out/runner/`, with plugins in their `plugins/`
-subdirectories. Release builds should use LDC (bead `confector-z7z.45`).
+Outputs land in `build/out/server/` and `build/out/runner/`, with the server's plugins in
+`build/out/server/plugins/`. Release builds should use LDC (bead `confector-z7z.45`).
 
 **The server's views are not copied to the output directory, and that is correct.** The `.dt`
 templates in `apps/server/views` are compiled into the server binary (`render!("x.dt", ...)` is

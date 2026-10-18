@@ -11,48 +11,6 @@ import confector.plugin_api.model : QueueDemand;
 alias LogDelegate = void delegate(string message);
 
 /**
- * Request payload for task execution.
- */
-struct ExecutionRequest
-{
-    @optional string taskId;
-    @optional string buildId;
-    @optional string script;
-    @optional string command;
-    @optional @asName("working_directory") string workingDirectory;
-    @optional string[string] environment;
-    @optional @asName("environment_variables") string[string] environmentVariables;
-    @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
-    @ignore LogDelegate logCallback;
-    @optional @asName("step_types") string[] stepTypes;
-
-    @property string effectiveScript() const
-    {
-        if (script.length > 0) return script;
-        return command;
-    }
-
-    @property string[string] effectiveEnvironment() const
-    {
-        if (environmentVariables.length > 0) return cast(string[string])environmentVariables;
-        return cast(string[string])environment;
-    }
-}
-
-/**
- * Result payload returned from task execution.
- */
-struct ExecutionResult
-{
-    @optional bool success = true;
-    @optional @asName("exit_code") int exitCode = 0;
-    @optional @asName("error_message") string errorMessage;
-    @optional @asName("output_lines") string[] outputLines;
-    @optional @asName("duration_ms") ulong durationMs = 0;
-}
-
-
-/**
  * Status or state of a provisioned worker or compute resource.
  */
 enum WorkerStatus : string
@@ -62,18 +20,6 @@ enum WorkerStatus : string
     running = "running",
     terminated = "terminated",
     error = "error"
-}
-
-/**
- * Abstract compute instance / task executor interface capable of running execution requests.
- */
-interface ComputeInstance
-{
-    @property string id() const;
-    @property string providerType() const;
-    @property bool isEnabled() const;
-    @property string[] supportedStepTypes() const;
-    ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null);
 }
 
 /**
@@ -116,7 +62,6 @@ interface ComputeProvider
     JSONValue defaultConfig() const;
     string[] validateConfig(in JSONValue config) const;
     string renderConfigFormHtml(in JSONValue currentConfig) const;
-    ComputeInstance createExecutor(in WorkerRecord record);
     ComputeProvisioner createProvisioner(in WorkerRecord record);
 }
 

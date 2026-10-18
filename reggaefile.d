@@ -66,12 +66,6 @@ Target plugins()
     "plugins",
     "",
     [
-      dubPathTarget("plugins/definition/bash"),
-      dubPathTarget("plugins/definition/git"),
-      dubPathTarget("plugins/definition/powershell"),
-      dubPathTarget("plugins/step_executor/bash"),
-      dubPathTarget("plugins/step_executor/git"),
-      dubPathTarget("plugins/step_executor/powershell"),
       dubPathTarget("plugins/worker/local_process"),
       dubPathTarget("plugins/artifact/local"),
       dubPathTarget("plugins/queue/mongo"),

@@ -3,362 +3,15 @@ module confector.plugins.worker.local_process;
 import std.format;
 import std.process;
 import std.stdio;
-import std.file : exists, mkdirRecurse, write, remove, tempDir;
+import std.file : exists;
 import std.parallelism : totalCPUs;
-import std.path : buildPath, isAbsolute;
-import std.json : JSONValue, JSONType, parseJSON;
-import std.uuid : randomUUID;
+import std.json : JSONValue, JSONType;
 import core.sync.mutex : Mutex;
-import core.time : Duration, seconds, msecs, MonoTime;
 import core.thread : Thread;
 
 import confector.plugin_api.model;
 import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, WorkerPlugin, ConfigDefinition, ConfigRegistry, Description, Key, Env, EnvVar, Required;
-import confector.plugin_api.executor : ComputeProvider, ComputeInstance, WorkerRecord, ExecutionRequest, ExecutionResult, LogDelegate, ComputeProvisioner;
-
-/**
- * Concrete ComputeInstance managing task execution by provisioning and launching
- * the standalone confector-runner subprocess with structured payloads and credentials.
- */
-class LocalProcessInstance : ComputeInstance
-{
-    private WorkerRecord m_record;
-    private LocalProcessProvisionerConfig m_pluginConfig;
-
-    this(in WorkerRecord record, LocalProcessProvisionerConfig pluginConfig = LocalProcessProvisionerConfig.init)
-    {
-        m_record = cast()record;
-        m_pluginConfig = pluginConfig;
-    }
-
-    @property string id() const
-    {
-        return m_record.id;
-    }
-
-    @property string providerType() const
-    {
-        return m_record.providerType;
-    }
-
-    @property bool isEnabled() const
-    {
-        return m_record.enabled;
-    }
-
-    @property string[] supportedStepTypes() const
-    {
-        if (m_record.configuration.type == JSONType.object)
-        {
-            auto pSteps = "allowedStepTypes" in m_record.configuration;
-            if (pSteps !is null && pSteps.type == JSONType.array)
-            {
-                string[] types;
-                foreach (step; pSteps.array)
-                {
-                    if (step.type == JSONType.string)
-                    {
-                        types ~= step.str;
-                    }
-                }
-                if (types.length > 0)
-                {
-                    return types;
-                }
-            }
-        }
-        return ["bash", "powershell", "git"];
-    }
-
-    ExecutionResult execute(in ExecutionRequest request, LogDelegate logCallback = null)
-    {
-        ExecutionResult result;
-
-        if (!m_record.enabled)
-        {
-            result.exitCode = -1;
-            result.success = false;
-            result.errorMessage = format("Compute instance '%s' is disabled. Enable it in the Executors dashboard to run tasks.", m_record.name.length > 0 ? m_record.name : m_record.id);
-            if (logCallback !is null)
-            {
-                logCallback(format("Execution error: %s", result.errorMessage));
-            }
-            return result;
-        }
-
-        string effectiveWorkDir = request.workingDirectory;
-        if (effectiveWorkDir.length == 0 && m_record.configuration.type == JSONType.object)
-        {
-            auto pWork = "workspaceDir" in m_record.configuration;
-            if (pWork !is null && pWork.type == JSONType.string && pWork.str.length > 0)
-            {
-                effectiveWorkDir = pWork.str;
-            }
-        }
-        if (effectiveWorkDir.length == 0)
-        {
-            effectiveWorkDir = ".";
-        }
-
-        if (!exists(effectiveWorkDir))
-        {
-            try
-            {
-                mkdirRecurse(effectiveWorkDir);
-            }
-            catch (Exception)
-            {
-            }
-        }
-
-        string defaultShell = "powershell";
-        bool isolateEnv = false;
-
-        if (m_record.configuration.type == JSONType.object)
-        {
-            auto pShell = "defaultShell" in m_record.configuration;
-            if (pShell !is null && pShell.type == JSONType.string && pShell.str.length > 0)
-            {
-                defaultShell = pShell.str;
-            }
-
-            auto pIso = "isolateEnvironment" in m_record.configuration;
-            if (pIso !is null)
-            {
-                if (pIso.type == JSONType.true_) isolateEnv = true;
-                else if (pIso.type == JSONType.false_) isolateEnv = false;
-            }
-        }
-
-        // Use runner binary from plugin config (passed at construction time)
-        string runnerBinary = m_pluginConfig.runnerBinary.length > 0 ? m_pluginConfig.runnerBinary : "bin/confector-runner";
-        // Generate a unique token for this runner agent so the server can verify its identity
-        string secretToken = randomUUID().toString();
-
-        // Resolve runner binary executable path
-        string resolvedRunner = runnerBinary;
-        version(Windows)
-        {
-            import std.string : endsWith;
-            if (!resolvedRunner.endsWith(".exe") && exists(resolvedRunner ~ ".exe"))
-            {
-                resolvedRunner ~= ".exe";
-            }
-        }
-
-        // Prepare environment map with brokered credentials and sandboxing
-        string[string] envMap;
-        if (!isolateEnv)
-        {
-            envMap = environment.toAA();
-        }
-
-        foreach (k, v; request.effectiveEnvironment)
-        {
-            envMap[k] = v;
-        }
-
-        // Inject brokered worker token/secret
-        if (secretToken.length > 0)
-        {
-            envMap["CONFECTOR_WORKER_TOKEN"] = secretToken;
-            envMap["CONFECTOR_SECRET_TOKEN"] = secretToken;
-        }
-
-        // Build structured TaskNode payload JSON for confector-runner
-        string scriptToRun = request.effectiveScript;
-        string taskId = request.taskId.length > 0 ? request.taskId : "task_1";
-
-        JSONValue stepObj = JSONValue([
-            "name": JSONValue(taskId),
-            "type": JSONValue(defaultShell),
-            "script": JSONValue(scriptToRun)
-        ]);
-
-        JSONValue taskObj = JSONValue([
-            "id": JSONValue(taskId),
-            "name": JSONValue(taskId),
-            "script": JSONValue(scriptToRun),
-            "steps": JSONValue([stepObj])
-        ]);
-
-        // confector-runner `run` takes a work order. An ExecutionRequest carries no fingerprint,
-        // which only the control plane computes, and no execution id; the runner requires both,
-        // so it refuses this order until ExecutionRequest is given them.
-        JSONValue payloadObj = JSONValue([
-            "task_id": JSONValue(taskId),
-            "task_node": taskObj,
-            "payload": JSONValue(["workspace_dir": JSONValue(effectiveWorkDir)])
-        ]);
-
-        string tempPayloadPath = buildPath(tempDir(), format("payload_%s.json", randomUUID().toString()));
-        try
-        {
-            write(tempPayloadPath, payloadObj.toString());
-        }
-        catch (Exception e)
-        {
-            result.exitCode = -1;
-            result.success = false;
-            result.errorMessage = format("Failed to write temporary runner payload: %s", e.msg);
-            return result;
-        }
-        scope(exit)
-        {
-            if (exists(tempPayloadPath))
-            {
-                remove(tempPayloadPath);
-            }
-        }
-
-        string[] cmdArgs = [
-            resolvedRunner,
-            "run",
-            format("--payload=%s", tempPayloadPath),
-            format("--workspace=%s", effectiveWorkDir)
-        ];
-
-        static class ExecState
-        {
-            Mutex mutex;
-            bool processExited = false;
-            int exitCode = -1;
-            string[] outputLines;
-            string errorMessage;
-            bool timedOut = false;
-
-            this()
-            {
-                mutex = new Mutex();
-            }
-        }
-
-        auto state = new ExecState();
-        MonoTime startTime = MonoTime.currTime;
-
-        try
-        {
-            auto pipe = pipeProcess(cmdArgs, Redirect.all, envMap, Config.none, effectiveWorkDir.length > 0 ? effectiveWorkDir : null);
-
-            auto readerThread = new Thread({
-                try
-                {
-                    foreach (line; pipe.stdout.byLineCopy)
-                    {
-                        synchronized (state.mutex)
-                        {
-                            state.outputLines ~= line;
-                        }
-                        if (logCallback !is null)
-                        {
-                            logCallback(line);
-                        }
-                    }
-
-                    auto ec = wait(pipe.pid);
-                    synchronized (state.mutex)
-                    {
-                        state.exitCode = ec;
-                        state.processExited = true;
-                    }
-                }
-                catch (Exception e)
-                {
-                    synchronized (state.mutex)
-                    {
-                        state.errorMessage = e.msg;
-                        state.processExited = true;
-                    }
-                }
-            });
-            readerThread.start();
-
-            size_t timeoutSec = request.timeoutSeconds > 0 ? request.timeoutSeconds : 900;
-            size_t elapsedMsecs = 0;
-            size_t checkInterval = 25;
-
-            while (true)
-            {
-                bool done = false;
-                synchronized (state.mutex)
-                {
-                    done = state.processExited;
-                }
-                if (done) break;
-
-                if (elapsedMsecs >= timeoutSec * 1000)
-                {
-                    synchronized (state.mutex)
-                    {
-                        state.timedOut = true;
-                    }
-                    try
-                    {
-                        kill(pipe.pid);
-                    }
-                    catch (Exception)
-                    {
-                    }
-                    break;
-                }
-
-                Thread.sleep(msecs(checkInterval));
-                elapsedMsecs += checkInterval;
-            }
-
-            try
-            {
-                readerThread.join();
-            }
-            catch (Exception)
-            {
-            }
-
-            MonoTime endTime = MonoTime.currTime;
-            result.durationMs = (endTime - startTime).total!"msecs";
-
-            synchronized (state.mutex)
-            {
-                result.outputLines = state.outputLines;
-                if (state.timedOut)
-                {
-                    result.exitCode = -2;
-                    result.success = false;
-                    result.errorMessage = format("Runner subprocess execution timed out after %d seconds", timeoutSec);
-                }
-                else if (state.errorMessage.length > 0)
-                {
-                    result.exitCode = -1;
-                    result.success = false;
-                    result.errorMessage = state.errorMessage;
-                }
-                else
-                {
-                    result.exitCode = state.exitCode;
-                    result.success = (state.exitCode == 0);
-                    if (!result.success)
-                    {
-                        result.errorMessage = format("Runner subprocess exited with code %d", state.exitCode);
-                    }
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            MonoTime endTime = MonoTime.currTime;
-            result.durationMs = (endTime - startTime).total!"msecs";
-            result.exitCode = -1;
-            result.success = false;
-            result.errorMessage = format("Failed to spawn confector-runner subprocess '%s': %s", resolvedRunner, e.msg);
-            if (logCallback !is null)
-            {
-                logCallback(format("Subprocess spawn error: %s", result.errorMessage));
-            }
-        }
-
-        return result;
-    }
-}
+import confector.plugin_api.executor : ComputeProvider, WorkerRecord, ComputeProvisioner;
 
 /**
  * Local process ComputeProvider / WorkerPlugin managing runner subprocess provisioning,
@@ -518,11 +171,6 @@ class LocalProcessProvider : WorkerPlugin, ComputeProvider
         return html.data;
     }
 
-    ComputeInstance createExecutor(in WorkerRecord record)
-    {
-        return new LocalProcessInstance(record, m_scopedConfig);
-    }
-
     ComputeProvisioner createProvisioner(in WorkerRecord record)
     {
         LocalProcessProvisionerConfig cfg = m_scopedConfig;
@@ -564,12 +212,6 @@ struct LocalProcessProvisionerConfig
 
     @Description("Base directory for runner workspaces")
     string workspaceDir = "/workspaces";
-
-    @Description("Base directory for runner artifacts")
-    string storageDir = "/artifacts";
-
-    @Description("Directory for bundled plugins")
-    string pluginsDir = "plugins";
 
     @Description("Maximum concurrent runner subprocesses allowed (0 = auto-detect CPU count)")
     size_t maxConcurrency = 0;
@@ -758,17 +400,12 @@ class LocalProcessProvisioner : ComputeProvisioner
                     "worker",
                     format("--server-url=%s", m_config.serverUrl),
                     format("--workspace=%s", m_config.workspaceDir),
-                    format("--storage-dir=%s", m_config.storageDir),
-                    format("--plugins-dir=%s", m_config.pluginsDir),
                     "--max-tasks=1",
                     "--poll-interval=1"
                 ];
-                // Generate a unique token for this runner agent so the server can verify its identity
-                string spawnToken = randomUUID().toString();
-                runnerArgs ~= format("--token=%s", spawnToken);
 
                 if (m_context !is null)
-                    m_context.info(format("[local_process] Spawning runner worker: %s (token=%s...)", runnerArgs[0], spawnToken[0..8]));
+                    m_context.info(format("[local_process] Spawning runner worker: %s", runnerArgs[0]));
 
                 auto pid = spawnProcess(runnerArgs);
                 if (m_context !is null)
@@ -823,9 +460,7 @@ unittest
     assert(defConfig["isolateEnvironment"].type == JSONType.false_);
 
     // runnerBinary comes from plugin config at construction time
-    // secretToken is server-generated and comes from environment
     assert(("runnerBinary" in defConfig) is null);
-    assert(("secretToken" in defConfig) is null);
 
     assert(provider.validateConfig(defConfig).length == 0);
 
@@ -838,9 +473,7 @@ unittest
     import std.string : indexOf;
     assert(formHtml.indexOf("config_maxConcurrency") != -1);
     assert(formHtml.indexOf("config_isolateEnvironment") != -1);
-    // runnerBinary and secretToken are no longer in the instance config form
     assert(formHtml.indexOf("config_runnerBinary") == -1);
-    assert(formHtml.indexOf("config_secretToken") == -1);
 
     WorkerRecord rec;
     rec.id = "worker_1";
@@ -848,38 +481,6 @@ unittest
     rec.providerType = "local_process";
     rec.enabled = false;
     rec.configuration = defConfig;
-
-    auto instance = provider.createExecutor(rec);
-    assert(instance !is null);
-    assert(instance.id == "worker_1");
-    assert(instance.providerType == "local_process");
-    assert(!instance.isEnabled);
-
-    // Verify disabled execution returns immediate failure
-    ExecutionRequest req;
-    req.command = "Write-Output 'should fail when disabled'";
-    auto disRes = instance.execute(req);
-    assert(!disRes.success);
-    assert(disRes.exitCode != 0);
-
-    // Enable and verify compute instance properties
-    rec.enabled = true;
-    auto enabledInstance = provider.createExecutor(rec);
-    assert(enabledInstance.isEnabled);
-    assert(enabledInstance.supportedStepTypes.length == 3);
-
-    // If confector-runner binary is built, test subprocess execution invocation
-    string testRunnerBin = "bin/confector-runner";
-    version(Windows) testRunnerBin ~= ".exe";
-    if (exists(testRunnerBin))
-    {
-        ExecutionRequest testReq;
-        testReq.taskId = "test_subproc";
-        testReq.script = "echo subproc_ok";
-        testReq.workingDirectory = "test_workspace";
-        auto subprocRes = enabledInstance.execute(testReq);
-        assert(subprocRes.exitCode == 0 || subprocRes.durationMs > 0);
-    }
 
     // Test LocalProcessProvisioner capability checking and demand handling
     LocalProcessProvisionerConfig provConfig;

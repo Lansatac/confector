@@ -311,11 +311,13 @@ class ForeignArtifactException : InvalidCompletionException
 }
 
 /**
- * The artifacts a worker reported for `execution`, each stamped with the execution's fingerprint.
- * An artifact may leave its fingerprint empty; one naming another fingerprint is rejected, so a
- * completion cannot place artifacts under a cache key the control plane did not compute. Pure.
+ * The artifacts a worker reported for `execution`, each stamped with the execution's fingerprint
+ * and id. An artifact may leave its fingerprint and execution id empty; one naming another
+ * fingerprint or another execution is rejected, so a completion cannot place artifacts under a
+ * cache key the control plane did not compute or attribute them to another execution. Pure.
  *
- * Throws: ForeignArtifactException if an artifact names a fingerprint other than the execution's.
+ * Throws: ForeignArtifactException if an artifact names a fingerprint or execution other than the
+ * execution's.
  */
 ArtifactMetadata[] executionArtifacts(in TaskExecution execution, ArtifactMetadata[] reported)
 {
@@ -328,8 +330,15 @@ ArtifactMetadata[] executionArtifacts(in TaskExecution execution, ArtifactMetada
                 "Execution '%s' (fingerprint %s) reported artifact '%s' under fingerprint %s; its completion is rejected",
                 execution.id, execution.fingerprint, artifact.artifactId, artifact.taskFingerprint));
         }
+        if (artifact.executionId.length > 0 && artifact.executionId != execution.id)
+        {
+            throw new ForeignArtifactException(format(
+                "Execution '%s' reported artifact '%s' as produced by execution '%s'; its completion is rejected",
+                execution.id, artifact.artifactId, artifact.executionId));
+        }
         ArtifactMetadata stamped = artifact;
         stamped.taskFingerprint = execution.fingerprint;
+        stamped.executionId = execution.id;
         own ~= stamped;
     }
     return own;
@@ -383,7 +392,7 @@ ExecutionStatus reportedExecutionStatus(TaskStatus status) pure @safe
  *
  * This is everything a completion does until the fingerprint ledger's fold lands (bead
  * confector-z7z.49.4): the execution is finished by compare-and-set. Nothing is cached and no
- * chain is re-evaluated. `result.logs` is not recorded: the worker streams its log lines to the
+ * chain is re-evaluated. Log lines are not part of a completion: the worker streams them to the
  * execution's log as it runs.
  *
  * Throws: as `finishExecution`, and InvalidCompletionException if `result.status` is not a
@@ -742,13 +751,25 @@ unittest
     assert(rejected);
     assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
 
+    // Nor attribute them to another execution
+    ArtifactMetadata misattributed;
+    misattributed.artifactId = "game.zip";
+    misattributed.executionId = "exe_somebody_else";
+    bool rejectedExecution = false;
+    try finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, [misattributed]);
+    catch (ForeignArtifactException e) rejectedExecution = e.msg.canFind("exe_somebody_else") && e.msg.canFind(id);
+    assert(rejectedExecution);
+    assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
+
     ArtifactMetadata unnamed;
     unnamed.artifactId = "game.zip";
     ArtifactMetadata own = unnamed;
     own.artifactId = "tools.zip";
     own.taskFingerprint = "fp1";
+    own.executionId = id;
     const done = finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, [unnamed, own]);
     assert(done.artifacts.length == 2 && done.artifacts[0].taskFingerprint == "fp1" && done.artifacts[1].taskFingerprint == "fp1");
+    assert(done.artifacts[0].executionId == id && done.artifacts[1].executionId == id);
 }
 
 unittest
@@ -791,7 +812,6 @@ unittest
     failed.exitCode = 2;
     failed.errorMessage = "make: *** [all] Error 2";
     failed.producedArtifacts = [ArtifactMetadata("partial.log")];
-    failed.logs = ["not recorded here"];
     const done = completeExecution(stores, id, failed, fixedNow());
     assert(done.id == id && done.status == ExecutionStatus.failed && done.exitCode == 2);
     assert(done.errorMessage == "make: *** [all] Error 2" && done.finishedAt == fixedNow());

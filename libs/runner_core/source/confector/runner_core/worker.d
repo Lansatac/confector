@@ -2,24 +2,20 @@ module confector.runner_core.worker;
 
 import confector.core.model;
 import confector.plugin_api.model : ArtifactStorage;
-import confector.core.plugin;
-import confector.core.plugin_loader;
 import confector.plugin_api.dispatch_queue : Lease;
 import confector.runner_core.engine;
-import confector.runner_core.artifacts;
 import confector.runner_core.http_artifact_storage;
 import confector.runner_core.logging;
+import confector.runner_core.steps.step : StepRunner;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, serializeToJsonString, parseJsonString;
 
 import std.net.curl : HTTP;
-import std.file : exists, mkdirRecurse, isDir;
+import std.file : exists, mkdirRecurse;
 import std.path : buildPath;
 import std.uuid : randomUUID;
 import std.format : format;
-import std.stdio : writeln, stderr;
-import std.datetime.systime : Clock;
-import std.process : environment;
+import std.stdio : writeln;
 import std.algorithm.searching : canFind;
 import core.thread : Thread;
 import core.time : Duration, seconds, msecs;
@@ -61,10 +57,7 @@ struct HttpWorkerConfig
 {
     string serverUrl = "http://localhost:8080";
     string workerId = "";
-    string workerToken = "";
     string workspaceDir = "";
-    string storageDir = "";
-    string pluginsDir = "plugins";
     size_t pollIntervalSeconds = 2;
     size_t visibilityTimeoutSeconds = 60;
     size_t heartbeatIntervalSeconds = 15;
@@ -80,18 +73,15 @@ class HttpWorkerClient
 {
     private string m_serverUrl;
     private string m_workerId;
-    private string m_workerToken;
 
-    this(string serverUrl, string workerId = "", string workerToken = "")
+    this(string serverUrl, string workerId = "")
     {
         this.m_serverUrl = normalizeBaseUrl(serverUrl);
         this.m_workerId = workerId.length > 0 ? workerId : "worker_" ~ randomUUID().toString()[0 .. 8];
-        this.m_workerToken = workerToken.length > 0 ? workerToken : environment.get("CONFECTOR_WORKER_TOKEN", environment.get("CONFECTOR_SECRET_TOKEN", ""));
     }
 
     @property string serverUrl() const pure nothrow @safe { return m_serverUrl; }
     @property string workerId() const pure nothrow @safe { return m_workerId; }
-    @property string workerToken() const pure nothrow @safe { return m_workerToken; }
 
     static string normalizeBaseUrl(string url)
     {
@@ -135,12 +125,6 @@ class HttpWorkerClient
 
         http.addRequestHeader("Content-Type", "application/json");
         http.addRequestHeader("Accept", "application/json");
-
-        if (m_workerToken.length > 0)
-        {
-            http.addRequestHeader("X-Worker-Token", m_workerToken);
-            http.addRequestHeader("Authorization", "Bearer " ~ m_workerToken);
-        }
         if (m_workerId.length > 0)
         {
             http.addRequestHeader("X-Worker-ID", m_workerId);
@@ -318,22 +302,27 @@ class HttpWorkerClient
 
 /**
  * Runner loop handling work order receipt, execution via TaskEngine, lease extensions,
- * artifact packing/unpacking, and completion reporting over HTTP.
+ * artifact packing/unpacking, and completion reporting over HTTP. Steps run with the
+ * `StepRunner` it is given.
  */
 class HttpWorkerDaemon
 {
     private HttpWorkerConfig m_config;
     private HttpWorkerClient m_client;
+    private StepRunner m_steps;
     private TaskEngine m_engine;
     private ArtifactStorage m_storage;
     private bool m_stopRequested = false;
     private bool m_running = false;
     private size_t m_tasksProcessed = 0;
 
-    this(in HttpWorkerConfig config, HttpWorkerClient client = null)
+    /// Throws: Exception if `steps` is null.
+    this(in HttpWorkerConfig config, StepRunner steps, HttpWorkerClient client = null)
     {
+        if (steps is null) throw new Exception("A worker needs a step runner");
         this.m_config = config;
-        this.m_client = client !is null ? client : new HttpWorkerClient(config.serverUrl, config.workerId, config.workerToken);
+        this.m_steps = steps;
+        this.m_client = client !is null ? client : new HttpWorkerClient(config.serverUrl, config.workerId);
     }
 
     @property const(HttpWorkerConfig) config() const pure nothrow @safe { return m_config; }
@@ -353,42 +342,10 @@ class HttpWorkerDaemon
             mkdirRecurse(m_config.workspaceDir);
         }
 
-        // Load step executor plugins only — artifact storage is handled via HTTP (HttpArtifactStorage)
-        // so agents no longer need to know about storage backends.
-        string[] searchDirs = [m_config.pluginsDir, "out/plugins", "plugins"];
-        size_t totalPluginsLoaded = 0;
-        foreach (dir; searchDirs)
-        {
-            if (exists(dir) && isDir(dir))
-            {
-                auto loaded = PluginLoader.instance.loadBundledPlugins(dir, [PluginCategory.step_executor]);
-                totalPluginsLoaded += loaded.length;
-                logInfo("[worker] Loaded %d plugin(s) from '%s'", loaded.length, dir);
-                foreach (p; loaded)
-                {
-                    logInfo("[worker]   - %s v%s (category: %s)", p.name, p.versionString, p.category);
-                }
-            }
-            else
-            {
-                logWarn("[worker] Plugins directory '%s' does not exist or is not accessible", dir);
-            }
-        }
-        if (totalPluginsLoaded == 0)
-        {
-            logError("[worker] WARNING: No runner plugins loaded! Task execution will fail.");
-            logError("[worker] Searched directories: %s", searchDirs);
-            logError("[worker] Ensure plugin .so/.dll files are present in one of the searched directories.");
-        }
-        else
-        {
-            logInfo("[worker] Total runner plugins loaded: %d", totalPluginsLoaded);
-        }
-
         // Use HttpArtifactStorage so the worker communicates with the server for all
         // artifact operations. The server decides whether to use presigned URLs or proxy.
-        m_storage = new HttpArtifactStorage(m_config.serverUrl, m_config.workerToken);
-        m_engine = new TaskEngine(m_storage);
+        m_storage = new HttpArtifactStorage(m_config.serverUrl);
+        m_engine = new TaskEngine(m_storage, m_steps);
     }
 
     TaskExecutionResult processOneMessage(in Lease lease)
@@ -615,107 +572,118 @@ version (unittest)
     }
 }
 
-unittest
+
+version (unittest)
 {
-    import std.file : exists, rmdirRecurse, mkdirRecurse, write;
-    import confector.core.plugin : PluginRegistry, Plugin;
-    import confector.plugin_api : BuildStepSystem, StepExecutionContext, StepExecutionResult, PluginCategory, LogDelegate;
-    import vibe.http.router : URLRouter;
-    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
-    import vibe.core.core : runTask, sleep;
-    import core.time : msecs;
+    import confector.runner_core.steps.step : StepContext, StepResult;
 
-    class MockStepRunner : Plugin, BuildStepSystem
+    /// A step runner for tests: each line of a step's `command` is one line of its output. A
+    /// step whose command is "fail" fails with exit code 4. Counts the steps it runs; it is
+    /// passed to the worker explicitly, so the worker's thread sees it.
+    private final class ScriptedStepRunner : StepRunner
     {
-        @property string name() const pure nothrow @safe { return "mock_runner"; }
-        @property string versionString() const pure nothrow @safe { return "1.0.0"; }
-        @property string description() const pure nothrow @safe { return "Mock Step Runner"; }
-        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.step_executor; }
-        ConfigDefinition[] configDefinitions() const { return null; }
-        @property string systemName() const pure nothrow @safe { return "mock-step-system"; }
-        void initialize(PluginContext context = null) {}
-        void shutdown() {}
+        size_t stepsRun;
 
-        bool canExecuteStep(in BuildStep step) const { return true; }
-        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
+        StepResult run(in BuildStep step, ref StepContext context)
         {
-            StepExecutionResult res;
-            res.exitCode = 0;
-            res.success = true;
-            res.outputLines = ["Mock step execution finished successfully"];
-            if (context.logCallback !is null)
+            import std.string : splitLines;
+
+            ++stepsRun;
+            StepResult result;
+            if (step.command == "fail")
             {
-                context.logCallback("Mock step execution finished successfully");
+                context.log("scripted failure");
+                result.success = false;
+                result.exitCode = 4;
+                result.errorMessage = "The scripted step failed";
+                return result;
             }
-            return res;
+            foreach (line; step.command.splitLines) context.log(line);
+            return result;
         }
     }
 
-    PluginRegistry.instance.shutdownAll();
-    PluginRegistry.instance.registerPlugin(new MockStepRunner());
-    scope(exit) PluginRegistry.instance.unregisterPlugin("mock_step_runner");
+    private BuildStep scriptedStep(string name, string command)
+    {
+        BuildStep step;
+        step.name = name;
+        step.type = "scripted";
+        step.command = command;
+        return step;
+    }
+
+    /// Runs `work` on a thread of its own while this thread's event loop serves the mock
+    /// control plane, and returns once it is done. Rethrows what `work` threw.
+    private void runOffThread(void delegate() work)
+    {
+        import vibe.core.core : sleep;
+        import core.time : msecs;
+
+        Throwable thrown;
+        auto thread = new Thread({
+            try work();
+            catch (Throwable t) thrown = t;
+        });
+        thread.start();
+        while (thread.isRunning) sleep(10.msecs);
+        thread.join();
+        if (thrown !is null) throw thrown;
+    }
+}
+
+unittest
+{
+    // The worker protocol against a mock control plane: receive a lease, run the task with the
+    // step runner it was given, stream its logs, report its completion, acknowledge the lease.
+    // Handlers only record what they see; the test asserts after the worker is done, on this
+    // thread, so a wrong value fails the test.
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
 
     string testDir = "test_http_worker_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    // Test URL resolution & client headers
-    auto client = new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1", "secret_tok_123");
+    auto client = new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1");
     assert(client.resolveEndpointUrl("/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
     assert(client.resolveEndpointUrl("/api/v1/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
-
     auto clientApiV1 = new HttpWorkerClient("http://127.0.0.1:9099/api/v1", "test_worker_1");
     assert(clientApiV1.resolveEndpointUrl("/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
 
-    // Setup Mock HTTP Control Plane Server
     auto router = new URLRouter();
     bool dequeueCalled = false;
-    bool heartbeatCalled = false;
-    bool logsCalled = false;
-    bool completeCalled = false;
-    bool ackCalled = false;
+    string[] loggedExecutions;
+    string[] completedExecutions;
+    TaskExecutionResult[] reported;
+    bool[] reportedFingerprint;
+    string[] ackedReceipts;
+    int rejectCompletion = 0;
 
     WorkOrder mockOrder;
     mockOrder.executionId = "exe_mock_1";
     mockOrder.taskId = "task_test_1";
     mockOrder.fingerprint = "fp_mock_123";
     mockOrder.taskNode.id = "task_test_1";
-    mockOrder.taskNode.steps = [BuildStep("step", "mock", null, "echo done")];
+    mockOrder.taskNode.steps = [scriptedStep("step", "Mock step execution finished successfully")];
     Json mockLeases = testLeases("receipt_xyz", mockOrder);
 
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCalled = true;
-        if (dequeueCalled && !ackCalled)
-        {
-            res.writeJsonBody(mockLeases);
-        }
-        else
-        {
-            res.writeJsonBody(Json.emptyArray);
-        }
+        res.writeJsonBody(ackedReceipts.length == 0 ? mockLeases : Json.emptyArray);
     });
-
     router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
-        heartbeatCalled = true;
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
-
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        logsCalled = req.params["execution_id"] == "exe_mock_1";
+        loggedExecutions ~= req.params["execution_id"];
         res.writeJsonBody(["status": "ok"]);
     });
-
-    int rejectCompletion = 0;
-    string reportedExecution;
-    bool reportedFingerprint;
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
-        completeCalled = true;
-        // The result's status is not checked: the worker runs on its own thread, whose
-        // (thread-local) plugin registry lacks the mock step system, so the task fails there.
-        // These tests cover the control-plane protocol.
-        reportedExecution = req.params["execution_id"];
-        reportedFingerprint = ("fingerprint" in req.json) !is null;
+        completedExecutions ~= req.params["execution_id"];
+        reportedFingerprint ~= ("fingerprint" in req.json) !is null;
+        reported ~= deserializeJson!TaskExecutionResult(req.json);
         if (rejectCompletion != 0)
         {
             res.statusCode = rejectCompletion;
@@ -724,10 +692,8 @@ unittest
         }
         res.writeJsonBody(["status": "recorded"]);
     });
-
     router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
-        ackCalled = true;
-        assert(req.json["receipt"].get!string == "receipt_xyz");
+        ackedReceipts ~= req.json["receipt"].get!string;
         res.writeJsonBody(["status": "acknowledged"]);
     });
 
@@ -741,30 +707,24 @@ unittest
     config.serverUrl = "http://127.0.0.1:19188";
     config.workerId = "test_worker_runner";
     config.workspaceDir = buildPath(testDir, "ws");
-    config.storageDir = buildPath(testDir, "storage");
     config.maxTasksToProcess = 1;
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
 
-    auto workerRunner = new HttpWorkerDaemon(config);
-    auto workerThread = new Thread({
-        workerRunner.run();
-    });
-    workerThread.start();
-
-    // Drive vibe event loop until worker thread completes
-    while (workerThread.isRunning)
-    {
-        sleep(50.msecs);
-    }
-    workerThread.join();
+    auto steps = new ScriptedStepRunner();
+    auto workerRunner = new HttpWorkerDaemon(config, steps);
+    runOffThread({ workerRunner.run(); });
 
     assert(workerRunner.tasksProcessed == 1);
     assert(dequeueCalled);
-    assert(completeCalled);
-    assert(ackCalled);
-    assert(reportedExecution == "exe_mock_1", "The completion names the work order's execution");
-    assert(!reportedFingerprint, "The completion carries no fingerprint");
+    assert(steps.stepsRun == 1, "The worker ran the task's step with the step runner it was given");
+    assert(completedExecutions == ["exe_mock_1"], "The completion names the work order's execution");
+    assert(reported.length == 1 && reported[0].status == TaskStatus.succeeded, format("Reported %s", reported));
+    assert(reported[0].taskId == "task_test_1" && reported[0].exitCode == 0 && reported[0].errorMessage.length == 0);
+    assert(reportedFingerprint == [false], "The completion carries no fingerprint");
+    assert(ackedReceipts == ["receipt_xyz"]);
+    assert(loggedExecutions.length > 0);
+    foreach (logged; loggedExecutions) assert(logged == "exe_mock_1", logged);
 
     // The workspace is the execution's own directory
     assert(exists(buildPath(config.workspaceDir, "exe_mock_1")));
@@ -777,98 +737,143 @@ unittest
     foreach (status, acked; [500: false, 503: false, 409: true, 422: true])
     {
         rejectCompletion = status;
-        ackCalled = false;
-        completeCalled = false;
-        auto retryThread = new Thread({ workerRunner.processOneMessage(lease); });
-        retryThread.start();
-        while (retryThread.isRunning)
-        {
-            sleep(50.msecs);
-        }
-        retryThread.join();
-        assert(completeCalled && ackCalled == acked, format("HTTP %s", status));
+        ackedReceipts = null;
+        reported = null;
+        runOffThread({ workerRunner.processOneMessage(lease); });
+        assert(reported.length == 1 && reported[0].status == TaskStatus.succeeded, format("HTTP %s: reported %s", status, reported));
+        string[] expectedAcks;
+        if (acked) expectedAcks = ["receipt_xyz"];
+        assert(ackedReceipts == expectedAcks, format("HTTP %s: acknowledged %s", status, ackedReceipts));
     }
     rejectCompletion = 0;
-    ackCalled = false;
+
+    // A failing step is reported as a failed task, with its exit code and error
+    WorkOrder failing = mockOrder;
+    failing.executionId = "exe_failing";
+    failing.taskNode.steps = [scriptedStep("Fail", "fail"), scriptedStep("Never", "never runs")];
+    reported = null;
+    ackedReceipts = null;
+    steps.stepsRun = 0;
+    auto failingLease = Lease("receipt_failing", 1, serializeToJson(failing));
+    runOffThread({ workerRunner.processOneMessage(failingLease); });
+    assert(reported.length == 1 && reported[0].status == TaskStatus.failed, format("Reported %s", reported));
+    assert(reported[0].exitCode == 4 && reported[0].errorMessage == "The scripted step failed", reported[0].errorMessage);
+    assert(steps.stepsRun == 1, "Steps after a failed one do not run");
+    assert(ackedReceipts == ["receipt_failing"]);
 
     // A work order naming no execution is refused before anything runs: its completion could
     // not say what it completes
-    completeCalled = false;
+    reported = null;
+    ackedReceipts = null;
     WorkOrder anonymous = mockOrder;
     anonymous.executionId = null;
     auto anonymousLease = Lease("receipt_anon", 1, serializeToJson(anonymous));
-    bool refused = false;
-    auto anonymousThread = new Thread({
-        try workerRunner.processOneMessage(anonymousLease);
-        catch (Exception e) refused = e.msg.canFind("names no execution");
-    });
-    anonymousThread.start();
-    while (anonymousThread.isRunning)
-    {
-        sleep(50.msecs);
-    }
-    anonymousThread.join();
-    assert(refused && !completeCalled && !ackCalled);
+    string refusal;
+    try runOffThread({ workerRunner.processOneMessage(anonymousLease); });
+    catch (Exception e) refusal = e.msg;
+    assert(refusal.canFind("names no execution"), refusal);
+    assert(reported.length == 0 && ackedReceipts.length == 0);
 }
 
 unittest
 {
-    import std.file : exists, rmdirRecurse, mkdirRecurse, write;
-    import confector.core.plugin : PluginRegistry, Plugin;
-    import confector.plugin_api : BuildStepSystem, StepExecutionContext, StepExecutionResult, PluginCategory, LogDelegate;
+    // With the runner's built-in steps, a step type that is not built in fails the task and a
+    // built-in that is not implemented yet fails it loudly; both are reported, naming the bead
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
-    import vibe.core.core : runTask, sleep;
-    import core.time : msecs;
+    import confector.runner_core.steps.builtin : BuiltinStepRunner;
 
-    class MockMultiStepRunner : Plugin, BuildStepSystem
+    string testDir = "test_http_worker_builtin";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    auto router = new URLRouter();
+    TaskExecutionResult[string] reported;
+    string[] ackedReceipts;
+    router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.writeJsonBody(["status": "ok"]);
+    });
+    router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        reported[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json);
+        res.writeJsonBody(["status": "recorded"]);
+    });
+    router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
+        ackedReceipts ~= req.json["receipt"].get!string;
+        res.writeJsonBody(["status": "acknowledged"]);
+    });
+
+    auto settings = new HTTPServerSettings();
+    settings.port = 19190;
+    settings.bindAddresses = ["127.0.0.1"];
+    auto listener = listenHTTP(settings, router);
+    scope(exit) listener.stopListening();
+
+    HttpWorkerConfig config;
+    config.serverUrl = "http://127.0.0.1:19190";
+    config.workerId = "test_builtin_worker";
+    config.workspaceDir = buildPath(testDir, "ws");
+    config.heartbeatIntervalSeconds = 0;
+    auto worker = new HttpWorkerDaemon(config, new BuiltinStepRunner());
+
+    WorkOrder order;
+    order.taskId = "package";
+    order.fingerprint = "fp_package";
+    order.taskNode.id = "package";
+    foreach (type, execution; ["docker:build": "exe_unknown", "bash": "exe_bash", "powershell": "exe_powershell"])
     {
-        @property string name() const pure nothrow @safe { return "mock_multistep_runner"; }
-        @property string versionString() const pure nothrow @safe { return "1.0.0"; }
-        @property string description() const pure nothrow @safe { return "Mock Multistep Runner"; }
-        @property PluginCategory category() const pure nothrow @safe { return PluginCategory.step_executor; }
-        ConfigDefinition[] configDefinitions() const { return null; }
-        @property string systemName() const pure nothrow @safe { return "mock-multistep-system"; }
-        void initialize(PluginContext context = null) {}
-        void shutdown() {}
-
-        bool canExecuteStep(in BuildStep step) const { return true; }
-        StepExecutionResult executeStep(in BuildStep step, ref StepExecutionContext context)
-        {
-            StepExecutionResult res;
-            res.exitCode = 0;
-            res.success = true;
-            res.outputLines = ["Step finished"];
-            if (context.logCallback !is null)
-            {
-                context.logCallback(step.script.length > 0 ? step.script : step.command);
-            }
-            return res;
-        }
+        order.executionId = execution;
+        BuildStep step;
+        step.type = type;
+        order.taskNode.steps = [step];
+        auto lease = Lease("receipt_" ~ execution, 1, serializeToJson(order));
+        runOffThread({ worker.initialize(); worker.processOneMessage(lease); });
     }
+    assert(reported["exe_unknown"].status == TaskStatus.failed);
+    assert(reported["exe_unknown"].errorMessage.canFind("confector-z7z.35.1"), reported["exe_unknown"].errorMessage);
+    foreach (execution; ["exe_bash", "exe_powershell"])
+    {
+        assert(reported[execution].status == TaskStatus.failed, execution);
+        assert(reported[execution].errorMessage.canFind("confector-z7z.35.6"), reported[execution].errorMessage);
+    }
+    // Each failure was recorded and its lease acknowledged, so the work order is not delivered
+    // again only to fail the same way
+    import std.algorithm.sorting : sort;
+    assert(ackedReceipts.sort.release == ["receipt_exe_bash", "receipt_exe_powershell", "receipt_exe_unknown"], format("Acknowledged %s", ackedReceipts));
+}
 
-    PluginRegistry.instance.shutdownAll();
-    PluginRegistry.instance.registerPlugin(new MockMultiStepRunner());
-    scope(exit) PluginRegistry.instance.unregisterPlugin("mock_multistep_runner");
+unittest
+{
+    // Two work orders in a row: every line a task's steps log reaches its execution's log, in
+    // order, before its completion
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
+    import std.array : join;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
 
     string testDir = "test_http_multistep_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    // Setup Multi-Step HTTP Control Plane
     auto router = new URLRouter();
-    int dequeueCount = 0;
-    string[] completedTasks;
+    string[] completedExecutions;
+    TaskStatus[string] reportedStatus;
     string[] acknowledgedReceipts;
-    string[] streamedLogs;
+    string[][string] streamedByExecution;
+    bool logAfterCompletion = false;
+
+    // More lines than the worker sends in one batch, so batching and the final flush both count
+    string[] firstLines;
+    foreach (i; 1 .. 13) firstLines ~= format("first task line %s", i);
 
     WorkOrder orderStep1;
     orderStep1.executionId = "exe_step_1";
     orderStep1.taskId = "task_step_1";
     orderStep1.fingerprint = "fp_step_1";
     orderStep1.taskNode.id = "task_step_1";
-    orderStep1.taskNode.steps = [BuildStep("step1", "mock", null, "echo step 1 finished")];
+    orderStep1.taskNode.steps = [scriptedStep("step1", firstLines.join("\n"))];
     Json msgStep1 = testLeases("receipt_step_1", orderStep1);
 
     WorkOrder orderStep2;
@@ -876,57 +881,30 @@ unittest
     orderStep2.taskId = "task_step_2";
     orderStep2.fingerprint = "fp_step_2";
     orderStep2.taskNode.id = "task_step_2";
-    orderStep2.taskNode.steps = [BuildStep("step2", "mock", null, "echo step 2 finished")];
+    orderStep2.taskNode.steps = [scriptedStep("step2a", "second task line 1"), scriptedStep("step2b", "second task line 2")];
     Json msgStep2 = testLeases("receipt_step_2", orderStep2);
 
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
-        dequeueCount++;
-        if (completedTasks.length == 0)
-        {
-            res.writeJsonBody(msgStep1);
-        }
-        else if (completedTasks.length == 1)
-        {
-            res.writeJsonBody(msgStep2);
-        }
-        else
-        {
-            res.writeJsonBody(Json.emptyArray);
-        }
+        if (completedExecutions.length == 0) res.writeJsonBody(msgStep1);
+        else if (completedExecutions.length == 1) res.writeJsonBody(msgStep2);
+        else res.writeJsonBody(Json.emptyArray);
     });
-
     router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
-
-    string[] loggedExecutions;
-    string[][string] streamedByExecution;
-    string[][string] completionLogs;
-    bool logAfterCompletion = false;
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         const execution = req.params["execution_id"];
-        loggedExecutions ~= execution;
         // The server refuses log lines for a finished execution: the worker must send its last
         // lines before its completion
-        if (completedTasks.canFind(execution)) logAfterCompletion = true;
-        if ("lines" in req.json)
-        {
-            foreach (line; req.json["lines"])
-            {
-                streamedLogs ~= line.get!string;
-                streamedByExecution[execution] ~= line.get!string;
-            }
-        }
+        if (completedExecutions.canFind(execution)) logAfterCompletion = true;
+        foreach (line; req.json["lines"]) streamedByExecution[execution] ~= line.get!string;
         res.writeJsonBody(["status": "ok"]);
     });
-
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
-        completedTasks ~= req.params["execution_id"];
-        completionLogs[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json).logs;
-        // Status not checked; see the previous test
+        completedExecutions ~= req.params["execution_id"];
+        reportedStatus[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json).status;
         res.writeJsonBody(["status": "recorded"]);
     });
-
     router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
         acknowledgedReceipts ~= req.json["receipt"].get!string;
         res.writeJsonBody(["status": "acknowledged"]);
@@ -942,46 +920,30 @@ unittest
     config.serverUrl = "http://127.0.0.1:19189";
     config.workerId = "test_multistep_worker";
     config.workspaceDir = buildPath(testDir, "ws");
-    config.storageDir = buildPath(testDir, "storage");
-    config.maxTasksToProcess = 2; // Process both chained steps
+    config.maxTasksToProcess = 2;
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
 
-    auto workerRunner = new HttpWorkerDaemon(config);
-    auto workerThread = new Thread({
-        workerRunner.run();
-    });
-    workerThread.start();
-
-    // Drive vibe event loop until worker thread completes
-    while (workerThread.isRunning)
-    {
-        sleep(50.msecs);
-    }
-    workerThread.join();
+    auto workerRunner = new HttpWorkerDaemon(config, new ScriptedStepRunner());
+    runOffThread({ workerRunner.run(); });
 
     assert(workerRunner.tasksProcessed == 2);
-    assert(completedTasks.length == 2);
-    assert(completedTasks[0] == "exe_step_1");
-    assert(completedTasks[1] == "exe_step_2");
-    assert(acknowledgedReceipts.length == 2);
-    assert(acknowledgedReceipts[0] == "receipt_step_1");
-    assert(acknowledgedReceipts[1] == "receipt_step_2");
-    assert(streamedLogs.length > 0);
-    foreach (logged; loggedExecutions) assert(logged == "exe_step_1" || logged == "exe_step_2", logged);
-
-    // Every line of a run reaches its execution's log, in order, before its completion
+    assert(completedExecutions == ["exe_step_1", "exe_step_2"]);
+    assert(reportedStatus == ["exe_step_1": TaskStatus.succeeded, "exe_step_2": TaskStatus.succeeded], format("Reported %s", reportedStatus));
+    assert(acknowledgedReceipts == ["receipt_step_1", "receipt_step_2"]);
+    assert(streamedByExecution.length == 2, format("Logs went to %s", streamedByExecution.keys));
     assert(!logAfterCompletion, "A log batch was sent after the completion");
-    foreach (execution; ["exe_step_1", "exe_step_2"])
+
+    // Each execution's log holds its steps' lines in order (among the runner's own lines)
+    string[][string] expectedLines = ["exe_step_1": firstLines, "exe_step_2": ["second task line 1", "second task line 2"]];
+    foreach (execution, expected; expectedLines)
     {
-        auto streamed = streamedByExecution.get(execution, null);
-        auto reported = completionLogs[execution];
-        assert(reported.length > 0, execution);
+        auto streamed = streamedByExecution[execution];
         size_t next = 0;
         foreach (line; streamed)
         {
-            if (next < reported.length && line == reported[next]) ++next;
+            if (next < expected.length && line == expected[next]) ++next;
         }
-        assert(next == reported.length, format("%s: streamed %s, reported %s", execution, streamed, reported));
+        assert(next == expected.length, format("%s: streamed %s, expected %s in order", execution, streamed, expected));
     }
 }
