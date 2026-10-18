@@ -120,7 +120,7 @@ followed.
 
 Prefer obvious failures to silent degradation, within reason.
 
-- If required configuration, a plugin context, or a dependency is missing or invalid, throw an
+- If required configuration, a backend setting, or a dependency is missing or invalid, throw an
   exception with a clear message immediately. Do not log a warning and continue.
 - Do not invent defaults for required settings (for example, a default database connection
   string). A wrong default that "works" hides the real problem.
@@ -650,9 +650,9 @@ Be aware of these so you do not spread them:
   callers.
 - **There are no external consumers.** Do not add "backward compatibility" shims, re-export
   modules, or deprecated fields. Change the code and its callers together.
-- **`PluginRegistry` is a global singleton** used from core logic, and plugins are still loaded as
-  shared libraries. Both are being removed (see "Backends and extensions"; bead
-  `confector-z7z.31`). Do not add new dependencies on them; pass what you need explicitly.
+- **Backends are compiled in.** The server builds a typed `Backends` value at startup
+  (`apps/server` `backends.d`) and passes it explicitly; there is no plugin registry or runtime
+  loading, and each backend has one implementation for now (beads `confector-z7z.31.x`).
 - **In-memory test fakes do not always behave like the real backends.** Make fakes match the real
   behavior, not the other way around.
 
@@ -661,9 +661,9 @@ Be aware of these so you do not spread them:
 Each dub package is a directory with its own `dub.json` and a `source/` folder holding the full
 module path (for example `libs/core/source/confector/core/`).
 
-- `libs/core/` — graph construction, input resolution, fingerprinting, trigger matching, plugin
-  registry.
-- `libs/plugin_api/` — data types and interfaces shared with plugins.
+- `libs/core/` — graph construction, input resolution, fingerprinting, trigger matching.
+- `libs/plugin_api/` — data types and backend interfaces (document store, dispatch queue,
+  scheduler, artifact storage).
 - `libs/runner_core/` — executes a single task on a worker, including the built-in checkout step.
 - `libs/config/` — configuration types.
 - `libs/mongo_helpers/` — MongoDB connection and BSON helpers.
@@ -671,9 +671,9 @@ module path (for example `libs/core/source/confector/core/`).
 - `apps/runner/` — the runner command-line program.
 - `apps/server/` — web server, API and dashboard, with its web UI templates
   (`views/`) and static assets (`public/`).
-- `plugins/<category>/<name>/` — plugins by category (workers, artifact storage, document store,
-  queue, scheduler). Build steps are not plugins: the runner's built-in steps live in
-  `libs/runner_core` (`steps/`).
+- `plugins/<category>/<name>/` — compiled-in backend libraries by kind (artifact store, document
+  store, queue, scheduler); the directory is to be renamed. Build steps are not backends: the
+  runner's built-in steps live in `libs/runner_core` (`steps/`).
 
 Explore the code for anything more specific; file-level details change too often to list here.
 
@@ -704,7 +704,7 @@ anywhere else. From the repository root:
 - Run core unit tests: `dub test :core`
 - Other subpackages follow the same pattern, for example `:server` or `:runner-core`; check each
   subpackage's `dub.json` for its exact name.
-- Build everything: `dub build :server`, `dub build :runner`, `dub build :plugins`.
+- Build everything: `dub build` (or `dub build :server`, `dub build :runner`).
 
 **dub is the source of truth for the build.** Change `dub.json` files to change what is built;
 never make `reggaefile.d` the only place something is defined.
@@ -716,10 +716,9 @@ for incremental builds). From the repository root:
 cd build && reggae -b ninja .. && ninja
 ```
 
-Targets: `server`, `runner`, `plugins` (plain `ninja` builds all three).
+Targets: `server`, `runner` (plain `ninja` builds both).
 
-Outputs land in `build/out/server/` and `build/out/runner/`, with the server's plugins in
-`build/out/server/plugins/`. Release builds should use LDC (bead `confector-z7z.45`).
+Outputs land in `build/out/server/` and `build/out/runner/`. Release builds should use LDC (bead `confector-z7z.45`).
 
 **The server's views are not copied to the output directory, and that is correct.** The `.dt`
 templates in `apps/server/views` are compiled into the server binary (`render!("x.dt", ...)` is

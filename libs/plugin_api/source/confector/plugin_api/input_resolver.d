@@ -15,8 +15,7 @@ import confector.plugin_api.model : InputDecl, InputPin, RepositoryRecord;
 
 /**
  * Resolves repository inputs for one version control provider. How the shell selects the
- * resolver for a repository is left to the provider wiring (z7z.20.6). Supersedes the
- * revision-fetching `VcsStateResolver` for fingerprinting.
+ * resolver for a repository is left to the provider wiring (z7z.20.6).
  */
 interface RepositoryResolver
 {

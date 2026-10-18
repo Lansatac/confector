@@ -21,7 +21,7 @@ module confector.core.git_resolver;
 
 import confector.plugin_api.input_resolver : RepositoryResolver;
 import confector.plugin_api.model : InputDecl, InputKind, InputPin, RepositoryRecord;
-import confector.plugin_api.vcs : isFullSha, redactUserInfo;
+import confector.core.git : isFullSha, redactUserInfo;
 
 import vibe.data.json : Json;
 

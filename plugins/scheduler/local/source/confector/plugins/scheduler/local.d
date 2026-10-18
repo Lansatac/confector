@@ -8,26 +8,23 @@ import std.format;
 import std.string : indexOf;
 import std.datetime : Clock, DateTime;
 
-import confector.plugin_api.plugin : Plugin, PluginContext, NullPluginContext, PluginCategory, SchedulerPlugin, ConfigDefinition, ScopedConfigAccessor, ResolutionEngine;
 import confector.plugin_api.scheduler : Scheduler, ScheduleEntry, schedulerSecretHeader;
 
-import vibe.data.json : Json;
 import std.net.curl : HTTP, get, post;
 import std.stdio : writeln;
 import nova.cron : CronExpr;
 
 /**
- * LocalSchedulerPlugin is a reference implementation of the Scheduler interface.
+ * LocalScheduler is the reference implementation of the Scheduler interface.
  * It uses a dedicated thread to iterate over registered schedule entries and fire
  * HTTP POST requests at their configured intervals.
  *
- * This implementation is fully in-memory — entries are lost on shutdown and rebuilt
- * on restart. For cloud-based scheduling, implement a different SchedulerPlugin that
- * uses external trigger services (e.g., AWS CloudWatch Events).
+ * This implementation is fully in-memory: entries are lost on shutdown and rebuilt
+ * on restart. Cloud deployments use a scheduler backed by an external trigger service
+ * (e.g., AWS EventBridge).
  */
-class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
+class LocalScheduler : Scheduler
 {
-    private PluginContext m_context;
     private ScheduleEntry[string] m_entries;
     private CronExpr[string] m_parsedCronExprs;  // Cached parsed cron expressions
     private Mutex m_mutex;
@@ -36,49 +33,21 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
     private bool m_running;
     private string m_callbackSecret;  // Sent in schedulerSecretHeader on every fired request
 
-    this()
+    /**
+     * A scheduler that sends `callbackSecret` with every callback. Throws if the secret is empty:
+     * scheduled callbacks could not be authenticated.
+     */
+    this(string callbackSecret)
     {
+        // Never logged: the value is only held here and written into the callback headers.
+        if (callbackSecret.length == 0)
+            throw new Exception("The local scheduler needs a callback secret: scheduled callbacks cannot be authenticated without one.");
+        m_callbackSecret = callbackSecret;
         m_entries = new ScheduleEntry[string];
         m_parsedCronExprs = new CronExpr[string];
         m_mutex = new Mutex();
         m_stopEvent = new Event(false, false);
         m_running = false;
-    }
-
-    @property string name() const { return "local-scheduler"; }
-    @property string versionString() const { return "1.0.0"; }
-    @property string description() const { return "Local thread-based scheduler that fires HTTP POST requests to registered URIs"; }
-    @property PluginCategory category() const { return PluginCategory.scheduler; }
-
-    ConfigDefinition[] configDefinitions() const
-    {
-        return [
-            ConfigDefinition("callbackSecret", "CONFECTOR_SCHEDULER_CALLBACK_SECRET", Json.undefined,
-                "Secret sent in the X-Confector-Scheduler-Secret header on every callback (required)", true)
-        ];
-    }
-
-    void initialize(PluginContext context = null)
-    {
-        if (context is null)
-            throw new Exception("[local-scheduler] PluginContext must not be null; the host failed to provide configuration.");
-        m_context = context;
-
-        // Never logged: the value is only held here and written into the callback headers.
-        m_callbackSecret = m_context.config.getString("callbackSecret");
-        if (m_callbackSecret.length == 0)
-            throw new Exception("[local-scheduler] Required setting 'callbackSecret' is missing (plugins.local-scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): scheduled callbacks cannot be authenticated.");
-
-        m_context.info("LocalSchedulerPlugin initialized");
-    }
-
-    void shutdown()
-    {
-        stop();
-        if (m_context !is null)
-        {
-            m_context.info("LocalSchedulerPlugin shut down");
-        }
     }
 
     void schedule(ScheduleEntry entry)
@@ -104,20 +73,9 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
             try
             {
                 m_parsedCronExprs[entry.id] = CronExpr.parse(entry.cronExpression);
-                if (m_context !is null)
-                {
-                    m_context.info(format("Scheduled entry '%s': %s %s (cron: %s, recurring: %s)",
-                        entry.id, entry.httpMethod.length > 0 ? entry.httpMethod : "POST",
-                        entry.uri, entry.cronExpression, entry.recurring ? "true" : "false"));
-                }
             }
             catch (Exception e)
             {
-                if (m_context !is null)
-                {
-                    m_context.error(format("Invalid cron expression for entry '%s': %s - %s",
-                        entry.id, entry.cronExpression, e.msg));
-                }
                 throw new Exception(format("Invalid cron expression for entry '%s': %s",
                     entry.id, e.msg));
             }
@@ -126,15 +84,10 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
 
     void unschedule(string entryId)
     {
-        bool removed;
         synchronized (m_mutex)
         {
-            removed = m_entries.remove(entryId);
+            m_entries.remove(entryId);
             m_parsedCronExprs.remove(entryId);
-        }
-        if (removed && m_context !is null)
-        {
-            m_context.info(format("Unscheduled entry '%s'", entryId));
         }
     }
 
@@ -150,11 +103,6 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
         m_thread = new Thread(dg);
         m_thread.isDaemon = true;
         m_thread.start();
-
-        if (m_context !is null)
-        {
-            m_context.info("LocalSchedulerPlugin started");
-        }
     }
 
     void stop()
@@ -170,11 +118,6 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
             m_thread.join();
             m_thread = null;
         }
-
-        if (m_context !is null)
-        {
-            m_context.info("LocalSchedulerPlugin stopped");
-        }
     }
 
     @property bool isRunning() const
@@ -189,11 +132,6 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
 
     private void runLoop()
     {
-        if (m_context !is null)
-        {
-            m_context.info("Scheduler thread started");
-        }
-
         while (m_running)
         {
             ScheduleEntry[string] entriesCopy;
@@ -255,20 +193,11 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
                         m_entries.remove(id);
                         m_parsedCronExprs.remove(id);
                     }
-                    if (m_context !is null)
-                    {
-                        m_context.info(format("Removed one-time entry '%s' after firing", id));
-                    }
                 }
             }
 
             // Sleep for a short interval before checking again
             Thread.sleep(msecs(100));
-        }
-
-        if (m_context !is null)
-        {
-            m_context.info("Scheduler thread stopped");
         }
     }
 
@@ -313,34 +242,12 @@ class LocalSchedulerPlugin : SchedulerPlugin, Scheduler
     }
 }
 
-/**
- * Exported factory function for dynamic plugin loading.
- */
-extern(C) export Plugin confector_create_plugin()
-{
-    return new LocalSchedulerPlugin();
-}
-
-/// A context whose plugins.local-scheduler scope holds the given callback secret (empty = unset).
-private PluginContext schedulerTestContext(string callbackSecret)
-{
-    Json fileConfig = Json.emptyObject;
-    fileConfig["plugins"] = Json.emptyObject;
-    fileConfig["plugins"]["local-scheduler"] = Json.emptyObject;
-    if (callbackSecret.length > 0)
-        fileConfig["plugins"]["local-scheduler"]["callbackSecret"] = Json(callbackSecret);
-    auto scope_ = new ScopedConfigAccessor(new ResolutionEngine(fileConfig), "plugins.local-scheduler");
-    return new NullPluginContext("local-scheduler", scope_);
-}
-
 unittest
 {
     import std.exception : assertThrown;
 
-    // The callback secret is required: initialization fails loudly when it is unset
-    auto plugin = new LocalSchedulerPlugin();
-    assertThrown!Exception(plugin.initialize(schedulerTestContext("")));
-    assertThrown!Exception(plugin.initialize(null));
+    // The callback secret is required: construction fails loudly without one
+    assertThrown!Exception(new LocalScheduler(""));
 }
 
 /// Fires one entry at a loopback listener and returns the raw request it received. Every wait is
@@ -385,8 +292,7 @@ private string captureFiredRequest(string httpMethod, string jsonBody)
     });
     acceptor.start();
 
-    auto plugin = new LocalSchedulerPlugin();
-    plugin.initialize(schedulerTestContext("test-secret"));
+    auto scheduler = new LocalScheduler("test-secret");
 
     ScheduleEntry entry;
     entry.id = "header-check";
@@ -394,7 +300,7 @@ private string captureFiredRequest(string httpMethod, string jsonBody)
     entry.httpMethod = httpMethod;
     entry.jsonBody = jsonBody;
     entry.cronExpression = "* * * * *";
-    plugin.fireEntry(entry);
+    scheduler.fireEntry(entry);
 
     acceptor.join();
     listener.close();
@@ -418,7 +324,7 @@ unittest
 {
     import std.algorithm.searching : canFind, startsWith;
 
-    // The plugin sends the configured secret in the scheduler header
+    // The scheduler sends the configured secret in the scheduler header
     auto received = captureFiredRequest("POST", null);
     assert(received.canFind("X-Confector-Scheduler-Secret: test-secret"), received);
 
@@ -444,11 +350,8 @@ unittest
 
 unittest
 {
-    auto plugin = new LocalSchedulerPlugin();
-    plugin.initialize(schedulerTestContext("test-secret"));
-    assert(plugin.name == "local-scheduler");
-    assert(plugin.category == PluginCategory.scheduler);
-    assert(!plugin.isRunning);
+    auto scheduler = new LocalScheduler("test-secret");
+    assert(!scheduler.isRunning);
 
     // Test scheduling with empty id
     bool caught = false;
@@ -457,7 +360,7 @@ unittest
         ScheduleEntry entry;
         entry.uri = "http://localhost:8080/test";
         entry.cronExpression = "* * * * *";
-        plugin.schedule(entry);
+        scheduler.schedule(entry);
     }
     catch (Exception e)
     {
@@ -473,7 +376,7 @@ unittest
         ScheduleEntry entry;
         entry.id = "test-1";
         entry.cronExpression = "* * * * *";
-        plugin.schedule(entry);
+        scheduler.schedule(entry);
     }
     catch (Exception e)
     {
@@ -489,7 +392,7 @@ unittest
         ScheduleEntry entry;
         entry.id = "test-2";
         entry.uri = "http://localhost:8080/test";
-        plugin.schedule(entry);
+        scheduler.schedule(entry);
     }
     catch (Exception e)
     {
@@ -507,17 +410,15 @@ unittest
     validEntry.jsonBody = `{"test": true}`;
     validEntry.cronExpression = "*/5 * * * *";
     validEntry.recurring = true;
-    plugin.schedule(validEntry);
+    scheduler.schedule(validEntry);
 
     // Test unschedule
-    plugin.unschedule("test-valid");
-    plugin.unschedule("non-existent"); // Should be no-op
+    scheduler.unschedule("test-valid");
+    scheduler.unschedule("non-existent"); // Should be no-op
 
     // Test start/stop
-    plugin.start();
-    assert(plugin.isRunning);
-    plugin.stop();
-    assert(!plugin.isRunning);
-
-    plugin.shutdown();
+    scheduler.start();
+    assert(scheduler.isRunning);
+    scheduler.stop();
+    assert(!scheduler.isRunning);
 }

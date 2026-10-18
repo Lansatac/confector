@@ -1,13 +1,12 @@
-module confector.plugin_api.vcs;
-
-import confector.plugin_api.plugin;
-import confector.plugin_api.executor : LogDelegate;
-import confector.plugin_api.model : VcsRepositoryState;
-import std.json : JSONValue;
+module confector.core.git;
 
 /**
- * True if `s` is a complete git object id: 40 (SHA-1) or 64 (SHA-256) hex digits. Shared by the
- * control-plane git resolver and the runner-side checkout step.
+ * Pure text helpers shared by the control-plane git resolver (confector.core.git_resolver) and
+ * the runner's checkout step.
+ */
+
+/**
+ * True if `s` is a complete git object id: 40 (SHA-1) or 64 (SHA-256) hex digits.
  */
 bool isFullSha(string s) pure nothrow @safe @nogc
 {
@@ -85,45 +84,4 @@ unittest
     assert(isFullSha("AB" ~ "0000000000000000000000000000000000000000000000000000000000000000"[0 .. 62]));
     assert(!isFullSha("abc123"));
     assert(!isFullSha("g111111111111111111111111111111111111111"));
-}
-
-/**
- * VCS plugin interface for querying remote repository state and parsing provider webhooks.
- * Implements this interface to enable Confector to probe revisions, parse webhooks, and
- * invalidate DAG caches for a specific VCS provider (Git, Perforce, Plastic SCM, etc.).
- */
-interface VcsStateResolver : Plugin
-{
-    /**
-     * Returns the VCS provider type identifier (e.g., "git", "perforce", "plastic").
-     */
-    @property string providerType() const;
-
-    /**
-     * Returns true if this resolver can handle the given repository URL.
-     */
-    bool canHandle(string repositoryUrl) const;
-
-    /**
-     * Fetches the latest revision state for a repository and optional target ref.
-     * Performs a remote query (e.g., `git ls-remote`) to resolve the current head revision.
-     */
-    VcsRepositoryState fetchLatestState(string repositoryUrl, string targetRef = null);
-
-    /**
-     * Returns true if this resolver can handle the incoming webhook payload
-     * based on HTTP headers and payload structure.
-     */
-    bool canHandleWebhook(in string[string] headers, in JSONValue payload) const;
-
-    /**
-     * Parses a webhook payload into a resolved `VcsRepositoryState`.
-     *
-     * Returns true if parsing succeeded and populated `resolvedState`.
-     */
-    bool parseWebhookPayload(
-        in string[string] headers,
-        in JSONValue payload,
-        out VcsRepositoryState resolvedState
-    );
 }

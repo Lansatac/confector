@@ -16,11 +16,9 @@ struct HttpConfig
 }
 
 /**
- * Where the server keeps its state: the MongoDB behind the document store. Both settings are
- * required and have no defaults; the server refuses to start without them (see
- * requireDocumentStoreConfig). The connection string is shared with the mongo-queue plugin
- * through CONFECTOR_MONGO_URI. This is an interim shape until backends are chosen from
- * configuration (bead confector-z7z.31.1).
+ * The MongoDB that holds the document store and the dispatch queue. Both settings are required
+ * and have no defaults; the server refuses to start without them (see
+ * requireDocumentStoreConfig).
  */
 struct DocumentStoreConfig
 {
@@ -36,8 +34,8 @@ struct DocumentStoreConfig
 
 /**
  * Scheduler callbacks. The scheduler fires HTTP requests back into the server (cron
- * triggers, VCS polling); each one must carry this secret. Required, with no default.
- * The scheduler plugin reads the same value through CONFECTOR_SCHEDULER_CALLBACK_SECRET.
+ * triggers, VCS polling); each one must carry this secret, which the server checks and the
+ * local scheduler sends. Required, with no default.
  */
 struct SchedulerConfig
 {
@@ -48,12 +46,14 @@ struct SchedulerConfig
 }
 
 /**
- * Plugins subsystem configuration.
+ * The artifact store: artifacts are kept as files under a base directory. Required, with no
+ * default; the server refuses to start without it (see requireArtifactStoreConfig).
  */
-struct PluginsConfig
+struct ArtifactStoreConfig
 {
-    @Description("Directory for bundled plugins")
-    string bundledPluginsDir = "plugins";
+    @Required
+    @Description("Directory the local artifact store keeps artifacts in, created if missing (required)")
+    string baseDirectory = "";
 }
 
 /**
@@ -67,7 +67,7 @@ struct ServerConfig
     HttpConfig http;
     DocumentStoreConfig documentStore;
     SchedulerConfig scheduler;
-    PluginsConfig plugins;
+    ArtifactStoreConfig artifactStore;
 }
 
 /**
@@ -90,7 +90,8 @@ void requireDocumentStoreConfig(in DocumentStoreConfig config)
             ~ "(server.documentStore.connectionString or CONFECTOR_MONGO_URI): the server cannot start without a document store.");
     if (config.database.length == 0)
         throw new Exception("[config] Required setting 'server.documentStore.database' is missing "
-            ~ "(server.documentStore.database): the server cannot start without a document store.");
+            ~ "(server.documentStore.database or " ~ keyToDefaultEnvVar("server.documentStore.database")
+            ~ "): the server cannot start without a document store.");
 }
 
 /**
@@ -103,6 +104,17 @@ void requireSchedulerConfig(in SchedulerConfig config)
         throw new Exception("[config] Required setting 'server.scheduler.callbackSecret' is missing "
             ~ "(server.scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): the server cannot start "
             ~ "without it, because scheduler callbacks would be unauthenticated.");
+}
+
+/**
+ * Throws, naming the missing setting, unless the artifact store is configured.
+ */
+void requireArtifactStoreConfig(in ArtifactStoreConfig config)
+{
+    if (config.baseDirectory.length == 0)
+        throw new Exception("[config] Required setting 'server.artifactStore.baseDirectory' is missing "
+            ~ "(server.artifactStore.baseDirectory or " ~ keyToDefaultEnvVar("server.artifactStore.baseDirectory")
+            ~ "): the server cannot start without an artifact store.");
 }
 
 /**
@@ -130,7 +142,7 @@ unittest
     assert(cfg.http.bindAddress == "0.0.0.0");
     assert(cfg.documentStore.database == "");
     assert(cfg.scheduler.callbackSecret == "");
-    assert(cfg.plugins.bundledPluginsDir == "plugins");
+    assert(cfg.artifactStore.baseDirectory == "");
 }
 
 unittest
@@ -162,4 +174,43 @@ unittest
 
     config.database = "confector";
     requireDocumentStoreConfig(config);
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    ArtifactStoreConfig config;
+    auto message = collectException(requireArtifactStoreConfig(config));
+    assert(message !is null && message.msg.canFind("server.artifactStore.baseDirectory")
+        && message.msg.canFind("CONFECTOR_SERVER_ARTIFACT_STORE_BASE_DIRECTORY"), message.msg);
+
+    config.baseDirectory = "/artifacts";
+    requireArtifactStoreConfig(config);
+}
+
+unittest
+{
+    import std.process : environment;
+
+    // The environment variables the messages name do set the settings
+    enum artifactVar = "CONFECTOR_SERVER_ARTIFACT_STORE_BASE_DIRECTORY";
+    enum databaseVar = "CONFECTOR_SERVER_DOCUMENT_STORE_DATABASE";
+    assert(keyToDefaultEnvVar("server.artifactStore.baseDirectory") == artifactVar);
+    assert(keyToDefaultEnvVar("server.documentStore.database") == databaseVar);
+    const savedArtifact = environment.get(artifactVar), savedDatabase = environment.get(databaseVar);
+    scope(exit)
+    {
+        if (savedArtifact is null) environment.remove(artifactVar); else environment[artifactVar] = savedArtifact;
+        if (savedDatabase is null) environment.remove(databaseVar); else environment[databaseVar] = savedDatabase;
+    }
+    environment[artifactVar] = "/from/environment";
+    environment[databaseVar] = "from_environment";
+
+    auto registry = new ConfigRegistry();
+    registerServerConfigDefinitions(registry);
+    auto cfg = loadServerConfig(registry);
+    assert(cfg.artifactStore.baseDirectory == "/from/environment");
+    assert(cfg.documentStore.database == "from_environment");
 }

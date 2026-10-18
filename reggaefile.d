@@ -13,7 +13,7 @@ Target dubPathTarget(string path)
   // Use native separators: on Windows, dub reports subpackage paths with backslashes, and a
   // forward-slash path here makes ninja see each subpackage's dub.json as a duplicate output.
   // Anchor outputs at $builddir: reggae otherwise moves the relative outputs of a target nested
-  // in a phony (server, plugins) into that phony's .reggae/objs directory.
+  // in a phony (server) into that phony's .reggae/objs directory.
   return dubPackage(opts, DubPath(path.replace("/", dirSeparator), Configuration("default")))
     .mapOutputs((string o) => o.isAbsolute ? o : buildPath("$builddir", o));
 }
@@ -59,21 +59,6 @@ Target runner()
   return dubPathTarget("apps/runner");
 }
 
-// Libraries are not top-level targets: the executables and plugins that use them build them.
-Target plugins()
-{
-  return Target.phony(
-    "plugins",
-    "",
-    [
-      dubPathTarget("plugins/worker/local_process"),
-      dubPathTarget("plugins/artifact/local"),
-      dubPathTarget("plugins/queue/mongo"),
-      dubPathTarget("plugins/scheduler/local"),
-    ],
-  );
-}
-
 // Optional unit test target
 Target test()
 {
@@ -86,6 +71,5 @@ Target test()
 mixin build!(
   server,
   runner,
-  plugins,
   optional!test,
 );

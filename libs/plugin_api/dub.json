@@ -3,9 +3,6 @@
 	"targetType": "library",
 	"targetName": "confector_plugin_api",
 	"dependencies": {
-		"confector:config": {
-			"path": "../.."
-		},
 		"vibe-serialization": "~>1.2.0"
 	},
 	"targetPath": "../../out/lib"

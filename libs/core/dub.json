@@ -3,9 +3,6 @@
 	"targetType": "library",
 	"targetName": "confector_core",
 	"dependencies": {
-		"confector:config": {
-			"path": "../.."
-		},
 		"confector:plugin-api": {
 			"path": "../.."
 		},

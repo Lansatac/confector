@@ -10,7 +10,7 @@ module confector.core.state_stores;
 import confector.core.api_token_store : ApiTokenStore;
 import confector.core.build_stores : BuildRequestStore, ChainStore, ExecutionStore;
 import confector.core.counters : CounterStore;
-import confector.core.legacy_stores : ExecutionLogStore, TriggerRuleStore, VcsStateStore, WorkerStore;
+import confector.core.legacy_stores : ExecutionLogStore, TriggerRuleStore, VcsStateStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
 import confector.core.rerun_generations : RerunGenerationStore;
 import confector.plugin_api.document_store : DocumentStore;
@@ -36,7 +36,6 @@ final class StateStores
     // Records being replaced; see confector.core.legacy_stores for when each goes
     ExecutionLogStore logs;
     TriggerRuleStore triggerRules;
-    WorkerStore workers;
     VcsStateStore vcsStates;
 
     private DocumentStore m_store;
@@ -60,7 +59,6 @@ final class StateStores
         apiTokens = new ApiTokenStore(store);
         logs = new ExecutionLogStore(store);
         triggerRules = new TriggerRuleStore(store);
-        workers = new WorkerStore(store);
         vcsStates = new VcsStateStore(store);
     }
 

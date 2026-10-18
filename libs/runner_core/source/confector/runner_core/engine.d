@@ -1,7 +1,6 @@
 module confector.runner_core.engine;
 
 import confector.core.model;
-import confector.plugin_api.executor : LogDelegate;
 import confector.plugin_api.model : ArtifactStorage;
 import confector.runner_core.artifacts;
 import confector.runner_core.steps.step : StepContext, StepResult, StepRunner;
@@ -9,7 +8,7 @@ import confector.runner_core.steps.step : StepContext, StepResult, StepRunner;
 import std.format : format;
 import std.algorithm.searching : canFind;
 import std.datetime.stopwatch : StopWatch, AutoStart;
-import confector.runner_core.logging : logInfo;
+import confector.runner_core.logging : LogDelegate, logInfo;
 
 /**
  * Binds a work order's resolved inputs to the task's declared inputs, keyed by input name.

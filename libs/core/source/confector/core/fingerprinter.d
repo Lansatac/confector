@@ -92,8 +92,7 @@ private void putCanonical(Out)(ref Out app, in Json value) @trusted
  *
  * A task_output input's pinned value is the upstream task's full fingerprint, so hashing, and
  * with it a rerun, is transitive. Fields are length-prefixed so distinct inputs can never
- * serialize alike. This function is pure: it does not consult the plugin registry or any other
- * state.
+ * serialize alike. This function is pure: it reads no global state.
  *
  * Throws: Exception if the project id is empty, two inputs share a name, or a pinned
  * value is undefined.

@@ -7,9 +7,8 @@ module confector.testing.memory_artifact_storage;
  * stores (confector.core.state_stores) run in tests, is confector.testing.memory_document_store.
  */
 
-import confector.plugin_api.model;
+import confector.plugin_api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;
 import std.format : format;
-import std.json : JSONValue;
 
 
 /**
@@ -30,9 +29,9 @@ class InMemoryArtifactStorage : ArtifactStorage
         if (writer is null)
             throw new Exception("Writer delegate cannot be null");
         if (taskFingerprint.length == 0)
-            throw new Exception("taskFingerprint cannot be empty");
+            throw new InvalidArtifactKeyException("taskFingerprint cannot be empty");
         if (artifactId.length == 0)
-            throw new Exception("artifactId cannot be empty");
+            throw new InvalidArtifactKeyException("artifactId cannot be empty");
 
         import std.array : Appender;
         Appender!(ubyte[]) buffer;
@@ -50,7 +49,7 @@ class InMemoryArtifactStorage : ArtifactStorage
 
         string key = artifactKey(taskFingerprint, artifactId);
         if (key !in m_artifacts)
-            throw new Exception(format("Artifact not found in storage: fingerprint='%s', artifactId='%s'", taskFingerprint, artifactId));
+            throw new ArtifactNotFoundException(format("Artifact not found in storage: fingerprint='%s', artifactId='%s'", taskFingerprint, artifactId));
 
         sink(m_artifacts[key]);
     }
@@ -71,31 +70,6 @@ class InMemoryArtifactStorage : ArtifactStorage
     @property string backendType() const pure nothrow @safe
     {
         return "memory";
-    }
-
-    @property string displayName() const pure nothrow @safe
-    {
-        return "In-Memory (Test)";
-    }
-
-    @property string description() const
-    {
-        return "In-memory artifact storage for unit testing only.";
-    }
-
-    JSONValue defaultConfig() const
-    {
-        return JSONValue(string[string].init);
-    }
-
-    string[] validateConfig(in JSONValue config) const
-    {
-        return null;
-    }
-
-    string renderConfigFormHtml(in JSONValue currentConfig) const
-    {
-        return "<p>In-memory storage (test only) — no configuration required.</p>";
     }
 
     override string presignUpload(string taskFingerprint, string artifactId)
@@ -146,7 +120,7 @@ unittest
     {
         storage.retrieveArtifactStream("no_such_fp", "no_such_art", (chunk) {});
     }
-    catch (Exception)
+    catch (ArtifactNotFoundException)
     {
         caughtNotFound = true;
     }

@@ -33,7 +33,7 @@
       "description": "Sub-package to test",
       "options": [
         "core", "plugin-api", "config", "mongo-helpers", "runner-core", "testing", "server", "runner",
-        "document-store-mongo", "queue-mongo"
+        "document-store-mongo", "queue-mongo", "scheduler-local", "artifact-local"
       ],
       "default": "core"
     }

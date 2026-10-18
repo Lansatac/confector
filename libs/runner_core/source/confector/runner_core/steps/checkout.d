@@ -10,8 +10,8 @@ import std.conv : to;
 import std.string : strip, toLower;
 
 import confector.core.model : BuildStep, InputKind, ResolvedInput;
-import confector.plugin_api.vcs : isFullSha, redactUserInfo;
-import confector.plugin_api.executor : LogDelegate;
+import confector.core.git : isFullSha, redactUserInfo;
+import confector.runner_core.logging : LogDelegate;
 import confector.runner_core.steps.step : StepContext, StepResult;
 import vibe.data.json : Json;
 

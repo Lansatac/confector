@@ -8,4 +8,3 @@ div.navbar-container
     a.nav-item(href="/", data-route="dashboard") Dashboard
     a.nav-item(href="/projects/", data-route="projects") Projects
     a.nav-item(href="/repositories/", data-route="repositories") Repositories
-    a.nav-item(href="/artifacts/", data-route="artifacts") Artifacts

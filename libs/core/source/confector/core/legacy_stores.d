@@ -8,7 +8,6 @@ module confector.core.legacy_stores;
  *   this is the interim home of the log lines workers stream for their executions.
  * - TriggerRuleStore: when trigger rules become part of the project definition (bead
  *   confector-z7z.23.7).
- * - WorkerStore: when compute pools replace worker records (bead confector-z7z.31.5).
  * - VcsStateStore (VcsRepositoryState, VcsChangeRecord): when tracked branches replace them (bead
  *   confector-z7z.24.1).
  *
@@ -170,47 +169,6 @@ final class TriggerRuleStore
 }
 
 /**
- * Worker records (compute provider configurations), by id.
- */
-final class WorkerStore
-{
-    private DocumentCollection!WorkerRecord m_workers;
-
-    /// Declares the worker collection on `store`.
-    this(DocumentStore store)
-    {
-        m_workers = new DocumentCollection!WorkerRecord(store,
-            CollectionSpec("workers", [IndexSpec("all", "listing", "id")]),
-            ["listing"], (in WorkerRecord worker) => ["listing": everything]);
-    }
-
-    /// Writes `worker` (last edit wins).
-    void save(WorkerRecord worker)
-    {
-        if (worker.id.length == 0) throw new Exception("A worker record needs an id");
-        m_workers.put(worker.id, worker);
-    }
-
-    /// Reads worker `id`. Returns false if it does not exist.
-    bool get(string id, out WorkerRecord worker)
-    {
-        return m_workers.get(id).tryValue(worker);
-    }
-
-    /// Lists every worker record, by id. Discovery.
-    WorkerRecord[] list()
-    {
-        return listAll(m_workers);
-    }
-
-    /// Removes worker `id`. Returns false if it did not exist.
-    bool remove(string id)
-    {
-        return m_workers.removeLatest(id);
-    }
-}
-
-/**
  * The latest known revision of each repository URL and ref, and the changes detected between
  * revisions, as webhooks and polling record them.
  */
@@ -325,7 +283,7 @@ unittest
 
 unittest
 {
-    // Trigger rules and worker records: written whole, listed and removed
+    // Trigger rules: written whole, listed and removed
     auto documents = new InMemoryDocumentStore();
     auto rules = new TriggerRuleStore(documents);
     TriggerRuleRecord rule;
@@ -337,15 +295,6 @@ unittest
     assert(rules.list() == [rule]);
     assert(rules.remove("trig_1") && !rules.remove("trig_1") && rules.list().length == 0);
 
-    auto workers = new WorkerStore(documents);
-    WorkerRecord worker;
-    worker.id = "w1";
-    worker.providerType = "local";
-    workers.save(worker);
-    WorkerRecord read;
-    assert(workers.get("w1", read) && read.providerType == "local");
-    assert(workers.list().length == 1);
-    assert(workers.remove("w1") && !workers.get("w1", read));
 }
 
 unittest

@@ -64,8 +64,8 @@ struct Key
  */
 struct ConfigDefinition
 {
-    string key;                 // e.g. "runnerBinary" or "server.port"
-    string envVar;              // e.g. "CONFECTOR_RUNNER_BIN"
+    string key;                 // e.g. "dataPath" or "server.port"
+    string envVar;              // e.g. "CONFECTOR_DATA_PATH"
     Json defaultValue;          // Default JSON-compatible value
     string description;         // Human-readable documentation
     bool required = false;
@@ -294,10 +294,10 @@ void registerDefinitionsFromStruct(T, Target)(Target target, string prefix = "")
 }
 
 /**
- * Helper to convert hierarchical key (e.g. "server.http.port" or "plugins.local_process.maxConcurrency")
+ * Helper to convert hierarchical key (e.g. "server.http.port" or "plugins.example_store.maxConcurrency")
  * into a default environment variable name:
  * "server.http.port" -> "CONFECTOR_SERVER_HTTP_PORT"
- * "plugins.local_process.maxConcurrency" -> "CONFECTOR_LOCAL_PROCESS_MAX_CONCURRENCY"
+ * "plugins.example_store.maxConcurrency" -> "CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY"
  */
 string keyToDefaultEnvVar(string key)
 {
@@ -338,7 +338,7 @@ string keyToDefaultEnvVar(string key)
 }
 
 /**
- * Helper to traverse nested Json by dot-separated path (e.g. "plugins.local-process.maxConcurrency").
+ * Helper to traverse nested Json by dot-separated path (e.g. "plugins.example-store.maxConcurrency").
  */
 Json getNestedJson(in Json root, string dotPath)
 {
@@ -772,51 +772,51 @@ unittest
     // Test 2: Scoped Plugin Configuration Lookup & Convention Env Vars
     string jsonStr = `{
         "plugins": {
-            "local_process": {
+            "example_store": {
                 "maxConcurrency": 8,
-                "runnerBinary": "out/custom-runner"
+                "dataPath": "out/custom-path"
             }
         }
     }`;
     auto registry = new ConfigRegistry(parseJsonString(jsonStr));
-    auto pluginScope = registry.getScope("plugins.local_process");
+    auto pluginScope = registry.getScope("plugins.example_store");
 
     assert(pluginScope.get!size_t("maxConcurrency") == 8);
-    assert(pluginScope.get!string("runnerBinary") == "out/custom-runner");
+    assert(pluginScope.get!string("dataPath") == "out/custom-path");
     assert(pluginScope.getInt("maxConcurrency") == 8);
-    assert(pluginScope.getString("runnerBinary") == "out/custom-runner");
+    assert(pluginScope.getString("dataPath") == "out/custom-path");
 
-    // Test 3: Environment Variable Override for Plugins (via automatic CONFECTOR_LOCAL_PROCESS_MAX_CONCURRENCY mapping)
-    environment["CONFECTOR_LOCAL_PROCESS_MAX_CONCURRENCY"] = "16";
+    // Test 3: Environment Variable Override for Plugins (via automatic CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY mapping)
+    environment["CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY"] = "16";
     assert(pluginScope.get!size_t("maxConcurrency") == 16);
-    environment.remove("CONFECTOR_LOCAL_PROCESS_MAX_CONCURRENCY");
+    environment.remove("CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY");
     assert(pluginScope.get!size_t("maxConcurrency") == 8);
 }
 
 unittest
 {
     // Test 4: Struct Binding (bind!T)
-    struct LocalProcessProvisionerConfig
+    struct ExampleStoreConfig
     {
         size_t maxConcurrency = 4;
-        string runnerBinary = "out/confector-runner";
+        string dataPath = "out/default-path";
         bool enabled = true;
     }
 
     string jsonStr = `{
         "plugins": {
-            "local_process": {
+            "example_store": {
                 "maxConcurrency": 12,
-                "runnerBinary": "out/alt-runner"
+                "dataPath": "out/alt-path"
             }
         }
     }`;
     auto registry = new ConfigRegistry(parseJsonString(jsonStr));
-    auto pluginScope = registry.getScope("plugins.local_process");
+    auto pluginScope = registry.getScope("plugins.example_store");
 
-    auto cfg = pluginScope.bind!LocalProcessProvisionerConfig();
+    auto cfg = pluginScope.bind!ExampleStoreConfig();
     assert(cfg.maxConcurrency == 12);
-    assert(cfg.runnerBinary == "out/alt-runner");
+    assert(cfg.dataPath == "out/alt-path");
     assert(cfg.enabled == true); // Default preserved when absent
 }
 

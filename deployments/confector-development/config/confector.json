@@ -12,24 +12,8 @@
     "scheduler": {
       "callbackSecret": "dev-scheduler-secret"
     },
-    "plugins": {
-      "bundledPluginsDir": "./plugins"
-    }
-  },
-  "plugins": {
-    "mongo-queue": {
-      "connectionString": "mongodb://mongo:27017",
-      "dbName": "confector"
-    },
-    "local-scheduler": {
-      "callbackSecret": "dev-scheduler-secret"
-    },
-    "local-process": {
-      "runnerBinary": "/code/build/out/runner/confector-runner",
-      "serverUrl": "http://development:8080",
-      "workspaceDir": "/runner/workspace",
-      "maxConcurrency": 0,
-      "supportedExecutorTypes": ["local", "local_process", ""]
+    "artifactStore": {
+      "baseDirectory": "/artifacts"
     }
   }
 }

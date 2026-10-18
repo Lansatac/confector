@@ -35,8 +35,8 @@ Events (commits, webhooks, cron, or manual actions) can trigger any specific nod
 ### 4. Elastic & Serverless Topologies
 Run workloads anywhere—from local development environments and serverless runtimes to ephemeral container clusters—without changing pipeline definitions.
 
-### 5. Modular Plugin & Build Step Architecture
-Execution runtimes, version control providers, and storage backends are decoupled from the core graph engine. Tasks compose ordered build steps; checking out a repository input at its pinned revision is built into the runner.
+### 5. Pluggable Backends & Build Steps
+Execution runtimes, version control providers, and storage backends are decoupled from the core graph engine; backends are chosen by configuration at startup. Tasks compose ordered build steps; checking out a repository input at its pinned revision is built into the runner.
 
 ---
 
@@ -56,9 +56,9 @@ Execution runtimes, version control providers, and storage backends are decouple
    - MongoDB: `localhost:27017`
    - Mongo Express UI: `http://localhost:8081`
 
-   The server keeps all state in MongoDB and will not start without it: set `server.documentStore.connectionString` (or `CONFECTOR_MONGO_URI`) and `server.documentStore.database` in `confector.json` (see `deployments/confector-development/config/confector.json`). A missing setting or an unreachable MongoDB stops startup with an error.
+   The server keeps all state, and its dispatch queue, in MongoDB and will not start without it: set `server.documentStore.connectionString` (or `CONFECTOR_MONGO_URI`) and `server.documentStore.database` in `confector.json` (see `deployments/confector-development/config/confector.json`). Artifacts are kept as files under `server.artifactStore.baseDirectory`, which is required too. A missing setting or an unreachable MongoDB stops startup with an error.
 
-   The scheduler calls back into the server (cron triggers, VCS polling), and every callback must carry a shared secret in the `X-Confector-Scheduler-Secret` header. Set `server.scheduler.callbackSecret` (or `CONFECTOR_SCHEDULER_CALLBACK_SECRET`); the local scheduler plugin reads the same value as `plugins.local-scheduler.callbackSecret`, which the same environment variable also provides. There is no default: the server will not start without it, and callbacks without the correct secret are refused with 401.
+   The scheduler calls back into the server (cron triggers, VCS polling), and every callback must carry a shared secret in the `X-Confector-Scheduler-Secret` header. Set `server.scheduler.callbackSecret` (or `CONFECTOR_SCHEDULER_CALLBACK_SECRET`); the server checks it and the built-in local scheduler sends it. There is no default: the server will not start without it, and callbacks without the correct secret are refused with 401.
 
 2. **Generate build files & compile:**
    ```bash
@@ -66,14 +66,13 @@ Execution runtimes, version control providers, and storage backends are decouple
    reggae -b ninja ..
    ninja
    ```
-   This builds the server (`build/out/server/`), the runner (`build/out/runner/`), and every plugin shared library, and copies the server's `public/` assets next to it.
+   This builds the server (`build/out/server/`, with every backend compiled in) and the runner (`build/out/runner/`), and copies the server's `public/` assets next to it.
 
    **Granular build targets:**
    - `ninja server` — Compile the server and copy its assets
    - `ninja runner` — Compile the runner
-   - `ninja plugins` — Compile all loadable plugins
 
-   Without reggae, dub builds the same targets from the repository root: `dub build :server`, `dub build :runner`, `dub build :plugins` (output in `out/`).
+   Without reggae, dub builds the same targets from the repository root: `dub build` (both), `dub build :server`, `dub build :runner` (output in `out/`).
 
 3. **Run the server:**
    - **Linux / Dev Container:**

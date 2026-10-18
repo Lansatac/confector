@@ -1,7 +1,7 @@
 module confector.runner_core.http_artifact_storage;
 
 import confector.plugin_api.model : ArtifactStorage;
-import std.json : JSONValue, JSONType, parseJSON;
+import std.json : JSONType, parseJSON;
 import std.net.curl : HTTP;
 import std.array : Appender;
 import std.format : format;
@@ -283,16 +283,5 @@ class HttpArtifactStorage : ArtifactStorage
         }
     }
 
-    // -- Display/config methods (not used by agents, but required by interface) --
-
     @property string backendType() const pure nothrow @safe { return "http"; }
-    @property string displayName() const pure nothrow @safe { return "HTTP (Server-Proxyed)"; }
-    @property string description() const { return "Artifact storage via Confector server — supports presigned URLs with proxy fallback."; }
-
-    JSONValue defaultConfig() const { return JSONValue(string[string].init); }
-    string[] validateConfig(in JSONValue config) const { return null; }
-    string renderConfigFormHtml(in JSONValue currentConfig) const
-    {
-        return "<p>HTTP artifact storage — configured via server URL.</p>";
-    }
 }

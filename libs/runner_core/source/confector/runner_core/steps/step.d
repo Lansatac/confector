@@ -1,7 +1,7 @@
 module confector.runner_core.steps.step;
 
 import confector.core.model : BuildStep, ResolvedInput;
-import confector.plugin_api.executor : LogDelegate;
+import confector.runner_core.logging : LogDelegate;
 
 /**
  * What a step sees of the task it runs in.

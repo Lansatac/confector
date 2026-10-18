@@ -626,7 +626,6 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
 
 unittest
 {
-    import confector.core.plugin;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import std.file : exists, rmdirRecurse, mkdirRecurse;

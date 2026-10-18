@@ -2,7 +2,6 @@ module confector.plugins.queue.mongo;
 
 import confector.mongo_helpers : bson_value, document, MongoConnection;
 import confector.plugin_api.dispatch_queue;
-import confector.plugin_api.plugin : Plugin, PluginContext, PluginCategory, DispatchQueuePlugin, ConfigDefinition;
 import core.time : Duration;
 import std.format : format;
 import vibe.data.json : Json;
@@ -297,72 +296,11 @@ class MongoDispatchQueue : DispatchQueue
 }
 
 /**
- * The MongoDB dispatch queue as a plugin. Both settings are required; there is no default
- * connection string or database.
- */
-class MongoQueuePlugin : DispatchQueuePlugin, DispatchQueue
-{
-    private MongoDispatchQueue m_queue;
-
-    @property string name() const { return "mongo-queue"; }
-    @property string versionString() const { return "2.0.0"; }
-    @property string description() const { return "MongoDB-backed dispatch queue"; }
-    @property PluginCategory category() const { return PluginCategory.queue; }
-
-    ConfigDefinition[] configDefinitions() const
-    {
-        return [
-            ConfigDefinition("connectionString", "CONFECTOR_MONGO_URI", Json.undefined, "MongoDB connection URI", true),
-            ConfigDefinition("dbName", "", Json.undefined, "MongoDB database name", true)
-        ];
-    }
-
-    void initialize(PluginContext context = null)
-    {
-        if (context is null)
-            throw new Exception("[mongo-queue] PluginContext must not be null; the host failed to provide configuration.");
-
-        string connectionString = context.config.getString("connectionString");
-        if (connectionString.length == 0)
-            throw new Exception("[mongo-queue] Required setting 'connectionString' is missing (plugins.mongo-queue.connectionString or CONFECTOR_MONGO_URI).");
-        string dbName = context.config.getString("dbName");
-        if (dbName.length == 0)
-            throw new Exception("[mongo-queue] Required setting 'dbName' is missing (plugins.mongo-queue.dbName).");
-
-        m_queue = new MongoDispatchQueue(new MongoConnection(connectionString), dbName);
-        context.info(format("Connected to MongoDB for the dispatch queue, database: %s", dbName));
-    }
-
-    void shutdown()
-    {
-    }
-
-    override void ensureQueue(string queue) { initialized.ensureQueue(queue); }
-    override void send(string queue, Json message, Duration delay = Duration.zero) { initialized.send(queue, message, delay); }
-    override Lease[] receive(string queue, size_t maxMessages, Duration visibility) { return initialized.receive(queue, maxMessages, visibility); }
-    override void ack(string queue, string receipt) { initialized.ack(queue, receipt); }
-    override void extend(string queue, string receipt, Duration visibility) { initialized.extend(queue, receipt, visibility); }
-    override void release(string queue, string receipt, Duration delay = Duration.zero) { initialized.release(queue, receipt, delay); }
-
-    private MongoDispatchQueue initialized()
-    {
-        if (m_queue is null)
-            throw new Exception("[mongo-queue] The plugin was used before initialize().");
-        return m_queue;
-    }
-}
-
-extern(C) export Plugin confector_create_plugin()
-{
-    return new MongoQueuePlugin();
-}
-
-/**
  * Runs the DispatchQueue conformance suite against a real MongoDB. Set CONFECTOR_TEST_MONGO_URI
  * to a server the tests may write to, for example:
  *
  *     docker run -d --rm -p 127.0.0.1:27027:27017 mongo
- *     CONFECTOR_TEST_MONGO_URI=mongodb://127.0.0.1:27027 dub test :mongo_queue
+ *     CONFECTOR_TEST_MONGO_URI=mongodb://127.0.0.1:27027 dub test :queue-mongo
  *
  * The tests drop and recreate the database confector_dispatch_queue_test.
  */

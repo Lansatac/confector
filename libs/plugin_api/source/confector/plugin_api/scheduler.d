@@ -2,21 +2,21 @@ module confector.plugin_api.scheduler;
 
 /**
  * Header that carries the scheduler secret on every callback the scheduler fires. The server
- * rejects a callback whose header does not match its configured secret, and the scheduler plugin
+ * rejects a callback whose header does not match its configured secret, and the scheduler
  * sends the configured secret in this header.
  */
 enum string schedulerSecretHeader = "X-Confector-Scheduler-Secret";
 
 /**
  * Represents a scheduled job entry. The server registers these with the scheduler
- * to define WHAT to run and WHEN. The scheduler plugin decides HOW to fire them
+ * to define WHAT to run and WHEN. The scheduler decides HOW to fire them
  * (thread loop making HTTP requests, CloudWatch Events, Kubernetes CronJob, etc.).
  *
  * The scheduler fires HTTP POST requests to the registered URI — not in-process
  * delegate callbacks — making it fully compatible with serverless deployment where
  * the scheduler and server may run in completely separate processes.
  *
- * All scheduling uses cron expressions. The plugin is responsible for parsing and
+ * All scheduling uses cron expressions. The implementation is responsible for parsing and
  * evaluating cron. Minimum resolution is 1 minute (serverless-compatible — CloudWatch
  * Events minimum rate is 1 minute). The `recurring` flag supports one-time triggers.
  */
@@ -35,12 +35,12 @@ struct ScheduleEntry
  * Scheduler interface that decouples the server from the scheduling mechanism.
  *
  * The server tells the scheduler what to run and when by calling schedule().
- * The scheduler plugin fires HTTP POST requests to the registered URIs at the
+ * The scheduler fires HTTP POST requests to the registered URIs at the
  * configured times.
  *
  * Key design decisions:
  * - schedule() is idempotent: calling with the same entryId must not create duplicate triggers.
- * - The plugin reconciles actual trigger state with the desired state on schedule().
+ * - The implementation reconciles actual trigger state with the desired state on schedule().
  * - unschedule() removes the external trigger (e.g., CloudWatch rule).
  * - reconcile() is optional for full audit of all triggers.
  */
@@ -48,7 +48,7 @@ interface Scheduler
 {
     /**
      * Register or update a schedule entry. Idempotent: calling with the same entryId
-     * must not create duplicate triggers. The plugin reconciles actual trigger state
+     * must not create duplicate triggers. The implementation reconciles actual trigger state
      * with the desired state described by the entry.
      *
      * @param entry The schedule entry defining what to run, when, and where (URI).
@@ -57,7 +57,7 @@ interface Scheduler
 
     /**
      * Remove a schedule entry and its corresponding trigger.
-     * The plugin must delete the external trigger (e.g., CloudWatch rule).
+     * The implementation must delete the external trigger (e.g., CloudWatch rule).
      *
      * @param entryId The unique identifier of the entry to remove.
      */
@@ -80,9 +80,9 @@ interface Scheduler
 
     /**
      * Optional: perform a full reconciliation of all triggers.
-     * The plugin audits actual triggers against registered entries and removes
-     * orphaned triggers. The LocalSchedulerPlugin doesn't need it (in-memory state
-     * is always consistent). A CloudWatch plugin uses this to remove orphaned rules.
+     * The implementation audits actual triggers against registered entries and removes
+     * orphaned triggers. The LocalScheduler doesn't need it (in-memory state
+     * is always consistent). A CloudWatch scheduler uses this to remove orphaned rules.
      */
     void reconcile();
 }

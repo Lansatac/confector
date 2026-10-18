@@ -1,6 +1,6 @@
 {
 	"name": "document-store-mongo",
-	"description": "MongoDB DocumentStore backend for Confector (a compiled-in library, not a loadable plugin)",
+	"description": "MongoDB DocumentStore backend for Confector (a compiled-in library)",
 	"targetType": "library",
 	"targetName": "confector_mongo_document_store",
 	"targetPath": "../../../out/lib",

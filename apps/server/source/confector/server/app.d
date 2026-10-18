@@ -1,22 +1,16 @@
 module confector.server.app;
 
-import std.conv : to;
-import std.file : exists, isDir;
 import std.functional : toDelegate;
+import std.file : exists;
 import std.path : buildPath;
 import std.process : environment;
 
 import vibe.vibe;
 
 import confector.config;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireDocumentStoreConfig, requireSchedulerConfig;
-import confector.core.plugin : Plugin, PluginCategory, PluginRegistry;
-import confector.core.plugin_loader : PluginLoader;
 import confector.core.state_stores : StateStores;
-import confector.mongo_helpers : MongoConnection;
-import confector.plugins.document_store.mongo : MongoDocumentStore;
-import confector.server.storage.configured_storage : ConfiguredArtifactStorage;
-import confector.plugin_api.dispatch_queue : DispatchQueue;
+import confector.server.backends : Backends, buildBackends;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig;
 
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
@@ -29,48 +23,9 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
     res.render!("error.dt", req, error);
 }
 
-/// Discovers and loads the bundled plugins.
-void initPlugins(string bundledPluginsDir = "")
-{
-    Plugin[] bundledPlugins;
-    string[] searchDirs = bundledPluginsDir.length > 0
-        ? [bundledPluginsDir]
-        : ["./plugins"];
-    foreach (pluginDir; searchDirs)
-    {
-        if (exists(pluginDir) && isDir(pluginDir))
-        {
-            bundledPlugins ~= PluginLoader.instance.loadBundledPlugins(
-              pluginDir,
-              [PluginCategory.worker,
-               PluginCategory.artifact,
-               PluginCategory.queue,
-               PluginCategory.scheduler]
-              );
-        }
-    }
-
-    if (bundledPlugins.length > 0)
-    {
-        foreach (p; bundledPlugins)
-        {
-            logInfo("[plugins] Loaded bundled plugin '%s' v%s (%s)", p.name, p.versionString, p.category);
-        }
-    }
-    else
-    {
-        logInfo("[plugins] No bundled plugins found in ./plugins.");
-    }
-
-    logInfo("[plugins] Active plugins in registry: %d", PluginRegistry.instance.allPlugins().length);
-}
-
-/// Configures application URL routing.
-URLRouter createRouter(
-    DispatchQueue dispatchQueue,
-    StateStores stores,
-    string schedulerCallbackSecret,
-    ConfiguredArtifactStorage configuredStorage = null)
+/// Configures application URL routing over `backends` and `stores`, the state stores kept in
+/// its document store.
+URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret)
 {
     auto router = new URLRouter();
 
@@ -85,10 +40,11 @@ URLRouter createRouter(
     fsettings.serverPathPrefix = "/static";
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
-    // API endpoints
-    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, dispatchQueue, stores));
+    // API endpoints. The artifact routes come first, so the API router never answers them.
+    router.any("/api/v1/artifacts/*", artifactsRouter(backends.artifactStore));
+    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, backends.dispatchQueue, stores));
 
-    // Dashboard, projects, tasks, repositories and artifacts UI. Build views wait for request intake
+    // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
     // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
     router.any("/projects/*", dashboardRouter(stores));
     router.get("/projects", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
@@ -99,9 +55,6 @@ URLRouter createRouter(
 
     router.any("/repositories/*", repositoryRouter(stores));
     router.get("/repositories", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/repositories/"); });
-
-    router.any("/artifacts/*", artifactsRouter(PluginRegistry.instance, configuredStorage));
-    router.get("/artifacts", (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/artifacts/"); });
 
     return router;
 }
@@ -162,17 +115,8 @@ ConfigRegistry loadConfigRegistry()
 
 void main()
 {
-    // Initialize central ConfigRegistry
     auto configRegistry = loadConfigRegistry();
-    // Connect ConfigRegistry to PluginRegistry for scoped plugin configs
-    PluginRegistry.instance.setConfigRegistry(configRegistry);
-
-    // Load typed server configuration
     ServerConfig serverConfig = loadServerConfig(configRegistry);
-
-    // Scheduler callbacks are authenticated by a shared secret; without one the server cannot
-    // start, because the scheduler always calls back into it.
-    requireSchedulerConfig(serverConfig.scheduler);
 
     // Configure log level
     LogLevel configuredLogLevel = LogLevel.info;
@@ -187,45 +131,13 @@ void main()
     }
     setLogLevel(configuredLogLevel);
 
-    // Load all plugins (storage, queue, definition, worker, artifact) via plugin loader
-    initPlugins(serverConfig.plugins.bundledPluginsDir);
-
-    // The state stores run over the Mongo document store, configured under server.documentStore.
-    // Missing settings or an unreachable MongoDB end startup here (constructing StateStores
-    // declares every collection, which needs the database). Choosing the backend from
-    // configuration is bead confector-z7z.31.1.
-    requireDocumentStoreConfig(serverConfig.documentStore);
-    auto stores = new StateStores(new MongoDocumentStore(
-        new MongoConnection(serverConfig.documentStore.connectionString),
-        serverConfig.documentStore.database));
+    // A missing or invalid backend setting, or an unreachable MongoDB, ends startup here.
+    // Constructing StateStores declares every collection, which needs the database.
+    Backends backends = buildBackends(serverConfig);
+    auto stores = new StateStores(backends.documentStore);
     logInfo("[state] State is kept in MongoDB database '%s'.", serverConfig.documentStore.database);
 
-    DispatchQueue dispatchQueue = PluginRegistry.instance.getDispatchQueue();
-    if (dispatchQueue is null)
-    {
-        throw new Exception("No dispatch queue plugin registered: the server cannot start without one.");
-    }
-    logInfo("Using dispatch queue %s.", typeid(cast(Object) dispatchQueue).name);
-
-    // Validate that at least one artifact storage plugin is registered
-    auto artifactStorage = PluginRegistry.instance.getDefaultArtifactStorage();
-    if (artifactStorage is null)
-    {
-        throw new Exception("No artifact storage plugin registered: the server cannot start without one.");
-    }
-
-    auto configuredStorage = new ConfiguredArtifactStorage(PluginRegistry.instance);
-
-    // Load scheduler plugin
-    auto scheduler = PluginRegistry.instance.getDefaultScheduler();
-    if (scheduler is null)
-        throw new Exception("No scheduler plugin registered: the server cannot start without one.");
-
-    // Configure router and server settings
-    auto router = createRouter(dispatchQueue,
-      stores,
-      serverConfig.scheduler.callbackSecret,
-      configuredStorage);
+    auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -234,9 +146,8 @@ void main()
 
     listenHTTP(settings, router);
 
-    // Start the scheduler plugin
-    scheduler.start();
-    logInfo("[scheduler] Scheduler plugin started");
+    backends.scheduler.start();
+    logInfo("[scheduler] Scheduler started");
 
     logInfo("Starting server on port %d", serverConfig.http.port);
     runApplication();
@@ -244,15 +155,62 @@ void main()
 
 unittest
 {
-    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import confector.plugins.scheduler.local : LocalScheduler;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import std.uri : encodeComponent;
+    import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
 
-    auto configRegistry = new ConfigRegistry();
-    registerServerConfigDefinitions(configRegistry);
-    PluginRegistry.instance.setConfigRegistry(configRegistry);
+    Backends backends;
+    backends.documentStore = new InMemoryDocumentStore();
+    backends.dispatchQueue = new InMemoryDispatchQueue();
+    backends.scheduler = new LocalScheduler("test-scheduler-secret");
+    auto artifacts = new InMemoryArtifactStorage();
+    backends.artifactStore = artifacts;
+    auto router = createRouter(backends, new StateStores(backends.documentStore), "test-scheduler-secret");
 
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new InMemoryDispatchQueue();
-    auto router = createRouter(queue, stores, "test-scheduler-secret");
-    assert(router !is null);
+    struct Answer { int status; string body; }
+
+    Answer call(HTTPMethod method, string path, string body = null)
+    {
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+        auto req = createTestHTTPServerRequest(URL("http://localhost" ~ path), method, InetHeaderMap.init,
+            createMemoryStream(cast(ubyte[]) body.dup, false));
+        router.handleRequest(req, res);
+        assert(res.headerWritten, "No route answered " ~ path);
+        return Answer(res.statusCode, cast(string) sink.data);
+    }
+
+    // Every path the runner's HttpArtifactStorage (libs/runner_core http_artifact_storage.d)
+    // requests, built the same way, reaches the artifact routes and the configured store. The
+    // artifact id needs encoding, and must arrive decoded exactly once.
+    enum prefix = "/api/v1/artifacts";
+    enum rawId = "100% done.zip";
+    const fp = encodeComponent("fp1"), id = encodeComponent(rawId);
+    const query = "?fingerprint=" ~ fp ~ "&artifactId=" ~ id;
+
+    auto presignUpload = call(HTTPMethod.GET, prefix ~ "/presign-upload" ~ query);
+    assert(presignUpload.status == HTTPStatus.ok && parseJsonString(presignUpload.body) == Json.emptyObject, presignUpload.body);
+    auto presignDownload = call(HTTPMethod.GET, prefix ~ "/presign-download" ~ query);
+    assert(presignDownload.status == HTTPStatus.ok && parseJsonString(presignDownload.body) == Json.emptyObject, presignDownload.body);
+
+    assert(call(HTTPMethod.HEAD, prefix ~ "/_head/" ~ fp ~ "/" ~ id).status == HTTPStatus.notFound);
+    assert(call(HTTPMethod.POST, prefix ~ "/" ~ fp ~ "/" ~ id ~ "/upload", "artifact bytes").status == HTTPStatus.ok);
+    assert(artifacts.artifactExists("fp1", rawId), "The upload reached the configured store under the decoded id");
+    assert(call(HTTPMethod.HEAD, prefix ~ "/_head/" ~ fp ~ "/" ~ id).status == HTTPStatus.ok);
+
+    auto download = call(HTTPMethod.GET, prefix ~ "/" ~ fp ~ "/" ~ id ~ "/download");
+    assert(download.status == HTTPStatus.ok && download.body == "artifact bytes", download.body);
+
+    assert(call(HTTPMethod.DELETE, prefix ~ "/" ~ fp ~ "/" ~ id).status == HTTPStatus.ok);
+    assert(!artifacts.artifactExists("fp1", rawId));
+    assert(call(HTTPMethod.HEAD, prefix ~ "/_head/" ~ fp ~ "/" ~ id).status == HTTPStatus.notFound);
+
+    // The artifacts page is gone
+    auto sink = createMemoryOutputStream();
+    auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+    router.handleRequest(createTestHTTPServerRequest(URL("http://localhost/artifacts/"), HTTPMethod.GET), res);
+    assert(!res.headerWritten, "No route answers /artifacts/");
 }

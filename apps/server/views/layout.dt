@@ -24,13 +24,10 @@ html(lang="en")
         var navLinks = document.querySelectorAll('.nav-item');
         navLinks.forEach(function(link) {
           var href = link.getAttribute('href');
-          var route = link.getAttribute('data-route');
           var isActive = false;
           if (href === '/' && (currentPath === '/' || currentPath === '')) {
             isActive = true;
           } else if (href !== '/' && currentPath.indexOf(href) === 0) {
-            isActive = true;
-          } else if (route === 'artifacts' && currentPath.indexOf('/artifacts') === 0) {
             isActive = true;
           }
           if (isActive) {

@@ -226,7 +226,7 @@ struct OutputArtifactDecl
 }
 
 /**
- * Represents an individual plugin-defined build step within a TaskNode.
+ * Represents an individual build step within a TaskNode.
  */
 struct BuildStep
 {
@@ -376,23 +376,6 @@ string[] repositoryIds(in TaskNode task) pure nothrow @safe
 }
 
 /**
- * Represents outstanding demand for compute capacity from the work queue.
- */
-struct QueueDemand
-{
-    @optional @asName("executor_type") string executorType;
-    @optional @asName("requirements") string[string] requirements;
-    @optional @asName("pending_work_order_count") size_t pendingWorkOrderCount;
-
-    this(string executorType, size_t pendingWorkOrderCount = 0, string[string] requirements = null) pure nothrow @safe
-    {
-        this.executorType = executorType;
-        this.pendingWorkOrderCount = pendingWorkOrderCount;
-        this.requirements = requirements;
-    }
-}
-
-/**
  * Metadata recorded for stored artifacts.
  */
 struct ArtifactMetadata
@@ -410,8 +393,33 @@ struct ArtifactMetadata
 }
 
 /**
- * Abstract storage interface for content-addressed artifact streams.
- * Implementations are provided by ArtifactStoragePlugin instances.
+ * Thrown by an ArtifactStorage asked to read an artifact it does not hold.
+ */
+class ArtifactNotFoundException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * Thrown by an ArtifactStorage given a fingerprint or artifact id it cannot hold (empty, or
+ * containing characters the store does not allow).
+ */
+class InvalidArtifactKeyException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * Abstract storage interface for content-addressed artifact streams. Operations given a key the
+ * store cannot hold throw InvalidArtifactKeyException (artifactExists answers false instead);
+ * reading an artifact the store does not hold throws ArtifactNotFoundException. Any other
+ * exception is a storage failure.
  */
 interface ArtifactStorage
 {
@@ -419,32 +427,6 @@ interface ArtifactStorage
      * Unique backend identifier (e.g., "local", "s3", "artifactory").
      */
     @property string backendType() const;
-
-    /**
-     * Human-readable display name for the storage backend.
-     */
-    @property string displayName() const;
-
-    /**
-     * Short description of the storage backend.
-     */
-    @property string description() const;
-
-    /**
-     * Returns the default configuration as a JSON value.
-     */
-    JSONValue defaultConfig() const;
-
-    /**
-     * Validates a configuration JSON value and returns an array of error messages.
-     * Returns an empty array if the configuration is valid.
-     */
-    string[] validateConfig(in JSONValue config) const;
-
-    /**
-     * Renders an HTML form for configuring the artifact storage backend.
-     */
-    string renderConfigFormHtml(in JSONValue currentConfig) const;
 
     /**
      * Stores an artifact by streaming bytes from writer into storage, addressed by task fingerprint and artifact ID.
@@ -708,7 +690,7 @@ struct TaskExecution
     /// succeeded execution with this set is a cache miss, not a cache hit (AGENTS.md, "The caching
     /// contract"). Only a succeeded execution has artifacts to expire.
     @optional @asName("artifacts_expired_at") string artifactsExpiredAt;
-    /// The worker that holds or last held it (`WorkerRecord.id`); empty until claimed.
+    /// The id of the worker that holds or last held it; empty until claimed.
     @optional string worker;
     @asName("created_at") string createdAt;
     /// When the current attempt started, and when the execution reached a terminal status.
@@ -961,9 +943,6 @@ class FingerprintException : Exception
         super(msg, file, line);
     }
 }
-
-/// Re-export WorkerRecord from executor module so it's available via model
-public import confector.plugin_api.executor : WorkerRecord;
 
 unittest
 {

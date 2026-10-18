@@ -1,9 +1,9 @@
 {
 	"name": "queue-mongo",
-	"description": "MongoDB queue plugin for Confector",
-	"targetType": "dynamicLibrary",
+	"description": "MongoDB DispatchQueue backend for Confector (a compiled-in library)",
+	"targetType": "library",
 	"targetName": "confector_mongo_queue",
-	"targetPath": "../../../out/server/plugins",
+	"targetPath": "../../../out/lib",
 	"dependencies": {
 		"confector:plugin-api": {
 			"path": "../../.."
@@ -26,7 +26,7 @@
 	],
 	"configurations": [
 		{
-			"name": "plugin"
+			"name": "library"
 		},
 		{
 			"name": "unittest",

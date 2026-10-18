@@ -9,8 +9,7 @@
   "targetType": "none",
   "dependencies": {
     "confector:server": "*",
-    "confector:runner": "*",
-    "confector:plugins": "*"
+    "confector:runner": "*"
   },
   "subPackages": [
     "libs/config",
@@ -21,21 +20,9 @@
     "libs/testing",
     "apps/server",
     "apps/runner",
-    "plugins/worker/local_process",
     "plugins/artifact/local",
     "plugins/queue/mongo",
     "plugins/document_store/mongo",
-    "plugins/scheduler/local",
-    {
-      "name": "plugins",
-      "description": "Every loadable plugin, so one build produces them all.",
-      "targetType": "none",
-      "dependencies": {
-        "confector:worker-local-process": "*",
-        "confector:artifact-local": "*",
-        "confector:queue-mongo": "*",
-        "confector:scheduler-local": "*"
-      }
-    }
+    "plugins/scheduler/local"
   ]
 }
