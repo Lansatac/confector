@@ -12,7 +12,7 @@ module confector.core.project_stores;
 
 import confector.core.build_stores : InvalidStateTransitionException;
 import confector.core.document_collection;
-import confector.core.model;
+import confector.plugin_api.model;
 import confector.plugin_api.document_store;
 
 import std.format : format;
@@ -271,11 +271,11 @@ unittest
     repository.name = "game";
     repository.address = "https://example.com/game.git";
     repositories.put(repository);
-    repository.refreshPolicy = "polling";
+    repository.address = "https://example.com/moved/game.git";
     repositories.put(repository);
 
     RepositoryRecord read;
-    assert(repositories.get("game").tryValue(read) && read.refreshPolicy == "polling");
+    assert(repositories.get("game").tryValue(read) && read.address == "https://example.com/moved/game.git");
     assert(repositories.get("other").isNull);
     assert(repositories.list() == [repository]);
     assert(repositories.remove("game") && repositories.list().length == 0);

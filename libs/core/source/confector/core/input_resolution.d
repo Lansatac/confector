@@ -24,7 +24,7 @@ module confector.core.input_resolution;
 
 import confector.core.dag : TaskGraph;
 import confector.core.fingerprinter : computeBaseFingerprint, computeFingerprint, pinInputs;
-import confector.core.model;
+import confector.plugin_api.model;
 
 import vibe.data.json : Json;
 
@@ -432,7 +432,7 @@ unittest
 
     // Build configuration is not an input: changing steps leaves every fingerprint unchanged
     TaskNode compileSteps = compile;
-    compileSteps.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
+    compileSteps.steps = [BuildStep("Build", "bash", Json(["script": Json("dub build --build=release")]))];
     assert(evaluate(new TaskGraph([package_, lint, test, compileSteps]), none, resolved).fingerprints
         == r.fingerprints);
 
@@ -623,7 +623,7 @@ unittest
     TaskNode compile; compile.id = "compile";
     compile.inputs["src"] = repositoryInput("game", "main");
     compile.inputs["flavor"] = valueInput("internal");
-    compile.steps = [BuildStep("Build", "bash", null, "dub build")];
+    compile.steps = [BuildStep("Build", "bash", Json(["script": Json("dub build")]))];
     TaskNode test; test.id = "test";
     test.inputs["bin"] = taskOutputInput("compile", "binaries");
     TaskNode lint; lint.id = "lint";

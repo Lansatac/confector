@@ -1,7 +1,6 @@
 module confector.runner_core.artifacts;
 
-import confector.core.model;
-import confector.plugin_api.model : ArtifactStorage;
+import confector.plugin_api.model;
 import confector.core.zip_packager;
 
 import std.file : exists, mkdirRecurse, isDir;
@@ -97,8 +96,11 @@ final class ArtifactStager
         string storageBaseDir = ""
     )
     {
-        string artId = decl.effectiveId;
-        string artPath = decl.effectivePath;
+        string artId = decl.id;
+        string artPath = decl.path;
+        if (artId.length == 0 || artPath.length == 0)
+            throw new Exception(format("Task '%s' declares an output artifact without an id or a path (id '%s', path '%s'); both are required",
+                taskId, artId, artPath));
 
         SHA256 sha;
         sha.start();
@@ -191,4 +193,14 @@ unittest
     try ArtifactStager.packOutputArtifact(null, "fp123", "exe1", "task1", wsDir, decl);
     catch (Exception ex) noStorage = ex.msg.canFind("no artifact storage");
     assert(noStorage);
+
+    // An output needs both its id and its path; neither is defaulted from the other
+    foreach (incomplete; [OutputArtifactDecl("", "out.txt"), OutputArtifactDecl("my_art", "")])
+    {
+        bool refused = false;
+        try ArtifactStager.packOutputArtifact(storage, "fp124", "exe1", "task1", wsDir, incomplete);
+        catch (Exception ex) refused = ex.msg.canFind("both are required");
+        assert(refused);
+    }
+    assert(!storage.artifactExists("fp124", "my_art") && !storage.artifactExists("fp124", "out.txt"));
 }

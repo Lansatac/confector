@@ -1,8 +1,9 @@
 module confector.server.controller.dashboard_controller;
 
 import vibe.vibe;
-import vibe.core.log : logError, logInfo, logWarn;
-import confector.core.model;
+import vibe.core.log : logError;
+import confector.core.builtin_steps : builtinStepTypes, checkoutConfigIssues, checkoutStepType;
+import confector.plugin_api.model;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;
@@ -11,7 +12,7 @@ import confector.server.controller.api_controller : buildsNotImplemented;
 import std.algorithm : canFind;
 import std.datetime.systime : Clock;
 import std.format : format;
-import std.string : split, strip;
+import std.string : strip;
 import std.uuid : randomUUID;
 
 // View model for task summary on dashboard
@@ -31,10 +32,11 @@ struct DashboardProjectViewModel
 }
 
 /**
- * Thrown when the task editor's input fields cannot be mapped onto declared inputs,
- * for example when two different inputs would get the same name.
+ * Thrown when the task editor's form cannot be turned into a task: its inputs, steps or output
+ * declarations are invalid, for example two inputs with the same name or a step config that is
+ * not a JSON object. The message lists every problem, one per line.
  */
-class TaskInputFormException : Exception
+class TaskFormException : Exception
 {
     this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
     {
@@ -88,7 +90,7 @@ TaskInputRow[] taskInputRows(in InputDecl[string] inputs) pure @safe
 /**
  * Zips the parallel `input_*` form fields into rows.
  *
- * Throws: TaskInputFormException if the fields do not all have the same length.
+ * Throws: TaskFormException if the fields do not all have the same length.
  */
 TaskInputRow[] taskInputRowsFromForm(
     in string[] names, in string[] kinds, in string[] repositories, in string[] refSelectors,
@@ -99,7 +101,7 @@ TaskInputRow[] taskInputRowsFromForm(
     {
         if (fieldLength != names.length)
         {
-            throw new TaskInputFormException("The input fields of the form are inconsistent; reload the editor and try again");
+            throw new TaskFormException("The input fields of the form are inconsistent; reload the editor and try again");
         }
     }
     TaskInputRow[] rows;
@@ -118,7 +120,7 @@ TaskInputRow[] taskInputRowsFromForm(
  * selector (there is no default ref); a value input a value; a task output input another task
  * of the project. All problems are reported together, one per line.
  *
- * Throws: TaskInputFormException listing every problem.
+ * Throws: TaskFormException listing every problem.
  */
 InputDecl[string] parseTaskInputRows(
     string taskId,
@@ -188,54 +190,371 @@ InputDecl[string] parseTaskInputRows(
         if (ok) result[name] = decl;
     }
 
-    if (errors.length > 0) throw new TaskInputFormException(errors.join("\n"));
+    if (errors.length > 0) throw new TaskFormException(errors.join("\n"));
     return result;
 }
 
-/// The step type of the built-in checkout step, whose `input` parameter names a repository input.
-enum checkoutStepType = "checkout";
+/**
+ * The repository inputs among the editor's input rows, by name, as far as the rows say:
+ * what checkout steps are checked against when the rows themselves have problems or were not
+ * saved yet.
+ */
+InputDecl[string] shownRepositoryInputs(in TaskInputRow[] rows) pure @safe
+{
+    InputDecl[string] shown;
+    foreach (row; rows)
+    {
+        if (row.kind == InputKind.repository && row.name.strip().length > 0)
+        {
+            shown[row.name.strip()] = repositoryInput(row.repository, row.refSelector);
+        }
+    }
+    return shown;
+}
 
 /**
- * Problems with the checkout steps in `steps`, aligned with `steps` (empty for steps without
- * problems and for steps of other types): a checkout step's `input` must name one of the task's
- * repository inputs.
+ * One row of the task editor's Steps tab, as the form submits it: the step's display name, its
+ * type, and its config as JSON text. The text is kept as typed, so a rejected save shows it
+ * again unchanged.
  */
-string[][] checkoutStepIssues(in BuildStep[] steps, in InputDecl[string] inputs) @safe
+struct TaskStepRow
 {
-    string[][] issues;
-    issues.length = steps.length;
-    foreach (i, step; steps)
+    string name;
+    string type;
+    string config;
+}
+
+/// The editor rows for a task's steps. A step without config shows an empty object.
+TaskStepRow[] taskStepRows(in BuildStep[] steps) @trusted
+{
+    TaskStepRow[] rows;
+    foreach (step; steps)
     {
-        if (step.type != checkoutStepType) continue;
-        const name = step.parameters.get("input", "");
-        if (name.length == 0)
-        {
-            issues[i] ~= "A checkout step must name the repository input to check out ('input')";
-            continue;
-        }
-        auto decl = name in inputs;
+        const config = step.config.type == Json.Type.undefined ? Json.emptyObject : step.config;
+        rows ~= TaskStepRow(step.name, step.type, config.toPrettyString());
+    }
+    return rows;
+}
+
+/**
+ * Zips the parallel `step_*` form fields into rows.
+ *
+ * Throws: TaskFormException if the fields do not all have the same length.
+ */
+TaskStepRow[] taskStepRowsFromForm(in string[] names, in string[] types, in string[] configs) pure @safe
+{
+    if (types.length != names.length || configs.length != names.length)
+    {
+        throw new TaskFormException("The step fields of the form are inconsistent; reload the editor and try again");
+    }
+    TaskStepRow[] rows;
+    foreach (i; 0 .. names.length) rows ~= TaskStepRow(names[i], types[i], configs[i]);
+    return rows;
+}
+
+/**
+ * Problems with a checkout step's `config`: those the runner would refuse it for
+ * (`checkoutConfigIssues`: its keys and their value types), and an `input` that does not name
+ * one of `inputs`' repository inputs.
+ */
+string[] checkoutStepIssues(in Json config, in InputDecl[string] inputs) @trusted
+{
+    string[] issues = checkoutConfigIssues(config);
+    if (config.type != Json.Type.object) return issues;
+    auto input = "input" in config;
+    if (input !is null && input.type == Json.Type.string && input.get!string.length > 0)
+    {
+        auto decl = input.get!string in inputs;
         if (decl is null || decl.kind != InputKind.repository)
         {
-            issues[i] ~= format("Input '%s' is not a repository input declared on this task", name);
+            issues ~= format("input '%s' is not a repository input declared on this task", input.get!string);
         }
     }
     return issues;
 }
 
+/**
+ * Problems with each of the editor's step rows, aligned with `rows` (empty for a row without
+ * problems): the type must be a built-in step type, the config must be a JSON object, and a
+ * checkout step's config must pass `checkoutStepIssues` against `inputs`.
+ */
+string[][] taskStepRowIssues(in TaskStepRow[] rows, in InputDecl[string] inputs) @trusted
+{
+    string[][] issues;
+    issues.length = rows.length;
+    foreach (i, row; rows)
+    {
+        const type = row.type.strip();
+        if (!builtinStepTypes.canFind(type))
+        {
+            issues[i] ~= format("step type '%s' is not a built-in step type (%-(%s, %)); step programs are bead confector-z7z.35.1",
+                type, builtinStepTypes);
+        }
+        Json config;
+        try config = parseJsonString(row.config.strip());
+        catch (Exception e)
+        {
+            issues[i] ~= format("the config is not valid JSON (%s); write a JSON object, {} for none", e.msg);
+            continue;
+        }
+        if (config.type != Json.Type.object)
+        {
+            issues[i] ~= "the config must be a JSON object; write {} for none";
+            continue;
+        }
+        if (type == checkoutStepType) issues[i] ~= checkoutStepIssues(config, inputs);
+    }
+    return issues;
+}
+
 /// Formats step issues for the error banner of a rejected save.
-string formatStepIssues(in BuildStep[] steps, in string[][] issues) pure @safe
+string formatStepIssues(in TaskStepRow[] rows, in string[][] issues) pure @safe
 {
     import std.array : join;
 
     string[] lines;
     foreach (i, stepIssues; issues)
     {
+        const label = rows[i].name.strip().length > 0 ? rows[i].name.strip() : rows[i].type.strip();
         foreach (issue; stepIssues)
         {
-            lines ~= format("Step %s (%s): %s", i + 1, steps[i].name.length > 0 ? steps[i].name : steps[i].type, issue);
+            lines ~= format("Step %s (%s): %s", i + 1, label, issue);
         }
     }
     return lines.join("\n");
+}
+
+/**
+ * Validates the editor's step rows (see `taskStepRowIssues`) and turns them into the task's
+ * steps, in order.
+ *
+ * Throws: TaskFormException listing every problem.
+ */
+BuildStep[] parseTaskStepRows(in TaskStepRow[] rows, in InputDecl[string] inputs) @trusted
+{
+    const problems = formatStepIssues(rows, taskStepRowIssues(rows, inputs));
+    if (problems.length > 0) throw new TaskFormException(problems);
+    BuildStep[] steps;
+    foreach (row; rows)
+    {
+        steps ~= BuildStep(row.name.strip(), row.type.strip(), parseJsonString(row.config.strip()));
+    }
+    return steps;
+}
+
+/// True if `path` is absolute (a leading `/` or `\`), drive-qualified (`C:`) or has a `..` segment.
+private bool escapesWorkingDirectory(string path) pure @safe
+{
+    import std.algorithm.iteration : splitter;
+    import std.ascii : isAlpha;
+
+    if (path.length > 0 && (path[0] == '/' || path[0] == '\\')) return true;
+    if (path.length >= 2 && isAlpha(path[0]) && path[1] == ':') return true;
+    foreach (segment; path.splitter!(c => c == '/' || c == '\\'))
+    {
+        if (segment == "..") return true;
+    }
+    return false;
+}
+
+/// The Outputs tab's text for `artifacts`: one `id: path` line per declared output.
+string outputDeclarationsText(in OutputArtifactDecl[] artifacts) pure @safe
+{
+    import std.array : join;
+
+    string[] lines;
+    foreach (artifact; artifacts) lines ~= artifact.id ~ ": " ~ artifact.path;
+    return lines.join("\n");
+}
+
+/**
+ * Parses the Outputs tab's text: one `id: path` line per declared output (the id ends at the
+ * first colon). Blank lines are ignored. Each line needs both an id and a path, ids must be
+ * unique, and a path must stay inside the working directory: not absolute, not drive-qualified
+ * and without `..` segments.
+ *
+ * Throws: TaskFormException listing every problem.
+ */
+OutputArtifactDecl[] parseOutputDeclarations(string text) @safe
+{
+    import std.array : join;
+    import std.string : indexOf, lineSplitter;
+
+    OutputArtifactDecl[] artifacts;
+    string[] errors;
+    bool[string] seen;
+    size_t lineNumber;
+    foreach (line; text.lineSplitter)
+    {
+        ++lineNumber;
+        const s = line.strip();
+        if (s.length == 0) continue;
+        const colon = s.indexOf(':');
+        const id = colon < 0 ? "" : s[0 .. colon].strip();
+        const path = colon < 0 ? "" : s[colon + 1 .. $].strip();
+        if (id.length == 0 || path.length == 0)
+        {
+            errors ~= format("Output line %s ('%s'): write each output as id: path; both are required", lineNumber, s);
+            continue;
+        }
+        if (escapesWorkingDirectory(path))
+        {
+            errors ~= format("Output line %s ('%s'): the path must be relative to the working directory, without a drive, a leading slash or '..'",
+                lineNumber, s);
+            continue;
+        }
+        if (id in seen)
+        {
+            errors ~= format("Output line %s: the id '%s' is used by another output", lineNumber, id);
+            continue;
+        }
+        seen[id] = true;
+        artifacts ~= OutputArtifactDecl(id, path);
+    }
+    if (errors.length > 0) throw new TaskFormException(errors.join("\n"));
+    return artifacts;
+}
+
+/// The Environment field's text for `environment`: one `KEY=VALUE` line per variable, by key.
+string environmentText(in string[string] environment) pure @safe
+{
+    import std.algorithm.sorting : sort;
+    import std.array : join;
+
+    string[] keys;
+    foreach (key; environment.byKey) keys ~= key;
+    keys.sort();
+    string[] lines;
+    foreach (key; keys) lines ~= key ~ "=" ~ environment[key];
+    return lines.join("\n");
+}
+
+/**
+ * Parses the Environment field's text: one `KEY=VALUE` line per variable (the key ends at the
+ * first `=`; the value is the rest of the line as typed, possibly empty). Blank lines are
+ * ignored. A key must be non-empty without whitespace, and keys must be unique.
+ *
+ * Throws: TaskFormException listing every problem.
+ */
+string[string] parseEnvironment(string text) @safe
+{
+    import std.algorithm.searching : any;
+    import std.array : join;
+    import std.ascii : isWhite;
+    import std.string : indexOf, lineSplitter;
+
+    string[string] environment;
+    string[] errors;
+    size_t lineNumber;
+    foreach (line; text.lineSplitter)
+    {
+        ++lineNumber;
+        if (line.strip().length == 0) continue;
+        const eq = line.indexOf('=');
+        const key = eq < 0 ? "" : line[0 .. eq];
+        if (eq < 0 || key.length == 0 || key.any!isWhite)
+        {
+            errors ~= format("Environment line %s ('%s'): write each variable as KEY=VALUE, with a key and no spaces around it",
+                lineNumber, line);
+            continue;
+        }
+        if (key in environment)
+        {
+            errors ~= format("Environment line %s: the variable '%s' is set more than once", lineNumber, key);
+            continue;
+        }
+        environment[key] = line[eq + 1 .. $];
+    }
+    if (errors.length > 0) throw new TaskFormException(errors.join("\n"));
+    return environment;
+}
+
+/**
+ * Parses the Timeout field: a positive whole number of seconds. There is no default: a blank
+ * field is refused.
+ *
+ * Throws: TaskFormException if it is not one.
+ */
+size_t parseTimeout(string text) @safe
+{
+    import std.conv : to;
+
+    const s = text.strip();
+    size_t seconds;
+    try seconds = s.to!size_t;
+    catch (Exception) seconds = 0;
+    if (seconds == 0)
+    {
+        throw new TaskFormException(format("Timeout: '%s' is not a positive whole number of seconds", s));
+    }
+    return seconds;
+}
+
+/**
+ * Everything the task editor's form shows beyond the task's id and name, as text and rows the
+ * user edits. Built from the task to edit it (`taskEditorForm`), or from what was submitted, so
+ * a rejected save shows the user's edits unchanged.
+ */
+struct TaskEditorForm
+{
+    TaskInputRow[] inputRows;
+    TaskStepRow[] stepRows;
+    string outputsText;
+    string environmentText;
+    string timeoutText;
+}
+
+/// The editor form for `task`. Saving it unchanged stores `task` unchanged.
+TaskEditorForm taskEditorForm(in TaskNode task) @trusted
+{
+    TaskEditorForm form;
+    form.inputRows = taskInputRows(task.inputs);
+    form.stepRows = taskStepRows(task.steps);
+    form.outputsText = outputDeclarationsText(task.outputs.artifacts);
+    form.environmentText = environmentText(task.environment);
+    form.timeoutText = format("%d", task.timeoutSeconds);
+    return form;
+}
+
+unittest
+{
+    import std.exception : collectExceptionMsg;
+    import std.algorithm.searching : canFind;
+
+    // Environment: KEY=VALUE lines round-trip, values as typed (spaces, '=' and empty values kept)
+    string[string] environment = ["MODE": "release", "FLAGS": "-O2 -g", "EMPTY": "", "URL": "a=b"];
+    const text = environmentText(environment);
+    assert(text == "EMPTY=\nFLAGS=-O2 -g\nMODE=release\nURL=a=b");
+    assert(parseEnvironment(text) == environment);
+    assert(parseEnvironment("\n  \nA=1\r\n").length == 1 && parseEnvironment("A=1\r\n")["A"] == "1");
+    assert(parseEnvironment("").length == 0);
+
+    auto problems = collectExceptionMsg!TaskFormException(parseEnvironment("NOVALUE\n=x\nA B=1\nA=1\nA=2"));
+    foreach (fragment; ["Environment line 1 ('NOVALUE')", "Environment line 2", "Environment line 3",
+        "Environment line 5: the variable 'A' is set more than once"])
+    {
+        assert(problems.canFind(fragment), fragment ~ "\n" ~ problems);
+    }
+    assert(!problems.canFind("Environment line 4"), problems);
+
+    // Timeout: a positive whole number of seconds, never defaulted
+    assert(parseTimeout(" 1200 ") == 1200);
+    foreach (bad; ["", "0", "-5", "1.5", "ten", "99999999999999999999999"])
+    {
+        assert(collectExceptionMsg!TaskFormException(parseTimeout(bad)).canFind("positive whole number"), bad);
+    }
+
+    // A task's form holds every field of the task the editor edits
+    TaskNode task;
+    task.id = "package";
+    task.inputs["src"] = repositoryInput("game", "main");
+    task.steps = [BuildStep("Fetch", "checkout", Json(["input": Json("src")]))];
+    task.outputs.artifacts = [OutputArtifactDecl("game", "out/game.zip")];
+    task.environment = ["MODE": "release"];
+    task.timeoutSeconds = 3600;
+    auto form = taskEditorForm(task);
+    assert(form.inputRows == taskInputRows(task.inputs) && form.stepRows == taskStepRows(task.steps));
+    assert(form.outputsText == "game: out/game.zip" && form.environmentText == "MODE=release" && form.timeoutText == "3600");
 }
 
 unittest
@@ -254,6 +573,7 @@ unittest
     auto rows = taskInputRows(existing);
     assert(rows.length == 5 && rows[0].name == "eng");
     assert(parseTaskInputRows("package", rows, ["game"], ["build-engine", "setup"]) == existing);
+    assert(shownRepositoryInputs(rows) == ["src": repositoryInput("game", "main"), "lib": repositoryInput("game", "release")]);
 
     // Fully blank rows are ignored; removed rows are gone.
     assert(parseTaskInputRows("package", [TaskInputRow("", "value", "", "", "", "", "")], [], []).length == 0);
@@ -261,20 +581,20 @@ unittest
 
     // Form fields zip into rows; mismatched lengths are rejected.
     assert(taskInputRowsFromForm(["a"], ["value"], [""], [""], ["v"], [""], [""]) == [TaskInputRow("a", "value", "", "", "v", "", "")]);
-    assertThrown!TaskInputFormException(taskInputRowsFromForm(["a"], [], [""], [""], ["v"], [""], [""]));
+    assertThrown!TaskFormException(taskInputRowsFromForm(["a"], [], [""], [""], ["v"], [""], [""]));
 
     // An empty ref selector or repository is rejected, not defaulted.
-    auto noRef = collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t",
+    auto noRef = collectExceptionMsg!TaskFormException(parseTaskInputRows("t",
         [TaskInputRow("src", "repository", "game", "  ", "", "", "")], ["game"], []));
     assert(noRef.canFind("src") && noRef.canFind("ref selector"));
-    auto noRepo = collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t",
+    auto noRepo = collectExceptionMsg!TaskFormException(parseTaskInputRows("t",
         [TaskInputRow("src", "repository", "", "main", "", "", "")], ["game"], []));
     assert(noRepo.canFind("choose a repository"));
-    assert(collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t",
+    assert(collectExceptionMsg!TaskFormException(parseTaskInputRows("t",
         [TaskInputRow("src", "repository", "gone", "main", "", "", "")], ["game"], [])).canFind("not registered"));
 
     // Other mistakes, all reported together.
-    auto many = collectExceptionMsg!TaskInputFormException(parseTaskInputRows("t", [
+    auto many = collectExceptionMsg!TaskFormException(parseTaskInputRows("t", [
         TaskInputRow("", "value", "", "", "x", "", ""),
         TaskInputRow("v", "value", "", "", "", "", ""),
         TaskInputRow("o", "task_output", "", "", "", "t", ""),
@@ -286,49 +606,139 @@ unittest
     {
         assert(many.canFind(fragment), fragment);
     }
+}
 
-    // Checkout steps must name a declared repository input.
-    BuildStep checkout;
-    checkout.type = checkoutStepType;
-    checkout.parameters = ["input": "src"];
-    BuildStep bash;
-    bash.type = "bash";
-    bash.parameters = ["input": "ignored"];
-    BuildStep wrongInput;
-    wrongInput.type = checkoutStepType;
-    wrongInput.parameters = ["input": "flavor"];
-    BuildStep noInput;
-    noInput.type = checkoutStepType;
-    auto issues = checkoutStepIssues([checkout, bash, wrongInput, noInput], existing);
-    assert(issues.length == 4 && issues[0].length == 0 && issues[1].length == 0);
-    assert(issues[2].length == 1 && issues[2][0].canFind("flavor"));
-    assert(issues[3].length == 1 && issues[3][0].canFind("must name the repository input"));
-    assert(formatStepIssues([checkout, bash, wrongInput, noInput], issues).canFind("Step 3"));
+unittest
+{
+    import std.exception : assertThrown, collectExceptionMsg;
+    import std.algorithm.searching : canFind;
+
+    InputDecl[string] inputs = [
+        "src": repositoryInput("game", "main"),
+        "flavor": valueInput("external"),
+    ];
+
+    // Round trip: canonical steps survive rendering and saving the form, configs included; a step
+    // saved without config comes back with an empty one
+    BuildStep[] steps = [
+        BuildStep("Fetch", "checkout", Json(["input": Json("src"), "target_dir": Json("game"), "depth": Json(1), "submodules": Json(false)])),
+        BuildStep("Compile", "bash", Json(["script": Json("make"), "working_directory": Json("game"), "environment": Json(["MODE": Json("release")])])),
+        BuildStep("", "powershell"),
+    ];
+    auto rows = taskStepRows(steps);
+    assert(rows.length == 3 && rows[2].config == "{}");
+    auto saved = parseTaskStepRows(rows, inputs);
+    assert(saved.length == 3 && saved[0] == steps[0] && saved[1] == steps[1]);
+    assert(saved[2].name == "" && saved[2].type == "powershell" && saved[2].config == Json.emptyObject);
+
+    // Form fields zip into rows; mismatched lengths are rejected
+    assert(taskStepRowsFromForm(["a"], ["bash"], ["{}"]) == [TaskStepRow("a", "bash", "{}")]);
+    assertThrown!TaskFormException(taskStepRowsFromForm(["a"], ["bash"], []));
+
+    // The config is validated on save: it must be a JSON object
+    auto invalid = collectExceptionMsg!TaskFormException(parseTaskStepRows([
+        TaskStepRow("Broken", "bash", `{"script": `),
+        TaskStepRow("Blank", "bash", "  "),
+        TaskStepRow("Array", "bash", `["make"]`),
+        TaskStepRow("Text", "bash", `"make"`),
+    ], inputs));
+    assert(invalid.canFind("Step 1 (Broken): the config is not valid JSON"), invalid);
+    assert(invalid.canFind("Step 2 (Blank): the config is not valid JSON"), invalid);
+    assert(invalid.canFind("Step 3 (Array): the config must be a JSON object"), invalid);
+    assert(invalid.canFind("Step 4 (Text): the config must be a JSON object"), invalid);
+
+    // Only the built-in step types are offered and accepted
+    auto unknownType = collectExceptionMsg!TaskFormException(parseTaskStepRows([TaskStepRow("Image", "docker:build", "{}")], inputs));
+    assert(unknownType.canFind("'docker:build' is not a built-in step type") && unknownType.canFind("confector-z7z.35.1"), unknownType);
+    assert(collectExceptionMsg!TaskFormException(parseTaskStepRows([TaskStepRow("", "", "{}")], inputs)).canFind("Step 1 ()"));
+
+    // A checkout step's config may have only its own keys, and must name a declared repository
+    // input; every problem is reported, labelled by step
+    auto checkout = collectExceptionMsg!TaskFormException(parseTaskStepRows([
+        TaskStepRow("Legacy", "checkout", `{"input": "src", "repository": "https://example.test/game.git", "branch": "main"}`),
+        TaskStepRow("Nothing", "checkout", `{}`),
+        TaskStepRow("Empty", "checkout", `{"input": ""}`),
+        TaskStepRow("Number", "checkout", `{"input": 1}`),
+        TaskStepRow("Value", "checkout", `{"input": "flavor"}`),
+        TaskStepRow("Ghost", "checkout", `{"input": "tools"}`),
+    ], inputs));
+    assert(checkout.canFind("Step 1 (Legacy): config key 'branch' is not supported"), checkout);
+    assert(checkout.canFind("Step 1 (Legacy): config key 'repository' is not supported"), checkout);
+    assert(checkout.canFind("input, target_dir, depth, submodules"), checkout);
+    assert(checkout.canFind("Step 2 (Nothing): a checkout step's config has no 'input'"), checkout);
+    assert(checkout.canFind("Step 3 (Empty): a checkout step's config has no 'input'"), checkout);
+    assert(checkout.canFind("Step 4 (Number): 'input' must be a string"), checkout);
+    assert(!checkout.canFind("Step 4 (Number): input"), "No declared-input check on an input that is not a string");
+    assert(checkout.canFind("Step 5 (Value): input 'flavor' is not a repository input declared on this task"), checkout);
+    assert(checkout.canFind("Step 6 (Ghost): input 'tools' is not a repository input"), checkout);
+
+    // Value types are checked on save exactly as the runner checks them
+    auto types = collectExceptionMsg!TaskFormException(parseTaskStepRows([
+        TaskStepRow("Depth", "checkout", `{"input": "src", "depth": "1"}`),
+        TaskStepRow("Submodules", "checkout", `{"input": "src", "submodules": "false"}`),
+        TaskStepRow("Target", "checkout", `{"input": "src", "target_dir": ["a"]}`),
+    ], inputs));
+    assert(types.canFind("Step 1 (Depth): 'depth' must be a positive integer"), types);
+    assert(types.canFind("Step 2 (Submodules): 'submodules' must be true or false"), types);
+    assert(types.canFind("Step 3 (Target): 'target_dir' must be a string"), types);
+
+    // Other step types' configs belong to their step type and are not checked here
+    assert(parseTaskStepRows([TaskStepRow("Compile", "bash", `{"input": "anything", "x": [1, 2]}`)], inputs).length == 1);
+
+    // Issues are aligned with the rows, for the editor to show beside each step
+    auto issues = taskStepRowIssues([TaskStepRow("ok", "checkout", `{"input": "src"}`), TaskStepRow("bad", "checkout", `{}`)], inputs);
+    assert(issues.length == 2 && issues[0].length == 0 && issues[1].length == 1);
+}
+
+unittest
+{
+    import std.exception : collectExceptionMsg;
+    import std.algorithm.searching : canFind;
+
+    // Output declarations: one id: path per line, both required, ids unique
+    auto artifacts = [OutputArtifactDecl("game", "out/game.zip"), OutputArtifactDecl("symbols", "out/sym/*.pdb")];
+    const text = outputDeclarationsText(artifacts);
+    assert(text == "game: out/game.zip\nsymbols: out/sym/*.pdb");
+    assert(parseOutputDeclarations(text) == artifacts);
+    assert(parseOutputDeclarations("\n  game :  out/game.zip  \n\n") == artifacts[0 .. 1]);
+    assert(parseOutputDeclarations("logs: build/logs:old/*.txt") == [OutputArtifactDecl("logs", "build/logs:old/*.txt")],
+        "The id ends at the first colon");
+    assert(parseOutputDeclarations("dots: out/..hidden/a..b").length == 1, "Only a whole '..' segment escapes");
+    assert(parseOutputDeclarations("").length == 0);
+
+    // A path must stay inside the working directory
+    auto escaping = collectExceptionMsg!TaskFormException(parseOutputDeclarations(
+        "a: C:\\build\\out.zip\nb: /etc/passwd\nc: \\\\server\\share\\x\nd: ../sibling/out.zip\ne: out/../../x\nf: out\\..\\x\ng: c:out.zip\nok: out/ok.zip"));
+    foreach (line; 1 .. 8)
+    {
+        assert(escaping.canFind(format("Output line %s (", line)), format("line %s: %s", line, escaping));
+    }
+    assert(escaping.canFind("Output line 1 ('a: C:\\build\\out.zip'): the path must be relative"), escaping);
+    assert(!escaping.canFind("Output line 8"), escaping);
+
+    auto problems = collectExceptionMsg!TaskFormException(parseOutputDeclarations("out/game.zip\n: out/x\ngame:\ngame: a\ngame: b"));
+    assert(problems.canFind("Output line 1 ('out/game.zip'): write each output as id: path"), problems);
+    assert(problems.canFind("Output line 2"), problems);
+    assert(problems.canFind("Output line 3"), problems);
+    assert(problems.canFind("Output line 5: the id 'game' is used by another output"), problems);
+    assert(!problems.canFind("Output line 4"), problems);
 }
 
 URLRouter dashboardRouter(StateStores stores)
 {
     auto router = new URLRouter();
 
-    // Renders the task editor. `inputRows` are the Inputs tab rows to show: the task's declared
-    // inputs, or the submitted rows when the editor is shown again after a rejected save.
-    // `formError` is shown at the top of the editor; checkout steps with problems are flagged in
-    // the Steps tab.
-    void renderTaskEditor(HTTPServerResponse res, ProjectRecord project, TaskNode task,
-        TaskInputRow[] inputRows, string formError)
+    // Renders the task editor showing `form`: the task's own fields, or what was submitted when
+    // the editor is shown again after a rejected save. `formError` is shown at the top of the
+    // editor; steps with problems are flagged in the Steps tab.
+    void renderTaskEditor(HTTPServerResponse res, ProjectRecord project, TaskNode task, TaskEditorForm form,
+        string formError)
     {
         auto repositories = stores !is null ? stores.repositories.list() : [];
         // Checked against the rows being shown, which may include edits that were not saved.
-        InputDecl[string] shownInputs;
-        foreach (row; inputRows)
-        {
-            if (row.kind == InputKind.repository && row.name.strip().length > 0)
-            {
-                shownInputs[row.name.strip()] = repositoryInput(row.repository, row.refSelector);
-            }
-        }
-        string[][] stepIssues = checkoutStepIssues(task.steps, shownInputs);
-        res.render!("project/task-editor.dt", project, task, repositories, inputRows, stepIssues, formError);
+        string[][] stepIssues = taskStepRowIssues(form.stepRows, shownRepositoryInputs(form.inputRows));
+        const stepTypes = builtinStepTypes;
+        res.render!("project/task-editor.dt", project, task, repositories, form, stepIssues, stepTypes, formError);
     }
 
     // Home / Dashboard
@@ -418,11 +828,8 @@ URLRouter dashboardRouter(StateStores stores)
             project.name = "Unknown Project";
         }
 
-        // TODO(confector-z7z.24.1): show pending changes per repository from tracked branches.
-        // Until then there are none to show; the count this replaced always came out empty.
-        string pendingCommitsJson = "{}";
         string tasksJson = serializeToJson(project.tasks).toString();
-        res.render!("project/project-details.dt", project, tasksJson, pendingCommitsJson);
+        res.render!("project/project-details.dt", project, tasksJson);
     });
 
     router.get("/projects/edit", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -520,14 +927,17 @@ URLRouter dashboardRouter(StateStores stores)
             }
         }
 
-        renderTaskEditor(res, project, task, taskInputRows(task.inputs), "");
+        renderTaskEditor(res, project, task, taskEditorForm(task), "");
     });
 
     router.post("/projects/tasks/save", (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.form.get("project_id", "");
         ProjectRecord project;
         TaskNode task;
-        TaskInputRow[] inputRows;
+        TaskEditorForm form;
+        form.outputsText = req.form.get("output_artifacts", "");
+        form.environmentText = req.form.get("environment", "");
+        form.timeoutText = req.form.get("timeout_seconds", "");
         try
         {
             if (stores !is null && projId.length > 0)
@@ -542,166 +952,10 @@ URLRouter dashboardRouter(StateStores stores)
             }
             task.name = req.form.get("name", "").strip();
 
-            // Build steps
-            string stepsJsonStr = req.form.get("steps_json", "");
-            BuildStep[] steps;
-            if (stepsJsonStr.length > 0)
-            {
-                try
-                {
-                    Json parsedSteps = parseJsonString(stepsJsonStr);
-                    if (parsedSteps.type == Json.Type.array)
-                    {
-                        steps = deserializeJson!(BuildStep[])(parsedSteps);
-                    }
-                }
-                catch (Exception e)
-                {
-                    logWarn("Failed to deserialize steps_json: %s", e.msg);
-                }
-            }
-
-            // Fallback to form parameters if steps_json was empty
-            if (steps.length == 0)
-            {
-                auto stepTypes = req.form.getAll("step_type");
-                auto stepCustomTypes = req.form.getAll("step_custom_type");
-                auto stepNames = req.form.getAll("step_name");
-                auto stepScripts = req.form.getAll("step_script");
-                auto stepCommands = req.form.getAll("step_command");
-                auto stepWorkDirs = req.form.getAll("step_working_dir");
-                auto stepWorkDirs2 = req.form.getAll("step_workingDirectory");
-                auto stepInputs = req.form.getAll("step_param_input");
-                auto stepTargetDirs = req.form.getAll("step_repo_target");
-                auto stepTargetDirs2 = req.form.getAll("step_param_target_dir");
-                auto stepExecutables = req.form.getAll("step_param_executable");
-                auto stepProps = req.form.getAll("step_props");
-
-                for (size_t i = 0; i < stepTypes.length; i++)
-                {
-                    string sType = stepTypes[i].strip();
-                    if (sType == "custom" && i < stepCustomTypes.length && stepCustomTypes[i].strip().length > 0)
-                    {
-                        sType = stepCustomTypes[i].strip();
-                    }
-                    if (sType.length == 0) continue;
-
-                    BuildStep step;
-                    step.type = sType;
-                    if (i < stepNames.length) step.name = stepNames[i].strip();
-                    if (i < stepScripts.length && stepScripts[i].length > 0) step.script = stepScripts[i];
-                    if (i < stepCommands.length && stepCommands[i].length > 0) step.command = stepCommands[i];
-                    if (i < stepWorkDirs.length && stepWorkDirs[i].strip().length > 0) step.workingDirectory = stepWorkDirs[i].strip();
-                    else if (i < stepWorkDirs2.length && stepWorkDirs2[i].strip().length > 0) step.workingDirectory = stepWorkDirs2[i].strip();
-
-                    // A checkout step names a declared repository input; it takes no URL or ref
-                    if (i < stepInputs.length && stepInputs[i].strip().length > 0)
-                    {
-                        step.parameters["input"] = stepInputs[i].strip();
-                    }
-
-                    if (i < stepTargetDirs.length && stepTargetDirs[i].strip().length > 0)
-                    {
-                        step.parameters["target_dir"] = stepTargetDirs[i].strip();
-                    }
-                    else if (i < stepTargetDirs2.length && stepTargetDirs2[i].strip().length > 0)
-                    {
-                        step.parameters["target_dir"] = stepTargetDirs2[i].strip();
-                    }
-
-                    if (i < stepExecutables.length && stepExecutables[i].strip().length > 0)
-                    {
-                        step.parameters["executable"] = stepExecutables[i].strip();
-                    }
-
-                    if (i < stepProps.length && stepProps[i].strip().length > 0)
-                    {
-                        step.propertiesJson = stepProps[i].strip();
-                    }
-
-                    steps ~= step;
-                }
-            }
-            task.steps = steps;
-
-            // Output artifacts
-            string outStr = req.form.get("output_artifacts", "");
-            OutputArtifactDecl[] outDecls;
-            foreach (line; outStr.split("\n"))
-            {
-                string s = line.strip();
-                if (s.length == 0) continue;
-                auto parts = s.split(":");
-                if (parts.length >= 2)
-                {
-                    outDecls ~= OutputArtifactDecl(parts[0].strip(), parts[1].strip());
-                }
-                else
-                {
-                    outDecls ~= OutputArtifactDecl(parts[0].strip(), parts[0].strip());
-                }
-            }
-            task.outputs.artifacts = outDecls;
-
-            // Trigger rules
-            auto trigTypes = req.form.getAll("trigger_type");
-            auto trigBranches = req.form.getAll("trigger_branches");
-            auto trigTags = req.form.getAll("trigger_tags");
-            auto trigEndpoints = req.form.getAll("trigger_endpoint");
-            auto trigCrons = req.form.getAll("trigger_cron");
-
-            TriggerRule[] triggerRules;
-            for (size_t i = 0; i < trigTypes.length; i++)
-            {
-                string tTypeStr = trigTypes[i].strip();
-                if (tTypeStr.length == 0) continue;
-
-                TriggerRule rule;
-                if (tTypeStr == "git_push") rule.type = TriggerType.gitPush;
-                else if (tTypeStr == "git_tag") rule.type = TriggerType.gitTag;
-                else if (tTypeStr == "webhook") rule.type = TriggerType.webhook;
-                else if (tTypeStr == "cron") rule.type = TriggerType.cron;
-                else rule.type = TriggerType.manual;
-
-                if (i < trigBranches.length && trigBranches[i].strip().length > 0)
-                {
-                    string[] bList;
-                    foreach (b; trigBranches[i].split(","))
-                    {
-                        string s = b.strip();
-                        if (s.length > 0) bList ~= s;
-                    }
-                    rule.branches = bList;
-                }
-
-                if (i < trigTags.length && trigTags[i].strip().length > 0)
-                {
-                    string[] tgList;
-                    foreach (tg; trigTags[i].split(","))
-                    {
-                        string s = tg.strip();
-                        if (s.length > 0) tgList ~= s;
-                    }
-                    rule.tags = tgList;
-                }
-
-                if (i < trigEndpoints.length)
-                {
-                    rule.endpoint = trigEndpoints[i].strip();
-                }
-
-                if (i < trigCrons.length)
-                {
-                    rule.cronSchedule = trigCrons[i].strip();
-                }
-
-                triggerRules ~= rule;
-            }
-            task.triggers = triggerRules;
-
-            // Inputs. Validated here, on the server: the editor's own checks are a convenience.
-            // The submitted rows are kept so a rejected save shows the editor with the user's edits.
-            inputRows = taskInputRowsFromForm(
+            // Validated here, on the server: the editor's own checks are a convenience. The
+            // submitted rows are kept so a rejected save shows the editor with the user's edits,
+            // and every problem in every tab is reported at once.
+            form.inputRows = taskInputRowsFromForm(
                 req.form.getAll("input_name"),
                 req.form.getAll("input_kind"),
                 req.form.getAll("input_repository"),
@@ -710,6 +964,9 @@ URLRouter dashboardRouter(StateStores stores)
                 req.form.getAll("input_task"),
                 req.form.getAll("input_artifact")
             );
+            form.stepRows = taskStepRowsFromForm(req.form.getAll("step_name"), req.form.getAll("step_type"), req.form.getAll("step_config"));
+
+            string[] problems;
             string[] registeredRepositories;
             if (stores !is null)
             {
@@ -720,13 +977,28 @@ URLRouter dashboardRouter(StateStores stores)
             {
                 if (t.id != task.id) otherTaskIds ~= t.id;
             }
-            task.inputs = parseTaskInputRows(task.id, inputRows, registeredRepositories, otherTaskIds);
-
-            auto stepIssues = checkoutStepIssues(task.steps, task.inputs);
-            string stepProblems = formatStepIssues(task.steps, stepIssues);
-            if (stepProblems.length > 0)
+            bool inputsValid = true;
+            try task.inputs = parseTaskInputRows(task.id, form.inputRows, registeredRepositories, otherTaskIds);
+            catch (TaskFormException e)
             {
-                throw new TaskInputFormException(stepProblems);
+                problems ~= e.msg;
+                inputsValid = false;
+            }
+            // Checkout steps are checked against the declared inputs, or as far as the rows say
+            // when the inputs have problems of their own
+            try task.steps = parseTaskStepRows(form.stepRows, inputsValid ? task.inputs : shownRepositoryInputs(form.inputRows));
+            catch (TaskFormException e) problems ~= e.msg;
+            try task.outputs.artifacts = parseOutputDeclarations(form.outputsText);
+            catch (TaskFormException e) problems ~= e.msg;
+            try task.environment = parseEnvironment(form.environmentText);
+            catch (TaskFormException e) problems ~= e.msg;
+            try task.timeoutSeconds = parseTimeout(form.timeoutText);
+            catch (TaskFormException e) problems ~= e.msg;
+            if (problems.length > 0)
+            {
+                import std.array : join;
+
+                throw new TaskFormException(problems.join("\n"));
             }
 
             // Replace existing or append
@@ -754,10 +1026,10 @@ URLRouter dashboardRouter(StateStores stores)
                 stores.projects.put(project);
             }
         }
-        catch (TaskInputFormException e)
+        catch (TaskFormException e)
         {
             res.statusCode = HTTPStatus.badRequest;
-            renderTaskEditor(res, project, task, inputRows, e.msg);
+            renderTaskEditor(res, project, task, form, e.msg);
             return;
         }
         catch (Exception e)
@@ -765,7 +1037,7 @@ URLRouter dashboardRouter(StateStores stores)
             // Nothing was saved (for example the task graph is cyclic): say so, and keep the edits.
             logError("Failed to save task: %s", e.msg);
             res.statusCode = HTTPStatus.internalServerError;
-            renderTaskEditor(res, project, task, inputRows, "Failed to save task: " ~ e.msg);
+            renderTaskEditor(res, project, task, form, "Failed to save task: " ~ e.msg);
             return;
         }
 
@@ -866,119 +1138,164 @@ URLRouter dashboardRouter(StateStores stores)
     return router;
 }
 
+
 unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import std.algorithm.searching : canFind;
+    import std.uri : encodeComponent;
+    import vibe.inet.message : InetHeaderMap;
+    import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
 
     auto stores = new StateStores(new InMemoryDocumentStore());
-
     auto router = dashboardRouter(stores);
-    assert(router !is null);
 
-    // Populate a trigger rule
-    TriggerRuleRecord t;
-    t.id = "t_dash_1";
-    t.name = "Weekly Nightly";
-    t.triggerType = "cron";
-    t.criteria = "0 0 * * 0";
-    stores.triggerRules.save(t);
-
-    assert(stores.triggerRules.list().length == 1);
-
-    // Populate and verify Project & Task state
     ProjectRecord p;
     p.id = "proj_dash_1";
     p.name = "Dashboard Project";
     TaskNode tNode1;
     tNode1.id = "test_node_1";
-    tNode1.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 1")];
+    tNode1.steps = [BuildStep("Echo", "bash", Json(["script": Json("echo dashboard test 1")]))];
     tNode1.inputs["repo_main"] = repositoryInput("repo_main", "main");
-    tNode1.triggers = [TriggerRule(TriggerType.gitPush, ["main", "feature/*"])];
     TaskNode tNode2;
     tNode2.id = "test_node_2";
     tNode2.inputs["test_node_1"] = taskOutputInput("test_node_1");
-    tNode2.steps = [BuildStep("Echo", "bash", null, "echo dashboard test 2")];
-    tNode2.triggers = [TriggerRule(TriggerType.webhook, null, null, "/api/v1/deploy")];
+    tNode2.steps = [BuildStep("Echo", "bash", Json(["script": Json("echo dashboard test 2")]))];
     p.tasks = [tNode1, tNode2];
     stores.projects.put(p);
-    assert(stores.projects.list().length == 1);
 
     RepositoryRecord rRecord;
     rRecord.name = "repo_main";
     rRecord.address = "https://github.com/example/repo_main.git";
     stores.repositories.put(rRecord);
-    assert(stores.repositories.list().length == 1);
 
-    ProjectRecord fetchedProj;
-    assert(stores.projects.get("proj_dash_1").tryValue(fetchedProj));
-    assert(fetchedProj.tasks.length == 2);
-    assert(fetchedProj.tasks[0].id == "test_node_1");
-    assert(fetchedProj.tasks[0].inputs == ["repo_main": repositoryInput("repo_main", "main")]);
-    assert(fetchedProj.tasks[0].triggers.length == 1);
-    assert(fetchedProj.tasks[0].triggers[0].type == TriggerType.gitPush);
-    assert(fetchedProj.tasks[0].triggers[0].branches == ["main", "feature/*"]);
-    assert(fetchedProj.tasks[1].id == "test_node_2");
-    assert(fetchedProj.tasks[1].triggers.length == 1);
-    assert(fetchedProj.tasks[1].triggers[0].type == TriggerType.webhook);
-    assert(fetchedProj.tasks[1].triggers[0].endpoint == "/api/v1/deploy");
-
-    // Test Dashboard ViewModels
-    DashboardTaskViewModel taskVm;
-    taskVm.id = "test_node_1";
-    taskVm.name = "Test Node 1";
-
-    DashboardProjectViewModel projVm;
-    projVm.project = fetchedProj;
-    projVm.tasks = [taskVm];
-    projVm.totalTasks = 1;
-
-    assert(projVm.tasks.length == 1);
-    assert(projVm.tasks[0].id == "test_node_1");
-
-    // Test dashboard project assembly loop logic
-    DashboardProjectViewModel[] testDashboardProjects;
-    foreach (proj; stores.projects.list())
+    // Status and body of a request to the dashboard
+    struct Answer { int status; string body; }
+    Answer request(HTTPMethod method, string path, string[2][] form = null)
     {
-        DashboardProjectViewModel pvm;
-        pvm.project = proj;
-        pvm.totalTasks = proj.tasks.length;
+        import std.array : join;
 
-        foreach (task; proj.tasks)
-        {
-            DashboardTaskViewModel tvm;
-            tvm.id = task.id;
-            tvm.name = task.name.length > 0 ? task.name : task.id;
-            tvm.upstreamTasks = upstreamTaskIds(task);
-            pvm.tasks ~= tvm;
-        }
-
-        testDashboardProjects ~= pvm;
+        string[] pairs;
+        foreach (field; form) pairs ~= encodeComponent(field[0]) ~ "=" ~ encodeComponent(field[1]);
+        InetHeaderMap headers;
+        headers["Content-Type"] = "application/x-www-form-urlencoded";
+        auto req = createTestHTTPServerRequest(URL("http://localhost" ~ path), method, headers,
+            createMemoryStream(cast(ubyte[]) pairs.join("&").dup, false));
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
+        router.handleRequest(req, res);
+        res.finalize();
+        return Answer(res.statusCode, cast(string) sink.data.idup);
     }
 
-    assert(testDashboardProjects.length == 1);
-    assert(testDashboardProjects[0].tasks.length == 2);
-    assert(testDashboardProjects[0].tasks[0].id == "test_node_1");
-    assert(testDashboardProjects[0].tasks[1].id == "test_node_2");
-    assert(testDashboardProjects[0].tasks[1].upstreamTasks == ["test_node_1"]);
+    // The project, task and editor pages render the canonical model
+    auto details = request(HTTPMethod.GET, "/projects/details?id=proj_dash_1");
+    assert(details.status == HTTPStatus.ok && details.body.canFind("test_node_2"), details.body);
+    auto taskPage = request(HTTPMethod.GET, "/tasks/details?project_id=proj_dash_1&task_id=test_node_1");
+    assert(taskPage.status == HTTPStatus.ok && taskPage.body.canFind("echo dashboard test 1"), taskPage.body);
+    auto editor = request(HTTPMethod.GET, "/projects/tasks/edit?project_id=proj_dash_1&task_id=test_node_1");
+    assert(editor.status == HTTPStatus.ok && editor.body.canFind("echo dashboard test 1"), editor.body);
+    assert(!editor.body.canFind("trigger"), "The editor has no triggers tab");
 
-    // Test Task Details definition resolution
-    ProjectRecord detailProj;
-    TaskNode detailTask;
-    bool foundDetailTask = false;
-    assert(stores.projects.get("proj_dash_1").tryValue(detailProj));
-    foreach (tsk; detailProj.tasks)
+    // The form fields the editor submits for `task` when the user changes nothing
+    string[2][] editorFields(in TaskNode task)
     {
-        if (tsk.id == "test_node_2")
+        auto form = taskEditorForm(task);
+        string[2][] fields = [["project_id", "proj_dash_1"], ["task_id", task.id], ["name", task.name]];
+        foreach (row; form.inputRows)
         {
-            detailTask = tsk;
-            foundDetailTask = true;
-            break;
+            fields ~= [["input_name", row.name], ["input_kind", row.kind], ["input_repository", row.repository],
+                ["input_ref", row.refSelector], ["input_value", row.value], ["input_task", row.task], ["input_artifact", row.artifact]];
         }
+        foreach (row; form.stepRows)
+        {
+            fields ~= [["step_name", row.name], ["step_type", row.type], ["step_config", row.config]];
+        }
+        fields ~= [["output_artifacts", form.outputsText], ["environment", form.environmentText], ["timeout_seconds", form.timeoutText]];
+        return fields;
     }
-    assert(foundDetailTask);
-    assert(detailTask.id == "test_node_2");
-    assert(detailTask.steps.length == 1);
-    assert(upstreamTaskIds(detailTask) == ["test_node_1"]);
+
+    TaskNode storedTask(string id)
+    {
+        foreach (t; stores.projects.get("proj_dash_1").get.tasks) if (t.id == id) return t;
+        assert(false, "No task " ~ id);
+    }
+
+    // Saving a task from the editor: canonical step rows (name, built-in type, JSON config),
+    // named inputs, id: path outputs, the environment and the timeout are stored as the task's
+    // definition
+    string[2][] checkoutTask = [
+        ["project_id", "proj_dash_1"], ["task_id", "package"], ["name", "Package"],
+        ["input_name", "src"], ["input_kind", "repository"], ["input_repository", "repo_main"], ["input_ref", "main"],
+        ["input_value", ""], ["input_task", ""], ["input_artifact", ""],
+        ["input_name", "bin"], ["input_kind", "task_output"], ["input_repository", ""], ["input_ref", ""],
+        ["input_value", ""], ["input_task", "test_node_1"], ["input_artifact", ""],
+        ["step_name", "Fetch"], ["step_type", "checkout"], ["step_config", `{"input": "src", "target_dir": "game", "depth": 1}`],
+        ["step_name", "Zip"], ["step_type", "bash"], ["step_config", `{"script": "zip -r out/game.zip game"}`],
+        ["output_artifacts", "game: out/game.zip"],
+        ["environment", "MODE=release\nFLAGS=-O2 -g"],
+        ["timeout_seconds", "1234"],
+    ];
+    auto saved = request(HTTPMethod.POST, "/projects/tasks/save", checkoutTask);
+    assert(saved.status == HTTPStatus.found, format("HTTP %s: %s", saved.status, saved.body));
+    auto stored = storedTask("package");
+    assert(stored.name == "Package");
+    assert(stored.inputs == ["src": repositoryInput("repo_main", "main"), "bin": taskOutputInput("test_node_1")]);
+    assert(stored.steps == [
+        BuildStep("Fetch", "checkout", Json(["input": Json("src"), "target_dir": Json("game"), "depth": Json(1)])),
+        BuildStep("Zip", "bash", Json(["script": Json("zip -r out/game.zip game")])),
+    ]);
+    assert(stored.outputs.artifacts == [OutputArtifactDecl("game", "out/game.zip")]);
+    assert(stored.environment == ["MODE": "release", "FLAGS": "-O2 -g"] && stored.timeoutSeconds == 1234);
+
+    // The editor shows the saved task again, and saving it unchanged stores it unchanged: its
+    // environment, its non-default timeout and its definition hash are kept
+    {
+        import confector.core.definition_hash : computeDefinitionHash;
+
+        auto reopened = request(HTTPMethod.GET, "/projects/tasks/edit?project_id=proj_dash_1&task_id=package");
+        assert(reopened.status == HTTPStatus.ok && reopened.body.canFind("target_dir"), reopened.body);
+        assert(reopened.body.canFind(`value="1234"`) && reopened.body.canFind("FLAGS=-O2 -g&#10;MODE=release"), reopened.body);
+        auto resaved = request(HTTPMethod.POST, "/projects/tasks/save", editorFields(stored));
+        assert(resaved.status == HTTPStatus.found, format("HTTP %s: %s", resaved.status, resaved.body));
+        auto again = storedTask("package");
+        assert(again == stored, format("%s\n%s", again, stored));
+        assert(computeDefinitionHash(again) == computeDefinitionHash(stored));
+
+        // Tasks stored without going through the editor keep their default timeout too
+        auto echoForm = editorFields(storedTask("test_node_1"));
+        assert(request(HTTPMethod.POST, "/projects/tasks/save", echoForm).status == HTTPStatus.found);
+        assert(storedTask("test_node_1") == tNode1);
+    }
+
+    // A rejected save stores nothing and shows every problem in the editor, with the edits kept:
+    // a checkout config key the step does not support, an undeclared input, a config value of the
+    // wrong type, an invalid config, a step without a type, an output without a path, a duplicated
+    // variable and a zero timeout
+    string[2][] broken = [
+        ["project_id", "proj_dash_1"], ["task_id", "package"], ["name", "Package (edited)"],
+        ["step_name", "Fetch"], ["step_type", "checkout"], ["step_config", `{"input": "src", "url": "https://example.test/x.git", "depth": "1"}`],
+        ["step_name", "Zip"], ["step_type", "bash"], ["step_config", `{"script": `],
+        ["step_name", "Typeless"], ["step_type", ""], ["step_config", `{}`],
+        ["output_artifacts", "out/game.zip"],
+        ["environment", "A=1\nA=2"],
+        ["timeout_seconds", "0"],
+    ];
+    auto rejected = request(HTTPMethod.POST, "/projects/tasks/save", broken);
+    assert(rejected.status == HTTPStatus.badRequest, format("HTTP %s", rejected.status));
+    foreach (fragment; ["Step 1 (Fetch): config key", "is not supported; a checkout step", "is not a repository input declared",
+        "must be a positive integer", "Step 2 (Zip): the config is not valid JSON", "Step 3 (Typeless): step type",
+        "write each output as id: path", "Environment line 2", "Timeout:"])
+    {
+        assert(rejected.body.canFind(fragment), fragment ~ "\n" ~ rejected.body);
+    }
+    // The edits are shown again as typed: the name, the invalid config text, the empty type
+    // (which the editor leaves unselected rather than replacing it with the first type)
+    assert(rejected.body.canFind(`value="Package (edited)"`), rejected.body);
+    assert(rejected.body.canFind(`"config":"{\"script\": "`), rejected.body);
+    assert(rejected.body.canFind(`"type":""`) && rejected.body.canFind(`"name":"Typeless"`), rejected.body);
+    assert(rejected.body.canFind(`value="0"`), rejected.body);
+    assert(storedTask("package") == stored, "Nothing was saved");
 
     // Running a project fails loudly until request intake lands
     auto runReq = createTestHTTPServerRequest(URL("http://localhost/projects/run"), HTTPMethod.POST);
@@ -987,7 +1304,4 @@ unittest
     try router.handleRequest(runReq, runRes);
     catch (HTTPStatusException e) notImplemented = e.status == HTTPStatus.notImplemented && e.msg == buildsNotImplemented().msg;
     assert(notImplemented);
-
-    import std.file : exists, rmdirRecurse;
-    if (exists("test_dashboard_storage")) rmdirRecurse("test_dashboard_storage");
 }

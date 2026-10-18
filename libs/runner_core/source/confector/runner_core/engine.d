@@ -1,7 +1,6 @@
 module confector.runner_core.engine;
 
-import confector.core.model;
-import confector.plugin_api.model : ArtifactStorage;
+import confector.plugin_api.model;
 import confector.runner_core.artifacts;
 import confector.runner_core.steps.step : StepContext, StepResult, StepRunner;
 
@@ -200,7 +199,7 @@ class TaskEngine
         {
             if (m_artifactStorage is null)
             {
-                result.status = TaskStatus.failed;
+                result.status = ExecutionStatus.failed;
                 result.errorMessage = "ArtifactStorage is null but task requires upstream artifacts";
                 sw.stop();
                 result.durationMs = sw.peek.total!"msecs";
@@ -217,7 +216,7 @@ class TaskEngine
 
                 if (!m_artifactStorage.artifactExists(upFp, artId))
                 {
-                    result.status = TaskStatus.failed;
+                    result.status = ExecutionStatus.failed;
                     result.errorMessage = missingUpstreamArtifactMessage(upTaskId, upFp, artId);
                     sw.stop();
                     result.durationMs = sw.peek.total!"msecs";
@@ -227,7 +226,7 @@ class TaskEngine
                 bool staged = ArtifactStager.stageUpstreamArtifact(m_artifactStorage, upFp, artId, targetLocal);
                 if (!staged)
                 {
-                    result.status = TaskStatus.failed;
+                    result.status = ExecutionStatus.failed;
                     result.errorMessage = format(
                         "Failed to extract upstream artifact '%s' from task '%s' into '%s' (checksum mismatch or corrupt archive)",
                         artId, upTaskId, targetLocal
@@ -289,7 +288,7 @@ class TaskEngine
 
         if (!taskSuccess)
         {
-            result.status = TaskStatus.failed;
+            result.status = ExecutionStatus.failed;
             result.errorMessage = taskErrorMessage.length > 0 ? taskErrorMessage : format("Task execution failed with exit code %d", taskExitCode);
             sw.stop();
             result.durationMs = sw.peek.total!"msecs";
@@ -313,8 +312,8 @@ class TaskEngine
                     }
                     catch (Exception e)
                     {
-                        result.status = TaskStatus.failed;
-                        result.errorMessage = format("Failed to package output artifact '%s': %s", artDecl.effectiveId, e.msg);
+                        result.status = ExecutionStatus.failed;
+                        result.errorMessage = format("Failed to package output artifact '%s': %s", artDecl.id, e.msg);
                         sw.stop();
                         result.durationMs = sw.peek.total!"msecs";
                         return result;
@@ -324,7 +323,7 @@ class TaskEngine
         }
 
         result.producedArtifacts = producedArtifacts;
-        result.status = TaskStatus.succeeded;
+        result.status = ExecutionStatus.succeeded;
         sw.stop();
         result.durationMs = sw.peek.total!"msecs";
         logInfo("[engine] executeTask completed for task '%s' (execution '%s', status: '%s', duration: %d ms, artifacts: %d)",
@@ -335,8 +334,9 @@ class TaskEngine
 
 version (unittest)
 {
-    /// A step runner for tests: runs each step's `command` as a shell command in the step's
-    /// working directory, sending its output to the step's log, and records each step it runs.
+    /// A step runner for tests: runs each step's `command` config as a shell command in the
+    /// step's working directory, sending its output to the step's log, and records each step it
+    /// runs.
     private final class ShellStepRunner : StepRunner
     {
         StepContext[] seen;
@@ -347,7 +347,7 @@ version (unittest)
 
             seen ~= context;
             StepResult res;
-            auto pipe = pipeShell(step.command, Redirect.stdout | Redirect.stderrToStdout, null, Config.none, context.workingDirectory);
+            auto pipe = pipeShell(step.config["command"].get!string, Redirect.stdout | Redirect.stderrToStdout, null, Config.none, context.workingDirectory);
             foreach (line; pipe.stdout.byLineCopy) context.log(line);
             res.exitCode = wait(pipe.pid);
             res.success = res.exitCode == 0;
@@ -357,11 +357,9 @@ version (unittest)
 
     private BuildStep shellStep(string name, string command)
     {
-        BuildStep step;
-        step.name = name;
-        step.type = "shell";
-        step.command = command;
-        return step;
+        import vibe.data.json : Json;
+
+        return BuildStep(name, "shell", Json(["command": Json(command)]));
     }
 }
 
@@ -389,7 +387,7 @@ unittest
 
     string[] logged;
     auto res1 = engine.executeTask("exe_1", node1, testDir, "fp_step1", [], null, (string line) { logged ~= line; });
-    assert(res1.status == TaskStatus.succeeded, res1.errorMessage);
+    assert(res1.status == ExecutionStatus.succeeded, res1.errorMessage);
     assert(res1.producedArtifacts.length == 1);
     assert(res1.producedArtifacts[0].taskFingerprint == "fp_step1", "Outputs are stored under the work order's fingerprint");
     assert(res1.producedArtifacts[0].executionId == "exe_1", "Outputs name the execution that produced them");
@@ -415,13 +413,13 @@ unittest
     string[] staged;
     auto res2 = engine.executeTask("exe_2", node2, ws2, "fp_step2", [ResolvedInput("out", InputKind.taskOutput, Json("fp_step1"))],
         null, (string line) { staged ~= line; });
-    assert(res2.status == TaskStatus.succeeded, res2.errorMessage);
+    assert(res2.status == ExecutionStatus.succeeded, res2.errorMessage);
     assert(exists(buildPath(ws2, "output.txt")));
     assert(staged.canFind!(line => line.canFind("hello")), "The step read the staged artifact");
 
     // An upstream fingerprint with no such artifact fails the task
     auto res3 = engine.executeTask("exe_3", node2, ws2, "fp_step2", [ResolvedInput("out", InputKind.taskOutput, Json("fp_other"))]);
-    assert(res3.status == TaskStatus.failed && res3.errorMessage.canFind("fp_other"));
+    assert(res3.status == ExecutionStatus.failed && res3.errorMessage.canFind("fp_other"));
     assert(res3.errorMessage.canFind("'step1'") && res3.errorMessage.canFind("'output.txt'") && res3.errorMessage.canFind("Re-run task 'step1'"));
 
     // A failing step fails the task with its exit code, and later steps do not run
@@ -430,14 +428,14 @@ unittest
     failing.steps = [shellStep("Fail", "exit 3"), shellStep("Never", "echo never")];
     steps.seen = null;
     auto res4 = engine.executeTask("exe_4", failing, testDir, "fp_failing", []);
-    assert(res4.status == TaskStatus.failed && res4.exitCode == 3, res4.errorMessage);
+    assert(res4.status == ExecutionStatus.failed && res4.exitCode == 3, res4.errorMessage);
     assert(res4.errorMessage.canFind("'Fail'") && steps.seen.length == 1);
 
     // A task without steps fails rather than succeeding vacuously
     TaskNode empty;
     empty.id = "empty";
     auto res5 = engine.executeTask("exe_5", empty, testDir, "fp_empty", []);
-    assert(res5.status == TaskStatus.failed && res5.errorMessage.canFind("no build steps"));
+    assert(res5.status == ExecutionStatus.failed && res5.errorMessage.canFind("no build steps"));
 
     // An engine needs a step runner
     bool noRunner = false;
@@ -462,7 +460,7 @@ unittest
     auto steps = new ShellStepRunner();
     auto engine = new TaskEngine(null, steps);
     auto res = engine.executeTask("exe_c", task, ".", "fp", [flavor, src], ["src": "https://example.test/game.git"]);
-    assert(res.status == TaskStatus.succeeded, res.errorMessage);
+    assert(res.status == ExecutionStatus.succeeded, res.errorMessage);
     assert(steps.seen.length == 1);
     auto seen = steps.seen[0];
     assert(seen.inputs.length == 2 && seen.inputs["src"] == src && seen.inputs["flavor"] == flavor);
@@ -491,6 +489,6 @@ unittest
     string[] logged;
     auto engine = new TaskEngine(null, new BuiltinStepRunner());
     auto res = engine.executeTask("exe_d", task, ".", "fp", [], null, (string line) { logged ~= line; });
-    assert(res.status == TaskStatus.failed && res.errorMessage.canFind("confector-z7z.35.1"), res.errorMessage);
+    assert(res.status == ExecutionStatus.failed && res.errorMessage.canFind("confector-z7z.35.1"), res.errorMessage);
     assert(logged.canFind!(line => line.canFind("confector-z7z.35.1")));
 }

@@ -20,7 +20,7 @@ module confector.core.work_orders;
 
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
-import confector.core.model;
+import confector.plugin_api.model;
 import confector.core.state_stores : StateStores;
 import confector.plugin_api.dispatch_queue : DispatchQueue, DispatchQueueUsageException, Lease;
 import confector.plugin_api.document_store : DocumentConflictException;
@@ -29,7 +29,6 @@ import core.time : Duration;
 import std.datetime.systime : Clock;
 import std.datetime.timezone : UTC;
 import std.format : format;
-import std.json : JSONType;
 import std.typecons : Nullable;
 import vibe.core.log : logError;
 import vibe.data.json : Json, deserializeJson;
@@ -77,60 +76,20 @@ struct ReceivedWorkOrder
 }
 
 /**
- * The work order for `execution`: its definition, fingerprint, resolved inputs and repository
- * addresses, and the compute it needs: its executor type ("local" unless the task's `executor`
- * or `executor_type` component names another) and its requirements (the `requirements`
- * component, an object of strings). Pure.
+ * The work order for `execution`: its definition (whose steps, environment and declared outputs
+ * the runner uses), fingerprint, resolved inputs and repository addresses. Pure.
  */
 WorkOrder workOrderFor(in TaskExecution execution) @trusted
 {
     WorkOrder order;
     order.executionId = execution.id;
-    order.taskId = execution.taskId;
     order.taskNode = cast(TaskNode) execution.definition;
     order.fingerprint = execution.fingerprint;
-    order.executorType = executorTypeOf(execution.definition);
-    order.requirements = requirementsOf(execution.definition);
     order.payload.inputs = (cast(ResolvedInput[]) execution.inputs).dup;
     foreach (name, address; execution.repositoryAddresses) order.payload.repositoryAddresses[name] = address;
-    foreach (name, value; execution.definition.environment) order.payload.environment[name] = value;
-    order.payload.expectedOutputs = (cast(OutputArtifactDecl[]) execution.definition.outputs.artifacts).dup;
     order.timeoutSeconds = execution.definition.timeoutSeconds;
     order.createdAt = execution.createdAt;
     return order;
-}
-
-private string executorTypeOf(in TaskNode definition) @trusted
-{
-    if (definition.hasCustomComponent("executor"))
-    {
-        auto comp = definition.getCustomComponent("executor");
-        if (comp.type == JSONType.string) return comp.str;
-        if (comp.type == JSONType.object && "type" in comp) return comp["type"].str;
-    }
-    else if (definition.hasCustomComponent("executor_type"))
-    {
-        auto comp = definition.getCustomComponent("executor_type");
-        if (comp.type == JSONType.string) return comp.str;
-    }
-    return "local";
-}
-
-private string[string] requirementsOf(in TaskNode definition) @trusted
-{
-    string[string] requirements;
-    if (definition.hasCustomComponent("requirements"))
-    {
-        auto comp = definition.getCustomComponent("requirements");
-        if (comp.type == JSONType.object)
-        {
-            foreach (k, v; comp.object)
-            {
-                requirements[k] = v.type == JSONType.string ? v.str : v.toString();
-            }
-        }
-    }
-    return requirements;
 }
 
 /**
@@ -364,25 +323,19 @@ TaskExecution finishExecution(StateStores stores, string executionId, ExecutionS
 }
 
 /**
- * The execution status a worker's reported task status records: succeeded, failed or cancelled.
- * A worker ran the execution, so it can never report a cache hit.
+ * Checks that `status`, as a worker reported it, is one a worker can report: a terminal status
+ * (succeeded, failed or cancelled), since the worker finished running the execution. Returns it.
  *
- * Throws: InvalidCompletionException if `status` is not one of those three.
+ * Throws: InvalidCompletionException if `status` is active (queued or running).
  */
-ExecutionStatus reportedExecutionStatus(TaskStatus status) pure @safe
+ExecutionStatus reportedExecutionStatus(ExecutionStatus status) pure @safe
 {
-    switch (status)
+    if (ExecutionStore.isActive(status))
     {
-        case TaskStatus.succeeded:
-            return ExecutionStatus.succeeded;
-        case TaskStatus.failed:
-            return ExecutionStatus.failed;
-        case TaskStatus.cancelled:
-            return ExecutionStatus.cancelled;
-        default:
-            throw new InvalidCompletionException(format("A completion reported status '%s'; a worker can report only succeeded, failed or cancelled",
-                cast(string) status));
+        throw new InvalidCompletionException(format("A completion reported status '%s'; a worker can report only succeeded, failed or cancelled",
+            cast(string) status));
     }
+    return status;
 }
 
 /**
@@ -462,7 +415,6 @@ version (unittest)
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import core.time : hours;
     import std.algorithm.searching : canFind;
-    import std.json : JSONValue;
     import vibe.data.json : serializeToJson;
 
     private string fixedNow() { return "2026-10-16T10:00:02Z"; }
@@ -478,11 +430,10 @@ version (unittest)
         execution.status = ExecutionStatus.queued;
         execution.definition.id = "compile";
         execution.definition.inputs["src"] = repositoryInput("game", "main");
-        execution.definition.steps = [BuildStep("Compile", "bash", null, "make")];
+        execution.definition.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
         execution.definition.environment = ["MODE": "release"];
         execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
         execution.definition.timeoutSeconds = 1200;
-        execution.definition.setCustomComponent("executor", JSONValue("aws-ecs"));
         execution.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
         execution.repositoryAddresses = ["src": "https://example.test/game.git"];
         execution.createdAt = "2026-10-16T10:00:00Z";
@@ -515,11 +466,12 @@ unittest
     auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w1", () => fixedNow());
     assert(received.length == 1 && received[0].receiveCount == 1);
     auto order = received[0].workOrder;
-    assert(order.executionId == id && order.taskId == "compile" && order.fingerprint == "fp1");
-    assert(order.taskNode.steps[0].script == "make" && order.timeoutSeconds == 1200 && order.executorType == "aws-ecs");
+    assert(order.executionId == id && order.taskNode.id == "compile" && order.fingerprint == "fp1");
+    assert(order.taskNode.steps[0].config["script"].get!string == "make" && order.timeoutSeconds == 1200);
+    assert(order.taskNode.environment == ["MODE": "release"]);
+    assert(order.taskNode.outputs.artifacts == [OutputArtifactDecl("game.zip", "out/game.zip")]);
     assert(order.payload.inputs == sampleExecution(id).inputs);
     assert(order.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
-    assert(order.payload.environment == ["MODE": "release"] && order.payload.expectedOutputs.length == 1);
     auto running = stores.executions.get(id).get;
     assert(running.status == ExecutionStatus.running && running.attempts == 1 && running.worker == "w1");
     assert(running.startedAt == fixedNow() && running.sentAt == fixedNow(), "Receiving records the send it proves");
@@ -549,26 +501,6 @@ unittest
     assert(done.status == ExecutionStatus.succeeded && done.finishedAt == fixedNow());
     queue.release(defaultPoolQueue, again[0].receipt);
     assert(receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "w4").length == 0);
-}
-
-unittest
-{
-    // The executor type and requirements come from the definition's components; without them a
-    // task runs on the local executor with no requirements
-    auto plain = sampleExecution("exe_1");
-    plain.definition = TaskNode.init;
-    plain.definition.id = "compile";
-    assert(workOrderFor(plain).executorType == "local" && workOrderFor(plain).requirements.length == 0);
-
-    auto typed = plain;
-    typed.definition.setCustomComponent("executor", JSONValue(["type": JSONValue("kubernetes")]));
-    typed.definition.setCustomComponent("requirements", JSONValue(["gpu": JSONValue("true"), "cores": JSONValue(8)]));
-    assert(workOrderFor(typed).executorType == "kubernetes");
-    assert(workOrderFor(typed).requirements == ["gpu": "true", "cores": "8"]);
-
-    auto legacyKey = plain;
-    legacyKey.definition.setCustomComponent("executor_type", JSONValue("ecs"));
-    assert(workOrderFor(legacyKey).executorType == "ecs");
 }
 
 unittest
@@ -774,15 +706,16 @@ unittest
 
 unittest
 {
-    // A worker's completion: the reported status maps to the execution's outcome, a worker cannot
-    // report a cache hit or an unfinished status, and a completion naming another task is
-    // rejected. Each rejection records nothing
+    // A worker's completion: the reported status is the execution's outcome, a worker cannot
+    // report an unfinished status, and a completion naming another task is rejected. Each
+    // rejection records nothing
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = queueExecution(stores, "exe_1");
 
-    assert(reportedExecutionStatus(TaskStatus.succeeded) == ExecutionStatus.succeeded);
-    assert(reportedExecutionStatus(TaskStatus.failed) == ExecutionStatus.failed);
-    assert(reportedExecutionStatus(TaskStatus.cancelled) == ExecutionStatus.cancelled);
+    foreach (status; [ExecutionStatus.succeeded, ExecutionStatus.failed, ExecutionStatus.cancelled])
+    {
+        assert(reportedExecutionStatus(status) == status);
+    }
 
     bool rejectedWith(TaskExecutionResult result, string text)
     {
@@ -791,7 +724,7 @@ unittest
         return false;
     }
 
-    foreach (status; [TaskStatus.cached, TaskStatus.running, TaskStatus.pending, TaskStatus.queued])
+    foreach (status; [ExecutionStatus.running, ExecutionStatus.queued])
     {
         TaskExecutionResult result;
         result.status = status;
@@ -799,7 +732,7 @@ unittest
     }
     TaskExecutionResult otherTask;
     otherTask.taskId = "link";
-    otherTask.status = TaskStatus.succeeded;
+    otherTask.status = ExecutionStatus.succeeded;
     assert(rejectedWith(otherTask, "names task 'link'"));
     assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
 
@@ -808,7 +741,7 @@ unittest
     // written: no cache entry, no chain re-evaluation
     TaskExecutionResult failed;
     failed.taskId = "compile";
-    failed.status = TaskStatus.failed;
+    failed.status = ExecutionStatus.failed;
     failed.exitCode = 2;
     failed.errorMessage = "make: *** [all] Error 2";
     failed.producedArtifacts = [ArtifactMetadata("partial.log")];
@@ -824,7 +757,7 @@ unittest
     catch (UnknownExecutionException e) unknownExecution = e.msg.canFind("exe_nope");
     assert(unknownExecution);
     TaskExecutionResult again;
-    again.status = TaskStatus.succeeded;
+    again.status = ExecutionStatus.succeeded;
     bool stale = false;
     try completeExecution(stores, id, again);
     catch (StaleCompletionException e) stale = e.msg.canFind(id);
@@ -841,9 +774,9 @@ unittest
 
     TaskExecutionResult succeeded;
     succeeded.taskId = "compile";
-    succeeded.status = TaskStatus.succeeded;
+    succeeded.status = ExecutionStatus.succeeded;
     TaskExecutionResult cancelled = succeeded;
-    cancelled.status = TaskStatus.cancelled;
+    cancelled.status = ExecutionStatus.cancelled;
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);

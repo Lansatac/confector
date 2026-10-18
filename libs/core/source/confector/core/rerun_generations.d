@@ -19,7 +19,7 @@ module confector.core.rerun_generations;
 
 import confector.core.dag : TaskGraph;
 import confector.core.input_resolution : GraphResolution, RerunGenerations, graphResolution;
-import confector.core.model : InputDecl, InputPin;
+import confector.plugin_api.model : InputDecl, InputPin;
 import confector.plugin_api.document_store;
 
 import vibe.data.json : Json;
@@ -215,7 +215,7 @@ GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in 
 version (unittest)
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
-    import confector.core.model;
+    import confector.plugin_api.model;
 
     import std.algorithm.searching : canFind;
     import std.typecons : Nullable;

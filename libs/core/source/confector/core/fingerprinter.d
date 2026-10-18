@@ -1,6 +1,6 @@
 module confector.core.fingerprinter;
 
-import confector.core.model;
+import confector.plugin_api.model;
 
 import vibe.data.json : Json;
 
@@ -277,14 +277,14 @@ unittest
     TaskNode task;
     task.id = "build";
     task.inputs["flavor"] = valueInput("internal");
-    task.steps = [BuildStep("Build", "bash", null, "dub build --build=release")];
+    task.steps = [BuildStep("Build", "bash", Json(["script": Json("dub build --build=release")]))];
     task.environment = ["DUB_ARGS": "-q"];
     task.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
 
     const base = computeBaseFingerprint("p", task.id, pinInputs(task, null));
 
     TaskNode changed = task;
-    changed.steps = [BuildStep("Build", "bash", null, "dub build --build=debug"), BuildStep("Extra", "bash", null, "echo")];
+    changed.steps = [BuildStep("Build", "bash", Json(["script": Json("dub build --build=debug")])), BuildStep("Extra", "bash", Json(["script": Json("echo")]))];
     changed.environment = ["DUB_ARGS": "-v", "EXTRA": "1"];
     changed.outputs.artifacts = [OutputArtifactDecl("binaries", "dist/*")];
     assert(computeBaseFingerprint("p", changed.id, pinInputs(changed, null)) == base,

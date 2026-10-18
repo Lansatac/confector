@@ -638,16 +638,18 @@ Be aware of these so you do not spread them:
   `confector-z7z.49.4`). The chain evaluator, execution dispatcher and fingerprint claims were
   deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). Do not add a build path outside the
-  chain components. Nothing in the project is kept for backward compatibility.
+  chain components. The build log routes answer 501 until the log store lands (bead
+  `confector-z7z.31.12`). Nothing in the project is kept for backward compatibility.
 - **Steps run in-process.** The runner's only working step is the built-in checkout
   (`libs/runner_core` `steps/checkout.d`); bash and PowerShell throw `NotImplementedException`
   (bead `confector-z7z.35.6`), and any other step type fails the task (bead
   `confector-z7z.35.1`). Workers send no credential until per-execution tokens land (bead
   `confector-z7z.30.1`).
-- **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has accumulated
-  aliases: several ways to specify a repository, artifact identity via `id`/`name`/`path`, multiple fields describing a
-  build step. **Do not add another alias.** If a representation is wrong, change it and update its
-  callers.
+- **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has one canonical
+  form for each concept: a step is `{name, type, config}` (config is the step type's JSON object),
+  an output is `{id, path}`, a task is `{id, name, inputs, outputs, steps, timeout_seconds,
+  environment}`. **Do not add another alias.** If a representation is wrong, change it and update
+  its callers.
 - **There are no external consumers.** Do not add "backward compatibility" shims, re-export
   modules, or deprecated fields. Change the code and its callers together.
 - **Backends are compiled in.** The server builds a typed `Backends` value at startup
@@ -661,7 +663,7 @@ Be aware of these so you do not spread them:
 Each dub package is a directory with its own `dub.json` and a `source/` folder holding the full
 module path (for example `libs/core/source/confector/core/`).
 
-- `libs/core/` — graph construction, input resolution, fingerprinting, trigger matching.
+- `libs/core/` — graph construction, input resolution, fingerprinting, built-in step types.
 - `libs/plugin_api/` — data types and backend interfaces (document store, dispatch queue,
   scheduler, artifact storage).
 - `libs/runner_core/` — executes a single task on a worker, including the built-in checkout step.
@@ -687,7 +689,7 @@ Explore the code for anything more specific; file-level details change too often
   to the project owner instead. This file should state the project's intent, not an agent's.
 - **Change the existing thing, do not add a parallel one.** Adding a new field, function, or module
   alongside an old one that does nearly the same thing is how the data model got its aliases.
-- **Test the pure core.** Graph evaluation, fingerprinting, trigger matching, and similar decision
+- **Test the pure core.** Graph evaluation, fingerprinting, and similar decision
   logic need unit tests. Because the logic is pure, tests should not need databases or servers.
 - **D conventions.** Use `immutable`, `const`, `pure`, and `@safe` / `@trusted` where they apply.
   Use `std.digest.sha` for hashing and `vibe.data.json` for serialization.

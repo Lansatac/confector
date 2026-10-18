@@ -3,32 +3,12 @@
  * Interactive HTML5 Canvas graph visualizer for DAG nodes, repository inputs, and dependency edges.
  */
 (function() {
-  // Polyfill for CanvasRenderingContext2D.roundRect (not available in older browsers)
-  if (!CanvasRenderingContext2D.prototype.roundRect) {
-    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
-      if (typeof r === "number") r = [r, r, r, r];
-      var radii = r.map(function(v) { return Math.min(v, w / 2, h / 2); });
-      this.moveTo(x + radii[0], y);
-      this.lineTo(x + w - radii[1], y);
-      this.quadraticCurveTo(x + w, y, x + w, y + radii[1]);
-      this.lineTo(x + w, y + h - radii[2]);
-      this.quadraticCurveTo(x + w, y + h, x + w - radii[2], y + h);
-      this.lineTo(x + radii[3], y + h);
-      this.quadraticCurveTo(x, y + h, x, y + h - radii[3]);
-      this.lineTo(x, y + radii[0]);
-      this.quadraticCurveTo(x, y, x + radii[0], y);
-      this.closePath();
-      return this;
-    };
-  }
   // Stored node bounding boxes for click hit-detection
   var nodeBounds = [];
   var selectedNodeId = null;
-  var onNodeSelectedCallback = null;
   var currentCanvasId = null;
   var cachedNodes = [];
   var cachedEdges = [];
-  var cachedPendingCommits = {};
 
   function drawArrow(ctx, fromX, fromY, toX, toY, color) {
     var headLen = 8;
@@ -72,13 +52,11 @@
     return inputSpecValues(t, "task_output", "task");
   }
 
-  function renderGraph(canvasId, nodes, edges, selectedId, pendingCommits) {
+  function renderGraph(canvasId, nodes, edges, selectedId) {
     var canvas = document.getElementById(canvasId);
     if (!canvas) return;
     var ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    pendingCommits = pendingCommits || {};
 
     var width = canvas.width;
     var height = canvas.height;
@@ -95,23 +73,12 @@
     nodes.forEach(function(n, index) {
       var x = n.x !== undefined ? n.x : 50 + index * 140;
       var y = n.y !== undefined ? n.y : (index % 2 === 0 ? 60 : 130);
-      var isRepo = !!n.isRepo || n.type === "repository" || n.status === "repository";
-      var pendingCount = 0;
-      if (isRepo) {
-        // Extract repo name from node id (format: "repo:repoName")
-        var repoName = n.id.replace(/^repo:/, "");
-        var pc = pendingCommits[repoName];
-        if (pc !== undefined) {
-          pendingCount = parseInt(pc, 10) || 0;
-        }
-      }
+      var isRepo = !!n.isRepo;
       nodePositions[n.id] = {
         x: x,
         y: y,
         name: n.name || n.id,
-        status: n.status || "ready",
-        isRepo: isRepo,
-        pendingCount: pendingCount
+        isRepo: isRepo
       };
       // Store bounding box for hit-detection (only task nodes)
       if (!isRepo) {
@@ -144,22 +111,10 @@
       var textColor = "#222222";
       var isSelected = (id === selectedId);
 
-      if (pos.isRepo || pos.status === "repository") {
+      if (pos.isRepo) {
         bgColor = "#f5f3ff";
         borderColor = "#7c3aed";
         textColor = "#4c1d95";
-      } else if (pos.status === "succeeded" || pos.status === "success") {
-        bgColor = "#e8f5e9";
-        borderColor = "#4caf50";
-      } else if (pos.status === "cached") {
-        bgColor = "#e0f7fa";
-        borderColor = "#00bcd4";
-      } else if (pos.status === "running") {
-        bgColor = "#fff3e0";
-        borderColor = "#ff9800";
-      } else if (pos.status === "failed") {
-        bgColor = "#ffebee";
-        borderColor = "#f44336";
       }
 
       // Draw box with shadow
@@ -207,36 +162,6 @@
           repoName = repoName.substring(0, 11) + "..";
         }
         ctx.fillText(repoName, x + nodeWidth / 2, y + nodeHeight / 2 + 6);
-
-        // Draw pending commit badge if there are pending commits
-        if (pos.pendingCount > 0) {
-          var badgeX = x + nodeWidth - 8;
-          var badgeY = y + 4;
-          var badgeText = String(pos.pendingCount);
-          // Measure badge text for size
-          ctx.font = "bold 10px Verdana, sans-serif";
-          var textMetrics = ctx.measureText(badgeText);
-          var badgeW = textMetrics.width + 10;
-          var badgeH = 16;
-
-          // Draw badge background
-          ctx.shadowColor = "rgba(0,0,0,0.15)";
-          ctx.shadowBlur = 3;
-          ctx.shadowOffsetX = 0;
-          ctx.shadowOffsetY = 1;
-          ctx.fillStyle = "#e53e3e";
-          ctx.beginPath();
-          ctx.roundRect(badgeX - badgeW / 2, badgeY - badgeH / 2, badgeW, badgeH, 8);
-          ctx.fill();
-          ctx.shadowColor = "transparent";
-
-          // Draw badge text
-          ctx.fillStyle = "#ffffff";
-          ctx.font = "bold 10px Verdana, sans-serif";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(badgeText, badgeX, badgeY);
-        }
       } else {
         ctx.fillStyle = textColor;
         ctx.font = "bold 12px Verdana, sans-serif";
@@ -251,13 +176,10 @@
     });
   }
 
-  window.renderTaskGraph = function(canvasId, tasks, taskStatuses, onNodeSelected, pendingCommits) {
+  // Draws a project's task graph: its repository inputs and tasks, with edges from repository
+  // inputs and task_output inputs. Clicking a task highlights it.
+  window.renderTaskGraph = function(canvasId, tasks) {
     if (!tasks || !tasks.length) return;
-    taskStatuses = taskStatuses || {};
-    pendingCommits = pendingCommits || {};
-    if (typeof onNodeSelected === "function") {
-      onNodeSelectedCallback = onNodeSelected;
-    }
     currentCanvasId = canvasId;
     selectedNodeId = null;
 
@@ -387,9 +309,7 @@
       levelGroups[lvl].push({
         id: repoId,
         name: repoName,
-        isRepo: true,
-        type: "repository",
-        status: "repository"
+        isRepo: true
       });
     });
 
@@ -401,8 +321,6 @@
         id: t.id,
         name: t.name || t.id,
         isRepo: false,
-        type: "task",
-        status: taskStatuses[t.id] || "ready",
         task: t
       });
     });
@@ -437,9 +355,7 @@
           name: item.name,
           x: x,
           y: y,
-          status: item.status,
-          isRepo: item.isRepo,
-          type: item.type
+          isRepo: item.isRepo
         });
 
         if (!item.isRepo && item.task) {
@@ -463,8 +379,7 @@
     // Cache nodes and edges for click re-rendering
     cachedNodes = nodes;
     cachedEdges = edges;
-    cachedPendingCommits = pendingCommits;
-    renderGraph(canvasId, nodes, edges, selectedNodeId, pendingCommits);
+    renderGraph(canvasId, nodes, edges, selectedNodeId);
   };
 
   // Click handler for canvas — hit-detect task nodes
@@ -485,45 +400,14 @@
           selectedNodeId = b.id;
         }
         // Re-render with selection highlight
-        renderGraph(currentCanvasId, cachedNodes, cachedEdges, selectedNodeId, cachedPendingCommits);
-        // Fire callback
-        if (onNodeSelectedCallback) {
-          onNodeSelectedCallback(selectedNodeId);
-        }
+        renderGraph(currentCanvasId, cachedNodes, cachedEdges, selectedNodeId);
         return;
       }
     }
     // Clicked empty space — clear selection
     if (selectedNodeId) {
       selectedNodeId = null;
-      renderGraph(currentCanvasId, cachedNodes, cachedEdges, null, cachedPendingCommits);
-      if (onNodeSelectedCallback) {
-        onNodeSelectedCallback(null);
-      }
+      renderGraph(currentCanvasId, cachedNodes, cachedEdges, null);
     }
   }
-
-  window.renderDAG = window.renderTaskGraph;
-
-  window.renderSampleDAG = function(canvasId) {
-    var nodes = [
-      { id: "repo:confector", name: "confector", isRepo: true, status: "repository", x: 40, y: 90 },
-      { id: "lint", name: "lint", x: 190, y: 90, status: "ready" },
-      { id: "build", name: "build", x: 340, y: 90, status: "ready" },
-      { id: "test", name: "test", x: 490, y: 40, status: "ready" },
-      { id: "package", name: "package", x: 490, y: 140, status: "ready" },
-      { id: "deploy", name: "deploy", x: 640, y: 90, status: "ready" }
-    ];
-
-    var edges = [
-      { from: "repo:confector", to: "lint", color: "#7c3aed" },
-      { from: "lint", to: "build" },
-      { from: "build", to: "test" },
-      { from: "build", to: "package" },
-      { from: "test", to: "deploy" },
-      { from: "package", to: "deploy" }
-    ];
-
-    renderGraph(canvasId, nodes, edges);
-  };
 })();

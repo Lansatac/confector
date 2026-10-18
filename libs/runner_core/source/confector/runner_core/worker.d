@@ -1,7 +1,6 @@
 module confector.runner_core.worker;
 
-import confector.core.model;
-import confector.plugin_api.model : ArtifactStorage;
+import confector.plugin_api.model;
 import confector.plugin_api.dispatch_queue : Lease;
 import confector.runner_core.engine;
 import confector.runner_core.http_artifact_storage;
@@ -355,10 +354,10 @@ class HttpWorkerDaemon
         {
             // Its completion could not name what it completes: refuse it before running anything
             throw new Exception(format("Work order for task '%s' (receipt '%s') names no execution; it cannot be run or completed",
-                msg.taskId, lease.receipt));
+                msg.taskNode.id, lease.receipt));
         }
         const string executionId = msg.executionId;
-        string taskId = msg.taskId;
+        const string taskId = msg.taskNode.id;
         string taskWsDir = buildPath(m_config.workspaceDir, executionId);
         if (!exists(taskWsDir))
         {
@@ -402,30 +401,8 @@ class HttpWorkerDaemon
             }
         }
 
-        // Prepare TaskNode
+        // The task's steps, environment and declared outputs come from its definition
         TaskNode taskNode = deserializeJson!TaskNode(serializeToJson(msg.taskNode));
-        if (taskNode.id.length == 0)
-        {
-            taskNode.id = taskId;
-        }
-
-        if (taskNode.environment.length == 0 && msg.payload.environment.length > 0)
-        {
-            foreach (k, v; msg.payload.environment)
-            {
-                taskNode.environment[k] = v;
-            }
-        }
-
-
-        // Map expectedOutputs to taskNode outputs
-        if (msg.payload.expectedOutputs.length > 0)
-        {
-            foreach (expOut; msg.payload.expectedOutputs)
-            {
-                taskNode.outputs.artifacts ~= expOut;
-            }
-        }
 
         // Live Log streaming buffer
         string[] logBuffer;
@@ -471,7 +448,8 @@ class HttpWorkerDaemon
         }
         catch (Exception e)
         {
-            result.status = TaskStatus.failed;
+            result.taskId = taskId;
+            result.status = ExecutionStatus.failed;
             result.errorMessage = format("Worker unhandled exception during task execution: %s", e.msg);
             result.exitCode = 1;
             onLogLine(format("[worker] Exception: %s", e.msg));
@@ -577,8 +555,8 @@ version (unittest)
 {
     import confector.runner_core.steps.step : StepContext, StepResult;
 
-    /// A step runner for tests: each line of a step's `command` is one line of its output. A
-    /// step whose command is "fail" fails with exit code 4. Counts the steps it runs; it is
+    /// A step runner for tests: each line of a step's `command` config is one line of its
+    /// output. A step whose command is "fail" fails with exit code 4. Counts the steps it runs; it is
     /// passed to the worker explicitly, so the worker's thread sees it.
     private final class ScriptedStepRunner : StepRunner
     {
@@ -590,7 +568,8 @@ version (unittest)
 
             ++stepsRun;
             StepResult result;
-            if (step.command == "fail")
+            const command = step.config["command"].get!string;
+            if (command == "fail")
             {
                 context.log("scripted failure");
                 result.success = false;
@@ -598,18 +577,14 @@ version (unittest)
                 result.errorMessage = "The scripted step failed";
                 return result;
             }
-            foreach (line; step.command.splitLines) context.log(line);
+            foreach (line; command.splitLines) context.log(line);
             return result;
         }
     }
 
     private BuildStep scriptedStep(string name, string command)
     {
-        BuildStep step;
-        step.name = name;
-        step.type = "scripted";
-        step.command = command;
-        return step;
+        return BuildStep(name, "scripted", Json(["command": Json(command)]));
     }
 
     /// Runs `work` on a thread of its own while this thread's event loop serves the mock
@@ -663,7 +638,6 @@ unittest
 
     WorkOrder mockOrder;
     mockOrder.executionId = "exe_mock_1";
-    mockOrder.taskId = "task_test_1";
     mockOrder.fingerprint = "fp_mock_123";
     mockOrder.taskNode.id = "task_test_1";
     mockOrder.taskNode.steps = [scriptedStep("step", "Mock step execution finished successfully")];
@@ -719,7 +693,7 @@ unittest
     assert(dequeueCalled);
     assert(steps.stepsRun == 1, "The worker ran the task's step with the step runner it was given");
     assert(completedExecutions == ["exe_mock_1"], "The completion names the work order's execution");
-    assert(reported.length == 1 && reported[0].status == TaskStatus.succeeded, format("Reported %s", reported));
+    assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("Reported %s", reported));
     assert(reported[0].taskId == "task_test_1" && reported[0].exitCode == 0 && reported[0].errorMessage.length == 0);
     assert(reportedFingerprint == [false], "The completion carries no fingerprint");
     assert(ackedReceipts == ["receipt_xyz"]);
@@ -740,7 +714,7 @@ unittest
         ackedReceipts = null;
         reported = null;
         runOffThread({ workerRunner.processOneMessage(lease); });
-        assert(reported.length == 1 && reported[0].status == TaskStatus.succeeded, format("HTTP %s: reported %s", status, reported));
+        assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("HTTP %s: reported %s", status, reported));
         string[] expectedAcks;
         if (acked) expectedAcks = ["receipt_xyz"];
         assert(ackedReceipts == expectedAcks, format("HTTP %s: acknowledged %s", status, ackedReceipts));
@@ -756,7 +730,7 @@ unittest
     steps.stepsRun = 0;
     auto failingLease = Lease("receipt_failing", 1, serializeToJson(failing));
     runOffThread({ workerRunner.processOneMessage(failingLease); });
-    assert(reported.length == 1 && reported[0].status == TaskStatus.failed, format("Reported %s", reported));
+    assert(reported.length == 1 && reported[0].status == ExecutionStatus.failed, format("Reported %s", reported));
     assert(reported[0].exitCode == 4 && reported[0].errorMessage == "The scripted step failed", reported[0].errorMessage);
     assert(steps.stepsRun == 1, "Steps after a failed one do not run");
     assert(ackedReceipts == ["receipt_failing"]);
@@ -778,7 +752,9 @@ unittest
 unittest
 {
     // With the runner's built-in steps, a step type that is not built in fails the task and a
-    // built-in that is not implemented yet fails it loudly; both are reported, naming the bead
+    // built-in that is not implemented yet fails it loudly; both are reported, naming the bead.
+    // The server does not store log lines yet (bead confector-z7z.31.12) and answers 501: the
+    // worker only warns, and still reports and acknowledges each execution
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
@@ -792,8 +768,11 @@ unittest
     auto router = new URLRouter();
     TaskExecutionResult[string] reported;
     string[] ackedReceipts;
+    size_t logUploads;
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        res.writeJsonBody(["status": "ok"]);
+        ++logUploads;
+        res.statusCode = 501;
+        res.writeJsonBody(["error": "Build logs are not implemented", "bead": "confector-z7z.31.12"]);
     });
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         reported[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json);
@@ -818,7 +797,6 @@ unittest
     auto worker = new HttpWorkerDaemon(config, new BuiltinStepRunner());
 
     WorkOrder order;
-    order.taskId = "package";
     order.fingerprint = "fp_package";
     order.taskNode.id = "package";
     foreach (type, execution; ["docker:build": "exe_unknown", "bash": "exe_bash", "powershell": "exe_powershell"])
@@ -830,17 +808,18 @@ unittest
         auto lease = Lease("receipt_" ~ execution, 1, serializeToJson(order));
         runOffThread({ worker.initialize(); worker.processOneMessage(lease); });
     }
-    assert(reported["exe_unknown"].status == TaskStatus.failed);
+    assert(reported["exe_unknown"].status == ExecutionStatus.failed);
     assert(reported["exe_unknown"].errorMessage.canFind("confector-z7z.35.1"), reported["exe_unknown"].errorMessage);
     foreach (execution; ["exe_bash", "exe_powershell"])
     {
-        assert(reported[execution].status == TaskStatus.failed, execution);
+        assert(reported[execution].status == ExecutionStatus.failed, execution);
         assert(reported[execution].errorMessage.canFind("confector-z7z.35.6"), reported[execution].errorMessage);
     }
     // Each failure was recorded and its lease acknowledged, so the work order is not delivered
     // again only to fail the same way
     import std.algorithm.sorting : sort;
     assert(ackedReceipts.sort.release == ["receipt_exe_bash", "receipt_exe_powershell", "receipt_exe_unknown"], format("Acknowledged %s", ackedReceipts));
+    assert(logUploads > 0, "The worker tried to upload its log lines");
 }
 
 unittest
@@ -859,7 +838,7 @@ unittest
 
     auto router = new URLRouter();
     string[] completedExecutions;
-    TaskStatus[string] reportedStatus;
+    ExecutionStatus[string] reportedStatus;
     string[] acknowledgedReceipts;
     string[][string] streamedByExecution;
     bool logAfterCompletion = false;
@@ -870,7 +849,6 @@ unittest
 
     WorkOrder orderStep1;
     orderStep1.executionId = "exe_step_1";
-    orderStep1.taskId = "task_step_1";
     orderStep1.fingerprint = "fp_step_1";
     orderStep1.taskNode.id = "task_step_1";
     orderStep1.taskNode.steps = [scriptedStep("step1", firstLines.join("\n"))];
@@ -878,7 +856,6 @@ unittest
 
     WorkOrder orderStep2;
     orderStep2.executionId = "exe_step_2";
-    orderStep2.taskId = "task_step_2";
     orderStep2.fingerprint = "fp_step_2";
     orderStep2.taskNode.id = "task_step_2";
     orderStep2.taskNode.steps = [scriptedStep("step2a", "second task line 1"), scriptedStep("step2b", "second task line 2")];
@@ -929,7 +906,7 @@ unittest
 
     assert(workerRunner.tasksProcessed == 2);
     assert(completedExecutions == ["exe_step_1", "exe_step_2"]);
-    assert(reportedStatus == ["exe_step_1": TaskStatus.succeeded, "exe_step_2": TaskStatus.succeeded], format("Reported %s", reportedStatus));
+    assert(reportedStatus == ["exe_step_1": ExecutionStatus.succeeded, "exe_step_2": ExecutionStatus.succeeded], format("Reported %s", reportedStatus));
     assert(acknowledgedReceipts == ["receipt_step_1", "receipt_step_2"]);
     assert(streamedByExecution.length == 2, format("Logs went to %s", streamedByExecution.keys));
     assert(!logAfterCompletion, "A log batch was sent after the completion");

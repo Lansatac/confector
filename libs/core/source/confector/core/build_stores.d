@@ -13,7 +13,7 @@ module confector.core.build_stores;
 
 import confector.core.counters : CounterStore;
 import confector.core.document_collection;
-import confector.core.model;
+import confector.plugin_api.model;
 import confector.plugin_api.document_store;
 
 import std.algorithm.searching : canFind;
@@ -525,7 +525,7 @@ unittest
     redefined.definitionHash = "def2";
     assert(throwsA!InvalidStateTransitionException({ executions.update(v3, redefined); }), "The definition hash is fixed at dispatch");
     TaskExecution restepped = v3.value;
-    restepped.definition.steps = [BuildStep("Compile", "bash", null, "make release")];
+    restepped.definition.steps = [BuildStep("Compile", "bash", Json(["script": Json("make release")]))];
     assert(throwsA!InvalidStateTransitionException({ executions.update(v3, restepped); }), "The definition is fixed at dispatch");
     TaskExecution repinned = v3.value;
     repinned.inputs = [ResolvedInput("src", InputKind.repository, Json("bbb222"))];

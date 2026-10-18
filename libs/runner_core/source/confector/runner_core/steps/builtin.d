@@ -1,6 +1,7 @@
 module confector.runner_core.steps.builtin;
 
-import confector.core.model : BuildStep;
+import confector.core.builtin_steps : checkoutStepType;
+import confector.plugin_api.model : BuildStep;
 import confector.core.not_implemented : NotImplementedException;
 import confector.runner_core.steps.step;
 import confector.runner_core.steps.checkout : runCheckout;
@@ -14,14 +15,11 @@ import std.format : format;
  */
 final class BuiltinStepRunner : StepRunner
 {
-    /// The step type of the built-in checkout step.
-    enum checkoutType = "checkout";
-
     StepResult run(in BuildStep step, ref StepContext context)
     {
         switch (step.type)
         {
-            case checkoutType:
+            case checkoutStepType:
                 return runCheckout(step, context);
             case "bash":
             case "powershell":
@@ -72,5 +70,5 @@ unittest
     BuildStep checkout;
     checkout.type = "checkout";
     auto checkoutResult = runner.run(checkout, context);
-    assert(!checkoutResult.success && checkoutResult.errorMessage.canFind("no 'input' parameter"), checkoutResult.errorMessage);
+    assert(!checkoutResult.success && checkoutResult.errorMessage.canFind("no 'input'"), checkoutResult.errorMessage);
 }

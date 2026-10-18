@@ -10,7 +10,6 @@ module confector.core.state_stores;
 import confector.core.api_token_store : ApiTokenStore;
 import confector.core.build_stores : BuildRequestStore, ChainStore, ExecutionStore;
 import confector.core.counters : CounterStore;
-import confector.core.legacy_stores : ExecutionLogStore, TriggerRuleStore, VcsStateStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
 import confector.core.rerun_generations : RerunGenerationStore;
 import confector.plugin_api.document_store : DocumentStore;
@@ -33,11 +32,6 @@ final class StateStores
     TrackedBranchStore trackedBranches;
     ApiTokenStore apiTokens;
 
-    // Records being replaced; see confector.core.legacy_stores for when each goes
-    ExecutionLogStore logs;
-    TriggerRuleStore triggerRules;
-    VcsStateStore vcsStates;
-
     private DocumentStore m_store;
 
     /// Builds every store over `store`, declaring their collections.
@@ -57,9 +51,6 @@ final class StateStores
         repositories = new RepositoryStore(store);
         trackedBranches = new TrackedBranchStore(store);
         apiTokens = new ApiTokenStore(store);
-        logs = new ExecutionLogStore(store);
-        triggerRules = new TriggerRuleStore(store);
-        vcsStates = new VcsStateStore(store);
     }
 
     /// The DocumentStore the stores are kept in.
@@ -69,7 +60,7 @@ final class StateStores
 unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
-    import confector.core.model : ProjectRecord;
+    import confector.plugin_api.model : ProjectRecord;
 
     // Every store is declared over one document store; a restarted process redeclares the same
     // collections and sees the same data

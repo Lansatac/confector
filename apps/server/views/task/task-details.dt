@@ -34,7 +34,7 @@ block maincontent
           tr
             th(style="width: 140px;") Upstream Tasks
             td
-              - import confector.core.model : upstreamTaskIds, repositoryIds, InputKind;
+              - import confector.plugin_api.model : upstreamTaskIds, repositoryIds, InputKind;
               - auto upstreamTasks = upstreamTaskIds(taskNode);
               - if (upstreamTasks.length > 0)
                 div(style="display: flex; flex-wrap: wrap; gap: 6px;")
@@ -80,7 +80,7 @@ block maincontent
                 span.text-muted None
 
       div.card
-        h3 Outputs & Triggers
+        h3 Outputs
         table.data-table
           tr
             th(style="width: 140px;") Declared Outputs
@@ -89,19 +89,10 @@ block maincontent
                 div(style="display: flex; flex-direction: column; gap: 4px;")
                   - foreach(art; taskNode.outputs.artifacts)
                     div
-                      strong #{art.effectiveId}: 
-                      code #{art.effectivePath}
+                      strong #{art.id}: 
+                      code #{art.path}
               - else
                 span.text-muted No output artifacts declared
-          tr
-            th Triggers
-            td
-              - if (taskNode.triggers.length > 0)
-                div(style="display: flex; flex-wrap: wrap; gap: 6px;")
-                  - foreach(trig; taskNode.triggers)
-                    span.badge.badge-primary #{trig.type}
-              - else
-                span.text-muted Manual dispatch only
 
     div.section-title-bar(style="margin-top: 20px;")
       h2 Build Step Breakdown
@@ -118,8 +109,7 @@ block maincontent
             th #
             th Step Type
             th Step Name
-            th Target Command / Script
-            th Working Directory
+            th Config
         tbody
           - foreach(size_t idx, step; taskNode.steps)
             tr
@@ -129,13 +119,6 @@ block maincontent
               td
                 strong #{step.name.length > 0 ? step.name : step.type}
               td
-                - string cmdSummary = step.script.length > 0 ? step.script : step.command;
-                - if (cmdSummary.length == 0 && "script" in step.parameters) cmdSummary = step.parameters["script"];
-                - if (cmdSummary.length == 0 && "command" in step.parameters) cmdSummary = step.parameters["command"];
-                - if (cmdSummary.length > 60)
-                  code #{cmdSummary[0 .. 60]}...
-                - else if (cmdSummary.length > 0)
-                  code #{cmdSummary}
-                - else
-                  span.text-muted -
-              td #{step.workingDirectory.length > 0 ? step.workingDirectory : "."}
+                - import vibe.data.json : Json;
+                - string configText = step.config.type == Json.Type.undefined ? "{}" : step.config.toString();
+                code(style="white-space: pre-wrap; word-break: break-all;") #{configText}

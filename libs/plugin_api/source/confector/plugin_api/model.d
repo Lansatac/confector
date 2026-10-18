@@ -1,27 +1,9 @@
 module confector.plugin_api.model;
 
-import std.json : JSONValue, JSONType, parseJSON;
-import vibe.data.serialization : asName = name, optional, ignore;
+import vibe.data.serialization : asName = name, optional;
 
 /**
- * Task execution status states, in the build model that BuildChain and TaskExecution replace.
- * ExecutionStatus supersedes it: there, cached and skipped are derived chain task states, not
- * stored statuses.
- */
-enum TaskStatus : string
-{
-    pending = "pending",
-    queued = "queued",
-    running = "running",
-    succeeded = "succeeded",
-    failed = "failed",
-    cached = "cached",
-    skipped = "skipped",
-    cancelled = "cancelled"
-}
-
-/**
- * Supported trigger types.
+ * What made a build request (`BuildTrigger.type`).
  */
 enum TriggerType : string
 {
@@ -30,41 +12,6 @@ enum TriggerType : string
     gitTag = "git_tag",
     webhook = "webhook",
     cron = "cron"
-}
-
-/**
- * Specification for a trigger rule defined on a task node.
- */
-struct TriggerRule
-{
-    @optional TriggerType type;
-    @optional string[] branches;
-    @optional string[] tags;
-    @optional string endpoint;
-    @optional @asName("cron_schedule") string cronSchedule;
-    @optional string[string] parameters;
-
-    this(TriggerType type, string[] branches = null, string[] tags = null, string endpoint = null, string cronSchedule = null) pure nothrow @safe
-    {
-        this.type = type;
-        this.branches = branches;
-        this.tags = tags;
-        this.endpoint = endpoint;
-        this.cronSchedule = cronSchedule;
-    }
-}
-
-/**
- * Event payload representing an incoming trigger dispatch.
- */
-struct TriggerEvent
-{
-    @optional TriggerType type;
-    @optional string branch;
-    @optional string tag;
-    @optional string endpoint;
-    @optional string[string] parameters;
-    @optional @asName("target_task_id") string targetTaskId;
 }
 
 /**
@@ -187,95 +134,28 @@ struct InputPin
 }
 
 /**
- * Output artifact declaration produced by a task execution.
+ * An artifact a task declares it produces: the files at `path` (relative to the task's working
+ * directory; a glob may match several), stored under the artifact id `id`. Both are required.
+ * task_output inputs of downstream tasks name the artifact by `id`.
  */
 struct OutputArtifactDecl
 {
-    @optional @asName("id") string id;
-    @optional @asName("path") string path;
-    @optional string name;
-    @optional string type = "file";
-
-    this(string path) pure nothrow @safe
-    {
-        this.id = path;
-        this.path = path;
-        this.name = path;
-    }
-
-    this(string id, string path) pure nothrow @safe
-    {
-        this.id = id;
-        this.path = path;
-        this.name = id;
-    }
-
-    @property string effectiveId() const pure nothrow @safe
-    {
-        if (id.length > 0) return id;
-        if (name.length > 0) return name;
-        return path;
-    }
-
-    @property string effectivePath() const pure nothrow @safe
-    {
-        if (path.length > 0) return path;
-        if (name.length > 0) return name;
-        return id;
-    }
+    string id;
+    string path;
 }
 
 /**
- * Represents an individual build step within a TaskNode.
+ * One build step of a task: a step `type` (the built-in `checkout`, `bash` or `powershell`, or
+ * a step program; AGENTS.md, "Build steps") and its configuration. `config` is the step type's
+ * own JSON object (for checkout: `input`, `target_dir`, `depth`, `submodules`), including any
+ * step-level environment or working directory the type supports; its schema belongs to the step
+ * type. Absent and empty `config` both mean no settings. `name` is a display label only.
  */
 struct BuildStep
 {
     @optional string name;
     string type;
-    @optional string[string] parameters;
-    @optional string script;
-    @optional string command;
-    @optional @asName("working_directory") string workingDirectory;
-    @optional string[string] environment;
-    @optional @asName("properties") string propertiesJson;
-
-    this(string name, string type, string[string] parameters = null, string script = null, string command = null, string workingDirectory = null, string propertiesJson = null) pure nothrow @safe
-    {
-        this.name = name;
-        this.type = type;
-        this.parameters = parameters;
-        this.script = script;
-        this.command = command;
-        this.workingDirectory = workingDirectory;
-        this.propertiesJson = propertiesJson;
-    }
-
-    JSONValue properties() const @safe
-    {
-        if (propertiesJson.length == 0) return JSONValue(null);
-        try { return parseJSON(propertiesJson); } catch (Exception) { return JSONValue(propertiesJson); }
-    }
-
-    void properties(JSONValue val) @safe
-    {
-        propertiesJson = val.toString();
-    }
-}
-
-/**
- * Artifact output component data.
- */
-struct ArtifactOutputComponent
-{
-    @optional OutputArtifactDecl[] artifacts;
-}
-
-/**
- * Trigger rule component data.
- */
-struct TriggerRuleComponent
-{
-    @optional TriggerRule[] rules;
+    @optional Json config;
 }
 
 /**
@@ -287,8 +167,9 @@ struct TaskOutputs
 }
 
 /**
- * Represents a discrete task node in the Directed Acyclic Graph (DAG)
- * modeled as an entity with composable components.
+ * A task of a project's definition: its declared inputs, the steps that build it, the
+ * artifacts it produces, its timeout and the environment its steps run with. Graph edges are
+ * derived from its task_output inputs.
  */
 struct TaskNode
 {
@@ -298,43 +179,8 @@ struct TaskNode
     @optional InputDecl[string] inputs;
     @optional TaskOutputs outputs;
     @optional @asName("steps") BuildStep[] steps;
-    @optional TriggerRule[] triggers;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
     @optional string[string] environment;
-    @optional string[string] components;
-
-    bool hasCustomComponent(string componentName) const @safe
-    {
-        if (components is null) return false;
-        return (componentName in components) !is null;
-    }
-
-    JSONValue getCustomComponent(string componentName) const @safe
-    {
-        if (components is null) return JSONValue(null);
-        if (auto p = componentName in components)
-        {
-            try
-            {
-                return parseJSON(*p);
-            }
-            catch (Exception)
-            {
-                return JSONValue(*p);
-            }
-        }
-        return JSONValue(null);
-    }
-
-    void setCustomComponent(string componentName, JSONValue data) @safe
-    {
-        components[componentName] = data.toString();
-    }
-
-    ArtifactOutputComponent getArtifactOutputComponent() const pure nothrow @safe
-    {
-        return ArtifactOutputComponent(outputs.artifacts.dup);
-    }
 }
 
 /**
@@ -504,7 +350,9 @@ struct TaskExecutionResult
     /// The task that ran, for logs. The control plane takes the task from the execution record
     /// and rejects a completion naming a different one.
     @optional @asName("task_id") string taskId;
-    @optional @asName("status") TaskStatus status = TaskStatus.pending;
+    /// How the execution ended: succeeded, failed or cancelled. Required: a completion without
+    /// a status is malformed, and one with an active status is rejected.
+    @asName("status") ExecutionStatus status;
     @optional @asName("exit_code") int exitCode = 0;
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
@@ -538,8 +386,9 @@ enum BuildIntent : string
 struct BuildTrigger
 {
     TriggerType type;
-    /// The trigger rule that matched (`TriggerRuleRecord.id`); empty for a request made by hand
-    /// or through the API. One request is made per matched rule.
+    /// The id of the trigger rule that matched; empty for a request made by hand or through the
+    /// API. One request is made per matched rule. (How trigger rules are declared is beads
+    /// confector-z7z.24.4 and confector-z7z.37.1.)
     @optional @asName("rule_id") string ruleId;
     /// Event details as the trigger source reported them (ref, revision, sender, ...), for
     /// display and audit only: what the trigger pins is in `BuildRequest.pins`.
@@ -629,11 +478,8 @@ struct BuildChain
 
 /**
  * Status of a task execution. Only `queued` and `running` are active; an execution never
- * leaves a terminal status.
- *
- * Supersedes TaskStatus in the new build model. TaskStatus's other states are not execution
- * states: whether a chain's task is pending, cached or skipped is derived from the chain and
- * its executions, never stored.
+ * leaves a terminal status. Whether a chain's task is pending, cached or skipped is not an
+ * execution status: it is derived from the chain and its executions, never stored.
  */
 enum ExecutionStatus : string
 {
@@ -777,60 +623,13 @@ struct ApiToken
 }
 
 /**
- * Persisted configuration for a node-level trigger rule.
- */
-struct TriggerRuleRecord
-{
-    @optional @asName("id") string id;
-    @optional @asName("name") string name;
-    @optional @asName("project_id") string projectId = "default";
-    @optional @asName("target_task_id") string targetTaskId;
-    @optional @asName("trigger_type") string triggerType; // manual, git_push, git_tag, webhook, cron
-    @optional @asName("criteria") string criteria; // e.g. branch pattern, cron expression, webhook token
-    @optional @asName("enabled") bool enabled = true;
-    @optional @asName("created_at") string createdAt;
-}
-
-/**
  * Persisted record of a repository.
  */
 struct RepositoryRecord
 {
     @optional @asName("name") string name;
     @optional @asName("address") string address;
-    @optional @asName("refresh_policy") string refreshPolicy = "webhook";  // "webhook", "polling", "both"
     @optional @asName("created_at") string createdAt;
-}
-
-/**
- * Generic snapshot of a repository's latest revision state.
- * Completely agnostic of VCS backend (Git commit, Perforce changelist, Plastic changeset).
- */
-struct VcsRepositoryState
-{
-    @asName("repository_url") string repositoryUrl;
-    @asName("provider_type") string providerType;   // "git", "perforce", "plastic", etc.
-    @asName("target_ref") string targetRef;         // branch name, stream path, or depot path
-    @asName("revision") string revision;           // commit SHA, changelist number, changeset GUID
-    @optional @asName("author") string author;
-    @optional @asName("message") string message;
-    @optional @asName("updated_at") string updatedAt;
-    @optional @asName("metadata") string[string] metadata;
-}
-
-/**
- * Persisted record of a detected repository change event.
- */
-struct VcsChangeRecord
-{
-    @asName("id") string id;
-    @asName("repository_url") string repositoryUrl;
-    @asName("provider_type") string providerType;
-    @asName("target_ref") string targetRef;
-    @asName("from_revision") string fromRevision;
-    @asName("to_revision") string toRevision;
-    @asName("detected_at") string detectedAt;
-    @asName("trigger_source") string triggerSource; // "webhook", "polling", "manual"
 }
 
 /**
@@ -863,16 +662,6 @@ bool projectUsesRepository(const ref ProjectRecord project, const ref Repository
 }
 
 /**
- * Execution plan resolved from DAG and cache status.
- */
-struct ExecutionPlan
-{
-    string[] orderedTaskIds;
-    string[] cachedTaskIds;
-    string[] toExecuteTaskIds;
-}
-
-/**
  * Self-contained execution payload for worker tasks.
  *
  * Inputs reach the runner only as the work order's task declares them (`WorkOrder.taskNode.inputs`)
@@ -889,8 +678,6 @@ struct TaskExecutionPayload
     /// repository inputs. How to fetch, not what; never hashed. Used only by the built-in
     /// checkout step.
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
-    @optional string[string] environment;
-    @optional @asName("expected_outputs") OutputArtifactDecl[] expectedOutputs;
 }
 
 /**
@@ -904,14 +691,11 @@ struct WorkOrder
     /// The execution to run (`TaskExecution.id`). The worker's completion names it; a work order
     /// without one cannot be completed.
     @optional @asName("execution_id") string executionId;
-    @optional @asName("task_id") string taskId;
-    /// The task definition to execute.
+    /// The task definition to execute: its steps, environment and declared outputs.
     @optional @asName("task_node") TaskNode taskNode;
     /// The task's fingerprint, computed by the control plane from the build chain. The runner
     /// stores outputs under it and never computes its own; a work order without one fails.
     @optional @asName("fingerprint") string fingerprint;
-    @optional @asName("executor_type") string executorType;               // e.g., "local", "queue", "aws-ecs"
-    @optional @asName("requirements") string[string] requirements;       // e.g., ["arch": "x86_64", "gpu": "true"]
     @optional @asName("payload") TaskExecutionPayload payload;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
     @optional @asName("created_at") string createdAt;
@@ -933,17 +717,6 @@ class DAGValidationException : Exception
     }
 }
 
-/**
- * Exception thrown during fingerprint calculation.
- */
-class FingerprintException : Exception
-{
-    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
-    {
-        super(msg, file, line);
-    }
-}
-
 unittest
 {
     TaskNode node;
@@ -955,10 +728,45 @@ unittest
     node.inputs["flavor"] = valueInput("external");
     assert(repositoryIds(node) == ["repo1"]);
     assert(upstreamTaskIds(node) == ["build-engine", "setup"]);
+}
 
-    node.setCustomComponent("test", JSONValue("val"));
-    assert(node.hasCustomComponent("test"));
-    assert(node.getCustomComponent("test").str == "val");
+unittest
+{
+    import std.algorithm.searching : canFind;
+
+    // Steps and output declarations round-trip in their one canonical form: a step is a name, a
+    // type and a JSON config object; an output is an id and a path, both required
+    TaskNode node;
+    node.id = "compile";
+    node.steps = [
+        BuildStep("Checkout", "checkout", Json(["input": Json("src"), "depth": Json(1)])),
+        BuildStep("Compile", "bash"),
+    ];
+    node.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
+
+    auto json = serializeToJson(node);
+    assert(json["steps"][0]["type"].get!string == "checkout");
+    assert(json["steps"][0]["config"]["input"].get!string == "src");
+    assert(json["steps"][0]["config"]["depth"].get!long == 1);
+    assert(json["outputs"]["artifacts"][0]["id"].get!string == "game.zip");
+    assert(json["outputs"]["artifacts"][0]["path"].get!string == "out/game.zip");
+    // A step without config stores none
+    assert(!json.toString().canFind(`"config":null`) && !json.toString().canFind("undefined"), json.toString());
+
+    auto back = deserializeJson!TaskNode(json.toString());
+    assert(back.steps.length == 2 && back.steps[0] == node.steps[0]);
+    assert(back.steps[1].config.type == Json.Type.undefined);
+    assert(back.outputs.artifacts == node.outputs.artifacts);
+
+    // An output without an id or a path is malformed, not defaulted from the other field
+    foreach (malformed; [`{"id": "t", "outputs": {"artifacts": [{"path": "out/x"}]}}`,
+                         `{"id": "t", "outputs": {"artifacts": [{"id": "x"}]}}`])
+    {
+        bool threw = false;
+        try deserializeJson!TaskNode(malformed);
+        catch (Exception) threw = true;
+        assert(threw, malformed);
+    }
 }
 
 unittest
@@ -1124,7 +932,8 @@ unittest
     execution.attempts = 2;
     execution.definition.id = "compile";
     execution.definition.inputs["src"] = repositoryInput("game", "main");
-    execution.definition.steps = [BuildStep("Checkout", "checkout", ["input": "src"]), BuildStep("Compile", "bash", null, "make")];
+    execution.definition.steps = [BuildStep("Checkout", "checkout", Json(["input": Json("src")])),
+        BuildStep("Compile", "bash", Json(["script": Json("make")]))];
     execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
     execution.definitionHash = "def1";
     ArtifactMetadata artifact;
@@ -1143,7 +952,7 @@ unittest
     assert(json["status"].get!string == "succeeded");
     assert(json["attempts"].get!long == 2);
     assert(json["definition_hash"].get!string == "def1");
-    assert(json["definition"]["steps"][1]["script"].get!string == "make");
+    assert(json["definition"]["steps"][1]["config"]["script"].get!string == "make");
     assert(roundTrip(execution) == execution);
 
     // Retention keeps the record and marks when the artifacts went

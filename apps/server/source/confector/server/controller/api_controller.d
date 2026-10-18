@@ -1,12 +1,11 @@
 module confector.server.controller.api_controller;
 
 import vibe.vibe;
-import confector.core.model;
+import confector.plugin_api.model;
 import confector.core.dag;
 import confector.core.document_collection : tryValue;
 import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
-import confector.core.trigger;
 import confector.plugin_api.dispatch_queue;
 import confector.server.scheduler_callback : schedulerCallback;
 import confector.core.work_orders : completeExecution, defaultPoolQueue;
@@ -23,6 +22,16 @@ import std.datetime.systime : Clock;
 NotImplementedException buildsNotImplemented()
 {
     return new NotImplementedException("Starting builds", "confector-z7z.23.7");
+}
+
+/**
+ * Why the build log routes fail: build logs live in the log store, which is bead
+ * confector-z7z.31.12. The routes answer 501 Not Implemented with this exception's message; a
+ * worker only warns when its log lines are refused.
+ */
+NotImplementedException logsNotImplemented()
+{
+    return new NotImplementedException("Build logs", "confector-z7z.31.12");
 }
 
 /**
@@ -217,81 +226,14 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
         res.writeJsonBody(err);
     }
 
-    // An execution's log, as its worker streams it (`ExecutionLogStore`). Lines are appended only
-    // while the execution is active: the worker sends its last lines before its completion. (A
-    // completion landing between the check and the append can let one batch in after it.) A
-    // finished execution's log stays readable.
+    // An execution's log: reading it, and the lines its worker streams. Not implemented until
+    // the log store lands (see logsNotImplemented).
     getRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        string executionId = req.params["execution_id"];
-        try
-        {
-            if (!requireStores(res)) return;
-            if (stores.executions.get(executionId).isNull)
-            {
-                writeError(res, HTTPStatus.notFound, format("Execution '%s' does not exist", executionId));
-                return;
-            }
-            Json resp = Json.emptyObject;
-            resp["execution_id"] = Json(executionId);
-            resp["logs"] = serializeToJson(stores.logs.read(executionId));
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            writeError(res, HTTPStatus.internalServerError, format("Could not read the log of execution '%s': %s", executionId, e.msg));
-        }
+        writeNotImplemented(res, logsNotImplemented());
     });
 
     postRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
-        import confector.core.build_stores : ExecutionStore;
-
-        string executionId = req.params["execution_id"];
-        string[] lines;
-        try
-        {
-            Json bodyJson = req.json;
-            if (bodyJson.type != Json.Type.object || "lines" !in bodyJson || bodyJson["lines"].type != Json.Type.array)
-            {
-                writeError(res, HTTPStatus.badRequest, "A log upload needs a 'lines' array");
-                return;
-            }
-            lines = deserializeJson!(string[])(bodyJson["lines"]);
-        }
-        catch (Exception e)
-        {
-            writeError(res, HTTPStatus.badRequest, format("Malformed log upload for execution '%s': %s", executionId, e.msg));
-            return;
-        }
-        try
-        {
-            if (!requireStores(res)) return;
-            auto execution = stores.executions.get(executionId);
-            if (execution.isNull)
-            {
-                writeError(res, HTTPStatus.notFound, format("Execution '%s' does not exist; its log lines are rejected", executionId));
-                return;
-            }
-            if (!ExecutionStore.isActive(execution.get.status))
-            {
-                writeError(res, HTTPStatus.conflict, format("Execution '%s' already finished (%s); its log lines are rejected",
-                    executionId, execution.get.status));
-                return;
-            }
-            foreach (line; lines)
-            {
-                stores.logs.append(executionId, line);
-            }
-
-            Json resp = Json.emptyObject;
-            resp["status"] = Json("ok");
-            resp["execution_id"] = Json(executionId);
-            resp["appended"] = Json(lines.length);
-            res.writeJsonBody(resp);
-        }
-        catch (Exception e)
-        {
-            writeError(res, HTTPStatus.internalServerError, format("Could not append to the log of execution '%s': %s", executionId, e.msg));
-        }
+        writeNotImplemented(res, logsNotImplemented());
     });
 
     // A worker's completion of an execution. It names the execution only: the fingerprint and
@@ -656,24 +598,13 @@ unittest
     router.handleRequest(authReq, authRes);
     assert(authRes.statusCode == HTTPStatus.notImplemented);
 
-    // Test Trigger Rules state via repo
-    TriggerRuleRecord rule;
-    rule.id = "rule1";
-    rule.name = "CI Build";
-    rule.triggerType = "git_push";
-    rule.criteria = "main";
-    stores.triggerRules.save(rule);
-
-    assert(stores.triggerRules.list().length == 1);
-    assert(stores.triggerRules.list()[0].name == "CI Build");
-
     // Test Projects and Tasks via repo
     ProjectRecord proj;
     proj.id = "proj_api_1";
     proj.name = "API Project";
     TaskNode node;
     node.id = "n1";
-    node.steps = [BuildStep("Echo", "bash", null, "echo hi")];
+    node.steps = [BuildStep("Echo", "bash", Json(["script": Json("echo hi")]))];
     proj.tasks = [node];
     stores.projects.put(proj);
     assert(stores.projects.list().length == 1);
@@ -701,12 +632,20 @@ unittest
         return res.statusCode;
     }
 
-    int get(string path)
+    // The body a request to `path` is answered with
+    string answer(HTTPMethod method, string path, string body = null)
     {
-        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path), HTTPMethod.GET);
-        auto res = createTestHTTPServerResponse();
+        import vibe.stream.memory : createMemoryOutputStream;
+
+        InetHeaderMap headers;
+        headers["Content-Type"] = "application/json";
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path), method, headers,
+            createMemoryStream(cast(ubyte[]) body.dup, false));
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
         routerWithStores.handleRequest(req, res);
-        return res.statusCode;
+        res.finalize();
+        return cast(string) sink.data.idup;
     }
 
     assert(post("/projects/run", `{"project_id": "proj_api_1"}`) == HTTPStatus.notImplemented);
@@ -751,16 +690,19 @@ unittest
     auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "test-worker");
     assert(received.length == 1 && received[0].workOrder.executionId == executionId);
 
-    // The worker streams its log lines to the execution's log; lines for an execution that does
-    // not exist, or without a lines array, are rejected
-    assert(post("/executions/" ~ executionId ~ "/logs", `{"lines": ["compiling", "linking"]}`) == HTTPStatus.ok);
-    assert(stores.logs.read(executionId) == ["compiling", "linking"]);
-    assert(get("/executions/" ~ executionId ~ "/logs") == HTTPStatus.ok);
-    assert(post("/executions/exe_unknown/logs", `{"lines": ["lost"]}`) == HTTPStatus.notFound);
-    assert(get("/executions/exe_unknown/logs") == HTTPStatus.notFound);
-    assert(post("/executions/" ~ executionId ~ "/logs", `{"line": "old shape"}`) == HTTPStatus.badRequest);
-    assert(post("/executions/" ~ executionId ~ "/logs", `not json`) == HTTPStatus.badRequest);
-    assert(stores.logs.read("exe_unknown").length == 0 && stores.logs.read(executionId).length == 2);
+    // Build logs fail loudly until the log store lands, naming its bead: uploading lines and
+    // reading a log both answer 501
+    {
+        import std.algorithm.searching : canFind;
+
+        assert(post("/executions/" ~ executionId ~ "/logs", `{"lines": ["compiling", "linking"]}`) == HTTPStatus.notImplemented);
+        foreach (method; [HTTPMethod.POST, HTTPMethod.GET])
+        {
+            const written = answer(method, "/executions/" ~ executionId ~ "/logs", `{"lines": ["compiling"]}`);
+            assert(written.canFind(`"bead":"confector-z7z.31.12"`), written);
+            assert(written.canFind(logsNotImplemented().msg), written);
+        }
+    }
 
     // A worker's completion names its execution in the route. An unknown execution, a cache hit
     // or a completion naming another task is rejected and records nothing. A fingerprint in the
@@ -768,7 +710,9 @@ unittest
     const completion = `{"task_id": "n1", "status": "succeeded", "exit_code": 0, "duration_ms": 85,`
         ~ ` "fingerprint": "fp_chosen_by_the_worker"}`;
     assert(post("/executions/exe_unknown/complete", completion) == HTTPStatus.notFound, "An unknown execution is rejected");
-    assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1", "status": "cached"}`) == HTTPStatus.unprocessableEntity);
+    assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1", "status": "cached"}`) == HTTPStatus.badRequest,
+        "A cache hit is not an execution status");
+    assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1"}`) == HTTPStatus.badRequest, "A completion needs a status");
     assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1", "status": "running"}`) == HTTPStatus.unprocessableEntity);
     assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n2", "status": "succeeded"}`) == HTTPStatus.unprocessableEntity);
     assert(post("/executions/" ~ executionId ~ "/complete",
@@ -784,11 +728,6 @@ unittest
     assert(stores.executions.get("fp_chosen_by_the_worker").isNull);
     assert(post("/executions/" ~ executionId ~ "/complete", completion) == HTTPStatus.conflict, "A duplicate completion is rejected");
     assert(stores.executions.get(executionId).get.status == ExecutionStatus.succeeded);
-
-    // A finished execution's log takes no more lines but stays readable
-    assert(post("/executions/" ~ executionId ~ "/logs", `{"lines": ["too late"]}`) == HTTPStatus.conflict);
-    assert(stores.logs.read(executionId) == ["compiling", "linking"]);
-    assert(get("/executions/" ~ executionId ~ "/logs") == HTTPStatus.ok);
 
     // A store failure is a server error, not a rejection: the worker keeps its lease and the
     // work order is delivered again

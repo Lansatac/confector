@@ -354,8 +354,9 @@ private bool isObjectName(string name) @safe pure nothrow @nogc
     return true;
 }
 
-/// Formatting Json.Type directly trips over its deprecated member aliases.
-private string jsonTypeName(Json.Type type) @safe pure nothrow
+/// What kind of JSON value `type` is, for messages ("a string", "an array", ...). Formatting
+/// Json.Type directly trips over its deprecated member aliases.
+string jsonTypeName(Json.Type type) @safe pure nothrow
 {
     final switch (type)
     {

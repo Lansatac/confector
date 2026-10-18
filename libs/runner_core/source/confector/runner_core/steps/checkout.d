@@ -5,12 +5,11 @@ import std.process;
 import std.file;
 import std.path : buildPath, baseName, isAbsolute, buildNormalizedPath, absolutePath, relativePath, dirSeparator;
 import std.algorithm.searching : canFind, startsWith;
-import std.algorithm.sorting : sort;
-import std.conv : to;
 import std.string : strip, toLower;
 
-import confector.core.model : BuildStep, InputKind, ResolvedInput;
+import confector.plugin_api.model : BuildStep, InputKind, ResolvedInput;
 import confector.core.git : isFullSha, redactUserInfo;
+import confector.core.builtin_steps : checkoutConfig, checkoutConfigIssues, checkoutStepType;
 import confector.runner_core.logging : LogDelegate;
 import confector.runner_core.steps.step : StepContext, StepResult;
 import vibe.data.json : Json;
@@ -36,19 +35,17 @@ private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
     return true;
 }
 
-/**
- * Parameters of the checkout step. A checkout step names a declared repository input by its
- * name (`input`) and checks out exactly that input's pinned commit; it never takes a URL, a
- * repository or a ref. Options:
- *
- * - `target_dir`: directory to check out into, relative to the step's working directory
- *   (default: the working directory itself); must stay inside the workspace.
- * - `depth`: fetch depth, a positive integer (default: full history).
- * - `submodules`: `true` or `false` (default: `true`, recursive).
- *
- * The git program is always `git` from the runner's PATH; a task cannot choose it.
- */
-private immutable string[] checkoutParameters = ["input", "target_dir", "depth", "submodules"];
+// The checkout step's config (`BuildStep.config`) is a JSON object with the keys
+// `checkoutConfigKeys`, validated by `checkoutConfigIssues` (confector.core.builtin_steps). A checkout step names a declared repository input by its name (`input`,
+// a string, required) and checks out exactly that input's pinned commit; it never takes a URL, a
+// repository or a ref. Options:
+//
+// - `target_dir`: directory to check out into (a string), relative to the step's working
+//   directory (default: the working directory itself); must stay inside the workspace.
+// - `depth`: fetch depth, a positive integer (default: full history).
+// - `submodules`: `true` or `false` (default: `true`, recursive).
+//
+// The git program is always `git` from the runner's PATH; a task cannot choose it.
 
 /// The null device, used as git's global configuration so no user-level configuration applies.
 version (Windows) private enum nullDevice = "NUL";
@@ -56,7 +53,7 @@ else private enum nullDevice = "/dev/null";
 
 /**
  * Returns the environment checkout runs git with: `inherited` (the runner's own environment
- * with the task's and step's on top) without any variable that changes how git behaves, plus
+ * with the task's on top) without any variable that changes how git behaves, plus
  * Confector's own settings.
  *
  * Every `GIT_*` variable is dropped (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_*, GIT_SSH*, GIT_TRACE*,
@@ -116,9 +113,10 @@ unittest
  * passed to git on the command line, never written to `.git/config` or anywhere else in the
  * workspace, and redacted from everything logged.
  *
- * Fails, without running git, if the step names no input, names an input the task does not
- * declare or that is not a repository input, carries any parameter other than those in
- * `checkoutParameters`, or the input's pinned value is not a full commit SHA.
+ * Fails, without running git, if the step's config has any problem `checkoutConfigIssues` finds
+ * (not a JSON object, a key other than those in `checkoutConfigKeys`, a value of the wrong type,
+ * no input), names an input the task does not declare or that is not a repository input, or
+ * the input's pinned value is not a full commit SHA.
  *
  * Throws: Exception if `context.log` is null: a step's output always has somewhere to go.
  */
@@ -136,26 +134,14 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
         return res;
     }
 
-    string[] keys = step.parameters.keys;
-    keys.sort();
-    foreach (key; keys)
+    // The config's keys and value types are checked as the task editor checks them on save
+    const issues = checkoutConfigIssues(step.config);
+    if (issues.length > 0)
     {
-        if (!checkoutParameters.canFind(key))
-        {
-            return fail(format("Checkout step parameter '%s' is not supported. A checkout step names a declared repository input with 'input' and checks out its pinned commit; supported parameters: %-(%s, %)",
-                key, checkoutParameters));
-        }
+        return fail(format("Invalid checkout step config: %-(%s; %)", issues));
     }
-    if (step.command.length > 0 || step.script.length > 0)
-    {
-        return fail("A checkout step takes no command or script; name a declared repository input with the 'input' parameter");
-    }
-
-    string inputName = step.parameters.get("input", "");
-    if (inputName.length == 0)
-    {
-        return fail("Checkout step has no 'input' parameter naming the repository input to check out");
-    }
+    const settings = checkoutConfig(step.config);
+    const inputName = settings.input;
     auto input = inputName in context.inputs;
     if (input is null)
     {
@@ -183,7 +169,7 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
         return fail(format("The repository address of input '%s' must not start with '-'", inputName));
     }
 
-    string targetDirParam = step.parameters.get("target_dir", "");
+    const targetDirParam = settings.targetDir;
     string checkoutDir = targetDirParam.length == 0
         ? context.workingDirectory
         : (isAbsolute(targetDirParam) ? targetDirParam : buildPath(context.workingDirectory, targetDirParam));
@@ -192,25 +178,8 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
         return fail(format("Target directory '%s' escapes workspace boundary '%s'", checkoutDir, context.workspaceDir));
     }
 
-    string depth = step.parameters.get("depth", "");
-    if (depth.length > 0)
-    {
-        uint parsed;
-        try parsed = depth.to!uint;
-        catch (Exception) parsed = 0;
-        if (parsed == 0)
-        {
-            return fail(format("Checkout step 'depth' must be a positive integer, not '%s'", depth));
-        }
-    }
-
-    bool submodules = true;
-    if (auto p = "submodules" in step.parameters)
-    {
-        if (*p == "true") submodules = true;
-        else if (*p == "false") submodules = false;
-        else return fail(format("Checkout step 'submodules' must be 'true' or 'false', not '%s'", *p));
-    }
+    const string depth = settings.depth > 0 ? format("%d", settings.depth) : "";
+    const bool submodules = settings.submodules;
 
     // Checkout must start from a fresh repository: an existing .git (from an upstream
     // artifact or an earlier step) could carry configuration that redirects the fetch or
@@ -228,7 +197,6 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
 
     string[string] inherited = environment.toAA();
     foreach (k, v; context.environment) inherited[k] = v;
-    foreach (k, v; step.environment) inherited[k] = v;
     string[string] gitEnv = checkoutEnvironment(inherited, checkoutDir);
 
     context.log(format("[git] Checking out input '%s' at commit %s", inputName, sha));
@@ -337,11 +305,19 @@ version (unittest)
         return ctx;
     }
 
-    private BuildStep checkoutStep(string[string] parameters)
+    /// A checkout step whose config holds the string settings `settings`.
+    private BuildStep checkoutStep(string[string] settings)
     {
-        BuildStep step;
-        step.type = "checkout";
-        step.parameters = parameters;
+        Json config = Json.emptyObject;
+        foreach (key, value; settings) config[key] = value;
+        return BuildStep(null, checkoutStepType, config);
+    }
+
+    /// A checkout step of input `src` whose config also holds `key: value`.
+    private BuildStep checkoutStepWith(string key, Json value)
+    {
+        BuildStep step = checkoutStep(["input": "src"]);
+        step.config[key] = value;
         return step;
     }
 
@@ -381,20 +357,23 @@ unittest
 
     auto ctx = checkoutContext(".");
 
-    assert(failsWith(ctx, checkoutStep(null), "no 'input' parameter"));
+    assert(failsWith(ctx, checkoutStep(null), "no 'input'"));
+    assert(failsWith(ctx, BuildStep(null, "checkout"), "no 'input'"), "A step without config names no input");
+    assert(failsWith(ctx, BuildStep(null, "checkout", Json("src")), "must be a JSON object"));
+    assert(failsWith(ctx, BuildStep(null, "checkout", Json([Json("src")])), "must be a JSON object"));
+    assert(failsWith(ctx, BuildStep(null, "checkout", Json(["input": Json(1)])), "'input' must be a string"));
     assert(failsWith(ctx, checkoutStep(["input": "tools"]), "'tools', which task 'compile' does not declare"));
     assert(failsWith(ctx, checkoutStep(["input": "flavor"]), "value input, not a repository input"));
     assert(failsWith(ctx, checkoutStep(["input": "bin"]), "task_output input, not a repository input"));
 
-    // No URL, repository, address, ref or commit parameter: only the input's pinned commit
-    foreach (param; ["repository", "url", "address", "repo", "branch", "ref", "commit", "sha", "executable"])
+    // No URL, repository, address, ref, commit, command or script setting: only the input's
+    // pinned commit. Nor a step environment or working directory: git's environment is fixed
+    foreach (key; ["repository", "url", "address", "repo", "branch", "ref", "commit", "sha", "executable", "command", "script",
+        "environment", "working_directory"])
     {
-        assert(failsWith(ctx, checkoutStep(["input": "src", param: "https://example.test/other.git"]),
-            format("parameter '%s' is not supported", param)), param);
+        assert(failsWith(ctx, checkoutStep(["input": "src", key: "https://example.test/other.git"]),
+            format("key '%s' is not supported", key)), key);
     }
-    BuildStep withCommand = checkoutStep(["input": "src"]);
-    withCommand.command = "https://example.test/other.git";
-    assert(failsWith(ctx, withCommand, "takes no command"));
 
     // The pinned value must be a full commit SHA, and the work order must say where to fetch it
     assert(failsWith(checkoutContext(".", "main"), checkoutStep(["input": "src"]), "not pinned to a git commit SHA"));
@@ -405,8 +384,13 @@ unittest
 
     // Options are validated, and the checkout stays inside the workspace
     assert(failsWith(ctx, checkoutStep(["input": "src", "target_dir": "../escape"]), "escapes workspace"));
-    assert(failsWith(ctx, checkoutStep(["input": "src", "depth": "0"]), "positive integer"));
-    assert(failsWith(ctx, checkoutStep(["input": "src", "submodules": "maybe"]), "'true' or 'false'"));
+    assert(failsWith(ctx, checkoutStepWith("target_dir", Json(3)), "'target_dir' must be a string"));
+    foreach (depth; [Json(0), Json(-1), Json(1.5), Json("1"), Json(5_000_000_000L)])
+    {
+        assert(failsWith(ctx, checkoutStepWith("depth", depth), "positive integer"), depth.toString());
+    }
+    assert(failsWith(ctx, checkoutStepWith("submodules", Json("maybe")), "true or false"));
+    assert(failsWith(ctx, checkoutStepWith("submodules", Json("false")), "true or false"), "A string is not a boolean");
 
     // A context without a log is refused outright, not given a silent default
     auto noLog = checkoutContext(".");

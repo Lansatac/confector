@@ -3,7 +3,6 @@ extends layout
 block maincontent
   - import vibe.data.json : serializeToJson;
   - import std.array : replace;
-  - import confector.core.model : TriggerType, BuildStep;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
@@ -12,8 +11,9 @@ block maincontent
   - RepoOpt[] availableReposList;
   - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
   - string availableReposJson = serializeToJson(availableReposList).toString().replace("<", "\\u003c");
-  - string initialStepsJson = serializeToJson(task.steps).toString().replace("<", "\\u003c");
-  - string initialInputsJson = serializeToJson(inputRows).toString().replace("<", "\\u003c");
+  - string initialStepsJson = serializeToJson(form.stepRows).toString().replace("<", "\\u003c");
+  - string stepTypesJson = serializeToJson(stepTypes).toString().replace("<", "\\u003c");
+  - string initialInputsJson = serializeToJson(form.inputRows).toString().replace("<", "\\u003c");
   - string stepIssuesJson = serializeToJson(stepIssues).toString().replace("<", "\\u003c");
 
   div.projects-container
@@ -32,16 +32,14 @@ block maincontent
         strong The task was not saved:
         div #{formError}
 
-    form#task-form(action="/projects/tasks/save", method="POST", onsubmit="prepareTaskForm()", style="margin-top: 20px;")
+    form#task-form(action="/projects/tasks/save", method="POST", style="margin-top: 20px;")
       input(type="hidden", name="project_id", value="#{project.id}")
-      input(type="hidden", name="steps_json", id="steps_json", value="")
 
       div.tabs-nav
         button.tab-btn.active(type="button", onclick="switchTab('general', this)") General
         button.tab-btn(type="button", onclick="switchTab('inputs', this)") Inputs
         button.tab-btn(type="button", onclick="switchTab('steps', this)") Steps
         button.tab-btn(type="button", onclick="switchTab('outputs', this)") Outputs
-        button.tab-btn(type="button", onclick="switchTab('triggers', this)") Triggers
 
       div.card
         div#tab-general.tab-pane.active
@@ -54,6 +52,14 @@ block maincontent
             label(for="name") Display Name:
             input.form-control#name(type="text", name="name", value="#{task.name}", placeholder="e.g. Build Release Binary")
 
+          div.form-group
+            label(for="timeout_seconds") Timeout (seconds):
+            input.form-control#timeout_seconds(type="number", name="timeout_seconds", min="1", step="1", value="#{form.timeoutText}", required)
+
+          div.form-group
+            label(for="environment") Environment variables for every step, one per line as KEY=VALUE:
+            textarea.form-control#environment(name="environment", rows="4", placeholder="CONFIGURATION=Release", style="font-family: monospace;") #{form.environmentText}
+
         div#tab-inputs.tab-pane
           h3 Inputs
           p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Name everything this task depends on. A repository input is a registered repository at a ref (a branch, tag or other ref selector; there is no default). A task output input depends on an upstream task, and optionally one of its artifacts. A value input is a literal value. Checkout steps pick a repository input by name.
@@ -63,56 +69,16 @@ block maincontent
 
         div#tab-steps.tab-pane
           h3 Ordered Build Steps
-          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Build steps run sequentially in order.
+          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Build steps run sequentially in order. Each step has a type and a JSON config object; a checkout step names a repository input declared in the Inputs tab, for example {"input": "src"}.
           div#steps-container.step-list
           div(style="margin-top: 15px; display: flex; flex-wrap: wrap; gap: 8px;")
-            button.btn.btn-outline.btn-sm#add-custom-step-btn(type="button", onclick="addBuildStep('custom')") + Add Custom Step
+            button.btn.btn-outline.btn-sm#add-step-btn(type="button", onclick="addBuildStep()") + Add Step
 
         div#tab-outputs.tab-pane
           h3 Output Artifacts
           div.form-group
-            label(for="output_artifacts") Produced Output Artifacts (Format: filePath:type or filePath per line):
-            - string outVal = "";
-            - foreach(i, outArt; task.outputs.artifacts) { if (i > 0) outVal ~= "\n"; outVal ~= outArt.path ~ (outArt.type.length > 0 ? ":" ~ outArt.type : ""); }
-            textarea.form-control#output_artifacts(name="output_artifacts", rows="4", placeholder="bin/confector.exe:binary\nbuild/output.tar.gz:archive", style="font-family: monospace;") #{outVal}
-
-        div#tab-triggers.tab-pane
-          h3 Triggers & Event Dispatches
-          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Configure node-level triggers (Git Push, Git Tag, Webhook, Cron, Manual) that automatically dispatch this task and its downstream graph slice.
-          div#triggers-container.trigger-list
-            - foreach(trig; task.triggers)
-              div.trigger-row(style="border: 1px solid #e0e0e0; background: #fafafa; border-radius: 6px; padding: 15px; margin-bottom: 12px; position: relative;")
-                div(style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;")
-                  div(style="display: flex; align-items: center; gap: 10px;")
-                    label(style="font-weight: bold; margin: 0;") Trigger Type:
-                    select.form-control(name="trigger_type", style="width: auto;", onchange="onTriggerTypeChange(this)")
-                      option(value="git_push", selected=(trig.type == TriggerType.gitPush)) Git Push (Commit/Branch)
-                      option(value="git_tag", selected=(trig.type == TriggerType.gitTag)) Git Tag (Release)
-                      option(value="webhook", selected=(trig.type == TriggerType.webhook)) Webhook (HTTP Endpoint)
-                      option(value="cron", selected=(trig.type == TriggerType.cron)) Cron Schedule
-                      option(value="manual", selected=(trig.type == TriggerType.manual)) Manual Dispatch
-                  button.btn.btn-danger.btn-sm.btn-remove-trig(type="button", onclick="removeTriggerRule(this)", title="Remove trigger") ✕
-
-                - string branchStr = "";
-                - foreach(i, b; trig.branches) { if (i > 0) branchStr ~= ", "; branchStr ~= b; }
-                - string tagStr = "";
-                - foreach(i, tg; trig.tags) { if (i > 0) tagStr ~= ", "; tagStr ~= tg; }
-
-                div.trigger-fields
-                  div.form-group.field-branches(style=(trig.type == TriggerType.gitPush ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
-                    label Branch Patterns (Comma-separated globs, e.g. main, feature/*):
-                    input.form-control(type="text", name="trigger_branches", value="#{branchStr}", placeholder="e.g. main, feature/*, release/*")
-                  div.form-group.field-tags(style=(trig.type == TriggerType.gitTag ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
-                    label Tag Patterns (Comma-separated globs, e.g. v*.*.*, release-*):
-                    input.form-control(type="text", name="trigger_tags", value="#{tagStr}", placeholder="e.g. v*.*.*, release-*")
-                  div.form-group.field-endpoint(style=(trig.type == TriggerType.webhook ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
-                    label Webhook Endpoint Path:
-                    input.form-control(type="text", name="trigger_endpoint", value="#{trig.endpoint}", placeholder="e.g. /api/v1/triggers/deploy")
-                  div.form-group.field-cron(style=(trig.type == TriggerType.cron ? "margin-bottom: 8px;" : "display: none; margin-bottom: 8px;"))
-                    label Cron Schedule Expression:
-                    input.form-control(type="text", name="trigger_cron", value="#{trig.cronSchedule}", placeholder="e.g. 0 0 * * 0")
-          div(style="margin-top: 10px;")
-            button.btn.btn-outline.btn-sm#add-trig-btn(type="button", onclick="addTriggerRule()") + Add Trigger Rule
+            label(for="output_artifacts") Produced output artifacts, one per line as id: path (both required; the path is relative to the working directory and may be a glob):
+            textarea.form-control#output_artifacts(name="output_artifacts", rows="4", placeholder="binaries: bin/*\nsymbols: build/*.pdb", style="font-family: monospace;") #{form.outputsText}
 
         div(style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #eee; display: flex; gap: 10px;")
           button.btn.btn-primary(type="submit") Save Task
@@ -121,8 +87,8 @@ block maincontent
   script.
     var availableTasks = !{availableTasksJson};
     var availableRepos = !{availableReposJson};
-    var projectId = "#{project.id}";
     var initialSteps = !{initialStepsJson} || [];
+    var stepTypes = !{stepTypesJson};
     var initialInputs = !{initialInputsJson} || [];
     var stepIssues = !{stepIssuesJson} || [];
 
@@ -205,14 +171,12 @@ block maincontent
         var control = row.querySelector('.input-field-' + key + ' select, .input-field-' + key + ' input');
         if (control) control.required = (needs[key] === kind);
       }
-      updateAllInputSelects();
     }
 
     function removeInputRow(btn) {
       var row = btn.closest('.input-row');
       if (row) {
         row.remove();
-        updateAllInputSelects();
       }
     }
 
@@ -227,7 +191,6 @@ block maincontent
 
       var nameControl = textControl('input_name', d.name, 'e.g. src');
       nameControl.required = true;
-      nameControl.oninput = function() { updateAllInputSelects(); };
       row.appendChild(inputField('input-field-name', 'Name', nameControl));
 
       var kindControl = document.createElement('select');
@@ -269,54 +232,9 @@ block maincontent
       onInputKindChange(kindControl);
     }
 
-    // Names of the repository inputs currently declared in the Inputs tab.
-    function declaredRepositoryInputs() {
-      var names = [];
-      var rows = document.querySelectorAll('#inputs-container .input-row');
-      for (var i = 0; i < rows.length; i++) {
-        var kind = rows[i].querySelector('[name="input_kind"]').value;
-        var name = rows[i].querySelector('[name="input_name"]').value.trim();
-        if (kind === 'repository' && name.length > 0 && names.indexOf(name) === -1) names.push(name);
-      }
-      return names;
-    }
-
-    // Fills a checkout step's input select with the task's repository inputs, keeping `desired`
-    // (or the current choice) selected even if it is not declared, so the mistake stays visible.
-    function populateInputSelect(selectElem, desired) {
-      if (!selectElem) return;
-      var current = desired !== undefined ? desired : selectElem.value;
-      var names = declaredRepositoryInputs();
-      selectElem.innerHTML = '';
-
-      var placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = names.length > 0 ? '-- Select a repository input --' : 'No repository inputs declared (add one in the Inputs tab)';
-      selectElem.appendChild(placeholder);
-
-      var found = false;
-      for (var i = 0; i < names.length; i++) {
-        var opt = document.createElement('option');
-        opt.value = names[i];
-        opt.textContent = names[i];
-        if (names[i] === current) { opt.selected = true; found = true; }
-        selectElem.appendChild(opt);
-      }
-      if (current && !found) {
-        var stale = document.createElement('option');
-        stale.value = current;
-        stale.textContent = current + ' (not a declared repository input)';
-        stale.selected = true;
-        selectElem.appendChild(stale);
-      }
-    }
-
-    function updateAllInputSelects() {
-      var selects = document.querySelectorAll('#steps-container .step-field-input');
-      for (var i = 0; i < selects.length; i++) {
-        populateInputSelect(selects[i]);
-      }
-    }
+    // ---- Build steps --------------------------------------------------------------------------
+    // Each step is a name, a built-in step type and its config as a JSON object. The config is
+    // validated when the task is saved; there are no per-type forms.
 
     function updateStepIndices() {
       var container = document.getElementById('steps-container');
@@ -354,60 +272,22 @@ block maincontent
       }
     }
 
-    function getCustomStepHtml(customType, script, propsStr) {
-      return '<div class="step-subform step-subform-custom">\n' +
-        '  <div class="form-group" style="margin-bottom: 8px;">\n' +
-        '    <label style="font-size: 0.9em; font-weight: bold;">Custom Step Type Identifier:</label>\n' +
-        '    <input class="form-control" type="text" name="step_custom_type" value="' + escapeHtml(customType) + '" placeholder="e.g. docker:build, s3:sync, artifact:publish">\n' +
-        '  </div>\n' +
-        '  <div class="form-group" style="margin-bottom: 8px;">\n' +
-        '    <label style="font-size: 0.9em;">Step Command / Script / Payload:</label>\n' +
-        '    <textarea class="form-control code-font step-field-script" name="step_custom_script" rows="3" placeholder="Command or payload string">' + escapeHtml(script) + '</textarea>\n' +
-        '  </div>\n' +
-        '  <div class="form-group" style="margin-bottom: 0;">\n' +
-        '    <label style="font-size: 0.9em;">Custom JSON Properties (Optional):</label>\n' +
-        '    <textarea class="form-control code-font" name="step_props" rows="2" placeholder="{}">' + escapeHtml(propsStr) + '</textarea>\n' +
-        '  </div>\n' +
-        '</div>';
+    function controlButton(text, title, cls, onclick) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm ' + cls;
+      btn.textContent = text;
+      btn.title = title;
+      btn.onclick = function() { onclick(this); };
+      return btn;
     }
 
-    function onStepTypeChange(selectElem) {
-      var row = selectElem.closest('.step-row');
-      if (!row) return;
-      var newType = selectElem.value;
-      var subformContainer = row.querySelector('.step-subform-container');
-      if (!subformContainer) return;
-
-      // Preserve existing script and working dir across type switches
-      var prevScript = '';
-      var sElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]') || row.querySelector('[name="step_custom_script"]');
-      if (sElem) prevScript = sElem.value;
-
-      var prevWorkDir = '';
-      var wElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
-      if (wElem) prevWorkDir = wElem.value;
-
-      subformContainer.innerHTML = getCustomStepHtml(newType !== 'custom' ? newType : '', prevScript, '');
-
-      if (prevScript.length > 0) {
-        var newScriptElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]') || row.querySelector('[name="step_custom_script"]');
-        if (newScriptElem) newScriptElem.value = prevScript;
-      }
-      if (prevWorkDir.length > 0) {
-        var newWorkDirElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
-        if (newWorkDirElem) newWorkDirElem.value = prevWorkDir;
-      }
-
-      populateInputSelect(subformContainer.querySelector('.step-field-input'));
-    }
-
-    function addBuildStep(defaultType, stepData, issues) {
+    // Adds a step row for `data` ({name, type, config}, config as JSON text), with the problems
+    // the server found in it, if any.
+    function addBuildStep(data, issues) {
       var container = document.getElementById('steps-container');
       if (!container) return;
-
-      var data = stepData || {};
-      var type = data.type || defaultType || 'custom';
-      var name = data.name || (type === 'custom' ? 'Custom Step' : 'Step');
+      var d = data || {};
 
       var row = document.createElement('div');
       row.className = 'step-row';
@@ -423,95 +303,30 @@ block maincontent
       badge.textContent = 'Step';
       leftControls.appendChild(badge);
 
-      var typeSelect = document.createElement('select');
-      typeSelect.name = 'step_type';
-      typeSelect.className = 'form-control';
-      typeSelect.style.cssText = 'width: 220px; font-weight: bold;';
-      typeSelect.onchange = function() { onStepTypeChange(this); };
-
-      var optCustom = document.createElement('option');
-      optCustom.value = 'custom';
-      optCustom.textContent = 'Custom Step';
-      optCustom.selected = true;
-      typeSelect.appendChild(optCustom);
-
+      var typeOptions = stepTypes.map(function(t) { return { value: t, label: t }; });
+      // A new step starts as the first type; a submitted step keeps its type, even an empty one,
+      // so the problem stays visible
+      var typeSelect = selectControl('step_type', typeOptions, data ? d.type : stepTypes[0], '-- Select a step type --');
+      typeSelect.required = true;
+      typeSelect.style.cssText = 'width: 180px; font-weight: bold;';
       leftControls.appendChild(typeSelect);
 
-      var nameInput = document.createElement('input');
-      nameInput.type = 'text';
-      nameInput.name = 'step_name';
-      nameInput.className = 'form-control';
-      nameInput.placeholder = 'Step Name / Label (e.g. Build Binary, Fetch Source)';
-      nameInput.value = name;
+      var nameInput = textControl('step_name', d.name, 'Step name (e.g. Fetch source, Build binary)');
       leftControls.appendChild(nameInput);
 
       header.appendChild(leftControls);
 
       var rightControls = document.createElement('div');
       rightControls.className = 'step-controls';
-
-      var upBtn = document.createElement('button');
-      upBtn.type = 'button';
-      upBtn.className = 'btn btn-outline btn-sm';
-      upBtn.textContent = '↑';
-      upBtn.title = 'Move step up';
-      upBtn.onclick = function() { moveStepUp(this); };
-      rightControls.appendChild(upBtn);
-
-      var downBtn = document.createElement('button');
-      downBtn.type = 'button';
-      downBtn.className = 'btn btn-outline btn-sm';
-      downBtn.textContent = '↓';
-      downBtn.title = 'Move step down';
-      downBtn.onclick = function() { moveStepDown(this); };
-      rightControls.appendChild(downBtn);
-
-      var removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'btn btn-danger btn-sm';
-      removeBtn.textContent = '✕';
-      removeBtn.title = 'Remove step';
-      removeBtn.onclick = function() { removeStep(this); };
-      rightControls.appendChild(removeBtn);
-
+      rightControls.appendChild(controlButton('↑', 'Move step up', 'btn-outline', moveStepUp));
+      rightControls.appendChild(controlButton('↓', 'Move step down', 'btn-outline', moveStepDown));
+      rightControls.appendChild(controlButton('✕', 'Remove step', 'btn-danger', removeStep));
       header.appendChild(rightControls);
       row.appendChild(header);
 
       var body = document.createElement('div');
       body.className = 'step-body';
 
-      var subformContainer = document.createElement('div');
-      subformContainer.className = 'step-subform-container';
-
-      var scriptVal = data.script || data.command || '';
-      var workDirVal = data.working_directory || data.workingDirectory || '';
-      var params = data.parameters || {};
-      var propsStr = data.properties ? JSON.stringify(data.properties, null, 2) : '';
-
-      subformContainer.innerHTML = getCustomStepHtml(type !== 'custom' ? type : '', scriptVal, propsStr);
-
-      // Populate values from stepData
-      if (scriptVal.length > 0) {
-        var sElem = subformContainer.querySelector('.step-field-script') || subformContainer.querySelector('[name="step_script"]') || subformContainer.querySelector('[name="step_custom_script"]');
-        if (sElem) sElem.value = scriptVal;
-      }
-      if (workDirVal.length > 0) {
-        var wElem = subformContainer.querySelector('.step-field-working-dir') || subformContainer.querySelector('[name="step_workingDirectory"]') || subformContainer.querySelector('[name="step_working_dir"]');
-        if (wElem) wElem.value = workDirVal;
-      }
-      for (var paramKey in params) {
-        if (params.hasOwnProperty(paramKey)) {
-          var pElem = subformContainer.querySelector('[name="step_param_' + paramKey + '"]') || subformContainer.querySelector('.step-field-' + paramKey);
-          if (pElem) {
-            pElem.value = params[paramKey];
-          }
-        }
-      }
-      // A checkout step names one of the task's repository inputs.
-      populateInputSelect(subformContainer.querySelector('.step-field-input'), params.input || '');
-
-      // Problems found on the server (for example old parameters the step no longer supports)
-      // are shown with the step, together with what was saved, so they can be fixed here.
       if (issues && issues.length > 0) {
         var box = document.createElement('div');
         box.className = 'alert alert-danger step-issues';
@@ -519,92 +334,31 @@ block maincontent
         title.textContent = 'This step needs attention:';
         box.appendChild(title);
         var list = document.createElement('ul');
-        list.style.cssText = 'margin: 6px 0 6px 18px;';
+        list.style.cssText = 'margin: 6px 0 0 18px;';
         for (var n = 0; n < issues.length; n++) {
           var li = document.createElement('li');
           li.textContent = issues[n];
           list.appendChild(li);
         }
         box.appendChild(list);
-        var saved = [];
-        for (var k in params) {
-          if (params.hasOwnProperty(k)) saved.push(k + ' = ' + params[k]);
-        }
-        var detail = document.createElement('div');
-        detail.textContent = 'Saved parameters: ' + (saved.length > 0 ? saved.join(', ') : '(none)') + '. Parameters not shown in the fields below are dropped when the task is saved; declare the repository in the Inputs tab and choose it here.';
-        box.appendChild(detail);
-        body.insertBefore(box, body.firstChild);
+        body.appendChild(box);
       }
 
-      body.appendChild(subformContainer);
+      var configLabel = document.createElement('label');
+      configLabel.style.cssText = 'font-size: 0.9em; display: block;';
+      configLabel.textContent = 'Config (a JSON object; for checkout: input, target_dir, depth, submodules):';
+      body.appendChild(configLabel);
+      var config = document.createElement('textarea');
+      config.name = 'step_config';
+      config.className = 'form-control code-font';
+      config.rows = 4;
+      config.placeholder = '{}';
+      config.value = d.config !== undefined ? d.config : '{}';
+      body.appendChild(config);
+
       row.appendChild(body);
       container.appendChild(row);
-
       updateStepIndices();
-    }
-
-    function prepareTaskForm() {
-      var container = document.getElementById('steps-container');
-      if (!container) return;
-      var rows = container.querySelectorAll('.step-row');
-      var steps = [];
-      for (var i = 0; i < rows.length; i++) {
-        var row = rows[i];
-        var typeSelect = row.querySelector('[name="step_type"]');
-        var type = typeSelect ? typeSelect.value : 'process';
-        var nameInput = row.querySelector('[name="step_name"]');
-        var name = nameInput ? nameInput.value.trim() : '';
-
-        var stepObj = {
-          name: name,
-          parameters: {}
-        };
-
-        if (type === 'custom') {
-          var cTypeElem = row.querySelector('[name="step_custom_type"]');
-          stepObj.type = (cTypeElem && cTypeElem.value.trim().length > 0) ? cTypeElem.value.trim() : 'custom';
-          var cScriptElem = row.querySelector('[name="step_custom_script"]') || row.querySelector('.step-field-script');
-          if (cScriptElem && cScriptElem.value.length > 0) stepObj.script = cScriptElem.value;
-          var cPropsElem = row.querySelector('[name="step_props"]');
-          if (cPropsElem && cPropsElem.value.trim().length > 0) {
-            try {
-              stepObj.properties = JSON.parse(cPropsElem.value.trim());
-            } catch (e) {}
-          }
-        } else {
-          stepObj.type = type;
-
-          var sElem = row.querySelector('.step-field-script') || row.querySelector('[name="step_script"]');
-          if (sElem && sElem.value.length > 0) stepObj.script = sElem.value;
-
-          var wElem = row.querySelector('.step-field-working-dir') || row.querySelector('[name="step_workingDirectory"]') || row.querySelector('[name="step_working_dir"]');
-          if (wElem && wElem.value.trim().length > 0) stepObj.working_directory = wElem.value.trim();
-
-          // Collect all step_param_* fields
-          var paramInputs = row.querySelectorAll('input, textarea, select');
-          for (var p = 0; p < paramInputs.length; p++) {
-            var inputName = paramInputs[p].name || '';
-            if (inputName.indexOf('step_param_') === 0) {
-              var pKey = inputName.substring('step_param_'.length);
-              var pVal = paramInputs[p].value;
-              if (pVal && pVal.trim().length > 0) {
-                stepObj.parameters[pKey] = pVal.trim();
-              }
-            }
-          }
-        }
-
-        if (Object.keys(stepObj.parameters).length === 0) {
-          delete stepObj.parameters;
-        }
-
-        steps.push(stepObj);
-      }
-
-      var hiddenJson = document.getElementById('steps_json');
-      if (hiddenJson) {
-        hiddenJson.value = JSON.stringify(steps);
-      }
     }
 
     function switchTab(tabName, btn) {
@@ -623,126 +377,13 @@ block maincontent
       if (btn) {
         btn.classList.add('active');
       }
-      if (tabName === 'steps') {
-        updateAllInputSelects();
-      }
-    }
-
-    function onTriggerTypeChange(selectElem) {
-      var row = selectElem.closest('.trigger-row');
-      if (!row) return;
-      var val = selectElem.value;
-      var fieldBranches = row.querySelector('.field-branches');
-      var fieldTags = row.querySelector('.field-tags');
-      var fieldEndpoint = row.querySelector('.field-endpoint');
-      var fieldCron = row.querySelector('.field-cron');
-
-      if (fieldBranches) fieldBranches.style.display = (val === 'git_push') ? 'block' : 'none';
-      if (fieldTags) fieldTags.style.display = (val === 'git_tag') ? 'block' : 'none';
-      if (fieldEndpoint) fieldEndpoint.style.display = (val === 'webhook') ? 'block' : 'none';
-      if (fieldCron) fieldCron.style.display = (val === 'cron') ? 'block' : 'none';
-    }
-
-    function removeTriggerRule(btn) {
-      var row = btn.closest('.trigger-row');
-      if (row) {
-        row.remove();
-      }
-    }
-
-    function addTriggerRule(defaultType) {
-      var container = document.getElementById('triggers-container');
-      if (!container) return;
-
-      var type = defaultType || 'git_push';
-      var row = document.createElement('div');
-      row.className = 'trigger-row';
-      row.style.cssText = 'border: 1px solid #e0e0e0; background: #fafafa; border-radius: 6px; padding: 15px; margin-bottom: 12px; position: relative;';
-
-      var header = document.createElement('div');
-      header.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;';
-
-      var typeWrapper = document.createElement('div');
-      typeWrapper.style.cssText = 'display: flex; align-items: center; gap: 10px;';
-
-      var label = document.createElement('label');
-      label.style.cssText = 'font-weight: bold; margin: 0;';
-      label.textContent = 'Trigger Type:';
-      typeWrapper.appendChild(label);
-
-      var select = document.createElement('select');
-      select.name = 'trigger_type';
-      select.className = 'form-control';
-      select.style.width = 'auto';
-      select.onchange = function() { onTriggerTypeChange(this); };
-
-      var options = [
-        { value: 'git_push', label: 'Git Push (Commit/Branch)' },
-        { value: 'git_tag', label: 'Git Tag (Release)' },
-        { value: 'webhook', label: 'Webhook (HTTP Endpoint)' },
-        { value: 'cron', label: 'Cron Schedule' },
-        { value: 'manual', label: 'Manual Dispatch' }
-      ];
-
-      for (var i = 0; i < options.length; i++) {
-        var opt = document.createElement('option');
-        opt.value = options[i].value;
-        opt.textContent = options[i].label;
-        if (options[i].value === type) opt.selected = true;
-        select.appendChild(opt);
-      }
-      typeWrapper.appendChild(select);
-      header.appendChild(typeWrapper);
-
-      var removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'btn btn-danger btn-sm btn-remove-trig';
-      removeBtn.textContent = '✕';
-      removeBtn.title = 'Remove trigger';
-      removeBtn.onclick = function() { removeTriggerRule(this); };
-      header.appendChild(removeBtn);
-      row.appendChild(header);
-
-      var fields = document.createElement('div');
-      fields.className = 'trigger-fields';
-
-      fields.innerHTML =
-        '<div class="form-group field-branches" style="' + (type === 'git_push' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
-          '<label>Branch Patterns (Comma-separated globs, e.g. main, feature/*):</label>' +
-          '<input class="form-control" type="text" name="trigger_branches" placeholder="e.g. main, feature/*, release/*">' +
-        '</div>' +
-        '<div class="form-group field-tags" style="' + (type === 'git_tag' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
-          '<label>Tag Patterns (Comma-separated globs, e.g. v*.*.*, release-*):</label>' +
-          '<input class="form-control" type="text" name="trigger_tags" placeholder="e.g. v*.*.*, release-*">' +
-        '</div>' +
-        '<div class="form-group field-endpoint" style="' + (type === 'webhook' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
-          '<label>Webhook Endpoint Path:</label>' +
-          '<input class="form-control" type="text" name="trigger_endpoint" placeholder="e.g. /api/v1/triggers/deploy">' +
-        '</div>' +
-        '<div class="form-group field-cron" style="' + (type === 'cron' ? 'margin-bottom: 8px;' : 'display: none; margin-bottom: 8px;') + '">' +
-          '<label>Cron Schedule Expression:</label>' +
-          '<input class="form-control" type="text" name="trigger_cron" placeholder="e.g. 0 0 * * 0">' +
-        '</div>';
-
-      row.appendChild(fields);
-      container.appendChild(row);
     }
 
     document.addEventListener("DOMContentLoaded", function() {
-      // Inputs first: checkout steps pick from the repository inputs declared here.
       for (var n = 0; n < initialInputs.length; n++) {
         addInputRow(initialInputs[n]);
       }
-      if (initialSteps && initialSteps.length > 0) {
-        for (var i = 0; i < initialSteps.length; i++) {
-          addBuildStep(initialSteps[i].type, initialSteps[i], stepIssues[i]);
-        }
-      } else {
-        addBuildStep('process', {
-          name: 'Build Step',
-          type: 'process',
-          script: ''
-        });
+      for (var i = 0; i < initialSteps.length; i++) {
+        addBuildStep(initialSteps[i], stepIssues[i]);
       }
-      updateAllInputSelects();
     });
