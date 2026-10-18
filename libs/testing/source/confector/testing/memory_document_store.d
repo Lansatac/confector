@@ -1,6 +1,6 @@
 module confector.testing.memory_document_store;
 
-import confector.plugin_api.document_store;
+import confector.api.document_store;
 import std.format : format;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString;

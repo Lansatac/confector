@@ -34,7 +34,7 @@ block maincontent
           tr
             th(style="width: 140px;") Upstream Tasks
             td
-              - import confector.plugin_api.model : upstreamTaskIds, repositoryIds, InputKind;
+              - import confector.api.model : upstreamTaskIds, repositoryIds, InputKind;
               - auto upstreamTasks = upstreamTaskIds(taskNode);
               - if (upstreamTasks.length > 0)
                 div(style="display: flex; flex-wrap: wrap; gap: 6px;")

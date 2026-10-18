@@ -1,12 +1,12 @@
 module confector.server.controller.api_controller;
 
 import vibe.vibe;
-import confector.plugin_api.model;
+import confector.api.model;
 import confector.core.dag;
 import confector.core.document_collection : tryValue;
 import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
-import confector.plugin_api.dispatch_queue;
+import confector.api.dispatch_queue;
 import confector.server.scheduler_callback : schedulerCallback;
 import confector.core.work_orders : completeExecution, defaultPoolQueue;
 

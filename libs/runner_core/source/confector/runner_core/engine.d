@@ -1,6 +1,6 @@
 module confector.runner_core.engine;
 
-import confector.plugin_api.model;
+import confector.api.model;
 import confector.runner_core.artifacts;
 import confector.runner_core.steps.step : StepContext, StepResult, StepRunner;
 

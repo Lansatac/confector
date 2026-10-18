@@ -9,7 +9,7 @@ module confector.testing.conformance.scheduler;
  * Pass a new scheduler with no entries; the suite leaves it empty.
  */
 
-import confector.plugin_api.scheduler;
+import confector.api.scheduler;
 import core.time : days;
 import std.datetime : Clock;
 import std.exception : collectException;

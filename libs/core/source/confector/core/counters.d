@@ -9,7 +9,7 @@ module confector.core.counters;
  */
 
 import confector.core.document_collection;
-import confector.plugin_api.document_store;
+import confector.api.document_store;
 
 import std.format : format;
 import vibe.data.json : Json;

@@ -7,7 +7,7 @@ module confector.testing.memory_artifact_storage;
  * stores (confector.core.state_stores) run in tests, is confector.testing.memory_document_store.
  */
 
-import confector.plugin_api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;
+import confector.api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;
 import std.format : format;
 
 

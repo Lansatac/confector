@@ -20,10 +20,10 @@ module confector.core.work_orders;
 
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
-import confector.plugin_api.model;
+import confector.api.model;
 import confector.core.state_stores : StateStores;
-import confector.plugin_api.dispatch_queue : DispatchQueue, DispatchQueueUsageException, Lease;
-import confector.plugin_api.document_store : DocumentConflictException;
+import confector.api.dispatch_queue : DispatchQueue, DispatchQueueUsageException, Lease;
+import confector.api.document_store : DocumentConflictException;
 
 import core.time : Duration;
 import std.datetime.systime : Clock;

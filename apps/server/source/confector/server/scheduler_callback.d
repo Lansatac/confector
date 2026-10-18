@@ -2,7 +2,7 @@ module confector.server.scheduler_callback;
 
 import vibe.vibe;
 import std.format : format;
-import confector.plugin_api.scheduler : schedulerSecretHeader;
+import confector.api.scheduler : schedulerSecretHeader;
 
 /**
  * Compares two strings without stopping at the first difference, so the time taken does not

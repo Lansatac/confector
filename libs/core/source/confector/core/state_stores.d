@@ -12,7 +12,7 @@ import confector.core.build_stores : BuildRequestStore, ChainStore, ExecutionSto
 import confector.core.counters : CounterStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
 import confector.core.rerun_generations : RerunGenerationStore;
-import confector.plugin_api.document_store : DocumentStore;
+import confector.api.document_store : DocumentStore;
 
 /**
  * The core's state stores over one DocumentStore.
@@ -60,7 +60,7 @@ final class StateStores
 unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
-    import confector.plugin_api.model : ProjectRecord;
+    import confector.api.model : ProjectRecord;
 
     // Every store is declared over one document store; a restarted process redeclares the same
     // collections and sees the same data

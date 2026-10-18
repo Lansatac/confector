@@ -1,6 +1,6 @@
 module confector.core.dag;
 
-import confector.plugin_api.model;
+import confector.api.model;
 import std.algorithm : canFind, sort, filter;
 import std.array : array;
 import std.format : format;

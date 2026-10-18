@@ -7,7 +7,7 @@ import std.datetime.systime : Clock;
 import std.string : strip;
 import std.uri : encodeComponent;
 
-import confector.plugin_api.model : ProjectRecord, RepositoryRecord, projectUsesRepository, repositoryIds;
+import confector.api.model : ProjectRecord, RepositoryRecord, projectUsesRepository, repositoryIds;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 

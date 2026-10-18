@@ -12,7 +12,7 @@ module confector.core.document_collection;
  * missing results.
  */
 
-import confector.plugin_api.document_store;
+import confector.api.document_store;
 
 import std.datetime.systime : SysTime;
 import std.format : format;

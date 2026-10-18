@@ -1,7 +1,7 @@
 module confector.core.definition_hash;
 
 import confector.core.fingerprinter : canonicalPinned, sha256Hex;
-import confector.plugin_api.model;
+import confector.api.model;
 
 import vibe.data.json : Json;
 

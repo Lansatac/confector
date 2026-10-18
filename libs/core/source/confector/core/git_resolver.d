@@ -19,8 +19,8 @@ module confector.core.git_resolver;
  * An annotated tag resolves to the commit it points at (its peeled `^{}` entry).
  */
 
-import confector.plugin_api.input_resolver : RepositoryResolver;
-import confector.plugin_api.model : InputDecl, InputKind, InputPin, RepositoryRecord;
+import confector.api.input_resolver : RepositoryResolver;
+import confector.api.model : InputDecl, InputKind, InputPin, RepositoryRecord;
 import confector.core.git : isFullSha, redactUserInfo;
 
 import vibe.data.json : Json;
@@ -386,7 +386,7 @@ unittest // resolver fails loudly
 
 version (unittest)
 {
-    import confector.plugin_api.model : repositoryInput, valueInput;
+    import confector.api.model : repositoryInput, valueInput;
     import std.array : replicate;
 
     private InputDecl repositoryInputFor(string selector) { return repositoryInput("r", selector); }

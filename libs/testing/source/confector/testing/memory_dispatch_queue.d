@@ -1,6 +1,6 @@
 module confector.testing.memory_dispatch_queue;
 
-import confector.plugin_api.dispatch_queue;
+import confector.api.dispatch_queue;
 import core.time : Duration, MonoTime;
 import std.format : format;
 import vibe.data.json : Json;

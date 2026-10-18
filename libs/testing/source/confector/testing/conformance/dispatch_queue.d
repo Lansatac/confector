@@ -17,7 +17,7 @@ module confector.testing.conformance.dispatch_queue;
  * that uses real time sleeps. Checks wait about 20 seconds in total.
  */
 
-import confector.plugin_api.dispatch_queue;
+import confector.api.dispatch_queue;
 import core.time : Duration, hours, seconds;
 import std.format : format;
 import vibe.data.json : Json;

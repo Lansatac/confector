@@ -32,7 +32,7 @@
       "type": "pickString",
       "description": "Sub-package to test",
       "options": [
-        "core", "plugin-api", "config", "runner-core", "testing", "server", "runner",
+        "core", "api", "config", "runner-core", "testing", "server", "runner",
         "document-store-mongo", "queue-mongo", "scheduler-local", "artifact-local"
       ],
       "default": "core"

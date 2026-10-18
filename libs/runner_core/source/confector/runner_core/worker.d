@@ -1,7 +1,7 @@
 module confector.runner_core.worker;
 
-import confector.plugin_api.model;
-import confector.plugin_api.dispatch_queue : Lease;
+import confector.api.model;
+import confector.api.dispatch_queue : Lease;
 import confector.runner_core.engine;
 import confector.runner_core.http_artifact_storage;
 import confector.runner_core.logging;

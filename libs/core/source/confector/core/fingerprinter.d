@@ -1,6 +1,6 @@
 module confector.core.fingerprinter;
 
-import confector.plugin_api.model;
+import confector.api.model;
 
 import vibe.data.json : Json;
 

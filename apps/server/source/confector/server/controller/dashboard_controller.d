@@ -3,7 +3,7 @@ module confector.server.controller.dashboard_controller;
 import vibe.vibe;
 import vibe.core.log : logError;
 import confector.core.builtin_steps : builtinStepTypes, checkoutConfigIssues, checkoutStepType;
-import confector.plugin_api.model;
+import confector.api.model;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;

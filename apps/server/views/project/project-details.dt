@@ -79,7 +79,7 @@ block maincontent
               td
                 a(href="/tasks/details?project_id=#{project.id}&task_id=#{t.id}", style="font-weight: 600; text-decoration: none; color: inherit;") #{t.name.length > 0 ? t.name : t.id}
               td
-                - import confector.plugin_api.model : upstreamTaskIds, repositoryIds, InputKind;
+                - import confector.api.model : upstreamTaskIds, repositoryIds, InputKind;
                 - auto upstreamTasks = upstreamTaskIds(t);
                 - if (upstreamTasks.length > 0)
                   div(style="display: flex; flex-wrap: wrap; gap: 4px;")

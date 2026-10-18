@@ -1,7 +1,7 @@
 module confector.runner_core.steps.builtin;
 
 import confector.core.builtin_steps : checkoutStepType;
-import confector.plugin_api.model : BuildStep;
+import confector.api.model : BuildStep;
 import confector.core.not_implemented : NotImplementedException;
 import confector.runner_core.steps.step;
 import confector.runner_core.steps.checkout : runCheckout;

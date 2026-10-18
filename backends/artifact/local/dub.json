@@ -1,0 +1,12 @@
+{
+	"name": "artifact-local",
+	"description": "Local filesystem artifact storage backend for Confector (a compiled-in library)",
+	"targetType": "library",
+	"targetName": "confector_local_artifact",
+	"targetPath": "../../../out/lib",
+	"dependencies": {
+		"confector:api": {
+			"path": "../../.."
+		}
+	}
+}

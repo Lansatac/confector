@@ -4,7 +4,7 @@
 	"targetType": "library",
 	"targetName": "confector_testing",
 	"dependencies": {
-		"confector:plugin-api": {
+		"confector:api": {
 			"path": "../.."
 		},
 		"vibe-d": "~>0.10.3"

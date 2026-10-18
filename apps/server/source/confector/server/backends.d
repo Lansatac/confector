@@ -14,14 +14,14 @@ module confector.server.backends;
 import std.format : format;
 
 import kaleidic.mongo_standalone : MongoConnection;
-import confector.plugin_api.dispatch_queue : DispatchQueue;
-import confector.plugin_api.document_store : DocumentStore;
-import confector.plugin_api.model : ArtifactStorage;
-import confector.plugin_api.scheduler : Scheduler;
-import confector.plugins.artifact.local : LocalArtifactStorage;
-import confector.plugins.document_store.mongo : MongoDocumentStore;
-import confector.plugins.queue.mongo : MongoDispatchQueue;
-import confector.plugins.scheduler.local : LocalScheduler;
+import confector.api.dispatch_queue : DispatchQueue;
+import confector.api.document_store : DocumentStore;
+import confector.api.model : ArtifactStorage;
+import confector.api.scheduler : Scheduler;
+import confector.backends.artifact.local : LocalArtifactStorage;
+import confector.backends.document_store.mongo : MongoDocumentStore;
+import confector.backends.queue.mongo : MongoDispatchQueue;
+import confector.backends.scheduler.local : LocalScheduler;
 import confector.server.config : HttpConfig, ServerConfig, requireArtifactStoreConfig, requireDocumentStoreConfig,
     requireSchedulerConfig;
 

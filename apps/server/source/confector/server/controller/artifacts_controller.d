@@ -1,7 +1,7 @@
 module confector.server.controller.artifacts_controller;
 
 import vibe.vibe;
-import confector.plugin_api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;
+import confector.api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;
 import std.array : Appender;
 
 /**
@@ -169,7 +169,7 @@ URLRouter artifactsRouter(ArtifactStorage storage)
 
 unittest
 {
-    import confector.plugins.artifact.local : LocalArtifactStorage;
+    import confector.backends.artifact.local : LocalArtifactStorage;
     import std.algorithm.searching : canFind;
     import std.conv : to;
     import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;

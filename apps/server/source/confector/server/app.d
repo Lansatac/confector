@@ -152,7 +152,7 @@ void main()
 
 unittest
 {
-    import confector.plugins.scheduler.local : LocalScheduler;
+    import confector.backends.scheduler.local : LocalScheduler;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore;

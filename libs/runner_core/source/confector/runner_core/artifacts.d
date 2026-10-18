@@ -1,6 +1,6 @@
 module confector.runner_core.artifacts;
 
-import confector.plugin_api.model;
+import confector.api.model;
 import confector.core.zip_packager;
 
 import std.file : exists, mkdirRecurse, isDir;

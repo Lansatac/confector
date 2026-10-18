@@ -3,7 +3,7 @@
 	"targetType": "library",
 	"targetName": "confector_core",
 	"dependencies": {
-		"confector:plugin-api": {
+		"confector:api": {
 			"path": "../.."
 		},
 		"vibe-d": "~>0.10.3"

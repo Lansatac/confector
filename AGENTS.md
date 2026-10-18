@@ -645,7 +645,7 @@ Be aware of these so you do not spread them:
   (bead `confector-z7z.35.6`), and any other step type fails the task (bead
   `confector-z7z.35.1`). Workers send no credential until per-execution tokens land (bead
   `confector-z7z.30.1`).
-- **The data model** (`libs/plugin_api/source/confector/plugin_api/model.d`) has one canonical
+- **The data model** (`libs/api/source/confector/api/model.d`) has one canonical
   form for each concept: a step is `{name, type, config}` (config is the step type's JSON object),
   an output is `{id, path}`, a task is `{id, name, inputs, outputs, steps, timeout_seconds,
   environment}`. **Do not add another alias.** If a representation is wrong, change it and update
@@ -664,7 +664,7 @@ Each dub package is a directory with its own `dub.json` and a `source/` folder h
 module path (for example `libs/core/source/confector/core/`).
 
 - `libs/core/` — graph construction, input resolution, fingerprinting, built-in step types.
-- `libs/plugin_api/` — data types and backend interfaces (document store, dispatch queue,
+- `libs/api/` — data types and backend interfaces (document store, dispatch queue,
   scheduler, artifact storage).
 - `libs/runner_core/` — executes a single task on a worker, including the built-in checkout step.
 - `libs/config/` — configuration types.
@@ -672,8 +672,8 @@ module path (for example `libs/core/source/confector/core/`).
 - `apps/runner/` — the runner command-line program.
 - `apps/server/` — web server, API and dashboard, with its web UI templates
   (`views/`) and static assets (`public/`).
-- `plugins/<category>/<name>/` — compiled-in backend libraries by kind (artifact store, document
-  store, queue, scheduler); the directory is to be renamed. Build steps are not backends: the
+- `backends/<category>/<name>/` — compiled-in backend libraries by kind (artifact store, document
+  store, queue, scheduler). Build steps are not backends: the
   runner's built-in steps live in `libs/runner_core` (`steps/`).
 
 Explore the code for anything more specific; file-level details change too often to list here.

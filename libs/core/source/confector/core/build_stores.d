@@ -13,8 +13,8 @@ module confector.core.build_stores;
 
 import confector.core.counters : CounterStore;
 import confector.core.document_collection;
-import confector.plugin_api.model;
-import confector.plugin_api.document_store;
+import confector.api.model;
+import confector.api.document_store;
 
 import std.algorithm.searching : canFind;
 import std.format : format;

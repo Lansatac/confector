@@ -1,6 +1,6 @@
 module confector.runner_core.steps.step;
 
-import confector.plugin_api.model : BuildStep, ResolvedInput;
+import confector.api.model : BuildStep, ResolvedInput;
 import confector.runner_core.logging : LogDelegate;
 
 /**

@@ -7,7 +7,7 @@ import std.path : buildPath, baseName, isAbsolute, buildNormalizedPath, absolute
 import std.algorithm.searching : canFind, startsWith;
 import std.string : strip, toLower;
 
-import confector.plugin_api.model : BuildStep, InputKind, ResolvedInput;
+import confector.api.model : BuildStep, InputKind, ResolvedInput;
 import confector.core.git : isFullSha, redactUserInfo;
 import confector.core.builtin_steps : checkoutConfig, checkoutConfigIssues, checkoutStepType;
 import confector.runner_core.logging : LogDelegate;

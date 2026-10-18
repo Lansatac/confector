@@ -8,8 +8,8 @@ module confector.core.api_token_store;
 
 import confector.core.build_stores : InvalidStateTransitionException;
 import confector.core.document_collection;
-import confector.plugin_api.model;
-import confector.plugin_api.document_store;
+import confector.api.model;
+import confector.api.document_store;
 
 import std.format : format;
 import std.typecons : Nullable;

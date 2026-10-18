@@ -18,7 +18,7 @@ module confector.testing.conformance.document_store;
  * do not, such as a local emulator.
  */
 
-import confector.plugin_api.document_store;
+import confector.api.document_store;
 import std.format : format;
 import std.typecons : nullable;
 import vibe.data.json : Json;

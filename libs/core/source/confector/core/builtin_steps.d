@@ -6,7 +6,7 @@ module confector.core.builtin_steps;
  * programs with their own manifests are bead confector-z7z.35.1.
  */
 
-import confector.plugin_api.document_store : jsonTypeName;
+import confector.api.document_store : jsonTypeName;
 import vibe.data.json : Json;
 
 import std.algorithm.searching : canFind;

@@ -1,6 +1,6 @@
 module confector.runner_core.http_artifact_storage;
 
-import confector.plugin_api.model : ArtifactStorage;
+import confector.api.model : ArtifactStorage;
 import std.json : JSONType, parseJSON;
 import std.net.curl : HTTP;
 import std.array : Appender;

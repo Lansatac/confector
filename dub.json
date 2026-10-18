@@ -13,15 +13,15 @@
   },
   "subPackages": [
     "libs/config",
-    "libs/plugin_api",
+    "libs/api",
     "libs/core",
     "libs/runner_core",
     "libs/testing",
     "apps/server",
     "apps/runner",
-    "plugins/artifact/local",
-    "plugins/queue/mongo",
-    "plugins/document_store/mongo",
-    "plugins/scheduler/local"
+    "backends/artifact/local",
+    "backends/queue/mongo",
+    "backends/document_store/mongo",
+    "backends/scheduler/local"
   ]
 }

@@ -1,0 +1,9 @@
+{
+	"name": "api",
+	"targetType": "library",
+	"targetName": "confector_api",
+	"dependencies": {
+		"vibe-serialization": "~>1.2.0"
+	},
+	"targetPath": "../../out/lib"
+}
