@@ -8,6 +8,20 @@
 		"confector:plugin-api": {
 			"path": "../../.."
 		},
-		"cron": "~>0.1.1"
-	}
+		"cron": "~>0.1.1",
+		"vibe-core": "~>2.9"
+	},
+	"configurations": [
+		{
+			"name": "library"
+		},
+		{
+			"name": "unittest",
+			"dependencies": {
+				"confector:testing": {
+					"path": "../../.."
+				}
+			}
+		}
+	]
 }

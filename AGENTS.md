@@ -666,7 +666,6 @@ module path (for example `libs/core/source/confector/core/`).
   scheduler, artifact storage).
 - `libs/runner_core/` — executes a single task on a worker, including the built-in checkout step.
 - `libs/config/` — configuration types.
-- `libs/mongo_helpers/` — MongoDB connection and BSON helpers.
 - `libs/testing/` — in-memory fakes and backend conformance suites (test-only).
 - `apps/runner/` — the runner command-line program.
 - `apps/server/` — web server, API and dashboard, with its web UI templates

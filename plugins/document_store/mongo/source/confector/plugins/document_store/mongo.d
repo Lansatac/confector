@@ -1,6 +1,6 @@
 module confector.plugins.document_store.mongo;
 
-import confector.mongo_helpers : bson_value, document, MongoConnection;
+import kaleidic.mongo_standalone : bson_value, document, MongoConnection;
 import confector.plugin_api.document_store;
 import std.format : format;
 import std.typecons : Nullable, nullable;

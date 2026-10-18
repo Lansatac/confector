@@ -15,9 +15,7 @@
 		"confector:core": {
 			"path": "../.."
 		},
-		"confector:mongo-helpers": {
-			"path": "../.."
-		},
+		"mongo-standalone": "~>0.0.15",
 		"confector:document-store-mongo": {
 			"path": "../.."
 		},

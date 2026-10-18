@@ -146,9 +146,6 @@ void main()
 
     listenHTTP(settings, router);
 
-    backends.scheduler.start();
-    logInfo("[scheduler] Scheduler started");
-
     logInfo("Starting server on port %d", serverConfig.http.port);
     runApplication();
 }
@@ -165,7 +162,7 @@ unittest
     Backends backends;
     backends.documentStore = new InMemoryDocumentStore();
     backends.dispatchQueue = new InMemoryDispatchQueue();
-    backends.scheduler = new LocalScheduler("test-scheduler-secret");
+    backends.scheduler = new LocalScheduler("test-scheduler-secret", "http://127.0.0.1:8080");
     auto artifacts = new InMemoryArtifactStorage();
     backends.artifactStore = artifacts;
     auto router = createRouter(backends, new StateStores(backends.documentStore), "test-scheduler-secret");

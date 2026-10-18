@@ -1,6 +1,6 @@
 module confector.plugins.queue.mongo;
 
-import confector.mongo_helpers : bson_value, document, MongoConnection;
+import kaleidic.mongo_standalone : bson_value, document, MongoConnection;
 import confector.plugin_api.dispatch_queue;
 import core.time : Duration;
 import std.format : format;

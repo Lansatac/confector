@@ -14,7 +14,6 @@
   "subPackages": [
     "libs/config",
     "libs/plugin_api",
-    "libs/mongo_helpers",
     "libs/core",
     "libs/runner_core",
     "libs/testing",

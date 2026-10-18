@@ -11,7 +11,9 @@ module confector.server.backends;
  * not name which one to use.
  */
 
-import confector.mongo_helpers : MongoConnection;
+import std.format : format;
+
+import kaleidic.mongo_standalone : MongoConnection;
 import confector.plugin_api.dispatch_queue : DispatchQueue;
 import confector.plugin_api.document_store : DocumentStore;
 import confector.plugin_api.model : ArtifactStorage;
@@ -20,7 +22,7 @@ import confector.plugins.artifact.local : LocalArtifactStorage;
 import confector.plugins.document_store.mongo : MongoDocumentStore;
 import confector.plugins.queue.mongo : MongoDispatchQueue;
 import confector.plugins.scheduler.local : LocalScheduler;
-import confector.server.config : ServerConfig, requireArtifactStoreConfig, requireDocumentStoreConfig,
+import confector.server.config : HttpConfig, ServerConfig, requireArtifactStoreConfig, requireDocumentStoreConfig,
     requireSchedulerConfig;
 
 /**
@@ -39,6 +41,41 @@ struct Backends
 }
 
 /**
+ * The URL the local scheduler calls this server on: the address the server is bound to, or the
+ * loopback address when it listens on every address (empty, 0.0.0.0 or ::). An IPv6 literal is
+ * bracketed.
+ */
+string serverBaseUrl(in HttpConfig http)
+{
+    import std.algorithm.searching : canFind;
+
+    string host = http.bindAddress;
+    if (host.length == 0 || host == "0.0.0.0" || host == "::" || host == "[::]")
+        host = "127.0.0.1";
+    else if (host.canFind(':') && host[0] != '[')
+        host = "[" ~ host ~ "]";
+    return format("http://%s:%d", host, http.port);
+}
+
+unittest
+{
+    HttpConfig http;
+    http.port = 9090;
+    http.bindAddress = "0.0.0.0";
+    assert(serverBaseUrl(http) == "http://127.0.0.1:9090");
+    http.bindAddress = "";
+    assert(serverBaseUrl(http) == "http://127.0.0.1:9090");
+    http.bindAddress = "::";
+    assert(serverBaseUrl(http) == "http://127.0.0.1:9090");
+    http.bindAddress = "192.168.1.5";
+    assert(serverBaseUrl(http) == "http://192.168.1.5:9090");
+    http.bindAddress = "::1";
+    assert(serverBaseUrl(http) == "http://[::1]:9090");
+    http.bindAddress = "[::1]";
+    assert(serverBaseUrl(http) == "http://[::1]:9090");
+}
+
+/**
  * Builds the backends `config` describes. Every setting is checked before any backend is built,
  * so a missing one fails startup without touching a database; an invalid one (an unreachable
  * MongoDB, an artifact directory that cannot be created) fails when its backend is built.
@@ -54,7 +91,7 @@ Backends buildBackends(in ServerConfig config)
     Backends backends;
     // The local backends first: they are cheap and fail without a database.
     backends.artifactStore = new LocalArtifactStorage(config.artifactStore.baseDirectory);
-    backends.scheduler = new LocalScheduler(config.scheduler.callbackSecret);
+    backends.scheduler = new LocalScheduler(config.scheduler.callbackSecret, serverBaseUrl(config.http));
     backends.documentStore = new MongoDocumentStore(
         new MongoConnection(config.documentStore.connectionString), config.documentStore.database);
     backends.dispatchQueue = new MongoDispatchQueue(

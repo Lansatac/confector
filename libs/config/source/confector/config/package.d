@@ -116,14 +116,7 @@ interface ConfigAccessor
         {
             return defaultValue;
         }
-        try
-        {
-            return coerceJson!T(val);
-        }
-        catch (Exception)
-        {
-            return defaultValue;
-        }
+        return coerceJson!T(val);
     }
 
     final T bind(T)() const
@@ -173,14 +166,7 @@ interface ConfigAccessor
                             Json resolved = getJson(memberKey);
                             if (resolved.type != Json.Type.undefined)
                             {
-                                try
-                                {
-                                    __traits(getMember, result, member) = coerceJson!MemberType(resolved);
-                                }
-                                catch (Exception e)
-                                {
-                                    // Keep default value on coercion error
-                                }
+                                __traits(getMember, result, member) = coerceJson!MemberType(resolved);
                             }
                         }
                     }
@@ -294,21 +280,14 @@ void registerDefinitionsFromStruct(T, Target)(Target target, string prefix = "")
 }
 
 /**
- * Helper to convert hierarchical key (e.g. "server.http.port" or "plugins.example_store.maxConcurrency")
- * into a default environment variable name:
+ * Helper to convert hierarchical key (e.g. "server.http.port") into a default environment
+ * variable name:
  * "server.http.port" -> "CONFECTOR_SERVER_HTTP_PORT"
- * "plugins.example_store.maxConcurrency" -> "CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY"
  */
 string keyToDefaultEnvVar(string key)
 {
-    // If key starts with "plugins.", convert "plugins.foo.bar" to "CONFECTOR_FOO_BAR"
-    // or standard "CONFECTOR_KEY_PATH"
     string transformedKey = key;
-    if (transformedKey.length >= 8 && transformedKey[0 .. 8] == "plugins.")
-    {
-        transformedKey = transformedKey[8 .. $];
-    }
-    
+
     // Replace dots and hyphens with underscores, convert camelCase/mixed to upper snake
     string result = "CONFECTOR_";
     foreach (size_t i, dchar c; transformedKey)
@@ -338,7 +317,7 @@ string keyToDefaultEnvVar(string key)
 }
 
 /**
- * Helper to traverse nested Json by dot-separated path (e.g. "plugins.example-store.maxConcurrency").
+ * Helper to traverse nested Json by dot-separated path (e.g. "server.http.port").
  */
 Json getNestedJson(in Json root, string dotPath)
 {
@@ -464,11 +443,11 @@ class ResolutionEngine
     {
         if (hint.type == Json.Type.int_)
         {
-            try { return Json(val.to!long); } catch (ConvException) {}
+            return Json(val.to!long);
         }
         else if (hint.type == Json.Type.float_)
         {
-            try { return Json(val.to!double); } catch (ConvException) {}
+            return Json(val.to!double);
         }
         else if (hint.type == Json.Type.bool_)
         {
@@ -477,7 +456,7 @@ class ResolutionEngine
         }
         else if (hint.type == Json.Type.array || hint.type == Json.Type.object)
         {
-            try { return parseJsonString(val); } catch (Exception) {}
+            return parseJsonString(val);
         }
 
         // Fallback dynamic inference
@@ -501,7 +480,7 @@ class ResolutionEngine
                 if ((val.length >= 2 && val[0] == '[' && val[$ - 1] == ']') ||
                     (val.length >= 2 && val[0] == '{' && val[$ - 1] == '}'))
                 {
-                    try { return parseJsonString(val); } catch (Exception) {}
+                    return parseJsonString(val);
                 }
                 return Json(val);
             }
@@ -577,7 +556,7 @@ class ScopedConfigAccessor : ConfigAccessor
         if (val.type == Json.Type.float_) return cast(long)val.get!double;
         if (val.type == Json.Type.string)
         {
-            try { return val.get!string.to!long; } catch (ConvException) {}
+            return val.get!string.to!long;
         }
         return defaultValue;
     }
@@ -602,7 +581,7 @@ class ScopedConfigAccessor : ConfigAccessor
         if (val.type == Json.Type.int_) return cast(double)val.get!long;
         if (val.type == Json.Type.string)
         {
-            try { return val.get!string.to!double; } catch (ConvException) {}
+            return val.get!string.to!double;
         }
         return defaultValue;
     }
@@ -765,59 +744,26 @@ unittest
     // Remove JSON config entry; assert returns 8080
     registry.setFileConfig(Json.emptyObject);
     assert(serverConfig.getInt("port") == 8080);
+
+    // A key's default environment variable is its path in upper snake case
+    assert(keyToDefaultEnvVar("server.http.bindAddress") == "CONFECTOR_SERVER_HTTP_BIND_ADDRESS");
 }
 
 unittest
 {
-    // Test 2: Scoped Plugin Configuration Lookup & Convention Env Vars
-    string jsonStr = `{
-        "plugins": {
-            "example_store": {
-                "maxConcurrency": 8,
-                "dataPath": "out/custom-path"
-            }
-        }
-    }`;
-    auto registry = new ConfigRegistry(parseJsonString(jsonStr));
-    auto pluginScope = registry.getScope("plugins.example_store");
+    import std.exception : assertThrown;
 
-    assert(pluginScope.get!size_t("maxConcurrency") == 8);
-    assert(pluginScope.get!string("dataPath") == "out/custom-path");
-    assert(pluginScope.getInt("maxConcurrency") == 8);
-    assert(pluginScope.getString("dataPath") == "out/custom-path");
+    // A value that cannot be read as its setting's type fails loudly instead of being replaced
+    // by the default or by a differently typed value
+    struct Limits { int count = 3; }
+    auto registry = new ConfigRegistry(parseJsonString(`{"limits": {"count": "many"}}`));
+    registry.bindDefinition!Limits("limits");
+    assertThrown!ConvException(registry.getScope("limits").bind!Limits());
 
-    // Test 3: Environment Variable Override for Plugins (via automatic CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY mapping)
-    environment["CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY"] = "16";
-    assert(pluginScope.get!size_t("maxConcurrency") == 16);
-    environment.remove("CONFECTOR_EXAMPLE_STORE_MAX_CONCURRENCY");
-    assert(pluginScope.get!size_t("maxConcurrency") == 8);
-}
-
-unittest
-{
-    // Test 4: Struct Binding (bind!T)
-    struct ExampleStoreConfig
-    {
-        size_t maxConcurrency = 4;
-        string dataPath = "out/default-path";
-        bool enabled = true;
-    }
-
-    string jsonStr = `{
-        "plugins": {
-            "example_store": {
-                "maxConcurrency": 12,
-                "dataPath": "out/alt-path"
-            }
-        }
-    }`;
-    auto registry = new ConfigRegistry(parseJsonString(jsonStr));
-    auto pluginScope = registry.getScope("plugins.example_store");
-
-    auto cfg = pluginScope.bind!ExampleStoreConfig();
-    assert(cfg.maxConcurrency == 12);
-    assert(cfg.dataPath == "out/alt-path");
-    assert(cfg.enabled == true); // Default preserved when absent
+    environment["CONFECTOR_LIMITS_COUNT"] = "many";
+    scope (exit) environment.remove("CONFECTOR_LIMITS_COUNT");
+    assertThrown!ConvException(registry.resolveKey("limits.count"));
+    assertThrown!ConvException(registry.getScope("limits").getInt("count"));
 }
 
 unittest
