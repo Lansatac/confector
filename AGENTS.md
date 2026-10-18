@@ -314,8 +314,8 @@ and chain state (bead `confector-z7z.48`).
   definition of the request it runs for, and enqueues it.
 - **All state is persisted; nothing lives only in memory.** Each fingerprint has a *ledger*
   document, read by id, holding its active execution (at most one), its latest success, its latest
-  stopped execution with a sequence number, and the chains waiting on the active execution. At
-  most one active execution per fingerprint is enforced with compare-and-set on the ledger, not
+  stopped execution with a sequence number, the chains waiting on the active execution, and the
+  chains still to be woken, each with the execution whose end it must see. At most one active execution per fingerprint is enforced with compare-and-set on the ledger, not
   with locks. *Why:* multiple instances and serverless deployment must work, and a restart must
   lose nothing.
 - **Decisions read only what the store guarantees fresh.** Reading by id and compare-and-set are
@@ -637,7 +637,9 @@ Be aware of these so you do not spread them:
   (`confector.core.work_orders.completeExecution`) until the ledger fold lands (bead
   `confector-z7z.49.4`). The chain evaluator, execution dispatcher and fingerprint claims were
   deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
-  designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). Do not add a build path outside the
+  designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
+  (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing dispatches through
+  it or folds into it yet (beads `confector-z7z.49.3`, `confector-z7z.49.4`). Do not add a build path outside the
   chain components. The build log routes answer 501 until the log store lands (bead
   `confector-z7z.31.12`). Nothing in the project is kept for backward compatibility.
 - **Steps run in-process.** The runner's only working step is the built-in checkout

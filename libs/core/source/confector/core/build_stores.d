@@ -254,6 +254,50 @@ final class ExecutionStore
     }
 
     /**
+     * Records `execution` as `create` does, unless an execution with its id exists already; then
+     * returns the stored one, whatever its status, and writes nothing. For executions with
+     * deterministic ids (confector.core.fingerprint_ledger.executionIdFor): the dispatcher that
+     * won a claim, and anyone repairing a claim whose dispatcher crashed before recording it,
+     * create the same execution, and whichever writes first is kept. The stored execution may
+     * carry another request's definition: an execution runs with the definition of whoever
+     * recorded it (AGENTS.md, "Pipeline definitions").
+     *
+     * Callers must check the returned record's status: a slow dispatcher or repairer can get back
+     * an execution that already ran and finished, which must not be sent again or treated as
+     * newly queued.
+     *
+     * Throws: as `create`; InvalidStateTransitionException if the stored execution has another
+     * project, task or fingerprint, which a deterministic id rules out unless the store is
+     * corrupt.
+     */
+    Versioned!TaskExecution createIfAbsent(TaskExecution execution)
+    {
+        foreach (attempt; 0 .. 2)
+        {
+            auto existing = m_executions.get(execution.id);
+            if (!existing.isNull)
+            {
+                const was = existing.get.value;
+                requireValid(was.projectId == execution.projectId && was.taskId == execution.taskId
+                    && was.fingerprint == execution.fingerprint,
+                    format("Execution '%s' exists for project '%s', task '%s' at fingerprint %s, not for project '%s', task '%s' at fingerprint %s",
+                        execution.id, was.projectId, was.taskId, was.fingerprint, execution.projectId, execution.taskId,
+                        execution.fingerprint));
+                return existing.get;
+            }
+            try
+            {
+                return create(execution);
+            }
+            catch (DocumentConflictException)
+            {
+                // Created concurrently: read it and check it is the same execution.
+            }
+        }
+        throw new Exception(format("Execution '%s' was reported to exist and then not found", execution.id));
+    }
+
+    /**
      * Replaces the execution `current` with `next`.
      *
      * Throws: DocumentConflictException if the execution changed since `current` was read;

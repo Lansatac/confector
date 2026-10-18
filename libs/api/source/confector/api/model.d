@@ -361,8 +361,10 @@ struct TaskExecutionResult
 
 // The build model (design records: beads confector-z7z.14, confector-z7z.15 and confector-z7z.2;
 // AGENTS.md, "What a build is"). A request joins or creates a chain; chain state is derived from
-// the chain, its requests, the rerun generations and the executions for its fingerprints, and is
-// never stored. Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
+// authoritative inputs (the chain, its requests, the rerun generations, and the fingerprint
+// ledgers and executions for its fingerprints), with a small mutable ChainState document per
+// chain holding demand and a dirty marker (bead confector-z7z.48; ChainState is bead
+// confector-z7z.49.2). Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
 // (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because toISOExtString
 // leaves out zero fractional seconds: parse them to compare.
 
@@ -547,6 +549,52 @@ struct TaskExecution
     /// code: read `status` and `errorMessage`.
     @optional @asName("exit_code") int exitCode;
     @optional @asName("error_message") string errorMessage;
+}
+
+/**
+ * One chain to mark dirty because an execution it waited on ended: written by the ledger's fold
+ * (FingerprintLedger.pendingNotify) and removed once the chain has been marked. It names the
+ * execution as well as the chain, so a chain waiting on two executions in turn at one fingerprint
+ * gets a notice for each, and clearing the first never clears the second.
+ */
+struct LedgerNotice
+{
+    @asName("chain_id") string chainId;
+    /// The execution whose end the chain must see.
+    @asName("execution_id") string executionId;
+}
+
+/**
+ * The fingerprint ledger (design record: bead confector-z7z.48; AGENTS.md, "Coordinating
+ * builds"): one document per fingerprint, with the fingerprint as its id, read by id and changed
+ * only by compare-and-set (confector.core.fingerprint_ledger). It is the linearization point for
+ * one fingerprint: at most one active execution, the latest success and stop, and the chains
+ * waiting on the active execution.
+ */
+struct FingerprintLedger
+{
+    /// The fingerprint, which is also the document's id.
+    string fingerprint;
+    /// The execution queued or running at this fingerprint; empty when none is. Set by a claim,
+    /// cleared only by the fold of that execution's terminal outcome.
+    @optional @asName("active_execution_id") string activeExecutionId;
+    /// The latest execution that succeeded; empty when none has. Whether it is still usable (its
+    /// artifacts may have expired) is on the execution record.
+    @optional @asName("last_success_execution_id") string lastSuccessExecutionId;
+    /// The latest execution that failed or was cancelled (a lost execution ends failed); empty
+    /// when none has.
+    @optional @asName("last_stopped_execution_id") string lastStoppedExecutionId;
+    /// How many executions at this fingerprint have failed or been cancelled. Only grows; chain
+    /// state settles a demand by comparing it with the value seen when the demand was recorded,
+    /// never by comparing times.
+    @optional @asName("stop_seq") ulong stopSeq;
+    /// How many executions have ever been claimed at this fingerprint. The nth has the
+    /// deterministic id `executionIdFor(fingerprint, n)`.
+    @optional @asName("execution_seq") ulong executionSeq;
+    /// Chains waiting on the active execution. Empty when there is none.
+    @optional string[] subscribers;
+    /// Chains still to be marked dirty because an execution they waited on ended.
+    @optional @asName("pending_notify") LedgerNotice[] pendingNotify;
 }
 
 /**
