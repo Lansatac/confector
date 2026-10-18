@@ -93,6 +93,38 @@ InputDecl repositoryInputKey(in InputDecl decl) pure @safe
 }
 
 /**
+ * Returns the key under which an external input is pinned (on a chain, `BuildChain.pins`, or with
+ * a request, `BuildRequest.pins`): its kind plus its kind-specific key, so every task declaring
+ * the same input shares one pin. For a repository input it is `repositoryInputKey`: the
+ * repository id and ref selector.
+ *
+ * Only external inputs are pinned this way. A value input is pinned by its own declaration, and
+ * a task output input by its upstream task's fingerprint; neither has a pin key. A new kind of
+ * external input gets its own case here.
+ *
+ * Throws: InputResolutionException if `decl` is not an external input, or is a repository input
+ * naming no repository or no ref selector.
+ */
+InputDecl pinKey(in InputDecl decl) pure @safe
+{
+    final switch (decl.kind)
+    {
+        case InputKind.repository:
+            if (decl.spec.repository.length == 0 || decl.spec.refSelector.length == 0)
+            {
+                throw new InputResolutionException(format(
+                    "A repository input is pinned by repository and ref selector, and repository '%s' at ref '%s' lacks one",
+                    decl.spec.repository, decl.spec.refSelector));
+            }
+            return repositoryInputKey(decl);
+        case InputKind.value:
+        case InputKind.taskOutput:
+            throw new InputResolutionException(format(
+                "Input of kind '%s' is not an external input; only external inputs are pinned", cast(string) decl.kind));
+    }
+}
+
+/**
  * Returns the distinct repository inputs declared anywhere in `graph` that `knownPins` does not
  * already pin, sorted by repository id and then ref selector. The shell resolves each exactly
  * once and passes the results to `resolveGraphInputs`; pre-supplied pins are never resolved
@@ -307,8 +339,9 @@ GraphResolution completeGraphResolution(
     return result;
 }
 
-/// Re-keys `pins` by repositoryInputKey. Throws if a key is not a repository input, or if two
-/// keys that normalize alike carry different pins.
+/// Re-keys `pins` by repositoryInputKey. Throws if a key is not an external input, or if two
+/// keys that normalize alike carry different pins. Incomplete keys are reported where a task
+/// uses them (requireRepositorySpec), naming the task.
 private InputPin[InputDecl] normalizePins(in InputPin[InputDecl] pins, string source) @trusted
 {
     import confector.core.fingerprinter : canonicalPinned;
@@ -319,7 +352,7 @@ private InputPin[InputDecl] normalizePins(in InputPin[InputDecl] pins, string so
         if (decl.kind != InputKind.repository)
         {
             throw new InputResolutionException(format(
-                "A %s pin is keyed by an input of kind '%s'; only repository inputs are pinned this way",
+                "A %s pin is keyed by an input of kind '%s'; only external inputs are pinned",
                 source, cast(string) decl.kind));
         }
         const key = repositoryInputKey(decl);
@@ -794,4 +827,30 @@ unittest
     // Generations for bases the graph does not have are ignored
     RerunGenerations unrelated = [other.bases["compile"]: 5];
     assert(atGenerations("p", graphOne, atA, unrelated).fingerprints == one.fingerprints);
+}
+
+unittest
+{
+    // Only external inputs have a pin key; a repository input's is its repository and ref
+    // selector, whatever stray fields its declaration carries
+    InputDecl noisy = repositoryInput("game", "main");
+    noisy.spec.value = "stray";
+    noisy.spec.task = "stray";
+    assert(pinKey(noisy) == repositoryInput("game", "main"));
+    assert(pinKey(repositoryInput("game", "release")) != pinKey(repositoryInput("game", "main")));
+
+    foreach (notExternal; [valueInput("x"), taskOutputInput("compile")])
+    {
+        bool threw = false;
+        try pinKey(notExternal);
+        catch (InputResolutionException ex) threw = ex.msg.canFind("not an external input");
+        assert(threw, "Value and task output inputs are not pinned on a chain");
+    }
+    foreach (incomplete; [repositoryInput("game", ""), repositoryInput("", "main")])
+    {
+        bool threw = false;
+        try pinKey(incomplete);
+        catch (InputResolutionException) threw = true;
+        assert(threw, "An incomplete repository input has no pin key");
+    }
 }

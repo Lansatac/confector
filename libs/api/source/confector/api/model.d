@@ -398,20 +398,80 @@ struct BuildTrigger
 }
 
 /**
- * A pinned value supplied with a build request, from the trigger payload or a user, for the
- * repository input `input`. Resolution takes it as given instead of resolving the input live.
+ * An external input together with its pinned value: an entry of a chain's pins
+ * (`BuildChain.pins`) or of the pins supplied with a request (`BuildRequest.pins`).
  */
-struct RequestPin
+struct PinnedInput
 {
-    /// The repository input it pins, reduced to its kind, repository id and ref selector
-    /// (`repositoryInputKey`), so it pins that repository at that ref for every task.
+    /// The input it pins, reduced to its pin key (`confector.core.input_resolution.pinKey`): its
+    /// kind plus its kind-specific key. For a repository input, the repository id and ref
+    /// selector, so it pins that repository at that ref for every task that declares it.
     InputDecl input;
     InputPin pin;
 }
 
 /**
- * Who asked for what (bead confector-z7z.14). Immutable: written once, after the input
- * resolver has found or created the chain the request runs on.
+ * The branch a build belongs to (design record: bead confector-z7z.19): a ref of the triggering
+ * repository, identified as a tracked branch is (`TrackedBranch`: repository, kind and ref name).
+ * It is part of a chain's identity, so each branch has its own build history. A request made by
+ * hand names the branch it builds, as the UI's branch switcher does.
+ */
+struct BranchContext
+{
+    /// The repository's id (`RepositoryRecord.name`).
+    @asName("repository_id") string repositoryId;
+    RefKind kind;
+    /// The ref's name as the provider reports it, e.g. `main` or `pull/123`.
+    @asName("ref_name") string refName;
+}
+
+/**
+ * Where a project definition is kept (AGENTS.md, "Pipeline definitions").
+ */
+enum DefinitionLocation : string
+{
+    /// Edited in the UI and stored by Confector (the project record's tasks).
+    confector = "confector",
+    /// A file in a repository: a separate configuration repository or the code repository.
+    repository = "repository"
+}
+
+/**
+ * Which definition a request read (design record: bead confector-z7z.52): where it came from and,
+ * for a definition file, the revision it was read at. For display and audit; what the request runs with is the stored
+ * definition that `BuildRequest.definitionId` names.
+ */
+struct DefinitionSource
+{
+    DefinitionLocation location;
+    /// repository only: the repository, the ref the definition was read from (the configuration
+    /// branch, resolved when the request was made) and the file's path in the repository. Empty
+    /// for a definition kept by Confector.
+    @optional @asName("repository_id") string repositoryId;
+    @optional @asName("ref_name") string refName;
+    @optional string path;
+    /// repository only: the revision read, the provider's pinned value of the ref (git: the
+    /// commit SHA); required and not empty. Absent for a definition kept by Confector, which has
+    /// no revision of its own: the definition id identifies its content exactly. Null when
+    /// absent (not undefined, so that sources compare equal after a round trip).
+    @optional Json revision = Json(null);
+}
+
+/**
+ * A project definition (AGENTS.md, "Pipeline definitions"): the one document describing a
+ * project's tasks, with their inputs, steps and outputs. Each request reads it once and runs
+ * every task with it. Stored immutably under a hash of its content
+ * (`confector.core.definition_store`), so requests refer to it by id instead of copying it.
+ */
+struct ProjectDefinition
+{
+    @optional TaskNode[] tasks;
+}
+
+/**
+ * Who asked for what (beads confector-z7z.14 and confector-z7z.52). Immutable: written once, after
+ * the input resolver has found or created the chain the request runs on and added to it every pin
+ * the request supplies.
  */
 struct BuildRequest
 {
@@ -419,14 +479,22 @@ struct BuildRequest
     @asName("project_id") string projectId;
     /// The chain the request joined or created.
     @asName("chain_id") string chainId;
-    /// The task ids to build. The request also runs their upstream tasks, never downstream ones.
-    /// A rerun names exactly the task to rerun.
+    /// The task ids to build, each a task of the request's definition. The request also runs
+    /// their upstream tasks, never downstream ones. A rerun names exactly the task to rerun.
     string[] targets;
     BuildIntent intent;
     BuildTrigger trigger;
-    /// Pins for repository inputs, at most one per repository input, applied when the request
-    /// created its chain. A request that joined an existing chain resolved nothing.
-    @optional RequestPin[] pins;
+    /// Pins supplied with the request, from the trigger payload or a user ("build against these
+    /// revisions"), at most one per input, sorted by pin key. Resolution takes them as given
+    /// instead of resolving those inputs live, so they choose which chain the request joins; the
+    /// chain holds them before the request is recorded. The request is evaluated against the
+    /// chain's pins, not these.
+    @optional PinnedInput[] pins;
+    /// The id of the stored definition the request runs with (a hash of the `ProjectDefinition`'s
+    /// content). Every task the request runs uses it, structure and build configuration alike.
+    @asName("definition_id") string definitionId;
+    /// Where that definition was read from, and for a definition file at which revision.
+    @asName("definition_source") DefinitionSource definitionSource;
     /// The identity that made the request: a user, an API token, or the trigger source.
     @asName("requested_by") string requestedBy;
     @asName("requested_at") string requestedAt;
@@ -437,7 +505,7 @@ struct BuildRequest
  */
 enum ChainEventKind : string
 {
-    /// A task sharing a base fingerprint with one of the chain's tasks was rerun; the chain's
+    /// A task the chain uses was rerun (its base fingerprint's generation was bumped); the chain's
     /// earlier result for it is superseded. Reruns are recorded on every affected chain.
     rerun = "rerun"
 }
@@ -452,7 +520,7 @@ struct ChainEvent
     ChainEventKind kind;
     /// The request that caused the event. For a rerun it may belong to another chain.
     @asName("request_id") string requestId;
-    /// The chain's task the event concerns. rerun: the task whose result is superseded.
+    /// The task the event concerns. rerun: the task whose result is superseded.
     @asName("task_id") string taskId;
     /// rerun: the base fingerprint whose generation was bumped, and the generation it was
     /// bumped to.
@@ -461,9 +529,11 @@ struct ChainEvent
 }
 
 /**
- * A build chain: what the UI calls a build (bead confector-z7z.52). Everything but `labels` and
- * `events` is immutable once created; requests refer to it by id. Its branch context and pinned
- * inputs are bead confector-z7z.53.4.
+ * A build chain: what the UI calls a build (beads confector-z7z.14 and confector-z7z.52): the
+ * pinned inputs of one branch context of one project, and nothing else. It holds no tasks, edges
+ * or build configuration; those come from each request's definition. Its identity (id, project,
+ * number, branch, creation time) never changes; pins are only added and, once set, never change;
+ * labels change and events are only appended. Requests refer to it by id.
  */
 struct BuildChain
 {
@@ -471,6 +541,13 @@ struct BuildChain
     @asName("project_id") string projectId;
     /// Canonical per-project number ("build #123"), allocated when the chain is created.
     ulong number;
+    /// The branch the chain builds, part of its identity: a request joins only a chain of its own
+    /// branch context.
+    BranchContext branch;
+    /// The pinned value of every external input the chain's requests have needed, at most one per
+    /// input, sorted by pin key. The authoritative input to fingerprinting: the tasks of every
+    /// request's definition on the chain are fingerprinted against these.
+    @optional PinnedInput[] pins;
     @asName("created_at") string createdAt;
     /// User-editable labels, separate from the number.
     @optional string[] labels;
@@ -509,7 +586,8 @@ struct TaskExecution
     string id;
     @asName("project_id") string projectId;
     @asName("task_id") string taskId;
-    /// Computed by the control plane from the chain, never reported by a worker.
+    /// Computed by the control plane from a request's definition and its chain's pins, never
+    /// reported by a worker.
     string fingerprint;
     ExecutionStatus status;
     /// How many times a worker has claimed the execution. Infrastructure failures (a lost
@@ -741,7 +819,7 @@ struct WorkOrder
     @optional @asName("execution_id") string executionId;
     /// The task definition to execute: its steps, environment and declared outputs.
     @optional @asName("task_node") TaskNode taskNode;
-    /// The task's fingerprint, computed by the control plane from the build chain. The runner
+    /// The task's fingerprint, computed by the control plane from the build chain's pins. The runner
     /// stores outputs under it and never computes its own; a work order without one fails.
     @optional @asName("fingerprint") string fingerprint;
     @optional @asName("payload") TaskExecutionPayload payload;
@@ -846,7 +924,8 @@ version (unittest)
 
 unittest
 {
-    // A build request round-trips, pins included, with snake_case names and string intents
+    // A build request round-trips, pins and definition included, with snake_case names and
+    // string enums
     BuildRequest request;
     request.id = "r1";
     request.projectId = "game";
@@ -854,7 +933,9 @@ unittest
     request.targets = ["internal", "tests"];
     request.intent = BuildIntent.build;
     request.trigger = BuildTrigger(TriggerType.gitPush, "rule-1", ["ref": "refs/heads/main", "revision": "aaa111"]);
-    request.pins = [RequestPin(repositoryInput("game", "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    request.pins = [PinnedInput(repositoryInput("game", "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    request.definitionId = "d1";
+    request.definitionSource = DefinitionSource(DefinitionLocation.repository, "ci-config", "main", "game.yaml", Json("ccc333"));
     request.requestedBy = "webhook:github";
     request.requestedAt = "2026-10-15T14:02:00Z";
 
@@ -863,10 +944,17 @@ unittest
     assert(json["trigger"]["type"].get!string == "git_push");
     assert(json["trigger"]["rule_id"].get!string == "rule-1");
     assert(json["pins"][0]["input"]["spec"]["ref"].get!string == "main");
+    assert(json["pins"][0]["pin"]["pinned"].get!string == "aaa111");
+    assert(json["definition_id"].get!string == "d1");
+    assert(json["definition_source"]["location"].get!string == "repository");
+    assert(json["definition_source"]["repository_id"].get!string == "ci-config");
+    assert(json["definition_source"]["ref_name"].get!string == "main");
+    assert(json["definition_source"]["path"].get!string == "game.yaml");
+    assert(json["definition_source"]["revision"].get!string == "ccc333");
     assert(json["requested_by"].get!string == "webhook:github");
     assert(roundTrip(request) == request);
 
-    // A rerun request made by hand: no rule, no payload, no pins
+    // A rerun request made by hand from a definition edited in the UI: no rule, no payload, no pins
     BuildRequest rerun;
     rerun.id = "r2";
     rerun.projectId = "game";
@@ -874,25 +962,49 @@ unittest
     rerun.targets = ["release"];
     rerun.intent = BuildIntent.rerun;
     rerun.trigger.type = TriggerType.manual;
+    rerun.definitionId = "d2";
+    rerun.definitionSource = DefinitionSource(DefinitionLocation.confector);
     rerun.requestedBy = "jason";
     rerun.requestedAt = "2026-10-15T15:00:00Z";
     assert(serializeToJson(rerun)["intent"].get!string == "rerun");
+    assert(serializeToJson(rerun)["definition_source"]["location"].get!string == "confector");
+    assert(serializeToJson(rerun)["definition_source"]["revision"].type == Json.Type.null_, "A Confector definition has no revision");
     assert(roundTrip(rerun) == rerun);
 }
 
 unittest
 {
-    // A build chain round-trips its number, labels and history
+    // A project definition round-trips its tasks
+    TaskNode compile;
+    compile.id = "compile";
+    compile.inputs["src"] = repositoryInput("game", "main");
+    compile.steps = [BuildStep("Build", "bash", Json(["script": Json("make")]))];
+    auto definition = ProjectDefinition([compile]);
+    assert(serializeToJson(definition)["tasks"][0]["id"].get!string == "compile");
+    assert(roundTrip(definition) == definition);
+    assert(deserializeJson!ProjectDefinition(`{}`).tasks.length == 0);
+}
+
+unittest
+{
+    // A build chain round-trips its number, branch, pins, labels and history
     BuildChain chain;
     chain.id = "c1";
     chain.projectId = "game";
     chain.number = 123;
+    chain.branch = BranchContext("game", RefKind.changeRequest, "pull/12");
+    chain.pins = [PinnedInput(repositoryInput("game", "pull/12"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
     chain.createdAt = "2026-10-15T14:02:01Z";
     chain.labels = ["release candidate"];
     chain.events = [ChainEvent(ChainEventKind.rerun, "r2", "release", "base-fingerprint", 1)];
 
     auto json = serializeToJson(chain);
     assert(json["number"].get!long == 123);
+    assert(json["branch"]["repository_id"].get!string == "game");
+    assert(json["branch"]["kind"].get!string == "change_request");
+    assert(json["branch"]["ref_name"].get!string == "pull/12");
+    assert(json["pins"][0]["input"]["spec"]["repository"].get!string == "game");
+    assert(json["pins"][0]["pin"]["info"]["subject"].get!string == "Fix the build");
     assert(json["events"][0]["kind"].get!string == "rerun");
     assert(json["events"][0]["request_id"].get!string == "r2");
     assert(json["events"][0]["task_id"].get!string == "release");
@@ -917,11 +1029,15 @@ unittest
     auto request = deserializeJson!BuildRequest(`{
         "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
         "intent": "retry", "trigger": {"type": "manual"},
+        "definition_id": "d1", "definition_source": {"location": "confector"},
         "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
     }`);
     assert(request.intent == BuildIntent.retry && request.trigger.type == TriggerType.manual);
     assert(request.trigger.ruleId.length == 0 && request.trigger.payload.length == 0);
     assert(request.pins.length == 0 && request.targets == ["internal"]);
+    assert(request.definitionSource.location == DefinitionLocation.confector
+        && request.definitionSource.revision.type == Json.Type.null_);
+    assert(request.definitionSource.repositoryId.length == 0 && request.definitionSource.path.length == 0);
 
     // A pin without display info
     auto pinned = deserializeJson!BuildRequest(`{
@@ -929,21 +1045,40 @@ unittest
         "intent": "build", "trigger": {"type": "git_push", "rule_id": "rule-1", "payload": {"ref": "main"}},
         "pins": [{"input": {"kind": "repository", "spec": {"repository": "game", "ref": "main"}},
                   "pin": {"pinned": "aaa111"}}],
+        "definition_id": "d1", "definition_source": {"location": "confector"},
         "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z"
     }`);
     assert(pinned.pins.length == 1 && pinned.pins[0].input == repositoryInput("game", "main"));
     assert(pinned.pins[0].pin.pinned == Json("aaa111") && pinned.pins[0].pin.info.length == 0);
     assert(pinned.trigger.payload == ["ref": "main"]);
 
-    auto chain = deserializeJson!BuildChain(`{
-        "id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z"
+    // A request that does not say which definition it runs with is malformed
+    bool undefinedThrew = false;
+    try deserializeJson!BuildRequest(`{
+        "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
+        "intent": "retry", "trigger": {"type": "manual"},
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
     }`);
-    assert(chain.number == 7);
-    assert(chain.labels.length == 0 && chain.events.length == 0);
+    catch (Exception) undefinedThrew = true;
+    assert(undefinedThrew, "A request without a definition must not deserialize");
+
+    auto chain = deserializeJson!BuildChain(`{
+        "id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z",
+        "branch": {"repository_id": "game", "kind": "branch", "ref_name": "main"}
+    }`);
+    assert(chain.number == 7 && chain.branch == BranchContext("game", RefKind.branch, "main"));
+    assert(chain.pins.length == 0 && chain.labels.length == 0 && chain.events.length == 0);
+
+    // A chain without a branch context is malformed
+    bool branchlessThrew = false;
+    try deserializeJson!BuildChain(`{"id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z"}`);
+    catch (Exception) branchlessThrew = true;
+    assert(branchlessThrew, "A chain without a branch must not deserialize");
 
     // A rerun event without the optional fields of other kinds still reads
     auto withEvent = deserializeJson!BuildChain(`{
         "id": "c1", "project_id": "game", "number": 7,
+        "branch": {"repository_id": "game", "kind": "branch", "ref_name": "main"},
         "created_at": "2026-10-15T14:02:01Z", "labels": ["rc"],
         "events": [{"kind": "rerun", "request_id": "r2", "task_id": "compile", "base": "b", "generation": 2}]
     }`);

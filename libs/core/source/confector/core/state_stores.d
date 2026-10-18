@@ -10,6 +10,7 @@ module confector.core.state_stores;
 import confector.core.api_token_store : ApiTokenStore;
 import confector.core.build_stores : BuildRequestStore, ChainStore, ExecutionStore;
 import confector.core.counters : CounterStore;
+import confector.core.definition_store : DefinitionStore;
 import confector.core.fingerprint_ledger : LedgerStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
 import confector.core.rerun_generations : RerunGenerationStore;
@@ -22,6 +23,7 @@ final class StateStores
 {
     // The build model
     ChainStore chains;
+    DefinitionStore definitions;
     BuildRequestStore requests;
     ExecutionStore executions;
     LedgerStore ledgers;
@@ -45,7 +47,8 @@ final class StateStores
         }
         m_store = store;
         chains = new ChainStore(store);
-        requests = new BuildRequestStore(store);
+        definitions = new DefinitionStore(store);
+        requests = new BuildRequestStore(store, chains, definitions);
         executions = new ExecutionStore(store);
         ledgers = new LedgerStore(store, executions);
         rerunGenerations = new RerunGenerationStore(store);

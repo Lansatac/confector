@@ -358,8 +358,9 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
   stays.
 - **A branch spec chooses which branches are tracked** — include/exclude patterns such as
   `+:*` and `-:experimental/*`. It is set on the repository and can be overridden per project.
-- **Builds carry a branch context.** A request records the branch that triggered it, and the
-  branch is part of a build chain's identity, so each branch has its own build history. Nothing is
+- **Builds carry a branch context.** A chain records the branch context of the repository that
+  triggered it, and the branch is part of the chain's identity, so each branch has its own build
+  history; a request reaches its branch through its chain. Nothing is
   built twice, because task executions are shared across chains.
 - **Repository inputs bind to branches through ref selectors:** a fixed ref (`main`); *follow the
   trigger*, when the trigger came from this input's repository; or *same name with a fallback*,
@@ -511,7 +512,9 @@ request runs with the definition it was made with (bead `confector-z7z.52`).
   running build finishes with the configuration it started with; to apply a change to it, cancel
   and request again, reusing every result already finished. A later request — another target, a
   retry, a rerun — uses the definition current when it is made, against the chain's same pins.
-  Each execution records the full definition it ran with and the revision it came from. So fixing
+  Each execution records the full definition it ran with and the revision it came from; a request
+  stores its definition as an immutable document keyed by a hash of its content and records where
+  it came from. So fixing
   a configuration and retrying works the same whether you edit in the UI or commit — and an
   external build of an old, tested commit uses today's release configuration.
 - **An execution runs with the definition of the request that dispatched it.** A request that
@@ -640,7 +643,10 @@ Be aware of these so you do not spread them:
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
   (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing dispatches through
   it or folds into it yet (beads `confector-z7z.49.3`, `confector-z7z.49.4`). Do not add a build path outside the
-  chain components. The build log routes answer 501 until the log store lands (bead
+  chain components. Chains are pins-only (`BuildChain.branch` and grow-only `pins`;
+  `confector.core.chain_pins`) and requests reference stored definitions
+  (`confector.core.definition_store`; bead `confector-z7z.53.4`); nothing writes them yet (bead
+  `confector-z7z.53.2`). The build log routes answer 501 until the log store lands (bead
   `confector-z7z.31.12`). Nothing in the project is kept for backward compatibility.
 - **Steps run in-process.** The runner's only working step is the built-in checkout
   (`libs/runner_core` `steps/checkout.d`); bash and PowerShell throw `NotImplementedException`
