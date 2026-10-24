@@ -40,7 +40,7 @@ struct StepResult
 }
 
 /**
- * Runs the steps of a task. The engine is given one explicitly, so tests can supply fakes.
+ * Runs the steps of a task. The executor is given one explicitly, so tests can supply fakes.
  */
 interface StepRunner
 {

@@ -2,7 +2,7 @@ module confector.runner_core.worker;
 
 import confector.api.model;
 import confector.api.dispatch_queue : Lease;
-import confector.runner_core.engine;
+import confector.runner_core.task_executor;
 import confector.runner_core.http_artifact_storage;
 import confector.runner_core.logging;
 import confector.runner_core.steps.step : StepRunner;
@@ -300,7 +300,7 @@ class HttpWorkerClient
 }
 
 /**
- * Runner loop handling work order receipt, execution via TaskEngine, lease extensions,
+ * Runner loop handling work order receipt, execution via TaskExecutor, lease extensions,
  * artifact packing/unpacking, and completion reporting over HTTP. Steps run with the
  * `StepRunner` it is given.
  */
@@ -309,7 +309,7 @@ class HttpWorkerDaemon
     private HttpWorkerConfig m_config;
     private HttpWorkerClient m_client;
     private StepRunner m_steps;
-    private TaskEngine m_engine;
+    private TaskExecutor m_executor;
     private ArtifactStorage m_storage;
     private bool m_stopRequested = false;
     private bool m_running = false;
@@ -344,7 +344,7 @@ class HttpWorkerDaemon
         // Use HttpArtifactStorage so the worker communicates with the server for all
         // artifact operations. The server decides whether to use presigned URLs or proxy.
         m_storage = new HttpArtifactStorage(m_config.serverUrl);
-        m_engine = new TaskEngine(m_storage, m_steps);
+        m_executor = new TaskExecutor(m_storage, m_steps);
     }
 
     TaskExecutionResult processOneMessage(in Lease lease)
@@ -436,7 +436,7 @@ class HttpWorkerDaemon
         TaskExecutionResult result;
         try
         {
-            result = m_engine.executeTask(
+            result = m_executor.executeTask(
                 executionId,
                 taskNode,
                 taskWsDir,

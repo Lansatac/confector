@@ -1,4 +1,4 @@
-module confector.runner_core.engine;
+module confector.runner_core.task_executor;
 
 import confector.api.model;
 import confector.runner_core.artifacts;
@@ -109,10 +109,10 @@ unittest
 }
 
 /**
- * Core stateless execution engine capable of executing single nodes. Runs each step with the
+ * Core stateless executor capable of executing single nodes. Runs each step with the
  * `StepRunner` it is given.
  */
-class TaskEngine
+class TaskExecutor
 {
     private ArtifactStorage m_artifactStorage;
     private StepRunner m_steps;
@@ -120,7 +120,7 @@ class TaskEngine
     /// Throws: Exception if `steps` is null.
     this(ArtifactStorage artifactStorage, StepRunner steps)
     {
-        if (steps is null) throw new Exception("A task engine needs a step runner");
+        if (steps is null) throw new Exception("A task executor needs a step runner");
         m_artifactStorage = artifactStorage;
         m_steps = steps;
     }
@@ -143,7 +143,7 @@ class TaskEngine
      *   inputs = The task's resolved inputs from the work order, one per declared input.
      *   repositoryAddresses = Where to fetch each repository input from, keyed by input name.
      *   logCallback = Receives each output line as it is produced; when null, lines are dropped.
-     *   manageArtifacts = When true, engine stages upstream artifacts and packs outputs.
+     *   manageArtifacts = When true, the executor stages upstream artifacts and packs outputs.
      *
      * Throws: Exception if `fingerprint` is empty or `inputs` do not match the task's declared
      * inputs (see `bindInputs`); whatever the step runner throws for a step it cannot run.
@@ -164,7 +164,7 @@ class TaskEngine
         result.taskId = task.id;
         LogDelegate log = logCallback !is null ? logCallback : (string line) {};
 
-        logInfo("[engine] Starting executeTask for task '%s' (execution '%s', workspace '%s', manageArtifacts=%s)",
+        logInfo("[executor] Starting executeTask for task '%s' (execution '%s', workspace '%s', manageArtifacts=%s)",
             task.id, executionId, workspaceDir, manageArtifacts);
 
         // 1. The fingerprint is the control plane's; outputs are stored under it.
@@ -188,7 +188,7 @@ class TaskEngine
         }
 
         // 3. Retrieve upstream artifacts named by task_output inputs into the workspace root
-        //    (only when engine owns artifact I/O). Each comes from the upstream task's
+        //    (only when the executor owns artifact I/O). Each comes from the upstream task's
         //    fingerprint, which is the input's pinned value.
         string[] artifactInputs;
         foreach (name, decl; task.inputs)
@@ -326,7 +326,7 @@ class TaskEngine
         result.status = ExecutionStatus.succeeded;
         sw.stop();
         result.durationMs = sw.peek.total!"msecs";
-        logInfo("[engine] executeTask completed for task '%s' (execution '%s', status: '%s', duration: %d ms, artifacts: %d)",
+        logInfo("[executor] executeTask completed for task '%s' (execution '%s', status: '%s', duration: %d ms, artifacts: %d)",
             task.id, executionId, result.status, result.durationMs, producedArtifacts.length);
         return result;
     }
@@ -370,14 +370,14 @@ unittest
     import vibe.data.json : Json;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
 
-    string testDir = "test_runner_core_engine_run";
+    string testDir = "test_runner_core_executor_run";
     if (exists(testDir)) rmdirRecurse(testDir);
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
     auto storage = new InMemoryArtifactStorage();
     auto steps = new ShellStepRunner();
-    auto engine = new TaskEngine(storage, steps);
+    auto engine = new TaskExecutor(storage, steps);
 
     TaskNode node1;
     node1.id = "step1";
@@ -439,7 +439,7 @@ unittest
 
     // An engine needs a step runner
     bool noRunner = false;
-    try new TaskEngine(storage, null);
+    try new TaskExecutor(storage, null);
     catch (Exception ex) noRunner = ex.msg.canFind("step runner");
     assert(noRunner);
 }
@@ -458,7 +458,7 @@ unittest
     auto src = ResolvedInput("src", InputKind.repository, Json("1111111111111111111111111111111111111111"));
     auto flavor = ResolvedInput("flavor", InputKind.value, Json("internal"));
     auto steps = new ShellStepRunner();
-    auto engine = new TaskEngine(null, steps);
+    auto engine = new TaskExecutor(null, steps);
     auto res = engine.executeTask("exe_c", task, ".", "fp", [flavor, src], ["src": "https://example.test/game.git"]);
     assert(res.status == ExecutionStatus.succeeded, res.errorMessage);
     assert(steps.seen.length == 1);
@@ -487,7 +487,7 @@ unittest
     docker.type = "docker:build";
     task.steps = [docker];
     string[] logged;
-    auto engine = new TaskEngine(null, new BuiltinStepRunner());
+    auto engine = new TaskExecutor(null, new BuiltinStepRunner());
     auto res = engine.executeTask("exe_d", task, ".", "fp", [], null, (string line) { logged ~= line; });
     assert(res.status == ExecutionStatus.failed && res.errorMessage.canFind("confector-z7z.35.1"), res.errorMessage);
     assert(logged.canFind!(line => line.canFind("confector-z7z.35.1")));

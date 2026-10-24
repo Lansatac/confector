@@ -345,12 +345,12 @@ Json getNestedJson(in Json root, string dotPath)
 }
 
 /**
- * Core resolution engine evaluating precedence:
+ * Core resolver evaluating precedence:
  * 1. Environment Variable (Explicit mapping or automatic CONFECTOR_* mapping)
  * 2. Unified Config File (JSON)
  * 3. Registered Default Value
  */
-class ResolutionEngine
+class ConfigResolver
 {
     private Json m_fileConfig;
     private ConfigDefinition[string] m_definitions;
@@ -489,16 +489,16 @@ class ResolutionEngine
 }
 
 /**
- * Concrete ConfigAccessor implementation bound to a ResolutionEngine and optional namespace prefix.
+ * Concrete ConfigAccessor implementation bound to a ConfigResolver and optional namespace prefix.
  */
 class ScopedConfigAccessor : ConfigAccessor
 {
-    private ResolutionEngine m_engine;
+    private ConfigResolver m_resolver;
     private string m_prefix;
 
-    this(ResolutionEngine engine, string prefix = null)
+    this(ConfigResolver resolver, string prefix = null)
     {
-        m_engine = engine;
+        m_resolver = resolver;
         m_prefix = prefix;
     }
 
@@ -515,18 +515,18 @@ class ScopedConfigAccessor : ConfigAccessor
         {
             string fullKey = qualifyKey(def.key);
             string envVar = def.envVar.length > 0 ? def.envVar : keyToDefaultEnvVar(fullKey);
-            m_engine.registerDefinition(ConfigDefinition(fullKey, envVar, def.defaultValue, def.description, def.required));
+            m_resolver.registerDefinition(ConfigDefinition(fullKey, envVar, def.defaultValue, def.description, def.required));
         }
         else
         {
-            m_engine.registerDefinition(def);
+            m_resolver.registerDefinition(def);
         }
     }
 
     override ConfigAccessor getScope(string namespacePrefix) const
     {
         string newPrefix = qualifyKey(namespacePrefix);
-        return new ScopedConfigAccessor(cast(ResolutionEngine)m_engine, newPrefix);
+        return new ScopedConfigAccessor(cast(ConfigResolver)m_resolver, newPrefix);
     }
 
     override bool has(string key) const
@@ -538,7 +538,7 @@ class ScopedConfigAccessor : ConfigAccessor
     override Json getJson(string key) const
     {
         string fullKey = qualifyKey(key);
-        return m_engine.resolveKey(fullKey);
+        return m_resolver.resolveKey(fullKey);
     }
 
     override string getString(string key, string defaultValue = null) const
@@ -670,11 +670,11 @@ T coerceJson(T)(in Json val)
  */
 class ConfigRegistry : ConfigRegistryInterface
 {
-    private ResolutionEngine m_engine;
+    private ConfigResolver m_resolver;
 
     this(Json fileConfig = Json.emptyObject)
     {
-        m_engine = new ResolutionEngine(fileConfig);
+        m_resolver = new ConfigResolver(fileConfig);
     }
 
     /**
@@ -698,32 +698,32 @@ class ConfigRegistry : ConfigRegistryInterface
         }
         if (fileJson.type != Json.Type.object)
             throw new Exception("[config] Configuration file '" ~ path ~ "' must contain a JSON object.");
-        m_engine.setFileConfig(fileJson);
+        m_resolver.setFileConfig(fileJson);
     }
 
     void setFileConfig(Json fileConfig)
     {
-        m_engine.setFileConfig(fileConfig);
+        m_resolver.setFileConfig(fileConfig);
     }
 
     void registerDefinition(in ConfigDefinition def)
     {
-        m_engine.registerDefinition(def);
+        m_resolver.registerDefinition(def);
     }
 
     Json resolveKey(string fullKey) const
     {
-        return m_engine.resolveKey(fullKey);
+        return m_resolver.resolveKey(fullKey);
     }
 
     ConfigAccessor getScope(string namespacePrefix)
     {
-        return new ScopedConfigAccessor(m_engine, namespacePrefix);
+        return new ScopedConfigAccessor(m_resolver, namespacePrefix);
     }
 
     ConfigAccessor rootAccessor()
     {
-        return new ScopedConfigAccessor(m_engine, "");
+        return new ScopedConfigAccessor(m_resolver, "");
     }
 }
 
