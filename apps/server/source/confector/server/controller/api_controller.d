@@ -8,7 +8,7 @@ import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
 import confector.api.dispatch_queue;
 import confector.server.scheduler_callback : schedulerCallback;
-import confector.core.work_orders : completeExecution, defaultPoolQueue;
+import confector.core.work_orders : completeExecution, defaultMaxAttempts, defaultPoolQueue;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -38,7 +38,7 @@ NotImplementedException logsNotImplemented()
  * The REST API, served under /api/v1. Every route is registered once, with the prefix; the route
  * helpers take paths relative to it.
  */
-URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, StateStores stores = null)
+URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
 {
     auto router = new URLRouter();
 
@@ -110,7 +110,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
             try
             {
                 import core.time : seconds;
-                import confector.core.work_orders : receiveWork;
+                import confector.core.work_orders : giveBackUnstarted, receiveWork;
 
                 if (stores is null)
                 {
@@ -126,7 +126,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
                 string workerId = pWorker !is null ? pWorker.get!string : null;
                 // The queue carries execution ids; the work order is built from the execution's
                 // record, which receiving starts
-                auto received = receiveWork(stores, queue, defaultPoolQueue, maxMsgs, visibility.seconds, workerId);
+                auto received = receiveWork(stores, queue, defaultPoolQueue, maxMsgs, visibility.seconds, workerId, maxExecutionAttempts);
                 try
                 {
                     Json leases = Json.emptyArray;
@@ -143,16 +143,10 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
                 catch (Exception e)
                 {
                     // The worker will never see these leases; give them back rather than leave the
-                    // work invisible until the leases expire. Best effort: the original error is
-                    // what the caller needs. (The executions were started, so redelivery counts
-                    // as another attempt.)
-                    foreach (ref item; received)
-                    {
-                        try
-                            queue.release(defaultPoolQueue, item.receipt);
-                        catch (Exception releaseError)
-                            logError("[api] Failed to release receipt '%s' after a failed receive: %s", item.receipt, releaseError.msg);
-                    }
+                    // work invisible until the leases expire. The executions were started but no
+                    // worker ran them, so the starts are undone and redelivery does not count as
+                    // another attempt. Best effort: the original error is what the caller needs.
+                    giveBackUnstarted(stores, queue, defaultPoolQueue, received);
                     throw e;
                 }
             }
@@ -590,7 +584,7 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
 
-    auto router = apiRouter("test-scheduler-secret", queue);
+    auto router = apiRouter("test-scheduler-secret", defaultMaxAttempts, queue);
     assert(router !is null);
 
     // A scheduler callback without the scheduler secret is refused before its handler runs
@@ -628,7 +622,7 @@ unittest
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryStream;
 
-    auto routerWithStores = apiRouter("test-scheduler-secret", queue, stores);
+    auto routerWithStores = apiRouter("test-scheduler-secret", defaultMaxAttempts, queue, stores);
 
     int post(string path, string body)
     {
@@ -677,7 +671,7 @@ unittest
 
     // An execution recorded and sent to the dispatch queue, received by a worker
     import confector.core.fingerprint_ledger : ClaimOutcome;
-    import confector.core.work_orders : DispatchMessage, receiveWork;
+    import confector.core.work_orders : dispatchMessageFor, receiveWork;
     import core.time : hours;
 
     // Dispatches as the dispatcher does: claims the fingerprint's ledger, records the execution
@@ -697,13 +691,24 @@ unittest
         execution.createdAt = "2026-10-16T10:00:00Z";
         into.executions.createIfAbsent(execution);
         queue.ensureQueue(defaultPoolQueue);
-        queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id)));
+        queue.send(defaultPoolQueue, serializeToJson(dispatchMessageFor(id)));
         return id;
     }
 
     const executionId = queueExecution(stores, "fp_n1");
-    auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "test-worker");
+    auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "test-worker", defaultMaxAttempts);
     assert(received.length == 1 && received[0].workOrder.executionId == executionId);
+
+    // A poison message on the queue fails the receive that meets it loudly, and is gone for the
+    // next one instead of being delivered forever
+    queue.send(defaultPoolQueue, serializeToJson(dispatchMessageFor("exe_missing")));
+    import std.algorithm.searching : canFind;
+    assert(post("/queue/receive", `{"worker_id": "w-route", "max_messages": 5}`) == HTTPStatus.internalServerError,
+        "A poison message fails its receive");
+    queue.send(defaultPoolQueue, serializeToJson(dispatchMessageFor("exe_missing")));
+    const poisonAnswer = answer(HTTPMethod.POST, "/queue/receive", `{"worker_id": "w-route", "max_messages": 5}`);
+    assert(poisonAnswer.canFind("acknowledged and dropped"), poisonAnswer);
+    assert(post("/queue/receive", `{"worker_id": "w-route", "max_messages": 5}`) == HTTPStatus.ok);
 
     // Build logs fail loudly until the log store lands, naming its bead: uploading lines and
     // reading a log both answer 501
@@ -751,7 +756,7 @@ unittest
     auto failingStores = new StateStores(failingDocuments);
     const anotherId = queueExecution(failingStores, "fp_n1_again");
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
-    auto failingRouter = apiRouter("test-scheduler-secret", queue, failingStores);
+    auto failingRouter = apiRouter("test-scheduler-secret", defaultMaxAttempts, queue, failingStores);
     InetHeaderMap failingHeaders;
     failingHeaders["Content-Type"] = "application/json";
     auto failingReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ anotherId ~ "/complete"),

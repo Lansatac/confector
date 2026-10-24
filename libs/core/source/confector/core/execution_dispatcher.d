@@ -52,7 +52,7 @@ import confector.core.definition_hash : recordDefinition;
 import confector.core.document_collection : Versioned;
 import confector.core.fingerprint_ledger : ClaimOutcome;
 import confector.core.state_stores : StateStores;
-import confector.core.work_orders : DispatchMessage, defaultPoolQueue, maxWriteAttempts, utcNow;
+import confector.core.work_orders : defaultPoolQueue, dispatchMessageFor, maxWriteAttempts, utcNow;
 import confector.api.dispatch_queue : DispatchQueue;
 import confector.api.document_store : DocumentConflictException;
 import confector.api.model;
@@ -292,7 +292,7 @@ final class ExecutionDispatcher
     {
         if (!ExecutionStore.isActive(record.status)) return Delivery.ended;
         if (record.status == ExecutionStatus.running || record.sentAt.length > 0) return Delivery.alreadySent;
-        m_queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(record.id)));
+        m_queue.send(defaultPoolQueue, serializeToJson(dispatchMessageFor(record.id)));
         markSent(record.id);
         return Delivery.sent;
     }
@@ -357,7 +357,7 @@ version (unittest)
     import confector.core.chain_fixtures;
     import confector.core.definition_hash : computeDefinitionHash;
     import confector.core.fingerprint_ledger : executionIdFor;
-    import confector.core.work_orders : startExecution;
+    import confector.core.work_orders : StartKind, startExecution;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
 
@@ -589,7 +589,7 @@ unittest
     assert(sweeper.resendUnsent(10) == 1 && messagesIn(queue) == [testId]);
 
     // Running (a worker holds it) or ended: never sent
-    assert(!startExecution(stores.executions, testId, 1, "w1", fixedNow()).isNull);
+    assert(startExecution(stores.executions, testId, "m1", 1, "w1", fixedNow()).kind == StartKind.started);
     assert(dispatcher.deliver(testId) == Delivery.alreadySent);
     finish(stores, stores.chains.get("c3").get.value, "test", ExecutionStatus.succeeded);
     assert(dispatcher.deliver(testId) == Delivery.ended && dispatcher.deliver(id) == Delivery.ended);
@@ -614,7 +614,7 @@ unittest
     beforeWrite(interleaving, 2, () {
         assert(dispatcherOf(direct, queue).repair(awaitedNow(direct, "c1"), at.request) == Delivery.sent);
         const id = direct.ledgers.get(needed.fingerprint).get.activeExecutionId;
-        assert(!startExecution(direct.executions, id, 1, "w1", fixedNow()).isNull);
+        assert(startExecution(direct.executions, id, "m1", 1, "w1", fixedNow()).kind == StartKind.started);
         finish(direct, direct.chains.get("c1").get.value, "compile", ExecutionStatus.failed);
     });
     const dispatched = slow.dispatch(needed, at.request);
@@ -637,7 +637,7 @@ unittest
     // Writes: 1 the claim, 2 the record, 3 the stamp
     beforeWrite(interleaving, 3, () {
         const id = direct.ledgers.get(needed.fingerprint).get.activeExecutionId;
-        assert(!startExecution(direct.executions, id, 1, "w1", "2026-10-20T10:00:05Z").isNull);
+        assert(startExecution(direct.executions, id, "m1", 1, "w1", "2026-10-20T10:00:05Z").kind == StartKind.started);
     });
     const dispatched = dispatcherOf(new StateStores(interleaving), queue).dispatch(needed, at.request);
     assert(interleaving.beforeNextWrite is null);

@@ -17,8 +17,10 @@ module confector.api.dispatch_queue;
  * - Each delivery has its own receipt. Once a message has been delivered again, receipts from
  *   earlier deliveries are stale: extend() and release() reject them, and ack() with them never
  *   removes the message.
- * - receiveCount counts deliveries; receiving work (confector.core.work_orders) uses it to count
- *   execution attempts.
+ * - receiveCount counts deliveries of the message. A delivery after the first means the previous
+ *   lease expired or was released; receiving work (confector.core.work_orders) reads a message
+ *   that comes back while its execution is still running as a lost lease, and counts execution
+ *   attempts itself.
  */
 
 import core.time : Duration, hours, minutes, seconds;

@@ -58,6 +58,8 @@ Execution runtimes, version control providers, and storage backends are decouple
 
    The server keeps all state, and its dispatch queue, in MongoDB and will not start without it: set `server.documentStore.connectionString` (or `CONFECTOR_MONGO_URI`) and `server.documentStore.database` in `confector.json` (see `deployments/confector-development/config/confector.json`). Artifacts are kept as files under `server.artifactStore.baseDirectory`, which is required too. A missing setting or an unreachable MongoDB stops startup with an error.
 
+   Executions are retried automatically only after an infrastructure failure (a worker that died or lost its lease). `server.execution.maxAttempts` (or `CONFECTOR_SERVER_EXECUTION_MAX_ATTEMPTS`) sets how many times a worker may start one execution before it fails with "lease lost N times"; it is optional, defaults to 3, and must be at least 1. A task that fails is never retried automatically.
+
    The scheduler calls back into the server (cron triggers, VCS polling), and every callback must carry a shared secret in the `X-Confector-Scheduler-Secret` header. Set `server.scheduler.callbackSecret` (or `CONFECTOR_SCHEDULER_CALLBACK_SECRET`); the server checks it and the built-in local scheduler sends it. There is no default: the server will not start without it, and callbacks without the correct secret are refused with 401.
 
 2. **Generate build files & compile:**

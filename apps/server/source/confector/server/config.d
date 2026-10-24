@@ -1,6 +1,7 @@
 module confector.server.config;
 
 import confector.config;
+import confector.core.work_orders : defaultMaxAttempts;
 import vibe.data.json : Json;
 
 /**
@@ -57,6 +58,18 @@ struct ArtifactStoreConfig
 }
 
 /**
+ * How executions are retried after an infrastructure failure. Optional: every setting has a
+ * default.
+ */
+struct ExecutionConfig
+{
+    @Description("How many times a worker may start one execution before it fails with \"lease lost N times\": "
+        ~ "a worker that dies or loses its lease counts as one attempt, a task that fails is never retried "
+        ~ "automatically (optional, default 3, at least 1)")
+    uint maxAttempts = defaultMaxAttempts;
+}
+
+/**
  * Top-level Server configuration.
  */
 struct ServerConfig
@@ -68,6 +81,7 @@ struct ServerConfig
     DocumentStoreConfig documentStore;
     SchedulerConfig scheduler;
     ArtifactStoreConfig artifactStore;
+    ExecutionConfig execution;
 }
 
 /**
@@ -118,6 +132,17 @@ void requireArtifactStoreConfig(in ArtifactStoreConfig config)
 }
 
 /**
+ * Throws, naming the setting, unless executions get at least one attempt.
+ */
+void requireExecutionConfig(in ExecutionConfig config)
+{
+    if (config.maxAttempts == 0)
+        throw new Exception("[config] Setting 'server.execution.maxAttempts' is 0 "
+            ~ "(server.execution.maxAttempts or " ~ keyToDefaultEnvVar("server.execution.maxAttempts")
+            ~ "): an execution needs at least one attempt, or it could never run.");
+}
+
+/**
  * Loads and binds ServerConfig from the ConfigRegistry.
  */
 ServerConfig loadServerConfig(ConfigRegistry registry)
@@ -143,6 +168,28 @@ unittest
     assert(cfg.documentStore.database == "");
     assert(cfg.scheduler.callbackSecret == "");
     assert(cfg.artifactStore.baseDirectory == "");
+    assert(cfg.execution.maxAttempts == 3, "Executions get three attempts unless the admin sets a limit");
+}
+
+unittest
+{
+    import std.exception : collectException;
+    import std.algorithm.searching : canFind;
+
+    import vibe.data.json : parseJsonString;
+
+    // The attempt limit is an optional setting: three by default, set from the file or the
+    // environment, and zero is refused
+    auto registry = new ConfigRegistry(parseJsonString(`{"server": {"execution": {"maxAttempts": 5}}}`));
+    registerServerConfigDefinitions(registry);
+    assert(loadServerConfig(registry).execution.maxAttempts == 5);
+    assert(keyToDefaultEnvVar("server.execution.maxAttempts") == "CONFECTOR_SERVER_EXECUTION_MAX_ATTEMPTS");
+
+    ExecutionConfig config;
+    requireExecutionConfig(config);
+    config.maxAttempts = 0;
+    auto message = collectException(requireExecutionConfig(config));
+    assert(message !is null && message.msg.canFind("server.execution.maxAttempts"));
 }
 
 unittest

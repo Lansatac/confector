@@ -1075,6 +1075,10 @@ struct TaskExecution
     @optional @asName("artifacts_expired_at") string artifactsExpiredAt;
     /// The id of the worker that holds or last held it; empty until claimed.
     @optional string worker;
+    /// The id of the dispatch message that started the running attempt (`DispatchMessage.messageId`);
+    /// empty while no worker holds the execution. Only that message coming back means the attempt's
+    /// lease expired; another message for the execution is a duplicate.
+    @optional @asName("started_by_message") string startedByMessage;
     @asName("created_at") string createdAt;
     /// When the current attempt started, and when the execution reached a terminal status.
     @optional @asName("started_at") string startedAt;

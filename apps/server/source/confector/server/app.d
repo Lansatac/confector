@@ -10,7 +10,7 @@ import vibe.vibe;
 import confector.config;
 import confector.core.state_stores : StateStores;
 import confector.server.backends : Backends, buildBackends;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig;
 
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
@@ -25,7 +25,7 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
 
 /// Configures application URL routing over `backends` and `stores`, the state stores kept in
 /// its document store.
-URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret)
+URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, uint maxExecutionAttempts)
 {
     auto router = new URLRouter();
 
@@ -42,7 +42,7 @@ URLRouter createRouter(Backends backends, StateStores stores, string schedulerCa
 
     // API endpoints. The artifact routes come first, so the API router never answers them.
     router.any("/api/v1/artifacts/*", artifactsRouter(backends.artifactStore));
-    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, backends.dispatchQueue, stores));
+    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, maxExecutionAttempts, backends.dispatchQueue, stores));
 
     // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
     // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
@@ -131,13 +131,15 @@ void main()
     }
     setLogLevel(configuredLogLevel);
 
+    requireExecutionConfig(serverConfig.execution);
+
     // A missing or invalid backend setting, or an unreachable MongoDB, ends startup here.
     // Constructing StateStores declares every collection, which needs the database.
     Backends backends = buildBackends(serverConfig);
     auto stores = new StateStores(backends.documentStore);
     logInfo("[state] State is kept in MongoDB database '%s'.", serverConfig.documentStore.database);
 
-    auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret);
+    auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret, serverConfig.execution.maxAttempts);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -165,7 +167,7 @@ unittest
     backends.scheduler = new LocalScheduler("test-scheduler-secret", "http://127.0.0.1:8080");
     auto artifacts = new InMemoryArtifactStorage();
     backends.artifactStore = artifacts;
-    auto router = createRouter(backends, new StateStores(backends.documentStore), "test-scheduler-secret");
+    auto router = createRouter(backends, new StateStores(backends.documentStore), "test-scheduler-secret", 3);
 
     struct Answer { int status; string body; }
 
