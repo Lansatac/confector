@@ -35,8 +35,13 @@ Default to the cheapest agent that can do the job; the reviewer is always at lea
 | Work | Implementer | Reviewer |
 |---|---|---|
 | Well specified, self-contained, tests are the spec, few files (bug fixes, small features, plumbing, config, docs) | `implementer` (haiku) | sonnet |
-| Multi-file but well specified: wiring, audits, interface changes with clear acceptance | `implementer` with model sonnet | opus if it touches correctness-critical code, else sonnet |
-| Concurrency, CAS or crash-recovery protocols, security design, cross-cutting refactors, anything needing design judgment | `implementer-strong` (opus) | opus |
+| Multi-file but well specified: wiring, audits, interface changes with clear acceptance | `implementer-medium` (sonnet) | opus if it touches correctness-critical code, else sonnet |
+| Concurrency, CAS or crash-recovery protocols, security design, cross-cutting refactors, anything needing design judgment | `implementer-medium` first; `implementer-strong` (opus) only on escalation | opus |
+
+**Every first implementation attempt starts with at most `implementer-medium`.** Never start a bead
+with `implementer-strong`, however hard it looks: use `implementer-medium` and the strongest
+reviewer, and escalate to `implementer-strong` only under "Escalating" below. The one exception is
+an explicit instruction from the user to use the strong implementer.
 
 Pass `model` on the Agent call to override an agent's default. When a cheap implementer's first
 attempt shows it is out of its depth (it guesses at design, or the reviewer finds structural
@@ -44,7 +49,8 @@ problems), switch to `implementer-strong` for the rework instead of looping.
 
 ## 3. Brief the implementer
 
-Use `subagent_type: implementer` (or `implementer-strong`). The prompt must contain: bead ids; the
+Use `subagent_type: implementer` or `implementer-medium` for the first attempt (`implementer-strong`
+only for an escalation). The prompt must contain: bead ids; the
 files or area; "read AGENTS.md first"; `bd show <id>` and, for design context, the `design` field of
 the relevant closed design beads (`bd show <id> --json`); the acceptance criteria; what is out of
 scope; the verification commands; and the standing rules: no git write commands, do not close beads,
