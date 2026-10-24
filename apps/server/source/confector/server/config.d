@@ -89,7 +89,8 @@ struct ServerConfig
  */
 void registerServerConfigDefinitions(ConfigRegistry registry)
 {
-    if (registry is null) return;
+    if (registry is null)
+        throw new Exception("[config] Cannot register server configuration without a configuration registry.");
 
     registry.bindDefinition!ServerConfig("server");
 }
@@ -148,12 +149,21 @@ void requireExecutionConfig(in ExecutionConfig config)
 ServerConfig loadServerConfig(ConfigRegistry registry)
 {
     if (registry is null)
-    {
-        return ServerConfig.init;
-    }
+        throw new Exception("[config] Cannot load server configuration without a configuration registry.");
 
     auto serverScope = registry.getScope("server");
     return serverScope.bind!ServerConfig();
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    // Without a registry there is no configuration to load, so the server must not start on defaults
+    auto failure = collectException(loadServerConfig(null));
+    assert(failure !is null && failure.msg.canFind("configuration registry"), "loadServerConfig(null) must throw");
+    assert(collectException(registerServerConfigDefinitions(null)) !is null);
 }
 
 unittest

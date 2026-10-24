@@ -60,6 +60,8 @@ Execution runtimes, version control providers, and storage backends are decouple
 
    Executions are retried automatically only after an infrastructure failure (a worker that died or lost its lease). `server.execution.maxAttempts` (or `CONFECTOR_SERVER_EXECUTION_MAX_ATTEMPTS`) sets how many times a worker may start one execution before it fails with "lease lost N times"; it is optional, defaults to 3, and must be at least 1. A task that fails is never retried automatically.
 
+   Settings are read from `confector.json` in the directory named by `CONFECTOR_CONFIG_DIR`. That variable is optional: when it is unset, the server reads its settings from environment variables alone (each setting reads an environment variable, such as `CONFECTOR_MONGO_URI`, and the variable takes precedence over the file). When it is set, the directory must exist and contain a `confector.json` that parses as a JSON object; a missing or unparseable file, or a missing directory, stops startup with an error naming the path.
+
    The scheduler calls back into the server (cron triggers, VCS polling), and every callback must carry a shared secret in the `X-Confector-Scheduler-Secret` header. Set `server.scheduler.callbackSecret` (or `CONFECTOR_SCHEDULER_CALLBACK_SECRET`); the server checks it and the built-in local scheduler sends it. There is no default: the server will not start without it, and callbacks without the correct secret are refused with 401.
 
 2. **Generate build files & compile:**

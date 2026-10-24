@@ -1,7 +1,7 @@
 module confector.server.app;
 
 import std.functional : toDelegate;
-import std.file : exists;
+import std.file : exists, isDir;
 import std.path : buildPath;
 import std.process : environment;
 
@@ -73,49 +73,43 @@ HTTPServerSettings createServerSettings(ushort port = 8080)
     return settings;
 }
 
-ConfigRegistry loadConfigRegistry()
+/// The directory holding the server's configuration file, from CONFECTOR_CONFIG_DIR, or empty when
+/// it is unset: the server then runs on environment variables alone.
+string configDirectory()
 {
-    string configDir = environment.get("CONFECTOR_CONFIG_DIR", "");
-    if (configDir.length == 0)
-    {
-        logWarn("[config] CONFECTOR_CONFIG_DIR not set, using default './config'");
-        configDir = "./config";
-    }
+    return environment.get("CONFECTOR_CONFIG_DIR", "");
+}
 
+/// Loads the server's configuration from `configDir`, which holds confector.json. An empty
+/// `configDir` loads no file: the settings come from environment variables alone. A non-empty
+/// one must be an existing directory containing a parseable configuration file. Any failure
+/// throws, naming the path and the error.
+ConfigRegistry loadConfigRegistry(string configDir)
+{
     auto configRegistry = new ConfigRegistry();
     registerServerConfigDefinitions(configRegistry);
 
-    auto configLoaded = false;
-
-    foreach (cfgPath; [configDir.buildPath("confector.json"), configDir.buildPath("confector.yaml")])
+    if (configDir.length == 0)
     {
-        if (exists(cfgPath))
-        {
-            try
-            {
-                configRegistry.loadConfigFile(cfgPath);
-                logInfo("[config] Loaded configuration file from %s", cfgPath);
-                configLoaded = true;
-                break;
-            }
-            catch (Exception e)
-            {
-                logWarn("[config] Failed to load config file '%s': %s", cfgPath, e.msg);
-            }
-        }
+        logInfo("[config] CONFECTOR_CONFIG_DIR is not set, reading configuration from environment variables only.");
+        return configRegistry;
     }
 
-    if (!configLoaded)
-    {
-        logWarn("[config] No valid configuration file found, continuing with defaults.");
-    }
+    if (!(exists(configDir) && isDir(configDir)))
+        throw new Exception("[config] Configuration directory '" ~ configDir ~ "' does not exist or is not a directory.");
 
+    string cfgPath = configDir.buildPath("confector.json");
+    if (!exists(cfgPath))
+        throw new Exception("[config] No configuration file found in '" ~ configDir ~ "': expected '" ~ cfgPath ~ "'.");
+
+    configRegistry.loadConfigFile(cfgPath);
+    logInfo("[config] Loaded configuration file from %s", cfgPath);
     return configRegistry;
 }
 
 void main()
 {
-    auto configRegistry = loadConfigRegistry();
+    auto configRegistry = loadConfigRegistry(configDirectory());
     ServerConfig serverConfig = loadServerConfig(configRegistry);
 
     // Configure log level
@@ -212,4 +206,81 @@ unittest
     auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
     router.handleRequest(createTestHTTPServerRequest(URL("http://localhost/artifacts/"), HTTPMethod.GET), res);
     assert(!res.headerWritten, "No route answers /artifacts/");
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.conv : to;
+    import std.exception : collectException;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.process : thisProcessID;
+
+    // The directory comes from CONFECTOR_CONFIG_DIR, which is optional
+    enum dirVar = "CONFECTOR_CONFIG_DIR";
+    const savedDir = environment.get(dirVar);
+    scope (exit)
+    {
+        if (savedDir is null) environment.remove(dirVar); else environment[dirVar] = savedDir;
+    }
+    // Unset, the server runs on environment variables alone: no file is read, and the settings
+    // come from the environment
+    enum databaseVar = "CONFECTOR_SERVER_DOCUMENT_STORE_DATABASE";
+    const savedDatabase = environment.get(databaseVar);
+    scope (exit)
+    {
+        if (savedDatabase is null) environment.remove(databaseVar); else environment[databaseVar] = savedDatabase;
+    }
+    environment.remove(dirVar);
+    environment[databaseVar] = "from_environment";
+    assert(configDirectory() == "");
+    assert(loadServerConfig(loadConfigRegistry(configDirectory())).documentStore.database == "from_environment");
+    environment[dirVar] = "/from/environment";
+    assert(configDirectory() == "/from/environment");
+
+    const root = buildPath(tempDir, "confector_app_config_test_" ~ thisProcessID.to!string);
+    if (exists(root)) rmdirRecurse(root);
+    mkdirRecurse(root);
+    scope (exit) if (exists(root)) rmdirRecurse(root);
+
+    // A directory that does not exist fails, naming it
+    const missingDir = buildPath(root, "missing");
+    auto missingDirError = collectException(loadConfigRegistry(missingDir));
+    assert(missingDirError !is null && missingDirError.msg.canFind(missingDir), "A missing directory must throw");
+
+    // A path that names a file, not a directory, fails with the same message, naming it
+    const notDir = buildPath(root, "not-a-directory.json");
+    write(notDir, `{"server": {"http": {"port": 9125}}}`);
+    auto fileNotDir = collectException(loadConfigRegistry(notDir));
+    assert(fileNotDir !is null && fileNotDir.msg.canFind(notDir) && fileNotDir.msg.canFind("is not a directory"),
+        "A file named as the directory must throw, naming it");
+
+    // A directory without a configuration file fails, naming the file it expected
+    const emptyDir = buildPath(root, "empty");
+    mkdirRecurse(emptyDir);
+    auto noFile = collectException(loadConfigRegistry(emptyDir));
+    assert(noFile !is null && noFile.msg.canFind(buildPath(emptyDir, "confector.json")), "A missing file must throw");
+
+    // A file that does not parse fails, naming the file and the parse error
+    const brokenDir = buildPath(root, "broken");
+    mkdirRecurse(brokenDir);
+    const brokenFile = buildPath(brokenDir, "confector.json");
+    write(brokenFile, `{"server": {"http": `);
+    auto broken = collectException(loadConfigRegistry(brokenDir));
+    assert(broken !is null && broken.msg.canFind(brokenFile) && broken.msg.canFind("Failed to read or parse"),
+        "An unparseable file must throw, naming it");
+
+    // A valid file loads its settings
+    const validDir = buildPath(root, "valid");
+    mkdirRecurse(validDir);
+    write(buildPath(validDir, "confector.json"), `{"server": {"http": {"port": 9123}}}`);
+    assert(loadServerConfig(loadConfigRegistry(validDir)).http.port == 9123);
+
+    // A file whose content is not an object fails, naming the file
+    const arrayDir = buildPath(root, "array");
+    mkdirRecurse(arrayDir);
+    const arrayFile = buildPath(arrayDir, "confector.json");
+    write(arrayFile, `[{"server": {"http": {"port": 9124}}}]`);
+    auto notObject = collectException(loadConfigRegistry(arrayDir));
+    assert(notObject !is null && notObject.msg.canFind(arrayFile), "A non-object file must throw, naming it");
 }

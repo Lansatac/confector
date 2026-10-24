@@ -677,14 +677,28 @@ class ConfigRegistry : ConfigRegistryInterface
         m_engine = new ResolutionEngine(fileConfig);
     }
 
+    /**
+     * Replaces the file configuration with the JSON object in `path`. Throws, naming the file,
+     * when the file is missing, cannot be read or parsed, or is not a JSON object (its settings
+     * would otherwise be silently ignored).
+     */
     void loadConfigFile(string path)
     {
-        if (exists(path))
+        if (!exists(path))
+            throw new Exception("[config] Configuration file '" ~ path ~ "' does not exist.");
+
+        Json fileJson;
+        try
         {
-            string content = readText(path);
-            Json fileJson = parseJsonString(content);
-            m_engine.setFileConfig(fileJson);
+            fileJson = parseJsonString(readText(path));
         }
+        catch (Exception e)
+        {
+            throw new Exception("[config] Failed to read or parse configuration file '" ~ path ~ "': " ~ e.msg, e);
+        }
+        if (fileJson.type != Json.Type.object)
+            throw new Exception("[config] Configuration file '" ~ path ~ "' must contain a JSON object.");
+        m_engine.setFileConfig(fileJson);
     }
 
     void setFileConfig(Json fileConfig)
@@ -747,6 +761,47 @@ unittest
 
     // A key's default environment variable is its path in upper snake case
     assert(keyToDefaultEnvVar("server.http.bindAddress") == "CONFECTOR_SERVER_HTTP_BIND_ADDRESS");
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.conv : to;
+    import std.exception : collectException;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+
+    // A configuration file that is missing, or cannot be parsed, fails loudly, naming the file
+    const dir = buildPath(tempDir, "confector_config_load_test_" ~ thisProcessID.to!string);
+    if (exists(dir)) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+
+    const missing = buildPath(dir, "missing.json");
+    auto registry = new ConfigRegistry();
+    auto missingError = collectException(registry.loadConfigFile(missing));
+    assert(missingError !is null && missingError.msg.canFind(missing), "A missing file must throw");
+
+    const broken = buildPath(dir, "broken.json");
+    write(broken, `{"server": `);
+    auto brokenError = collectException(registry.loadConfigFile(broken));
+    assert(brokenError !is null && brokenError.msg.canFind(broken), "An unparseable file must throw");
+
+    // A file whose content is not an object would be silently ignored, so it throws too
+    const notObject = buildPath(dir, "array.json");
+    write(notObject, `[{"server": {"port": 1}}]`);
+    auto notObjectError = collectException(registry.loadConfigFile(notObject));
+    assert(notObjectError !is null && notObjectError.msg.canFind(notObject), "A non-object file must throw");
+
+    // The failed loads leave the configuration untouched
+    registry.registerDefinition(ConfigDefinition("server.port", "CONFECTOR_SERVER_PORT", Json(8080), ""));
+    assert(registry.getScope("server").getInt("port") == 8080);
+
+    const valid = buildPath(dir, "valid.json");
+    write(valid, `{"server": {"port": 9000}}`);
+    registry.loadConfigFile(valid);
+    assert(registry.getScope("server").getInt("port") == 9000);
 }
 
 unittest
