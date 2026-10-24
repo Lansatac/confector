@@ -53,15 +53,30 @@ Use `subagent_type: implementer` or `implementer-medium` for the first attempt (
 only for an escalation). The prompt must contain: bead ids; the
 files or area; "read AGENTS.md first"; `bd show <id>` and, for design context, the `design` field of
 the relevant closed design beads (`bd show <id> --json`); the acceptance criteria; what is out of
-scope; the verification commands; and the standing rules: no git write commands, do not close beads,
-update bead notes (`bd update <id> --notes`), report concisely (files, design choices, deferred
-items, exact test results, anything unverified).
+scope; the verification commands; and the standing rules: no git write commands, do not close or
+create beads, no bead ids or bead details in code, comments, test names, error messages or commit
+messages (beads are local only), record notes with `bd comments add <id> "..."`, report concisely
+(files, design choices, deferred items, exact test results, anything unverified).
 
-Run agents in the main tree one at a time. For parallel agents give each `isolation: "worktree"` and
-only parallelize beads that share no files (dub builds collide in one tree). Agents in a worktree
-cannot use `bd`, so tell them to put notes in their report and record them yourself. Apply a worktree
-result to the main tree by `git add -N` of its new files, `git diff --binary` into the scratchpad
-directory, and `git apply --3way` in the main tree.
+### Bead writes by agents
+
+`bd` is built for concurrent use and works from a worktree (it finds the main checkout's database), so
+agents may read beads anywhere. Agents (implementers and reviewers) record notes only with
+`bd comments add`: each comment is a new record, so concurrent agents cannot overwrite each other.
+Fields that are replaced whole (`--notes`, `--description`, `--design`, `--acceptance`), status
+changes, `bd close` and `bd create` are the orchestrator's: a read-modify-write of those fields from
+two writers loses an update. When a comment holds lasting context, fold it into the notes or design
+field yourself.
+
+Run agents in the main tree one at a time. For parallel agents use one git worktree each and only
+parallelize beads that share no files (dub builds collide in one tree). Create them yourself in the
+worktree folder the user has named, or ask where if they have not (`git worktree add -b wt-<name>
+<folder>/<name> HEAD`; keep the path short on Windows), tell the agent to work only inside that
+folder, and remove the worktree and branch after applying the result (`git worktree remove --force`,
+`git branch -D`). The harness's `isolation: "worktree"` does not let you choose the folder. Apply a worktree result to the main tree by `git add -N .` in the worktree, `git diff
+--binary` into the scratchpad directory, and `git apply --3way` in the main tree (expect conflicts in
+files another bead also touched, such as the README; resolve them by keeping both sides). Then run the
+tests and build in the main tree before committing.
 
 ## 4. Review
 
@@ -87,7 +102,8 @@ stale docs and references; line endings.
 - Commit only the files for this work (`git add <paths>`; never `-A`): leave the user's unrelated
   uncommitted changes alone. If `.git/index.lock` exists, confirm no git process is running before
   removing it. Message: what and why, the bead ids, which models implemented and reviewed when that
-  is useful, plus the attribution line the system provides.
+  is useful, plus the attribution line the system provides. No bead ids or bead details in the
+  message (beads are local only).
 - `bd close <ids> --reason "..."`. Create follow-up beads for deferred findings and real bugs found
   on the way (with a label and parent), and add notes where a later bead must know something.
 
