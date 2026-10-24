@@ -187,8 +187,10 @@ Decided October 2026 (design record: bead `confector-z7z.13`).
   kind-specific spec. Kinds include *repository* (the primary kind), *value*, and *task output*.
 - **Upstream task outputs are inputs.** Dependencies between tasks are declared as task-output
   inputs, and graph edges are derived from them. There is no separate dependency list.
-- **A repository input names a repository by id plus a ref selector.** Repositories are defined
-  globally or per project. Ref selectors are described under "Branches".
+- **A repository input names a repository by id.** Repositories are defined globally or per
+  project. An input may carry a *branch filter* (which refs the task may be built from) and a
+  *default ref spec*, but it does not choose the ref: the trigger or request does (see
+  "Branches"), and the default applies only when they say nothing.
 - **Declared, then resolved, then hashed.** Resolution is its own step: it turns every declared
   input in the whole DAG into a pinned value (branch to commit, and so on) once, when a build
   chain is created, so every task in the chain sees the same revisions. Pinned values can come
@@ -241,10 +243,11 @@ distinct:
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
   its payload, optional pins, and the project definition it runs with. Immutable.
-- **Build chain** — the pinned inputs of one branch context: the pinned value of every external
-  input its requests have needed (for a repository input, the revision of that repository at
-  that ref selector). It holds no tasks or edges. Pins only grow and never change once set. This is what the UI calls a *build*;
-  it has a canonical per-project number (#123) and, separately, user-editable labels.
+- **Build chain** — the pins of one build: for every repository input its requests have needed,
+  the ref it was built from and that ref's revision. It holds no tasks or edges. Pins only grow
+  and never change once set. A *headline ref* groups chains into a history. This is what the UI
+  calls a *build*; it has a canonical per-project number (#123) and, separately, user-editable
+  labels.
 - **Task execution** — one run of one task at one fingerprint ("task run" in the UI).
   Append-only and shared across chains; a cache hit is a chain using an execution another chain
   produced.
@@ -252,8 +255,8 @@ distinct:
 How they fit together:
 
 - **A request joins or creates a chain.** Read the current definition and resolve the inputs it
-  needs. If the project already has a chain with the same branch context whose pins agree with
-  every value the request resolved, the request joins it, adding any pins the chain lacks;
+  needs. If the project already has a chain whose pins agree with every value the request resolved
+  (same ref and same revision), the request joins it, adding any pins the chain lacks;
   otherwise a new chain is created. The request runs its targets and their upstream tasks, never
   downstream ones.
 - **Any task in today's definition can be built later for a chain**, against the chain's pins.
@@ -358,16 +361,28 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
   stays.
 - **A branch spec chooses which branches are tracked** — include/exclude patterns such as
   `+:*` and `-:experimental/*`. It is set on the repository and can be overridden per project.
-- **Builds carry a branch context.** A chain records the branch context of the repository that
-  triggered it, and the branch is part of the chain's identity, so each branch has its own build
-  history; a request reaches its branch through its chain. Nothing is
-  built twice, because task executions are shared across chains.
-- **Repository inputs bind to branches through ref selectors:** a fixed ref (`main`); *follow the
-  trigger*, when the trigger came from this input's repository; or *same name with a fallback*,
-  for feature branches that span several repositories.
+- **The trigger or request chooses the ref of every repository.** A trigger targets a task and
+  gives a *ref spec* per repository in that task's closure (optionally per input, so one closure
+  can use a repository at two refs): an event pattern (`A1: *`), which makes pushes to that
+  repository fire the trigger; *same name* as the event's branch; or a fixed ref (`B1: main`).
+  Each non-fixed spec can add `else <ref>` or `else skip` for when the name does not exist.
+  One event makes one request: other repositories are paired by name, never as a cross product.
+  A manual request asks for a ref per repository, prefilled from the defaults; cron and manual
+  requests have no event, so their specs are concrete.
+- **Inputs supply defaults, not choices.** What a trigger or request does not specify comes from
+  the input's own default ref spec; with neither, loading the definition fails.
+- **Builds carry a headline ref.** A chain records one ref (the event's, or the manual request's
+  choice for the primary repository) that groups its history; a project with no repositories has
+  one history. A request joins a chain by pin agreement, not by headline, so triggers on
+  different tasks for one push share a chain. Nothing is built twice, because task executions are
+  shared across chains.
+- **Visibility filters narrow what can be built:** the repository's branch spec, the project's
+  override of it, and each input's filter all apply. An event on a hidden ref does not fire a
+  trigger; a fixed ref that a filter hides fails loudly when the definition loads.
 - **Trigger rules filter on event kind** (push, tag, change request) **and branch patterns.**
-- **A pull request is a branch of kind *change request*,** so filters and selectors apply to it
-  unchanged; code reviews and shelves in other systems map onto the same kind. Each project
+- **A pull request is a branch of kind *change request*,** so filters and specs apply to it
+  unchanged (other repositories pair with its source branch name, and pull requests from forks
+  never pair); code reviews and shelves in other systems map onto the same kind. Each project
   chooses whether to build a change request's head, its merge result, or both, as far as the
   provider supports.
 - **A chain carries the trust level of its request.** See "Authentication and trust".
@@ -387,9 +402,10 @@ Decided October 2026 (design record: bead `confector-z7z.55`); implementation de
   selector. The upstream chain belongs to its own project, which numbers it, and shows in that
   project's history as a build used by the depender. Upstream inputs are resolved in the same pass,
   so inputs both projects use agree.
-- **Selection chooses the upstream chain.** By default, the upstream project's matching branch at
-  current heads. A dependency or a request can instead choose another branch, an existing chain by
-  number or label, or the latest chain where the task succeeded. Choosing revisions or "that
+- **Selection chooses the upstream chain.** By default, the upstream project's inputs use their
+  own default ref specs (a trigger may override them with project-qualified entries). A
+  dependency or a request can instead choose another branch, an existing chain by number or
+  label, or the latest chain where the task succeeded. Choosing revisions or "that
   build" fills pins before evaluation; nothing after evaluation changes.
 - **A request targets tasks in its own project.** To build several projects together, make a task
   that depends on all of them.
@@ -503,8 +519,9 @@ request runs with the definition it was made with (bead `confector-z7z.52`).
 - **Each project chooses where it lives:** a separate configuration repository (the default), the
   code repository, or Confector itself. A separate repository is the default because editing the
   pipeline then never invalidates builds, access can be limited to the people who own CI, and one
-  configuration can serve many code repositories. Code branches pair with configuration branches
-  through the *same name with a fallback* ref selector.
+  configuration can serve many code repositories. When the definition is read from a repository, the branch is a project-level default (a project
+  setting, since a definition cannot say where to find itself): the code event's branch name,
+  falling back to the main branch.
 - **Some things are never in a definition:** repository records and credentials, secrets, compute
   pools, permissions, admin settings. Definitions refer to them by name.
 - **One rule for every storage location:** a request reads the definition once, when it is made,
