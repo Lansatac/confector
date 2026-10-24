@@ -238,11 +238,12 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
 
     // A worker's completion of an execution. It names the execution only: the fingerprint and
     // task come from the execution record (design record: bead confector-z7z.2), and anything
-    // that does not match it is rejected. Until the fingerprint ledger lands (beads
-    // confector-z7z.49.4) a completion only finishes the execution; see
+    // that does not match it is rejected. A completion finishes the execution, folds it into its
+    // fingerprint's ledger and wakes the chains waiting on it; see
     // confector.core.work_orders.completeExecution. The worker acknowledges its own work order.
     postRoute("/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
-        import confector.core.work_orders : InvalidCompletionException, StaleCompletionException, UnknownExecutionException;
+        import confector.core.work_orders : InvalidCompletionException, OutcomeNotFoldedException, StaleCompletionException,
+            UnknownExecutionException;
 
         string executionId = req.params["execution_id"];
         void reject(HTTPStatus status, string message)
@@ -273,6 +274,14 @@ URLRouter apiRouter(string schedulerCallbackSecret, DispatchQueue queue = null, 
         catch (StaleCompletionException e) reject(HTTPStatus.conflict, e.msg);
         catch (UnknownExecutionException e) reject(HTTPStatus.notFound, e.msg);
         catch (InvalidCompletionException e) reject(HTTPStatus.unprocessableEntity, e.msg);
+        catch (OutcomeNotFoldedException e)
+        {
+            // The execution is finished and final; only the ledger fold or the wake failed. Say
+            // so loudly (500) rather than report success: resending is answered 409, and the fold
+            // is repaired by a sweep that settles ledgers and wakes their waiters (not yet built).
+            logError("[api] The completion of execution '%s' was recorded but not folded: %s", executionId, e.msg);
+            writeError(res, HTTPStatus.internalServerError, e.msg);
+        }
         catch (Exception e)
         {
             logError("[api] Could not record the completion of execution '%s': %s", executionId, e.msg);
@@ -667,11 +676,17 @@ unittest
     }
 
     // An execution recorded and sent to the dispatch queue, received by a worker
+    import confector.core.fingerprint_ledger : ClaimOutcome;
     import confector.core.work_orders : DispatchMessage, receiveWork;
     import core.time : hours;
 
-    string queueExecution(StateStores into, string id, string fingerprint)
+    // Dispatches as the dispatcher does: claims the fingerprint's ledger, records the execution
+    // under the claimed id and sends its message
+    string queueExecution(StateStores into, string fingerprint)
     {
+        const claimed = into.ledgers.claim(fingerprint, 0);
+        assert(claimed.outcome == ClaimOutcome.won);
+        const id = claimed.executionId;
         TaskExecution execution;
         execution.id = id;
         execution.projectId = "proj_api_1";
@@ -680,13 +695,13 @@ unittest
         execution.status = ExecutionStatus.queued;
         execution.definition = node;
         execution.createdAt = "2026-10-16T10:00:00Z";
-        into.executions.create(execution);
+        into.executions.createIfAbsent(execution);
         queue.ensureQueue(defaultPoolQueue);
         queue.send(defaultPoolQueue, serializeToJson(DispatchMessage(id)));
         return id;
     }
 
-    const executionId = queueExecution(stores, "exe_n1", "fp_n1");
+    const executionId = queueExecution(stores, "fp_n1");
     auto received = receiveWork(stores, queue, defaultPoolQueue, 10, 1.hours, "test-worker");
     assert(received.length == 1 && received[0].workOrder.executionId == executionId);
 
@@ -734,7 +749,7 @@ unittest
     import confector.testing.memory_document_store : InterleavingDocumentStore;
     auto failingDocuments = new InterleavingDocumentStore(new InMemoryDocumentStore());
     auto failingStores = new StateStores(failingDocuments);
-    const anotherId = queueExecution(failingStores, "exe_n1_again", "fp_n1_again");
+    const anotherId = queueExecution(failingStores, "fp_n1_again");
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
     auto failingRouter = apiRouter("test-scheduler-secret", queue, failingStores);
     InetHeaderMap failingHeaders;
@@ -746,6 +761,15 @@ unittest
     assert(failingRes.statusCode == HTTPStatus.internalServerError);
     failingDocuments.beforeNextWrite = null;
     assert(failingStores.executions.get(anotherId).get.status == ExecutionStatus.queued);
+
+    // A completion whose fold fails after the execution finished (a chain waiting on the
+    // fingerprint has no chain state) is a server error that says so; the execution stays finished
+    // and a resent completion is a conflict
+    const unfoldedId = queueExecution(stores, "fp_n1_unfolded");
+    stores.ledgers.subscribe(stores.ledgers.get("fp_n1_unfolded").get, "chain_without_state");
+    assert(post("/executions/" ~ unfoldedId ~ "/complete", completion) == HTTPStatus.internalServerError);
+    assert(stores.executions.get(unfoldedId).get.status == ExecutionStatus.succeeded);
+    assert(post("/executions/" ~ unfoldedId ~ "/complete", completion) == HTTPStatus.conflict);
 
     // Without the state stores the execution routes fail loudly rather than drop the report
     InetHeaderMap headers;

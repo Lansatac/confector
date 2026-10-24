@@ -17,6 +17,7 @@ import confector.core.fingerprint_ledger : ClaimOutcome;
 import confector.core.input_resolution : GraphResolution;
 import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
 import confector.core.state_stores : StateStores;
+import confector.core.work_orders : foldAndNotify;
 import confector.api.dispatch_queue : DispatchQueue;
 import confector.api.model;
 import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
@@ -202,9 +203,7 @@ void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionSta
     ended.status = status;
     ended.finishedAt = "2026-10-20T11:00:00Z";
     stores.executions.update(current, ended);
-    auto folded = stores.ledgers.fold(ended).ledger;
-    foreach (ref notice; folded.pendingNotify) stores.chainStates.markDirty(notice.chainId);
-    stores.ledgers.clearNotified(fingerprint, folded.pendingNotify);
+    foldAndNotify(stores, ended);
 }
 
 ChainTaskState taskOf(in ChainState state, string taskId)
