@@ -1064,8 +1064,8 @@ struct TaskExecution
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
     /// When a message for the execution was last sent to the dispatch queue; empty while none has
     /// been. A queued execution that was never sent (its dispatcher failed or crashed between
-    /// recording and sending it) is sent again by the dispatcher or the sweep (bead
-    /// confector-z7z.49.3).
+    /// recording and sending it) is sent again by the dispatcher, for a chain awaiting it, or by
+    /// the sweep (confector.core.execution_dispatcher).
     @optional @asName("sent_at") string sentAt;
     /// Artifacts the execution produced.
     @optional ArtifactMetadata[] artifacts;

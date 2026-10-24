@@ -665,12 +665,13 @@ Be aware of these so you do not spread them:
   `confector-z7z.49.4`). The chain evaluator, execution dispatcher and fingerprint claims were
   deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
-  (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing dispatches through
-  it or folds into it yet (beads `confector-z7z.49.3`, `confector-z7z.49.4`). The pure chain
-  evaluator (`confector.core.chain_evaluator`) and the chain state document
-  (`confector.core.chain_state`) exist (bead `confector-z7z.49.2`), but nothing reconciles chains
-  yet (bead `confector-z7z.49.3`). Do not add a build path outside the
-  chain components. Chains are pins-only (`BuildChain.headline` and grow-only per-input `pins`;
+  (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing folds into it yet
+  (bead `confector-z7z.49.4`). The pure chain evaluator (`confector.core.chain_evaluator`), the
+  chain state document (`confector.core.chain_state`, bead `confector-z7z.49.2`), the execution
+  dispatcher (`confector.core.execution_dispatcher`) and the chain reconciler
+  (`confector.core.chain_reconciler`, bead `confector-z7z.49.3`) exist, but no route or sweep
+  calls the reconciler yet (beads `confector-z7z.23.7`, `confector-z7z.49.5`). Do not add a build
+  path outside the chain components. Chains are pins-only (`BuildChain.headline` and grow-only per-input `pins`;
   `confector.core.chain_pins`) and requests reference stored definitions
   (`confector.core.definition_store`; bead `confector-z7z.53.4`); nothing writes them yet (bead
   `confector-z7z.53.2`). The build log routes answer 501 until the log store lands (bead

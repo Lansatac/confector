@@ -58,9 +58,11 @@ module confector.core.chain_evaluator;
  *
  * Unsent and unrecorded executions are not the evaluator's concern: a task whose fingerprint has
  * an active execution is queued (or running) whether or not that execution was ever sent or
- * recorded; the dispatcher and the sweep repair those at the execution level (bead
- * confector-z7z.49.3). Infrastructure failures retry within one execution, which stays active
- * meanwhile (TaskExecution.attempts). Stale index copies cannot confuse it: it reads no index.
+ * recorded; the reconciler hands each awaited execution to the dispatcher, which records an
+ * unrecorded one from the request it is awaited for (AwaitedExecution.requestId and inputs) and
+ * sends an unsent one, and the sweep resends unsent ones (confector.core.execution_dispatcher).
+ * Infrastructure failures retry within one execution, which stays active meanwhile
+ * (TaskExecution.attempts). Stale index copies cannot confuse it: it reads no index.
  *
  * Requests whose definitions give one task different fingerprints (different inputs for the same
  * task id) are refused loudly for now; evaluating each request over its own graph is bead
@@ -154,6 +156,11 @@ struct AwaitedExecution
     string executionId;
     /// The fingerprint's ledger as read for the evaluation, naming `executionId` as active.
     Versioned!FingerprintLedger ledger;
+    /// The request whose demand governs the task (ChainTaskState.demandSeq) and the task's resolved
+    /// inputs, as for NeededExecution: if the active execution was claimed but never recorded (its
+    /// dispatcher crashed), the dispatcher records it from them.
+    string requestId;
+    ResolvedInput[] inputs;
 }
 
 /**
@@ -440,7 +447,8 @@ ChainEvaluation evaluateChain(
         {
             state.status = fact.running ? ChainTaskStatus.running : ChainTaskStatus.queued;
             state.executionId = fact.activeId;
-            result.awaited ~= AwaitedExecution(taskId, covered.fingerprint, fact.activeId, cast(Versioned!FingerprintLedger) fact.ledger);
+            result.awaited ~= AwaitedExecution(taskId, covered.fingerprint, fact.activeId, cast(Versioned!FingerprintLedger) fact.ledger,
+                covered.requestId, (cast(ResolvedInput[]) covered.inputs).dup);
         }
         else if (fact.settles(covered.stopSeqAtDemand))
         {
@@ -955,6 +963,8 @@ unittest
     assert(awaited.taskId == "compile" && awaited.fingerprint == compileAt && awaited.executionId == id);
     assert(awaited.ledger.activeExecutionId == id && awaited.ledger.version_ == w.versions[compileAt],
         "The chain subscribes at the version the evaluation read");
+    assert(awaited.requestId == "r1" && awaited.inputs == [ResolvedInput("src", InputKind.repository, Json("aaa111"))],
+        "An unrecorded execution can be recorded from the governing request");
     assert(statusOf(queued, "test") == ChainTaskStatus.waitingUpstream);
 
     w.executions[id].status = ExecutionStatus.running;

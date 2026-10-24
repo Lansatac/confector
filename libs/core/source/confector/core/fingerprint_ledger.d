@@ -17,8 +17,9 @@ module confector.core.fingerprint_ledger;
  * 1. `claim(F, seen)`, where `seen` is the ledger's `executionSeq` as the caller read it when it
  *    decided F needs an execution (0 if it found no ledger). The claim moves the ledger from "no
  *    active execution" to active = `executionIdFor(F, seen + 1)`. A loser learns the active
- *    execution (and subscribes to it, below) or that an execution was created and finished since
- *    it read (and re-evaluates).
+ *    execution or that an execution was created and finished since it read; either way it
+ *    re-evaluates, and the chain reconciler's next pass subscribes it on the active execution
+ *    (below) at the ledger version that pass reads.
  * 2. `ExecutionStore.createIfAbsent` the queued TaskExecution with that id, carrying the
  *    definition, inputs and repository addresses of the request it is dispatched for.
  * 3. Send its DispatchMessage to the pool's dispatch queue.

@@ -1,0 +1,280 @@
+module confector.core.chain_fixtures;
+
+/**
+ * Test fixtures shared by the unittests of the chain components (chain_state, execution_dispatcher,
+ * chain_reconciler): a small project, chains, request intake, finishing executions, and the real
+ * dispatcher and reconciler over a test queue. Compiled only for unittests.
+ */
+
+version (unittest):
+
+import confector.core.chain_evaluator;
+import confector.core.chain_pins : pinMap;
+import confector.core.chain_reconciler : ChainReconciler;
+import confector.core.document_collection : Versioned;
+import confector.core.execution_dispatcher : Dispatched, ExecutionDispatcher;
+import confector.core.fingerprint_ledger : ClaimOutcome;
+import confector.core.input_resolution : GraphResolution;
+import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
+import confector.core.state_stores : StateStores;
+import confector.api.dispatch_queue : DispatchQueue;
+import confector.api.model;
+import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+import confector.testing.memory_document_store : InterleavingDocumentStore;
+
+import std.format : format;
+import vibe.data.json : Json;
+
+/// The address the fixtures register for repository "game".
+enum string gameAddress = "https://example.test/game.git";
+
+/// The clock the fixtures' dispatchers use.
+string fixedNow() { return "2026-10-20T10:00:00Z"; }
+
+/// compile -> test -> report, and lint; compile and lint build repository game.
+ProjectDefinition sampleDefinition()
+{
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
+    compile.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
+    TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
+    TaskNode report; report.id = "report"; report.inputs["results"] = taskOutputInput("test");
+    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game");
+    return ProjectDefinition([compile, test, report, lint]);
+}
+
+BuildChain sampleChain(string id)
+{
+    BuildChain chain;
+    chain.id = id;
+    chain.projectId = "game";
+    chain.number = 1;
+    chain.headline = HeadlineRef(HeadlineKind.branch, "main");
+    foreach (task; ["compile", "lint"])
+    {
+        chain.pins ~= PinnedInput(task, "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")));
+    }
+    chain.createdAt = "2026-10-20T10:00:00Z";
+    return chain;
+}
+
+/// Creates chain `id` without its state, as a resolver that crashed before creating it would, and
+/// registers repository game if it is not yet.
+BuildChain createChainOnly(StateStores stores, string id)
+{
+    if (stores.repositories.get("game").isNull)
+    {
+        RepositoryRecord game;
+        game.name = "game";
+        game.address = gameAddress;
+        stores.repositories.put(game);
+    }
+    return stores.chains.create(sampleChain(id)).value;
+}
+
+/// Creates chain `id` and its state, as the input resolver does.
+BuildChain createChain(StateStores stores, string id)
+{
+    auto chain = createChainOnly(stores, id);
+    stores.chainStates.createFor(chain);
+    return chain;
+}
+
+RerunGenerationReader readerOf(StateStores stores)
+{
+    return (in string[] bases) => stores.rerunGenerations.read(bases);
+}
+
+/// The fingerprints, now, of the tasks a request for `targets` covers.
+GraphResolution closureNow(StateStores stores, in BuildChain chain, in string[] targets,
+    ProjectDefinition definition = sampleDefinition())
+{
+    return readGraphResolution(chain.projectId, closureGraph(definition, targets), pinMap(chain.pins), readerOf(stores));
+}
+
+/// The fingerprint, now, of task `taskId` of chain `chainId`.
+string fingerprintNow(StateStores stores, string chainId, string taskId)
+{
+    return closureNow(stores, stores.chains.get(chainId).get.value, [taskId]).fingerprints[taskId];
+}
+
+/// Records request `id` as an intake does: its demands from the settled ledgers, then the
+/// request. It is not yet added to the chain's state (`intake` does both).
+BuildRequest recordRequest(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
+    ProjectDefinition definition = sampleDefinition())
+{
+    const chain = stores.chains.get(chainId).get.value;
+    auto closure = closureNow(stores, chain, targets, definition);
+    ulong[string] stopSeqs;
+    foreach (fingerprint; closure.fingerprints.byValue)
+    {
+        auto settled = stores.ledgers.settle(fingerprint);
+        stopSeqs[fingerprint] = settled.ledger.isNull ? 0 : settled.ledger.get.stopSeq;
+    }
+    BuildRequest request;
+    request.id = id;
+    request.projectId = chain.projectId;
+    request.chainId = chain.id;
+    request.targets = targets;
+    request.intent = BuildIntent.build;
+    request.trigger.type = TriggerType.manual;
+    request.definitionId = stores.definitions.put(definition);
+    request.definitionSource = DefinitionSource(DefinitionLocation.confector);
+    request.demands = requestDemands(closure, stopSeqs);
+    request.requestedBy = "jason";
+    request.requestedAt = requestedAt;
+    return stores.requests.create(request).value;
+}
+
+BuildRequest intake(StateStores stores, string chainId, string id, string[] targets, string requestedAt)
+{
+    auto request = recordRequest(stores, chainId, id, targets, requestedAt);
+    stores.chainStates.addRequest(request);
+    return request;
+}
+
+/// The chain's requests as its state names them, each with its definition, read by id.
+ChainRequest[] requestsOf(StateStores stores, in ChainState state)
+{
+    ChainRequest[] requests;
+    foreach (id; state.requestIds)
+    {
+        auto request = stores.requests.get(id).get.value;
+        requests ~= ChainRequest(request, stores.definitions.get(request.definitionId).get);
+    }
+    return requests;
+}
+
+/// Request `id` with its definition, read by id.
+ChainRequest chainRequest(StateStores stores, string id)
+{
+    auto request = stores.requests.get(id).get.value;
+    return ChainRequest(request, stores.definitions.get(request.definitionId).get);
+}
+
+/// Evaluates chain `read.chainId` from what the stores hold, all read by id, from the state `read`.
+ChainEvaluation evaluateFrom(StateStores stores, in Versioned!ChainState read)
+{
+    const chain = stores.chains.get(read.chainId).get.value;
+    auto requests = requestsOf(stores, read.value);
+    auto generations = readChainGenerations(chain, requests, readerOf(stores));
+    LedgerSummary[string] summaries;
+    foreach (fingerprint; chainFingerprints(chain, requests, generations))
+    {
+        summaries[fingerprint] = readLedgerSummary(stores.ledgers, stores.executions, fingerprint);
+    }
+    return evaluateChain(chain, requests, generations, summaries);
+}
+
+/// A dispatcher over `stores` sending to `queue` (a fresh test queue if null), on the fixed clock.
+ExecutionDispatcher dispatcherOf(StateStores stores, DispatchQueue queue = null)
+{
+    return new ExecutionDispatcher(stores, queue !is null ? queue : new InMemoryDispatchQueue(), () => fixedNow());
+}
+
+/// A reconciler over `stores` sending to `queue` (a fresh test queue if null).
+ChainReconciler reconcilerOf(StateStores stores, DispatchQueue queue = null)
+{
+    return new ChainReconciler(stores, dispatcherOf(stores, queue));
+}
+
+/// Dispatches the execution `needed` asks for with the real dispatcher; its claim must win.
+Dispatched dispatch(StateStores stores, in NeededExecution needed, DispatchQueue queue = null)
+{
+    auto dispatched = dispatcherOf(stores, queue).dispatch(needed, chainRequest(stores, needed.requestId));
+    assert(dispatched.claim == ClaimOutcome.won, "The test dispatch's claim must win");
+    return dispatched;
+}
+
+/// Reconciles chain `chainId` with the real reconciler and returns its state.
+Versioned!ChainState reconcile(StateStores stores, string chainId, DispatchQueue queue = null)
+{
+    return reconcilerOf(stores, queue).reconcile(chainId).state;
+}
+
+/// Ends the active execution of `taskId`'s current fingerprint in chain `chain` with `status`:
+/// the terminal compare-and-set, the fold, and the drain marking its waiters dirty.
+void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionStatus status)
+{
+    const fingerprint = closureNow(stores, chain, [taskId]).fingerprints[taskId];
+    auto ledger = stores.ledgers.get(fingerprint).get;
+    auto current = stores.executions.get(ledger.activeExecutionId).get;
+    TaskExecution ended = current.value;
+    ended.status = status;
+    ended.finishedAt = "2026-10-20T11:00:00Z";
+    stores.executions.update(current, ended);
+    auto folded = stores.ledgers.fold(ended).ledger;
+    foreach (ref notice; folded.pendingNotify) stores.chainStates.markDirty(notice.chainId);
+    stores.ledgers.clearNotified(fingerprint, folded.pendingNotify);
+}
+
+ChainTaskState taskOf(in ChainState state, string taskId)
+{
+    foreach (ref task; state.tasks)
+    {
+        if (task.taskId == taskId) return cast(ChainTaskState) task;
+    }
+    assert(false, format("task '%s' has no state", taskId));
+}
+
+bool throwsA(E)(scope void delegate() action)
+{
+    try action();
+    catch (E) return true;
+    return false;
+}
+
+/// Runs `action` just before the `n`th write (1 for the next one) through `store`.
+void beforeWrite(InterleavingDocumentStore store, size_t n, void delegate() action)
+{
+    assert(n >= 1);
+    if (n == 1)
+    {
+        store.beforeNextWrite = action;
+        return;
+    }
+    store.beforeNextWrite = () { beforeWrite(store, n - 1, action); };
+}
+
+/// The execution ids of the messages waiting on the default pool queue of `queue`, received (and
+/// so leased) by this call.
+string[] messagesIn(DispatchQueue queue)
+{
+    import confector.core.work_orders : DispatchMessage, defaultPoolQueue;
+    import core.time : hours;
+    import vibe.data.json : deserializeJson;
+
+    string[] ids;
+    for (;;)
+    {
+        auto leases = queue.receive(defaultPoolQueue, 10, 1.hours);
+        if (leases.length == 0) return ids;
+        foreach (lease; leases) ids ~= deserializeJson!DispatchMessage(lease.message).executionId;
+    }
+}
+
+/// A test dispatch queue whose next `failSends` sends throw, as a queue service that is down would.
+final class FlakyDispatchQueue : DispatchQueue
+{
+    import confector.api.dispatch_queue : Lease;
+    import core.time : Duration;
+
+    InMemoryDispatchQueue inner;
+    size_t failSends;
+
+    this() { inner = new InMemoryDispatchQueue(); }
+
+    override void ensureQueue(string queue) { inner.ensureQueue(queue); }
+    override void send(string queue, Json message, Duration delay = Duration.zero)
+    {
+        if (failSends > 0)
+        {
+            --failSends;
+            throw new Exception("The dispatch queue is unavailable");
+        }
+        inner.send(queue, message, delay);
+    }
+    override Lease[] receive(string queue, size_t maxMessages, Duration visibility) { return inner.receive(queue, maxMessages, visibility); }
+    override void ack(string queue, string receipt) { inner.ack(queue, receipt); }
+    override void extend(string queue, string receipt, Duration visibility) { inner.extend(queue, receipt, visibility); }
+    override void release(string queue, string receipt, Duration delay = Duration.zero) { inner.release(queue, receipt, delay); }
+}

@@ -29,10 +29,12 @@ module confector.core.chain_state;
  * - **Signals** (an execution the chain waited on ended, a rerun reached it): `markDirty`. It always
  *   writes, even to a state that is already dirty, so a reconcile that read the state before the
  *   signal cannot commit over it.
- * - **Reconciling** (bead confector-z7z.49.3): read the state, then by id its requests, their
- *   definitions, the generations and the ledgers; evaluate. If anything is needed, dispatch it and
- *   evaluate again: an evaluation that still needs executions is never committed (`commit`
- *   refuses it). Otherwise subscribe the chain on each awaited execution's ledger at the version
+ * - **Reconciling** (confector.core.chain_reconciler): read the state, then by id its requests,
+ *   their definitions, the generations and the ledgers; evaluate. If anything is needed, dispatch
+ *   it and evaluate again: an evaluation that still needs executions is never committed (`commit`
+ *   refuses it). Otherwise have the dispatcher repair each awaited execution (record it if it was
+ *   claimed but never recorded, send it if it was never sent; evaluate again if it has ended),
+ *   then subscribe the chain on each awaited execution's ledger at the version
  *   the evaluation read (AwaitedExecution.ledger), never on a fresh read: an execution that ended
  *   since then makes that subscribe fail with DocumentConflictException (or report notActive), and
  *   the reconcile re-reads and evaluates again without committing, because nothing would wake a
@@ -363,226 +365,9 @@ private void requireChainId(string chainId) @safe
 version (unittest)
 {
     import confector.core.chain_evaluator;
-    import confector.core.chain_pins : pinMap;
-    import confector.core.fingerprint_ledger : ClaimOutcome, SubscribeOutcome;
-    import confector.core.input_resolution : GraphResolution;
-    import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
+    import confector.core.chain_fixtures;
     import confector.core.state_stores : StateStores;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
-
-    import vibe.data.json : Json;
-
-    /// compile -> test -> report, and lint; compile and lint build repository game.
-    private ProjectDefinition sampleDefinition()
-    {
-        TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
-        TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
-        TaskNode report; report.id = "report"; report.inputs["results"] = taskOutputInput("test");
-        TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game");
-        return ProjectDefinition([compile, test, report, lint]);
-    }
-
-    private BuildChain sampleChain(string id)
-    {
-        BuildChain chain;
-        chain.id = id;
-        chain.projectId = "game";
-        chain.number = 1;
-        chain.headline = HeadlineRef(HeadlineKind.branch, "main");
-        foreach (task; ["compile", "lint"])
-        {
-            chain.pins ~= PinnedInput(task, "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")));
-        }
-        chain.createdAt = "2026-10-20T10:00:00Z";
-        return chain;
-    }
-
-    /// Creates chain `id` without its state, as a resolver that crashed before creating it would.
-    private BuildChain createChainOnly(StateStores stores, string id)
-    {
-        return stores.chains.create(sampleChain(id)).value;
-    }
-
-    /// Creates chain `id` and its state, as the input resolver does.
-    private BuildChain createChain(StateStores stores, string id)
-    {
-        auto chain = createChainOnly(stores, id);
-        stores.chainStates.createFor(chain);
-        return chain;
-    }
-
-    private RerunGenerationReader readerOf(StateStores stores)
-    {
-        return (in string[] bases) => stores.rerunGenerations.read(bases);
-    }
-
-    /// The fingerprints, now, of the tasks a request for `targets` covers.
-    private GraphResolution closureNow(StateStores stores, in BuildChain chain, in string[] targets,
-        ProjectDefinition definition = sampleDefinition())
-    {
-        return readGraphResolution(chain.projectId, closureGraph(definition, targets), pinMap(chain.pins), readerOf(stores));
-    }
-
-    /// Records request `id` as an intake does: its demands from the settled ledgers, then the
-    /// request. It is not yet added to the chain's state (`intake` does both).
-    private BuildRequest recordRequest(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
-        ProjectDefinition definition = sampleDefinition())
-    {
-        const chain = stores.chains.get(chainId).get.value;
-        auto closure = closureNow(stores, chain, targets, definition);
-        ulong[string] stopSeqs;
-        foreach (fingerprint; closure.fingerprints.byValue)
-        {
-            auto settled = stores.ledgers.settle(fingerprint);
-            stopSeqs[fingerprint] = settled.ledger.isNull ? 0 : settled.ledger.get.stopSeq;
-        }
-        BuildRequest request;
-        request.id = id;
-        request.projectId = chain.projectId;
-        request.chainId = chain.id;
-        request.targets = targets;
-        request.intent = BuildIntent.build;
-        request.trigger.type = TriggerType.manual;
-        request.definitionId = stores.definitions.put(definition);
-        request.definitionSource = DefinitionSource(DefinitionLocation.confector);
-        request.demands = requestDemands(closure, stopSeqs);
-        request.requestedBy = "jason";
-        request.requestedAt = requestedAt;
-        return stores.requests.create(request).value;
-    }
-
-    private BuildRequest intake(StateStores stores, string chainId, string id, string[] targets, string requestedAt)
-    {
-        auto request = recordRequest(stores, chainId, id, targets, requestedAt);
-        stores.chainStates.addRequest(request);
-        return request;
-    }
-
-    /// The chain's requests as its state names them, each with its definition, read by id.
-    private ChainRequest[] requestsOf(StateStores stores, in ChainState state)
-    {
-        ChainRequest[] requests;
-        foreach (id; state.requestIds)
-        {
-            auto request = stores.requests.get(id).get.value;
-            requests ~= ChainRequest(request, stores.definitions.get(request.definitionId).get);
-        }
-        return requests;
-    }
-
-    /// Evaluates chain `chainId` from what the stores hold, all read by id, from the state `read`.
-    private ChainEvaluation evaluateFrom(StateStores stores, in Versioned!ChainState read)
-    {
-        const chain = stores.chains.get(read.chainId).get.value;
-        auto requests = requestsOf(stores, read.value);
-        auto generations = readChainGenerations(chain, requests, readerOf(stores));
-        LedgerSummary[string] summaries;
-        foreach (fingerprint; chainFingerprints(chain, requests, generations))
-        {
-            summaries[fingerprint] = readLedgerSummary(stores.ledgers, stores.executions, fingerprint);
-        }
-        return evaluateChain(chain, requests, generations, summaries);
-    }
-
-    /// Claims and records the execution `needed` asks for, as the dispatcher does (bead
-    /// confector-z7z.49.3), with the definition of the request it is needed for.
-    private void dispatch(StateStores stores, in NeededExecution needed)
-    {
-        auto claimed = stores.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq);
-        assert(claimed.outcome == ClaimOutcome.won, "The test dispatcher's claim must win");
-        auto request = stores.requests.get(needed.requestId).get;
-        TaskExecution execution;
-        execution.id = claimed.executionId;
-        execution.projectId = request.projectId;
-        execution.taskId = needed.taskId;
-        execution.fingerprint = needed.fingerprint;
-        execution.status = ExecutionStatus.queued;
-        foreach (ref task; stores.definitions.get(request.definitionId).get.tasks)
-        {
-            if (task.id == needed.taskId) execution.definition = task;
-        }
-        execution.definitionHash = "def";
-        execution.inputs = cast(ResolvedInput[]) needed.inputs;
-        execution.createdAt = "2026-10-20T10:00:00Z";
-        stores.executions.createIfAbsent(execution);
-    }
-
-    /**
-     * Reconciles chain `chainId` until it commits, as the chain reconciler does (bead
-     * confector-z7z.49.3): read the state, evaluate, dispatch what is needed (then evaluate again),
-     * subscribe on what it waits on at the ledger versions the evaluation read (re-evaluating,
-     * without committing, if one conflicts or is no longer active), commit at the state version
-     * read; on a conflict, start again.
-     */
-    private Versioned!ChainState reconcile(StateStores stores, string chainId, void delegate() beforeSubscribing = null)
-    {
-        import confector.api.document_store : DocumentConflictException;
-
-        foreach (attempt; 0 .. 20)
-        {
-            auto read = stores.chainStates.get(chainId).get;
-            auto evaluation = evaluateFrom(stores, read);
-            if (evaluation.needed.length > 0)
-            {
-                foreach (ref needed; evaluation.needed) dispatch(stores, needed);
-                continue;
-            }
-            if (beforeSubscribing !is null && evaluation.awaited.length > 0)
-            {
-                auto hook = beforeSubscribing;
-                beforeSubscribing = null;
-                hook();
-            }
-            try
-            {
-                bool ended = false;
-                foreach (ref awaited; evaluation.awaited)
-                {
-                    const subscribed = stores.ledgers.subscribe(awaited.ledger, chainId);
-                    ended = ended || subscribed.outcome == SubscribeOutcome.notActive;
-                }
-                if (ended) continue;
-                return stores.chainStates.commit(read, evaluation);
-            }
-            catch (DocumentConflictException)
-            {
-                // Something changed since the read: reconcile again.
-            }
-        }
-        assert(false, "The test reconcile did not converge");
-    }
-
-    /// Ends the active execution of `taskId`'s current fingerprint in chain `chainId` with `status`:
-    /// the terminal compare-and-set, the fold, and the drain marking its waiters dirty.
-    private void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionStatus status)
-    {
-        const fingerprint = closureNow(stores, chain, [taskId]).fingerprints[taskId];
-        auto ledger = stores.ledgers.get(fingerprint).get;
-        auto current = stores.executions.get(ledger.activeExecutionId).get;
-        TaskExecution ended = current.value;
-        ended.status = status;
-        ended.finishedAt = "2026-10-20T11:00:00Z";
-        stores.executions.update(current, ended);
-        auto folded = stores.ledgers.fold(ended).ledger;
-        foreach (ref notice; folded.pendingNotify) stores.chainStates.markDirty(notice.chainId);
-        stores.ledgers.clearNotified(fingerprint, folded.pendingNotify);
-    }
-
-    private ChainTaskState taskOf(in ChainState state, string taskId)
-    {
-        foreach (ref task; state.tasks)
-        {
-            if (task.taskId == taskId) return cast(ChainTaskState) task;
-        }
-        assert(false, format("task '%s' has no state", taskId));
-    }
-
-    private bool throwsA(E)(scope void delegate() action)
-    {
-        try action();
-        catch (E) return true;
-        return false;
-    }
 }
 
 unittest
@@ -876,11 +661,15 @@ unittest
 
     // Through the reconcile: test is dispatched (nobody subscribed yet), and it ends between the
     // reconcile's evaluation and its subscribe. Its fold notices nobody, so only the subscribe at
-    // the version read can tell the reconcile to evaluate again
+    // the version read can tell the reconcile to evaluate again. test was dispatched and sent, so
+    // the reconcile's first write is that subscribe
     foreach (ref needed; evaluateFrom(direct, direct.chainStates.get("c1").get).needed) dispatch(direct, needed);
     const testAt = closureNow(direct, chain, ["test"]).fingerprints["test"];
     assert(direct.ledgers.get(testAt).get.subscribers.length == 0);
-    auto committed = reconcile(direct, "c1", () { finish(direct, chain, "test", ExecutionStatus.succeeded); });
+    auto interleaving = new InterleavingDocumentStore(documents);
+    interleaving.beforeNextWrite = () { finish(direct, chain, "test", ExecutionStatus.succeeded); };
+    auto committed = reconcile(new StateStores(interleaving), "c1");
+    assert(interleaving.beforeNextWrite is null, "test ended between the evaluation and the subscribe");
     assert(direct.ledgers.get(testAt).get.pendingNotify.length == 0, "Nobody was woken by the fold");
     assert(taskOf(committed, "test").status == ChainTaskStatus.succeeded, "The chain must not end clean and stuck");
     assert(!committed.dirty && taskOf(committed, "compile").status == ChainTaskStatus.succeeded);
