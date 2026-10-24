@@ -68,6 +68,9 @@ struct GraphResolution
     string[string] bases;
     /// Fingerprint keyed by task id.
     string[string] fingerprints;
+    /// The rerun generation of each task's base, keyed by task id: an entry exactly when the task
+    /// has a fingerprint.
+    ulong[string] generations;
 }
 
 /**
@@ -255,6 +258,7 @@ GraphResolution graphResolution(
             continue;
         }
         result.fingerprints[taskId] = computeFingerprint(base, *generation);
+        result.generations[taskId] = *generation;
     }
     return result;
 }

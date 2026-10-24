@@ -268,10 +268,13 @@ How they fit together:
   with the executions for those fingerprints (with no request open, today's definition). An old
   chain's view can change when the definition changes; what actually ran stays in the execution
   records.
-- **Chain state is derived from authoritative inputs**: the chain, its requests, the executions
-  for its fingerprints, and the rerun generations. A small mutable *chain state* document per
-  chain holds demand and a dirty marker so signals have somewhere durable to land; it can always
-  be rebuilt from those inputs.
+- **Chain state is derived from authoritative inputs**: the chain, its requests, the ledgers and
+  executions for its fingerprints, and the rerun generations. Each request records its demand: for
+  every task it covers, the task's fingerprint and how many executions had stopped there when it
+  was made. Evaluation reads the ledgers by id and settles demands from those records. A small
+  mutable *chain state* document per chain holds the chain's request ids, the cached last
+  evaluation and a dirty marker so signals have somewhere durable to land; it can always be
+  rebuilt from those inputs.
 - **A configuration change does not trigger a rebuild** of a chain whose task already succeeded;
   re-run the task to apply it.
 - **Retry and rerun are different.** *Retry* runs a failed or cancelled task again in the same
@@ -663,7 +666,10 @@ Be aware of these so you do not spread them:
   deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
   (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing dispatches through
-  it or folds into it yet (beads `confector-z7z.49.3`, `confector-z7z.49.4`). Do not add a build path outside the
+  it or folds into it yet (beads `confector-z7z.49.3`, `confector-z7z.49.4`). The pure chain
+  evaluator (`confector.core.chain_evaluator`) and the chain state document
+  (`confector.core.chain_state`) exist (bead `confector-z7z.49.2`), but nothing reconciles chains
+  yet (bead `confector-z7z.49.3`). Do not add a build path outside the
   chain components. Chains are pins-only (`BuildChain.headline` and grow-only per-input `pins`;
   `confector.core.chain_pins`) and requests reference stored definitions
   (`confector.core.definition_store`; bead `confector-z7z.53.4`); nothing writes them yet (bead

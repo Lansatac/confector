@@ -716,8 +716,9 @@ struct TaskExecutionResult
 // AGENTS.md, "What a build is"). A request joins or creates a chain; chain state is derived from
 // authoritative inputs (the chain, its requests, the rerun generations, and the fingerprint
 // ledgers and executions for its fingerprints), with a small mutable ChainState document per
-// chain holding demand and a dirty marker (bead confector-z7z.48; ChainState is bead
-// confector-z7z.49.2). Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
+// chain holding its request ids, its last evaluation and a dirty marker (bead confector-z7z.48;
+// ChainState is bead confector-z7z.49.2; each request records its demands, so ChainState can be
+// rebuilt). Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
 // (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because toISOExtString
 // leaves out zero fractional seconds: parse them to compare.
 
@@ -896,6 +897,28 @@ struct ProjectDefinition
 }
 
 /**
+ * What a build request asks of one task it covers (bead confector-z7z.49.2): the task's fingerprint
+ * when the request was made, and the `stopSeq` of that fingerprint's ledger then, read after
+ * settling it (`LedgerStore.settle`) so a stop that had already happened is counted. A later
+ * failure or cancellation at that fingerprint (the ledger's `stopSeq` grows past it) settles the
+ * request's demand; an earlier one never does, so a retry made after a failure always runs. Sequence
+ * numbers, never timestamps, decide it (AGENTS.md, "Coordinating builds").
+ */
+struct TaskDemand
+{
+    @asName("task_id") string taskId;
+    string fingerprint;
+    /// The task's base fingerprint and its rerun generation then. A fingerprint only moves when
+    /// the task or an upstream task is rerun (pins and the request's definition never change), so
+    /// the evaluator checks a moved fingerprint against these instead of trusting it.
+    string base;
+    @optional ulong generation;
+    /// How many executions had stopped (failed or been cancelled) at `fingerprint` when the
+    /// request was made; 0 when none had or its ledger did not exist.
+    @optional @asName("stop_seq") ulong stopSeq;
+}
+
+/**
  * Who asked for what (beads confector-z7z.14 and confector-z7z.52). Immutable: written once, after
  * the input resolver has found or created the chain the request runs on and added to it every pin
  * the request supplies.
@@ -922,6 +945,11 @@ struct BuildRequest
     @asName("definition_id") string definitionId;
     /// Where that definition was read from, and for a definition file at which revision.
     @asName("definition_source") DefinitionSource definitionSource;
+    /// One entry per task the request covers (its targets and their upstream tasks in its
+    /// definition), sorted by task id: the fingerprint and ledger `stopSeq` the task had when the
+    /// request was made (see `TaskDemand`). Chain state is derived from these, so it can be
+    /// rebuilt from the chain's requests (bead confector-z7z.49.2).
+    TaskDemand[] demands;
     /// The identity that made the request: a user, an API token, or the trigger source.
     @asName("requested_by") string requestedBy;
     @asName("requested_at") string requestedAt;
@@ -1102,6 +1130,91 @@ struct FingerprintLedger
     @optional string[] subscribers;
     /// Chains still to be marked dirty because an execution they waited on ended.
     @optional @asName("pending_notify") LedgerNotice[] pendingNotify;
+}
+
+/**
+ * A chain task's state, as the chain evaluator derives it (confector.core.chain_evaluator) and
+ * ChainState caches it. Only tasks some request on the chain covers have one: a task no request
+ * covers is not evaluated (its inputs may not even be pinned). Not an execution status: it is
+ * derived from the chain's requests and the fingerprint's ledger.
+ */
+enum ChainTaskStatus : string
+{
+    /// No valid success of its own (it never ran, or its success's artifacts expired), not
+    /// active, not settled, and no task that must run depends on it: every dependent is already
+    /// satisfied. It need not run.
+    notNeeded = "not_needed",
+    /// It must run and an upstream task has not succeeded yet.
+    waitingUpstream = "waiting_upstream",
+    /// It must run, every upstream task succeeded, and no execution is active: it needs an
+    /// execution (the evaluation lists it as needed).
+    needed = "needed",
+    /// Its fingerprint's active execution is claimed and not yet held by a worker (or not yet
+    /// recorded, if its dispatcher crashed: the dispatcher repairs that).
+    queued = "queued",
+    /// Its fingerprint's active execution is held by a worker.
+    running = "running",
+    /// Its fingerprint's latest success is usable, whichever chain produced it.
+    succeeded = "succeeded",
+    /// An execution at its fingerprint failed after its latest demand was recorded.
+    failed = "failed",
+    /// An execution at its fingerprint was cancelled after its latest demand was recorded.
+    cancelled = "cancelled",
+    /// It must run, but an upstream task failed or was cancelled.
+    blocked = "blocked"
+}
+
+/**
+ * One chain task's derived state (confector.core.chain_evaluator.evaluateChain), cached in
+ * ChainState.
+ */
+struct ChainTaskState
+{
+    @asName("task_id") string taskId;
+    /// The fingerprint the task was evaluated at: from the requests' definitions, the chain's pins
+    /// and the current rerun generations.
+    string fingerprint;
+    ChainTaskStatus status;
+    /// Whether some request on the chain targets the task (rather than only needing it upstream
+    /// of a target).
+    @optional bool target;
+    /// The position (1-based, in ChainState.requestIds) of the request whose demand governs the
+    /// task: of the requests covering it, the one with the highest `stopSeqAtDemand`, the latest
+    /// on ties. Its definition is the one an execution dispatched for the task runs with.
+    @asName("demand_seq") ulong demandSeq;
+    /// The ledger's `stopSeq` at `fingerprint` when that demand was recorded (`TaskDemand.stopSeq`),
+    /// or 0 when the request recorded another fingerprint (a rerun moved the task since). A
+    /// failure or cancellation settles the demand only once the ledger's `stopSeq` is greater.
+    @optional @asName("stop_seq_at_demand") ulong stopSeqAtDemand;
+    /// The execution the state comes from: the success used, the active execution, the stop that
+    /// settled it, or the expired success of a task not needed. Empty otherwise.
+    @optional @asName("execution_id") string executionId;
+    /// blocked: the upstream tasks that failed or were cancelled and block it, sorted.
+    @optional @asName("blocked_by") string[] blockedBy;
+}
+
+/**
+ * The chain state (design record: bead confector-z7z.48; AGENTS.md, "What a build is"): one small
+ * mutable document per chain, with the chain id as its id (confector.core.chain_state), created with
+ * the chain. It names the chain's requests in the order they were added, so demand never depends on
+ * a lagging index, caches the last evaluation, and carries the dirty marker signals land on. It is
+ * a projection: the chain, its requests (which record their demands), the ledgers and the rerun
+ * generations stay authoritative, and a missing or lost ChainState is rebuilt from them.
+ */
+struct ChainState
+{
+    /// The chain, which is also the document's id.
+    @asName("chain_id") string chainId;
+    @asName("project_id") string projectId;
+    /// The chain's requests, in the order they were added. Only appended to.
+    @optional @asName("request_ids") string[] requestIds;
+    /// The last evaluation's task states, in topological order; empty until the first evaluation
+    /// commits.
+    @optional ChainTaskState[] tasks;
+    /// Something the chain depends on changed since its last evaluation committed: a request was
+    /// added, an execution it waited on ended, or a rerun reached it. Cleared only by a reconcile
+    /// that commits at the version it read.
+    @optional bool dirty;
 }
 
 /**
@@ -1389,6 +1502,8 @@ unittest
     request.pins = [PinnedInput("compile", "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
     request.definitionId = "d1";
     request.definitionSource = DefinitionSource(DefinitionLocation.repository, "ci-config", "main", "game.yaml", Json("ccc333"));
+    request.demands = [TaskDemand("compile", "fp-compile", "b-compile", 1, 2), TaskDemand("internal", "fp-internal", "b-internal"),
+        TaskDemand("tests", "fp-tests", "b-tests")];
     request.requestedBy = "webhook:github";
     request.requestedAt = "2026-10-15T14:02:00Z";
 
@@ -1406,6 +1521,9 @@ unittest
     assert(json["definition_source"]["ref_name"].get!string == "main");
     assert(json["definition_source"]["path"].get!string == "game.yaml");
     assert(json["definition_source"]["revision"].get!string == "ccc333");
+    assert(json["demands"][0]["task_id"].get!string == "compile" && json["demands"][0]["fingerprint"].get!string == "fp-compile");
+    assert(json["demands"][0]["stop_seq"].get!long == 2 && json["demands"][1]["stop_seq"].get!long == 0);
+    assert(json["demands"][0]["base"].get!string == "b-compile" && json["demands"][0]["generation"].get!long == 1);
     assert(json["requested_by"].get!string == "webhook:github");
     assert(roundTrip(request) == request);
 
@@ -1419,6 +1537,7 @@ unittest
     rerun.trigger.type = TriggerType.manual;
     rerun.definitionId = "d2";
     rerun.definitionSource = DefinitionSource(DefinitionLocation.confector);
+    rerun.demands = [TaskDemand("release", "fp-release", "b-release")];
     rerun.requestedBy = "jason";
     rerun.requestedAt = "2026-10-15T15:00:00Z";
     assert(serializeToJson(rerun)["intent"].get!string == "rerun");
@@ -1488,8 +1607,10 @@ unittest
         "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
         "intent": "retry", "trigger": {"type": "manual"},
         "definition_id": "d1", "definition_source": {"location": "confector"},
+        "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1"}],
         "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
     }`);
+    assert(request.demands == [TaskDemand("internal", "fp1", "b1", 0, 0)], "A demand without a generation or stop_seq saw none");
     assert(request.intent == BuildIntent.retry && request.trigger.type == TriggerType.manual);
     assert(request.trigger.ruleId.length == 0 && request.trigger.payload.length == 0);
     assert(request.pins.length == 0 && request.targets == ["internal"]);
@@ -1504,6 +1625,7 @@ unittest
         "pins": [{"task_id": "compile", "input": "src", "repository_id": "game", "ref": {"kind": "branch", "name": "main"},
                   "pin": {"pinned": "aaa111"}}],
         "definition_id": "d1", "definition_source": {"location": "confector"},
+        "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1", "stop_seq": 1}],
         "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z"
     }`);
     assert(pinned.pins.length == 1 && inputKey(pinned.pins[0]) == InputKey("compile", "src"));
@@ -1520,6 +1642,15 @@ unittest
     }`);
     catch (Exception) undefinedThrew = true;
     assert(undefinedThrew, "A request without a definition must not deserialize");
+    bool undemandedThrew = false;
+    try deserializeJson!BuildRequest(`{
+        "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
+        "intent": "retry", "trigger": {"type": "manual"},
+        "definition_id": "d1", "definition_source": {"location": "confector"},
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
+    }`);
+    catch (Exception) undemandedThrew = true;
+    assert(undemandedThrew, "A request without its demands must not deserialize");
 
     auto chain = deserializeJson!BuildChain(`{
         "id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z",
@@ -1627,6 +1758,32 @@ unittest
     queued.definitionHash = "def1";
     queued.createdAt = "2026-10-15T14:02:02Z";
     assert(roundTrip(queued) == queued);
+}
+
+unittest
+{
+    // A chain state round-trips its requests, cached task states and dirty marker
+    ChainState state;
+    state.chainId = "c1";
+    state.projectId = "game";
+    state.requestIds = ["r1", "r2"];
+    state.tasks = [
+        ChainTaskState("compile", "fp1", ChainTaskStatus.succeeded, false, 2, 1, "e1"),
+        ChainTaskState("test", "fp2", ChainTaskStatus.blocked, true, 1, 0, null, ["compile"]),
+    ];
+    state.dirty = true;
+    auto json = serializeToJson(state);
+    assert(json["chain_id"].get!string == "c1" && json["request_ids"][1].get!string == "r2" && json["dirty"].get!bool);
+    assert(json["tasks"][0]["status"].get!string == "succeeded" && json["tasks"][0]["demand_seq"].get!long == 2);
+    assert(json["tasks"][0]["stop_seq_at_demand"].get!long == 1 && json["tasks"][0]["execution_id"].get!string == "e1");
+    assert(json["tasks"][1]["blocked_by"][0].get!string == "compile" && json["tasks"][1]["target"].get!bool);
+    assert(roundTrip(state) == state);
+
+    // A new chain's state has no requests, no evaluation and is clean
+    auto fresh = deserializeJson!ChainState(`{"chain_id": "c2", "project_id": "game"}`);
+    assert(fresh.requestIds.length == 0 && fresh.tasks.length == 0 && !fresh.dirty);
+    auto waiting = deserializeJson!ChainTaskState(`{"task_id": "t", "fingerprint": "f", "status": "waiting_upstream", "demand_seq": 1}`);
+    assert(waiting.status == ChainTaskStatus.waitingUpstream && !waiting.target && waiting.blockedBy.length == 0);
 }
 
 unittest

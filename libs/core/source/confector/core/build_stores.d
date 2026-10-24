@@ -29,6 +29,7 @@ import confector.api.document_store;
 import vibe.data.json : Json;
 
 import std.algorithm.searching : canFind;
+import std.algorithm.sorting : sort;
 import std.format : format;
 import std.typecons : Nullable;
 
@@ -345,9 +346,10 @@ final class BuildRequestStore
      * InvalidStateTransitionException if it is incomplete or malformed (see `validateRequest`),
      * its chain does not exist or belongs to another project, its chain lacks one of its pins or
      * pins that input differently (repository, ref or revision), its definition is not stored, a
-     * target is not a task of its definition, or its chain lacks a pin of a repository input its
+     * target is not a task of its definition, its chain lacks a pin of a repository input its
      * targets or their upstream tasks declare, or pins one to another repository than the
-     * definition declares; InvalidPinsException if its pins are not a well-formed list.
+     * definition declares, or its demands are not for exactly its targets and their upstream
+     * tasks; InvalidPinsException if its pins are not a well-formed list.
      */
     Versioned!BuildRequest create(BuildRequest request)
     {
@@ -419,6 +421,17 @@ final class BuildRequestStore
             requireValid(false, format("Request '%s' needs pins that chain '%s' lacks: %-(%s, %); add them to the chain first",
                 request.id, request.chainId, missing));
         }
+
+        // The request records a demand for exactly the tasks it covers, so chain state can be
+        // derived from it (validateRequest checked they are sorted and distinct)
+        string[] covered;
+        foreach (ref task; closure) covered ~= task.id;
+        covered.sort();
+        string[] demanded;
+        foreach (ref demand; request.demands) demanded ~= demand.taskId;
+        requireValid(demanded == covered, format(
+            "Request '%s' records demands for tasks [%-(%s, %)], but its targets and their upstream tasks are [%-(%s, %)]",
+            request.id, demanded, covered));
         return m_requests.create(request.id, request);
     }
 
@@ -447,8 +460,9 @@ final class BuildRequestStore
 
 /**
  * Throws unless `request` is complete and well formed on its own: an id, a project, a chain, at
- * least one target with none empty or repeated (exactly one for a rerun), well-formed pins, a
- * definition id and a complete definition source, who made it, and a valid request time.
+ * least one target with none empty or repeated (exactly one for a rerun), well-formed pins,
+ * demands sorted by task id with a task, fingerprint and base each, a definition id and a complete
+ * definition source, who made it, and a valid request time.
  *
  * Throws: InvalidStateTransitionException; InvalidPinsException for malformed pins.
  */
@@ -464,6 +478,15 @@ void validateRequest(in BuildRequest request)
     requireValid(request.intent != BuildIntent.rerun || request.targets.length == 1,
         format("Rerun request '%s' must name exactly the one task to rerun", request.id));
     validatePins(request.pins, format("request '%s'", request.id));
+    requireValid(request.demands.length > 0, format("Request '%s' records no demands", request.id));
+    foreach (i, ref demand; request.demands)
+    {
+        requireValid(demand.taskId.length > 0 && demand.fingerprint.length > 0 && demand.base.length > 0,
+            format("Demand %s of request '%s' needs a task id, a fingerprint and a base fingerprint", i, request.id));
+        requireValid(i == 0 || request.demands[i - 1].taskId < demand.taskId,
+            format("The demands of request '%s' must be sorted by task id, each task once ('%s' is out of order or repeated)",
+                request.id, demand.taskId));
+    }
     requireValid(request.definitionId.length > 0, format("Request '%s' needs the id of the definition it runs with", request.id));
 
     const source = request.definitionSource;
@@ -740,9 +763,18 @@ version (unittest)
         request.trigger.type = TriggerType.manual;
         request.definitionId = definitionId;
         request.definitionSource = DefinitionSource(DefinitionLocation.confector);
+        request.demands = [TaskDemand("compile", "fp-compile", "b-compile")];
         request.requestedBy = "jason";
         request.requestedAt = "2026-10-15T14:02:00.5Z";
         return request;
+    }
+
+    /// One demand, at a made-up fingerprint, for each of `taskIds` (sorted).
+    private TaskDemand[] demandsFor(string[] taskIds...)
+    {
+        TaskDemand[] demands;
+        foreach (taskId; taskIds) demands ~= TaskDemand(taskId, "fp-" ~ taskId, "b-" ~ taskId);
+        return demands;
     }
 }
 
@@ -1158,12 +1190,14 @@ unittest
     // compile needs only its own src, which the chain pins; lint needs nothing
     auto internal = sampleRequest("r1", "game-1", definitionId);
     internal.targets = ["compile", "lint"];
+    internal.demands = demandsFor("compile", "lint");
     requests.create(internal);
 
     // external needs sdk's inputs through its upstream task sdk, including sdk's own input of
     // game, which compile's pin does not cover; art is not upstream of it
     auto release = sampleRequest("r2", "game-1", definitionId);
     release.targets = ["external"];
+    release.demands = demandsFor("compile", "external", "sdk");
     try
     {
         requests.create(release);
@@ -1286,6 +1320,30 @@ unittest
     incompletePin.pins = [pinOf("compile", "src", "game", "", "aaa111")];
     assert(throwsA!InvalidPinsException({ requests.create(incompletePin); }));
     assert(requests.get("r").isNull, "Nothing was written");
+
+    // Demands must be for exactly the targets and their upstream tasks, sorted, each complete
+    TaskDemand[][string] badDemands = [
+        "no demands": null,
+        "a demand for a task not covered": demandsFor("compile", "lint"),
+        "a demand missing": demandsFor("lint"),
+        "unsorted demands": [TaskDemand("lint", "fp", "b"), TaskDemand("compile", "fp", "b")],
+        "a task demanded twice": [TaskDemand("compile", "fp", "b"), TaskDemand("compile", "fp", "b")],
+        "a demand without a fingerprint": [TaskDemand("compile", "", "b")],
+        "a demand without a base": [TaskDemand("compile", "fp", "")],
+        "a demand without a task": [TaskDemand("", "fp", "b")],
+    ];
+    foreach (what, demands; badDemands)
+    {
+        auto request = sampleRequest("r", "game-1", definitionId);
+        request.demands = demands;
+        assert(throwsA!InvalidStateTransitionException({ requests.create(request); }), "A request with " ~ what ~ " must be refused");
+    }
+    assert(requests.get("r").isNull);
+    auto wider = sampleRequest("wide", "game-1", definitionId);
+    wider.targets = ["compile", "lint"];
+    wider.demands = demandsFor("compile", "lint");
+    requests.create(wider);
+    assert(requests.get("wide").get.demands == demandsFor("compile", "lint"), "Demands are stored as given");
 
     // A rerun of one task and a request from a definition file are fine
     auto rerun = sampleRequest("rerun", "game-1", definitionId);
