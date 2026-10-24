@@ -256,9 +256,11 @@ final class ExecutionDispatcher
     }
 
     /**
-     * The sweep's half of resending: finds up to `limit` queued executions through the
-     * active-execution index (discovery, which may lag) and delivers each that was never sent,
-     * deciding from its record read by id. Returns how many were sent.
+     * The sweep's half of resending: walks the queued executions through the active-execution
+     * index (discovery, which may lag), oldest first and a page at a time, and delivers each that
+     * was never sent, deciding from its record read by id. Executions already sent do not count
+     * toward `limit`: the walk stops after `limit` unsent executions have been examined, or at
+     * the end of the index. Returns how many were sent.
      *
      * Throws: Exception, after delivering every other execution found, naming each execution
      * that could not be delivered.
@@ -266,19 +268,29 @@ final class ExecutionDispatcher
     size_t resendUnsent(size_t limit)
     {
         size_t sent = 0;
+        size_t examined = 0;
         string[] failures;
-        foreach (ref execution; m_stores.executions.listActive(ExecutionStatus.queued, limit))
+        string cursor;
+        while (examined < limit)
         {
-            if (execution.sentAt.length > 0) continue;
-            try
+            auto page = m_stores.executions.listActivePage(ExecutionStatus.queued, cursor);
+            foreach (ref item; page.items)
             {
-                if (deliver(execution.id) == Delivery.sent) ++sent;
+                if (examined == limit) break;
+                if (item.sentAt.length > 0) continue;
+                ++examined;
+                try
+                {
+                    if (deliver(item.id) == Delivery.sent) ++sent;
+                }
+                catch (Exception e)
+                {
+                    // Reported below, after the others were delivered
+                    failures ~= format("execution '%s': %s", item.id, e.msg);
+                }
             }
-            catch (Exception e)
-            {
-                // Reported below, after the others were delivered
-                failures ~= format("execution '%s': %s", execution.id, e.msg);
-            }
+            if (page.nextCursor.length == 0) break;
+            cursor = page.nextCursor;
         }
         if (failures.length > 0)
         {
@@ -644,4 +656,33 @@ unittest
     assert(dispatched.delivery == Delivery.sent);
     auto running = direct.executions.get(dispatched.executionId).get;
     assert(running.status == ExecutionStatus.running && running.sentAt == "2026-10-20T10:00:05Z");
+}
+
+unittest
+{
+    // Queued executions already sent, listed ahead of an unsent one, do not use up the resend
+    // limit: with a limit of 1 and 120 sent executions (more than one index page) before it, the
+    // unsent one is still resent, and nothing is resent twice
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto queue = new InMemoryDispatchQueue();
+    auto dispatcher = dispatcherOf(stores, queue);
+    auto at = requested(stores, ["test"]);
+    const needed = at.evaluation.needed[0];
+    RepositoryRecord[string] repositories = ["game": RepositoryRecord("game", gameAddress)];
+
+    foreach (i; 0 .. 120)
+    {
+        auto sent = executionFor(format("exe_sent_%03d", i), needed.taskId, needed.fingerprint, needed.inputs,
+            at.request, repositories, format("2026-10-20T11:%02d:%02dZ", i / 60, i % 60));
+        sent.sentAt = fixedNow();
+        stores.executions.createIfAbsent(sent);
+    }
+    auto unsent = executionFor("exe_unsent", needed.taskId, needed.fingerprint, needed.inputs, at.request,
+        repositories, "2026-10-20T12:00:00Z");
+    stores.executions.createIfAbsent(unsent);
+
+    assert(dispatcher.resendUnsent(1) == 1);
+    assert(messagesIn(queue) == ["exe_unsent"]);
+    assert(stores.executions.get("exe_unsent").get.sentAt == fixedNow());
+    assert(dispatcher.resendUnsent(1) == 0 && messagesIn(queue).length == 0);
 }

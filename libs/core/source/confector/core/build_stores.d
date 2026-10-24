@@ -669,6 +669,19 @@ final class ExecutionStore
         lookup.limit = pageSize;
         return values(m_executions.queryAll(lookup, limit));
     }
+
+    /// One page of the active executions with `status` (queued or running), oldest first, from
+    /// `cursor` (null for the first page). `nextCursor` is empty after the last page. Discovery.
+    Page!TaskExecution listActivePage(ExecutionStatus status, string cursor)
+    {
+        requireValid(isActive(status), format("%s is not an active execution status", status));
+        IndexQuery lookup;
+        lookup.index = "active";
+        lookup.partitionKey = status;
+        lookup.limit = pageSize;
+        lookup.cursor = cursor;
+        return m_executions.query(lookup);
+    }
 }
 
 private T[] values(T)(Versioned!T[] items)
