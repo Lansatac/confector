@@ -7,8 +7,10 @@ import confector.core.document_collection : tryValue;
 import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
 import confector.api.dispatch_queue;
+import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, requireExecution, requireReceipt, requireSigningKey, workerTokenClaimsFor;
 import confector.server.scheduler_callback : schedulerCallback;
-import confector.core.work_orders : completeExecution, defaultMaxAttempts, defaultPoolQueue;
+import confector.server.worker_auth : authenticateWorker, permitWorker, requireCurrentExecutionAttempt;
+import confector.core.work_orders : completeExecution, defaultMaxAttempts, defaultPoolQueue, finishExecution;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -37,9 +39,15 @@ NotImplementedException logsNotImplemented()
 /**
  * The REST API, served under /api/v1. Every route is registered once, with the prefix; the route
  * helpers take paths relative to it.
+ *
+ * The routes a worker calls once it holds a work order (lease extension, release and
+ * acknowledgement, logs, completion) need the worker token of that execution, signed with
+ * `workerTokenKey`; receiving work mints it. Receiving work itself is not covered: a worker holds no
+ * execution yet, and the credential that lets it receive is not built.
  */
-URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
+URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
 {
+    requireSigningKey(workerTokenKey);
     auto router = new URLRouter();
 
     enum string apiPrefix = "/api/v1";
@@ -132,6 +140,22 @@ URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, D
                     Json leases = Json.emptyArray;
                     foreach (ref item; received)
                     {
+                        try
+                        {
+                            item.workOrder.workerToken = mintWorkerToken(workerTokenKey,
+                                workerTokenClaimsFor(item.workOrder, item.receipt, item.attempt, Clock.currTime.toUnixTime()));
+                        }
+                        catch (Exception e)
+                        {
+                            // This execution's record cannot be run (say, an input without a resolved
+                            // value), and would fail every receive that meets it. Fail it, recording
+                            // why, drop its message and hand out the rest.
+                            logError("[api] Failing execution '%s': it cannot be given a worker token: %s", item.workOrder.executionId, e.msg);
+                            finishExecution(stores, item.workOrder.executionId, ExecutionStatus.failed, 1,
+                                "The execution could not be dispatched: " ~ e.msg, null);
+                            queue.ack(defaultPoolQueue, item.receipt);
+                            continue;
+                        }
                         Json lease = Json.emptyObject;
                         lease["receipt"] = Json(item.receipt);
                         lease["receive_count"] = Json(item.receiveCount);
@@ -156,10 +180,15 @@ URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, D
             }
         });
 
+        // A lease's routes need the token issued with that lease
         postRoute("/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
+            WorkerTokenClaims claims;
+            if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             try
             {
-                queue.ack(defaultPoolQueue, req.json["receipt"].get!string);
+                const receipt = req.json["receipt"].get!string;
+                if (!permitWorker(req, res, { requireReceipt(claims, receipt); })) return;
+                queue.ack(defaultPoolQueue, receipt);
                 Json resp = Json.emptyObject;
                 resp["status"] = Json("acknowledged");
                 res.writeJsonBody(resp);
@@ -171,13 +200,17 @@ URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, D
         });
 
         postRoute("/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
+            WorkerTokenClaims claims;
+            if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             try
             {
                 import core.time : seconds;
 
+                const receipt = req.json["receipt"].get!string;
+                if (!permitWorker(req, res, { requireReceipt(claims, receipt); })) return;
                 auto pVis = "visibility_timeout" in req.json;
                 long visibility = pVis !is null ? pVis.get!long : 30;
-                queue.extend(defaultPoolQueue, req.json["receipt"].get!string, visibility.seconds);
+                queue.extend(defaultPoolQueue, receipt, visibility.seconds);
                 Json resp = Json.emptyObject;
                 resp["status"] = Json("extended");
                 res.writeJsonBody(resp);
@@ -189,13 +222,17 @@ URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, D
         });
 
         postRoute("/queue/release", (HTTPServerRequest req, HTTPServerResponse res) {
+            WorkerTokenClaims claims;
+            if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             try
             {
                 import core.time : seconds;
 
+                const receipt = req.json["receipt"].get!string;
+                if (!permitWorker(req, res, { requireReceipt(claims, receipt); })) return;
                 auto pDelay = "delay" in req.json;
                 long delay = pDelay !is null ? pDelay.get!long : 0;
-                queue.release(defaultPoolQueue, req.json["receipt"].get!string, delay.seconds);
+                queue.release(defaultPoolQueue, receipt, delay.seconds);
                 Json resp = Json.emptyObject;
                 resp["status"] = Json("released");
                 res.writeJsonBody(resp);
@@ -221,12 +258,19 @@ URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, D
     }
 
     // An execution's log: reading it, and the lines its worker streams. Not implemented until
-    // the log store lands (see logsNotImplemented).
+    // the log store lands (see logsNotImplemented). Only the execution's own token posts lines.
     getRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         writeNotImplemented(res, logsNotImplemented());
     });
 
     postRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        WorkerTokenClaims claims;
+        if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
+        if (!requireStores(res)) return;
+        if (!permitWorker(req, res, {
+            requireExecution(claims, req.params["execution_id"]);
+            requireCurrentExecutionAttempt(stores, claims, true);
+        })) return;
         writeNotImplemented(res, logsNotImplemented());
     });
 
@@ -239,7 +283,14 @@ URLRouter apiRouter(string schedulerCallbackSecret, uint maxExecutionAttempts, D
         import confector.core.work_orders : InvalidCompletionException, OutcomeNotFoldedException, StaleCompletionException,
             UnknownExecutionException;
 
+        WorkerTokenClaims claims;
+        if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
         string executionId = req.params["execution_id"];
+        if (!requireStores(res)) return;
+        if (!permitWorker(req, res, {
+            requireExecution(claims, executionId);
+            requireCurrentExecutionAttempt(stores, claims, false);
+        })) return;
         void reject(HTTPStatus status, string message)
         {
             logWarn("[api] Rejected the completion of execution '%s' (HTTP %d): %s", executionId, cast(int) status, message);
@@ -584,8 +635,13 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     auto queue = new InMemoryDispatchQueue();
 
-    auto router = apiRouter("test-scheduler-secret", defaultMaxAttempts, queue);
+    enum workerTokenKey = "0123456789abcdef0123456789abcdef";
+    auto router = apiRouter("test-scheduler-secret", workerTokenKey, defaultMaxAttempts, queue);
     assert(router !is null);
+
+    // A router needs a signing key
+    import std.exception : assertThrown;
+    assertThrown!Exception(apiRouter("test-scheduler-secret", "", defaultMaxAttempts, queue));
 
     // A scheduler callback without the scheduler secret is refused before its handler runs
     auto unauthReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
@@ -622,17 +678,43 @@ unittest
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryStream;
 
-    auto routerWithStores = apiRouter("test-scheduler-secret", defaultMaxAttempts, queue, stores);
+    auto routerWithStores = apiRouter("test-scheduler-secret", workerTokenKey, defaultMaxAttempts, queue, stores);
 
-    int post(string path, string body)
+    import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, verifyWorkerToken, workerTokenHeader;
+
+    // The token of the execution a /executions/<id>/... path names, which every execution route
+    // below presents unless a test says otherwise
+    string tokenForPath(string path, StateStores of = null)
+    {
+        import std.algorithm.searching : startsWith;
+        import std.string : split;
+
+        if (!path.startsWith("/executions/")) return null;
+        WorkerTokenClaims claims;
+        claims.executionId = path.split("/")[2];
+        claims.fingerprint = "fp_n1";
+        claims.receipt = "receipt_test";
+        auto recorded = (of is null ? stores : of).executions.get(claims.executionId);
+        claims.attempt = recorded.isNull ? 0 : recorded.get.value.attempts;
+        claims.expiresAt = Clock.currTime.toUnixTime() + 600;
+        return mintWorkerToken(workerTokenKey, claims);
+    }
+
+    int postWith(string token, string path, string body)
     {
         InetHeaderMap headers;
         headers["Content-Type"] = "application/json";
+        if (token.length > 0) headers[workerTokenHeader] = token;
         auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path),
             HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) body.dup, false));
         auto res = createTestHTTPServerResponse();
         routerWithStores.handleRequest(req, res);
         return res.statusCode;
+    }
+
+    int post(string path, string body)
+    {
+        return postWith(tokenForPath(path), path, body);
     }
 
     // The body a request to `path` is answered with
@@ -642,6 +724,7 @@ unittest
 
         InetHeaderMap headers;
         headers["Content-Type"] = "application/json";
+        if (tokenForPath(path).length > 0) headers[workerTokenHeader] = tokenForPath(path);
         auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path), method, headers,
             createMemoryStream(cast(ubyte[]) body.dup, false));
         auto sink = createMemoryOutputStream();
@@ -676,7 +759,7 @@ unittest
 
     // Dispatches as the dispatcher does: claims the fingerprint's ledger, records the execution
     // under the claimed id and sends its message
-    string queueExecution(StateStores into, string fingerprint)
+    string queueExecution(StateStores into, string fingerprint, TaskNode definition = node)
     {
         const claimed = into.ledgers.claim(fingerprint, 0);
         assert(claimed.outcome == ClaimOutcome.won);
@@ -687,7 +770,7 @@ unittest
         execution.taskId = "n1";
         execution.fingerprint = fingerprint;
         execution.status = ExecutionStatus.queued;
-        execution.definition = node;
+        execution.definition = definition;
         execution.createdAt = "2026-10-16T10:00:00Z";
         into.executions.createIfAbsent(execution);
         queue.ensureQueue(defaultPoolQueue);
@@ -709,6 +792,90 @@ unittest
     const poisonAnswer = answer(HTTPMethod.POST, "/queue/receive", `{"worker_id": "w-route", "max_messages": 5}`);
     assert(poisonAnswer.canFind("acknowledged and dropped"), poisonAnswer);
     assert(post("/queue/receive", `{"worker_id": "w-route", "max_messages": 5}`) == HTTPStatus.ok);
+
+    // Receiving a work order mints the token for that execution, fingerprint and lease; the lease
+    // routes accept only that token, and only for that lease
+    {
+        const tokenExecutionId = queueExecution(stores, "fp_token");
+        import std.string : indexOf;
+
+        const response = answer(HTTPMethod.POST, "/queue/receive", `{"worker_id": "w-token", "max_messages": 10}`);
+        auto leases = parseJsonString(response[response.indexOf('[') .. $]);
+        assert(leases.length == 1, leases.toString());
+        const receipt = leases[0]["receipt"].get!string;
+        const issued = leases[0]["work_order"]["worker_token"].get!string;
+        const issuedClaims = verifyWorkerToken(workerTokenKey, issued, Clock.currTime.toUnixTime());
+        assert(issuedClaims.executionId == tokenExecutionId && issuedClaims.fingerprint == "fp_token" && issuedClaims.receipt == receipt);
+
+        auto other = cast() issuedClaims;
+        other.receipt = "another_receipt";
+        const otherLeaseToken = mintWorkerToken(workerTokenKey, other);
+        const body = `{"receipt": "` ~ receipt ~ `"}`;
+        foreach (route; ["/queue/extend", "/queue/release", "/queue/ack"])
+        {
+            assert(postWith(null, route, body) == HTTPStatus.unauthorized, route ~ " without a token");
+            assert(postWith("garbage", route, body) == HTTPStatus.unauthorized, route ~ " with a malformed token");
+            assert(postWith(otherLeaseToken, route, body) == HTTPStatus.forbidden, route ~ " with another lease's token");
+        }
+        auto lapsed = cast() issuedClaims;
+        lapsed.expiresAt = 1;
+        const lapsedToken = mintWorkerToken(workerTokenKey, lapsed);
+        const alteredToken = issued[0 .. 10] ~ (issued[10] == 'A' ? "B" : "A") ~ issued[11 .. $];
+        foreach (route; ["/queue/extend", "/queue/release", "/queue/ack"])
+        {
+            assert(postWith(lapsedToken, route, body) == HTTPStatus.unauthorized, route ~ " with an expired token");
+            assert(postWith(alteredToken, route, body) == HTTPStatus.unauthorized, route ~ " with an altered token");
+        }
+        assert(postWith(issued, "/queue/extend", body) == HTTPStatus.ok);
+
+        // A token for a superseded attempt may not complete, log or upload, even though it is
+        // genuine and unexpired
+        auto superseded = cast() issuedClaims;
+        superseded.attempt = issuedClaims.attempt + 1;
+        const supersededToken = mintWorkerToken(workerTokenKey, superseded);
+        foreach (route; ["/logs", "/complete"])
+        {
+            assert(postWith(supersededToken, "/executions/" ~ tokenExecutionId ~ route, `{}`) == HTTPStatus.forbidden, route);
+        }
+        assert(stores.executions.get(tokenExecutionId).get.status == ExecutionStatus.running);
+        assert(postWith(issued, "/queue/ack", body) == HTTPStatus.ok);
+
+        // The execution routes accept the execution's own token only
+        auto expired = cast() issuedClaims;
+        expired.expiresAt = 1;
+        const expiredToken = mintWorkerToken(workerTokenKey, expired);
+        const tampered = issued[0 .. 10] ~ (issued[10] == 'A' ? "B" : "A") ~ issued[11 .. $];
+        foreach (route; ["/logs", "/complete"])
+        {
+            const path = "/executions/" ~ tokenExecutionId ~ route;
+            assert(postWith(null, path, `{}`) == HTTPStatus.unauthorized, path ~ " without a token");
+            assert(postWith(expiredToken, path, `{}`) == HTTPStatus.unauthorized, path ~ " with an expired token");
+            assert(postWith(tampered, path, `{}`) == HTTPStatus.unauthorized, path ~ " with an altered token");
+            assert(postWith(issued, "/executions/" ~ executionId ~ route, `{}`) == HTTPStatus.forbidden, path ~ " with another execution's token");
+        }
+        assert(postWith(issued, "/executions/" ~ tokenExecutionId ~ "/logs", `{"lines": []}`) == HTTPStatus.notImplemented);
+        assert(stores.executions.get(executionId).get.status == ExecutionStatus.running,
+            "A refused completion records nothing");
+    }
+
+    // An execution that cannot be given a token (its input has no resolved value) is failed,
+    // with the reason, and its message dropped; the rest of the batch is handed out
+    {
+        import std.string : indexOf;
+
+        TaskNode needy = node;
+        needy.inputs["up"] = taskOutputInput("up-task", "a.zip");
+        const brokenId = queueExecution(stores, "fp_broken", needy);
+        const healthyId = queueExecution(stores, "fp_healthy");
+        const batch = answer(HTTPMethod.POST, "/queue/receive", `{"worker_id": "w-batch", "max_messages": 10}`);
+        auto handedOut = parseJsonString(batch[batch.indexOf('[') .. $]);
+        assert(handedOut.length == 1 && handedOut[0]["work_order"]["execution_id"].get!string == healthyId, batch);
+        const broken = stores.executions.get(brokenId).get;
+        assert(broken.status == ExecutionStatus.failed && broken.errorMessage.canFind("could not be dispatched")
+            && broken.errorMessage.canFind("up"), broken.errorMessage);
+        const nothingLeft = answer(HTTPMethod.POST, "/queue/receive", `{"worker_id": "w-batch", "max_messages": 10}`);
+        assert(nothingLeft.canFind("[]"), nothingLeft);
+    }
 
     // Build logs fail loudly until the log store lands, naming its bead: uploading lines and
     // reading a log both answer 501
@@ -756,9 +923,10 @@ unittest
     auto failingStores = new StateStores(failingDocuments);
     const anotherId = queueExecution(failingStores, "fp_n1_again");
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
-    auto failingRouter = apiRouter("test-scheduler-secret", defaultMaxAttempts, queue, failingStores);
+    auto failingRouter = apiRouter("test-scheduler-secret", workerTokenKey, defaultMaxAttempts, queue, failingStores);
     InetHeaderMap failingHeaders;
     failingHeaders["Content-Type"] = "application/json";
+    failingHeaders[workerTokenHeader] = tokenForPath("/executions/" ~ anotherId ~ "/complete", failingStores);
     auto failingReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ anotherId ~ "/complete"),
         HTTPMethod.POST, failingHeaders, createMemoryStream(cast(ubyte[]) completion.dup, false));
     auto failingRes = createTestHTTPServerResponse();
@@ -779,6 +947,7 @@ unittest
     // Without the state stores the execution routes fail loudly rather than drop the report
     InetHeaderMap headers;
     headers["Content-Type"] = "application/json";
+    headers[workerTokenHeader] = tokenForPath("/executions/" ~ executionId ~ "/complete");
     auto noStoresReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ executionId ~ "/complete"),
         HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) completion.dup, false));
     auto noStoresRes = createTestHTTPServerResponse();

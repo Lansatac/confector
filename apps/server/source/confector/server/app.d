@@ -10,7 +10,7 @@ import vibe.vibe;
 import confector.config;
 import confector.core.state_stores : StateStores;
 import confector.server.backends : Backends, buildBackends;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig, requireWorkerTokenConfig;
 
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
@@ -24,8 +24,8 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
 }
 
 /// Configures application URL routing over `backends` and `stores`, the state stores kept in
-/// its document store.
-URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, uint maxExecutionAttempts)
+/// its document store. Worker tokens are signed and checked with `workerTokenKey`.
+URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, string workerTokenKey, uint maxExecutionAttempts)
 {
     auto router = new URLRouter();
 
@@ -41,8 +41,8 @@ URLRouter createRouter(Backends backends, StateStores stores, string schedulerCa
     router.get("/static/*", serveStaticFiles(publicDir, fsettings));
 
     // API endpoints. The artifact routes come first, so the API router never answers them.
-    router.any("/api/v1/artifacts/*", artifactsRouter(backends.artifactStore));
-    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, maxExecutionAttempts, backends.dispatchQueue, stores));
+    router.any("/api/v1/artifacts/*", artifactsRouter(backends.artifactStore, workerTokenKey, stores));
+    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, workerTokenKey, maxExecutionAttempts, backends.dispatchQueue, stores));
 
     // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
     // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
@@ -126,6 +126,7 @@ void main()
     setLogLevel(configuredLogLevel);
 
     requireExecutionConfig(serverConfig.execution);
+    requireWorkerTokenConfig(serverConfig.workerTokens);
 
     // A missing or invalid backend setting, or an unreachable MongoDB, ends startup here.
     // Constructing StateStores declares every collection, which needs the database.
@@ -133,7 +134,8 @@ void main()
     auto stores = new StateStores(backends.documentStore);
     logInfo("[state] State is kept in MongoDB database '%s'.", serverConfig.documentStore.database);
 
-    auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret, serverConfig.execution.maxAttempts);
+    auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret,
+        serverConfig.workerTokens.signingKey, serverConfig.execution.maxAttempts);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -148,10 +150,13 @@ void main()
 
 unittest
 {
+    import confector.api.model : ExecutionStatus, TaskExecution;
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import confector.core.worker_token : InputArtifact, WorkerTokenClaims, mintWorkerToken, workerTokenHeader;
+    import std.datetime.systime : Clock;
     import std.uri : encodeComponent;
     import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
 
@@ -161,15 +166,39 @@ unittest
     backends.scheduler = new LocalScheduler("test-scheduler-secret", "http://127.0.0.1:8080");
     auto artifacts = new InMemoryArtifactStorage();
     backends.artifactStore = artifacts;
-    auto router = createRouter(backends, new StateStores(backends.documentStore), "test-scheduler-secret", 3);
+    enum testSigningKey = "0123456789abcdef0123456789abcdef";
+    auto testStores = new StateStores(backends.documentStore);
+    TaskExecution execution;
+    execution.id = "exe_1";
+    execution.projectId = "proj";
+    execution.taskId = "task";
+    execution.createdAt = "2026-10-16T10:00:00Z";
+    execution.fingerprint = "fp1";
+    execution.status = ExecutionStatus.queued;
+    execution.attempts = 1;
+    testStores.executions.createIfAbsent(execution);
+    auto router = createRouter(backends, testStores, "test-scheduler-secret", testSigningKey, 3);
 
     struct Answer { int status; string body; }
 
+    // The worker token of an execution that uploads under "fp1" and downloads "fp1"'s artifact
+    // "100% done.zip" as an input
+    WorkerTokenClaims claims;
+    claims.executionId = "exe_1";
+    claims.fingerprint = "fp1";
+    claims.receipt = "receipt_1";
+    claims.attempt = 1;
+    claims.expiresAt = Clock.currTime.toUnixTime() + 600;
+    claims.inputs = [InputArtifact("fp1", "100% done.zip")];
+    const token = mintWorkerToken(testSigningKey, claims);
+
     Answer call(HTTPMethod method, string path, string body = null)
     {
+        InetHeaderMap headers;
+        headers[workerTokenHeader] = token;
         auto sink = createMemoryOutputStream();
         auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-        auto req = createTestHTTPServerRequest(URL("http://localhost" ~ path), method, InetHeaderMap.init,
+        auto req = createTestHTTPServerRequest(URL("http://localhost" ~ path), method, headers,
             createMemoryStream(cast(ubyte[]) body.dup, false));
         router.handleRequest(req, res);
         assert(res.headerWritten, "No route answered " ~ path);
@@ -197,9 +226,16 @@ unittest
     auto download = call(HTTPMethod.GET, prefix ~ "/" ~ fp ~ "/" ~ id ~ "/download");
     assert(download.status == HTTPStatus.ok && download.body == "artifact bytes", download.body);
 
-    assert(call(HTTPMethod.DELETE, prefix ~ "/" ~ fp ~ "/" ~ id).status == HTTPStatus.ok);
-    assert(!artifacts.artifactExists("fp1", rawId));
-    assert(call(HTTPMethod.HEAD, prefix ~ "/_head/" ~ fp ~ "/" ~ id).status == HTTPStatus.notFound);
+    // A worker never deletes
+    assert(call(HTTPMethod.DELETE, prefix ~ "/" ~ fp ~ "/" ~ id).status == HTTPStatus.forbidden);
+    assert(artifacts.artifactExists("fp1", rawId));
+
+    // Without a token, none of these routes is reached, and the API router does not answer them
+    auto sinkWithoutToken = createMemoryOutputStream();
+    auto resWithoutToken = createTestHTTPServerResponse(sinkWithoutToken, null, TestHTTPResponseMode.bodyOnly);
+    router.handleRequest(createTestHTTPServerRequest(URL("http://localhost" ~ prefix ~ "/" ~ fp ~ "/" ~ id ~ "/download"),
+        HTTPMethod.GET), resWithoutToken);
+    assert(resWithoutToken.statusCode == HTTPStatus.unauthorized);
 
     // The artifacts page is gone
     auto sink = createMemoryOutputStream();

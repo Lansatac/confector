@@ -1,11 +1,28 @@
 module confector.runner_core.http_artifact_storage;
 
 import confector.api.model : ArtifactStorage;
+import confector.core.worker_token : workerTokenHeader;
 import std.json : JSONType, parseJSON;
 import std.net.curl : HTTP;
 import std.array : Appender;
 import std.format : format;
 import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
+
+/**
+ * The server refused the worker token (HTTP 401 or 403): it is missing, expired or altered, or does
+ * not allow this artifact or this attempt. Never a missing artifact, and never worth falling back
+ * to another route.
+ */
+class ArtifactAuthException : Exception
+{
+    const int statusCode;
+
+    this(int statusCode, string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+        this.statusCode = statusCode;
+    }
+}
 
 /**
  * ArtifactStorage implementation that communicates with the Confector server via HTTP.
@@ -16,10 +33,17 @@ import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
  * falls back to streaming through the server's proxy endpoints.
  *
  * Agents using this class do not need to know anything about artifact storage backends.
+ *
+ * Every request to the server carries the worker token of the execution being run, set with
+ * `workerToken` before it starts; presigned URLs, which point at the storage backend, do not get it.
  */
 class HttpArtifactStorage : ArtifactStorage
 {
     private string m_serverUrl;
+    private string m_workerToken;
+
+    /// The token of the execution whose artifacts this storage handles. Empty between executions.
+    @property void workerToken(string token) { m_workerToken = token; }
 
     /**
      * Creates an HttpArtifactStorage that communicates with the specified server.
@@ -48,11 +72,12 @@ class HttpArtifactStorage : ArtifactStorage
     /**
      * Make an HTTP request and return the response body as a string.
      */
-    private string doRequest(string url, HTTP.Method method = HTTP.Method.get, ubyte[] body = null)
+    private string doRequest(string url, HTTP.Method method = HTTP.Method.get, ubyte[] body = null, bool toServer = true)
     {
         auto http = HTTP(url);
         http.method = method;
         http.addRequestHeader("Accept", "application/json");
+        if (toServer) http.addRequestHeader(workerTokenHeader, requireWorkerToken());
 
         char[] responseData;
         http.onReceive = (ubyte[] data) {
@@ -83,8 +108,17 @@ class HttpArtifactStorage : ArtifactStorage
             {
                 errMsg = format("HTTP %d %s", http.statusLine.code, http.statusLine.reason);
             }
+            if (toServer && (http.statusLine.code == 401 || http.statusLine.code == 403))
+                throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token (HTTP %d): %s", http.statusLine.code, errMsg));
             throw new Exception(format("HTTP %d %s: %s", http.statusLine.code, http.statusLine.reason, errMsg));
         }
+    }
+
+    private string requireWorkerToken() const
+    {
+        if (m_workerToken.length == 0)
+            throw new Exception("No worker token set: artifact requests need the token of the execution being run");
+        return m_workerToken;
     }
 
     /**
@@ -94,7 +128,10 @@ class HttpArtifactStorage : ArtifactStorage
     {
         auto http = HTTP(url);
         http.method = HTTP.Method.head;
+        http.addRequestHeader(workerTokenHeader, requireWorkerToken());
         http.perform();
+        if (http.statusLine.code == 401 || http.statusLine.code == 403)
+            throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token (HTTP %d)", http.statusLine.code));
         return http.statusLine.code;
     }
 
@@ -126,7 +163,7 @@ class HttpArtifactStorage : ArtifactStorage
             // Direct upload to presigned URL
             logDebug("[HttpArtifactStorage] Uploading artifact '%s' (fp: %s) via presigned URL",
                 artifactId, taskFingerprint);
-            doRequest(presignedUrl, HTTP.Method.put, data);
+            doRequest(presignedUrl, HTTP.Method.put, data, false);
         }
         else
         {
@@ -159,7 +196,7 @@ class HttpArtifactStorage : ArtifactStorage
             // Direct download from presigned URL
             logDebug("[HttpArtifactStorage] Downloading artifact '%s' (fp: %s) via presigned URL",
                 artifactId, taskFingerprint);
-            body = doRequest(presignedUrl, HTTP.Method.get);
+            body = doRequest(presignedUrl, HTTP.Method.get, null, false);
         }
         else
         {
@@ -180,6 +217,7 @@ class HttpArtifactStorage : ArtifactStorage
     {
         if (taskFingerprint.length == 0 || artifactId.length == 0)
             return false;
+        requireWorkerToken();
 
         try
         {
@@ -191,6 +229,7 @@ class HttpArtifactStorage : ArtifactStorage
             int code = doHeadRequest(url);
             return code == 200;
         }
+        catch (ArtifactAuthException e) throw e;
         catch (Exception e)
         {
             logWarn("[HttpArtifactStorage] Failed to check artifact existence '%s' (fp: %s): %s",
@@ -199,29 +238,16 @@ class HttpArtifactStorage : ArtifactStorage
         }
     }
 
+    /// Always throws: the server refuses to let a worker delete artifacts.
     override void deleteArtifact(string taskFingerprint, string artifactId)
     {
-        if (taskFingerprint.length == 0 || artifactId.length == 0)
-            return;
-
-        try
-        {
-            import std.uri : encodeComponent;
-            string url = apiPath(format("/artifacts/%s/%s",
-                encodeComponent(taskFingerprint), encodeComponent(artifactId)));
-
-            doRequest(url, HTTP.Method.del);
-        }
-        catch (Exception e)
-        {
-            logWarn("[HttpArtifactStorage] Failed to delete artifact '%s' (fp: %s): %s",
-                artifactId, taskFingerprint, e.msg);
-        }
+        throw new Exception(format("Workers cannot delete artifacts (artifact '%s', fingerprint %s)", artifactId, taskFingerprint));
     }
 
     override string presignUpload(string taskFingerprint, string artifactId)
     {
         // Ask the server for a presigned upload URL
+        requireWorkerToken();
         try
         {
             import std.uri : encodeComponent;
@@ -243,6 +269,7 @@ class HttpArtifactStorage : ArtifactStorage
             }
             return null;
         }
+        catch (ArtifactAuthException e) throw e;
         catch (Exception e)
         {
             logWarn("[HttpArtifactStorage] Failed to get presigned upload URL for '%s' (fp: %s): %s",
@@ -254,6 +281,7 @@ class HttpArtifactStorage : ArtifactStorage
     override string presignDownload(string taskFingerprint, string artifactId)
     {
         // Ask the server for a presigned download URL
+        requireWorkerToken();
         try
         {
             import std.uri : encodeComponent;
@@ -275,6 +303,7 @@ class HttpArtifactStorage : ArtifactStorage
             }
             return null;
         }
+        catch (ArtifactAuthException e) throw e;
         catch (Exception e)
         {
             logWarn("[HttpArtifactStorage] Failed to get presigned download URL for '%s' (fp: %s): %s",

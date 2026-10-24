@@ -2,6 +2,7 @@ module confector.runner_core.worker;
 
 import confector.api.model;
 import confector.api.dispatch_queue : Lease;
+import confector.core.worker_token : workerTokenHeader;
 import confector.runner_core.task_executor;
 import confector.runner_core.http_artifact_storage;
 import confector.runner_core.logging;
@@ -117,7 +118,9 @@ class HttpWorkerClient
         }
     }
 
-    Json sendJson(string endpointPath, string method = "POST", in Json bodyJson = Json.undefined)
+    /// Sends a request to the control plane. `workerToken`, the execution's token from its work
+    /// order, is sent in the worker token header; receiving work, which has no execution yet, sends none.
+    Json sendJson(string endpointPath, string method = "POST", in Json bodyJson = Json.undefined, string workerToken = "")
     {
         string fullUrl = resolveEndpointUrl(endpointPath);
         auto http = HTTP(fullUrl);
@@ -127,6 +130,10 @@ class HttpWorkerClient
         if (m_workerId.length > 0)
         {
             http.addRequestHeader("X-Worker-ID", m_workerId);
+        }
+        if (workerToken.length > 0)
+        {
+            http.addRequestHeader(workerTokenHeader, workerToken);
         }
 
         char[] responseData;
@@ -213,7 +220,8 @@ class HttpWorkerClient
         return leases;
     }
 
-    bool extendLease(string receipt, size_t visibilityTimeout = 30)
+    /// Extends the lease `receipt`, which `workerToken` (from the same work order) was issued with.
+    bool extendLease(string receipt, string workerToken, size_t visibilityTimeout = 30)
     {
         if (receipt.length == 0) return false;
         try
@@ -222,7 +230,7 @@ class HttpWorkerClient
             req["receipt"] = Json(receipt);
             req["visibility_timeout"] = Json(visibilityTimeout);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/extend", "POST", req);
+            sendJson("/queue/extend", "POST", req, workerToken);
             return true;
         }
         catch (Exception e)
@@ -232,7 +240,8 @@ class HttpWorkerClient
         }
     }
 
-    bool ackTask(string receipt)
+    /// Acknowledges the lease `receipt`, which `workerToken` (from the same work order) was issued with.
+    bool ackTask(string receipt, string workerToken)
     {
         if (receipt.length == 0) return false;
         try
@@ -240,7 +249,7 @@ class HttpWorkerClient
             Json req = Json.emptyObject;
             req["receipt"] = Json(receipt);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/ack", "POST", req);
+            sendJson("/queue/ack", "POST", req, workerToken);
             return true;
         }
         catch (Exception e)
@@ -250,9 +259,9 @@ class HttpWorkerClient
         }
     }
 
-    /// Appends `lines` to execution `executionId`'s log. Returns false, logging why, if the
-    /// server did not take them.
-    bool streamLogs(string executionId, string[] lines)
+    /// Appends `lines` to execution `executionId`'s log, with the execution's `workerToken`.
+    /// Returns false, logging why, if the server did not take them.
+    bool streamLogs(string executionId, string[] lines, string workerToken)
     {
         if (lines.length == 0) return true;
         try
@@ -261,7 +270,7 @@ class HttpWorkerClient
             req["lines"] = serializeToJson(lines);
             req["worker_id"] = Json(m_workerId);
             string endpoint = format("/executions/%s/logs", executionId);
-            sendJson(endpoint, "POST", req);
+            sendJson(endpoint, "POST", req, workerToken);
             return true;
         }
         catch (Exception e)
@@ -271,16 +280,16 @@ class HttpWorkerClient
         }
     }
 
-    /// Reports the completion of execution `executionId` (`WorkOrder.executionId`). The result
-    /// names no fingerprint: the server reads it from the execution. Logs why it was not
-    /// recorded; see CompletionReport for which outcomes are permanent.
-    CompletionReport reportCompletion(string executionId, in TaskExecutionResult result)
+    /// Reports the completion of execution `executionId` (`WorkOrder.executionId`), with the
+    /// execution's `workerToken`. The result names no fingerprint: the server reads it from the
+    /// execution. Logs why it was not recorded; see CompletionReport for which outcomes are permanent.
+    CompletionReport reportCompletion(string executionId, in TaskExecutionResult result, string workerToken)
     {
         try
         {
             Json bodyJson = serializeToJson(result);
             string endpoint = format("/executions/%s/complete", executionId);
-            sendJson(endpoint, "POST", bodyJson);
+            sendJson(endpoint, "POST", bodyJson, workerToken);
             return CompletionReport.recorded;
         }
         catch (ServerResponseException e)
@@ -310,7 +319,7 @@ class HttpWorkerDaemon
     private HttpWorkerClient m_client;
     private StepRunner m_steps;
     private TaskExecutor m_executor;
-    private ArtifactStorage m_storage;
+    private HttpArtifactStorage m_storage;
     private bool m_stopRequested = false;
     private bool m_running = false;
     private size_t m_tasksProcessed = 0;
@@ -356,7 +365,14 @@ class HttpWorkerDaemon
             throw new Exception(format("Work order for task '%s' (receipt '%s') names no execution; it cannot be run or completed",
                 msg.taskNode.id, lease.receipt));
         }
+        if (msg.workerToken.length == 0)
+        {
+            // Every call to the server needs it: refuse before running anything
+            throw new Exception(format("Work order for execution '%s' (receipt '%s') carries no worker token; it cannot be run",
+                msg.executionId, lease.receipt));
+        }
         const string executionId = msg.executionId;
+        const string workerToken = msg.workerToken;
         const string taskId = msg.taskNode.id;
         string taskWsDir = buildPath(m_config.workspaceDir, executionId);
         if (!exists(taskWsDir))
@@ -382,7 +398,7 @@ class HttpWorkerDaemon
                     if (!heartbeatRunning) break;
                     if (m_client !is null && handle.length > 0)
                     {
-                        m_client.extendLease(handle, visTimeout);
+                        m_client.extendLease(handle, workerToken, visTimeout);
                     }
                 }
             });
@@ -400,6 +416,10 @@ class HttpWorkerDaemon
                 }
             }
         }
+
+        // The artifact routes accept only this execution's token
+        m_storage.workerToken = workerToken;
+        scope(exit) m_storage.workerToken = "";
 
         // The task's steps, environment and declared outputs come from its definition
         TaskNode taskNode = deserializeJson!TaskNode(serializeToJson(msg.taskNode));
@@ -425,7 +445,7 @@ class HttpWorkerDaemon
                     flushLines = logBuffer.dup;
                     logBuffer.length = 0;
                 }
-                m_client.streamLogs(executionId, flushLines);
+                m_client.streamLogs(executionId, flushLines, workerToken);
             }
         }
 
@@ -464,18 +484,18 @@ class HttpWorkerDaemon
         }
         if (finalLogs.length > 0)
         {
-            m_client.streamLogs(executionId, finalLogs);
+            m_client.streamLogs(executionId, finalLogs, workerToken);
         }
 
         // Report the execution's completion over HTTP, after its last log lines (flushed above),
         // since the server refuses log lines for a finished execution
-        final switch (m_client.reportCompletion(msg.executionId, result))
+        final switch (m_client.reportCompletion(msg.executionId, result, workerToken))
         {
             case CompletionReport.recorded:
             case CompletionReport.rejected:
                 // A rejection is permanent: delivering the work order again would only run the
                 // task again and be rejected again
-                if (lease.receipt.length > 0) m_client.ackTask(lease.receipt);
+                if (lease.receipt.length > 0) m_client.ackTask(lease.receipt, workerToken);
                 break;
             case CompletionReport.notRecorded:
                 // Not acknowledged: the lease expires and the work order is delivered again,
@@ -587,6 +607,17 @@ version (unittest)
         return BuildStep(name, "scripted", Json(["command": Json(command)]));
     }
 
+    /// A TCP port nothing listens on at the moment, for a test server.
+    private ushort freePort()
+    {
+        import std.socket : InternetAddress, Socket, TcpSocket;
+
+        auto probe = new TcpSocket();
+        scope(exit) probe.close();
+        probe.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
+        return (cast(InternetAddress) probe.localAddress).port;
+    }
+
     /// Runs `work` on a thread of its own while this thread's event loop serves the mock
     /// control plane, and returns once it is done. Rethrows what `work` threw.
     private void runOffThread(void delegate() work)
@@ -635,9 +666,15 @@ unittest
     bool[] reportedFingerprint;
     string[] ackedReceipts;
     int rejectCompletion = 0;
+    string[] presentedTokens;
+    void recordToken(HTTPServerRequest req)
+    {
+        presentedTokens ~= req.headers.get(workerTokenHeader, "");
+    }
 
     WorkOrder mockOrder;
     mockOrder.executionId = "exe_mock_1";
+    mockOrder.workerToken = "token_exe_mock_1";
     mockOrder.fingerprint = "fp_mock_123";
     mockOrder.taskNode.id = "task_test_1";
     mockOrder.taskNode.steps = [scriptedStep("step", "Mock step execution finished successfully")];
@@ -648,13 +685,16 @@ unittest
         res.writeJsonBody(ackedReceipts.length == 0 ? mockLeases : Json.emptyArray);
     });
     router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
+        recordToken(req);
         res.writeJsonBody(["status": "heartbeat_extended"]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        recordToken(req);
         loggedExecutions ~= req.params["execution_id"];
         res.writeJsonBody(["status": "ok"]);
     });
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        recordToken(req);
         completedExecutions ~= req.params["execution_id"];
         reportedFingerprint ~= ("fingerprint" in req.json) !is null;
         reported ~= deserializeJson!TaskExecutionResult(req.json);
@@ -667,6 +707,7 @@ unittest
         res.writeJsonBody(["status": "recorded"]);
     });
     router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
+        recordToken(req);
         ackedReceipts ~= req.json["receipt"].get!string;
         res.writeJsonBody(["status": "acknowledged"]);
     });
@@ -700,6 +741,10 @@ unittest
     assert(loggedExecutions.length > 0);
     foreach (logged; loggedExecutions) assert(logged == "exe_mock_1", logged);
 
+    // Logs, completion and acknowledgement all present the work order's token
+    assert(presentedTokens.length >= 3);
+    foreach (presented; presentedTokens) assert(presented == "token_exe_mock_1", "Presented '" ~ presented ~ "'");
+
     // The workspace is the execution's own directory
     assert(exists(buildPath(config.workspaceDir, "exe_mock_1")));
 
@@ -724,6 +769,7 @@ unittest
     // A failing step is reported as a failed task, with its exit code and error
     WorkOrder failing = mockOrder;
     failing.executionId = "exe_failing";
+    failing.workerToken = "token_exe_failing";
     failing.taskNode.steps = [scriptedStep("Fail", "fail"), scriptedStep("Never", "never runs")];
     reported = null;
     ackedReceipts = null;
@@ -746,6 +792,16 @@ unittest
     try runOffThread({ workerRunner.processOneMessage(anonymousLease); });
     catch (Exception e) refusal = e.msg;
     assert(refusal.canFind("names no execution"), refusal);
+    assert(reported.length == 0 && ackedReceipts.length == 0);
+
+    // So is one without a token: the server would refuse every call it made
+    WorkOrder untokened = mockOrder;
+    untokened.workerToken = null;
+    auto untokenedLease = Lease("receipt_untokened", 1, serializeToJson(untokened));
+    refusal = null;
+    try runOffThread({ workerRunner.processOneMessage(untokenedLease); });
+    catch (Exception e) refusal = e.msg;
+    assert(refusal.canFind("no worker token"), refusal);
     assert(reported.length == 0 && ackedReceipts.length == 0);
 }
 
@@ -798,6 +854,7 @@ unittest
 
     WorkOrder order;
     order.fingerprint = "fp_package";
+    order.workerToken = "token_package";
     order.taskNode.id = "package";
     foreach (type, execution; ["docker:build": "exe_unknown", "bash": "exe_bash", "powershell": "exe_powershell"])
     {
@@ -849,6 +906,7 @@ unittest
 
     WorkOrder orderStep1;
     orderStep1.executionId = "exe_step_1";
+    orderStep1.workerToken = "token_step_1";
     orderStep1.fingerprint = "fp_step_1";
     orderStep1.taskNode.id = "task_step_1";
     orderStep1.taskNode.steps = [scriptedStep("step1", firstLines.join("\n"))];
@@ -856,6 +914,7 @@ unittest
 
     WorkOrder orderStep2;
     orderStep2.executionId = "exe_step_2";
+    orderStep2.workerToken = "token_step_2";
     orderStep2.fingerprint = "fp_step_2";
     orderStep2.taskNode.id = "task_step_2";
     orderStep2.taskNode.steps = [scriptedStep("step2a", "second task line 1"), scriptedStep("step2b", "second task line 2")];
@@ -922,5 +981,109 @@ unittest
             if (next < expected.length && line == expected[next]) ++next;
         }
         assert(next == expected.length, format("%s: streamed %s, expected %s in order", execution, streamed, expected));
+    }
+}
+
+unittest
+{
+    // The artifact storage sends the execution's token to the server, never to a presigned URL
+    // (which belongs to the storage backend), and refuses to talk to the server without one. A
+    // 401 or 403 is an authorization error, not a missing artifact and not a cue to try another route.
+    import std.exception : collectException;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+
+    const port = freePort();
+    const serverUrl = format("http://127.0.0.1:%d", port);
+    string[string] presented;
+    int refuseWith = 0;
+    size_t proxyUploads;
+    auto router = new URLRouter();
+    router.get("/api/v1/artifacts/presign-upload", (HTTPServerRequest req, HTTPServerResponse res) {
+        presented["presign-upload"] = req.headers.get(workerTokenHeader, "");
+        if (refuseWith != 0)
+        {
+            res.statusCode = refuseWith;
+            return res.writeJsonBody(["error": "refused"]);
+        }
+        res.writeJsonBody(["uploadUrl": serverUrl ~ "/backend/upload"]);
+    });
+    router.put("/backend/upload", (HTTPServerRequest req, HTTPServerResponse res) {
+        presented["backend"] = req.headers.get(workerTokenHeader, "none");
+        res.writeJsonBody(["status": "ok"]);
+    });
+    router.post("/api/v1/artifacts/:fingerprint/:artifactId/upload", (HTTPServerRequest req, HTTPServerResponse res) {
+        ++proxyUploads;
+        res.writeJsonBody(["status": "ok"]);
+    });
+    router.get("/api/v1/artifacts/presign-download", (HTTPServerRequest req, HTTPServerResponse res) {
+        presented["presign-download"] = req.headers.get(workerTokenHeader, "");
+        if (refuseWith != 0)
+        {
+            res.statusCode = refuseWith;
+            return res.writeJsonBody(["error": "refused"]);
+        }
+        res.writeJsonBody(Json.emptyObject);
+    });
+    router.get("/api/v1/artifacts/:fingerprint/:artifactId/download", (HTTPServerRequest req, HTTPServerResponse res) {
+        presented["download"] = req.headers.get(workerTokenHeader, "");
+        res.writeBody("bytes");
+    });
+    router.get("/api/v1/artifacts/_head/:fingerprint/:artifactId", (HTTPServerRequest req, HTTPServerResponse res) {
+        presented["head"] = req.headers.get(workerTokenHeader, "");
+        res.statusCode = refuseWith != 0 ? refuseWith : 200;
+        res.writeVoidBody();
+    });
+
+    auto settings = new HTTPServerSettings();
+    settings.port = port;
+    settings.bindAddresses = ["127.0.0.1"];
+    auto listener = listenHTTP(settings, router);
+    scope(exit) listener.stopListening();
+
+    auto storage = new HttpArtifactStorage(serverUrl);
+    string failure;
+    bool exists;
+    string downloaded;
+    string deleteFailure;
+    runOffThread({
+        failure = collectException(storage.storeArtifactStream("fp", "art", (void delegate(const(ubyte)[]) sink) {
+            sink(cast(const(ubyte)[]) "x");
+        })).msg;
+        storage.workerToken = "token_exe_1";
+        storage.storeArtifactStream("fp", "art", (void delegate(const(ubyte)[]) sink) { sink(cast(const(ubyte)[]) "x"); });
+        storage.retrieveArtifactStream("fp", "art", (const(ubyte)[] chunk) { downloaded ~= cast(string) chunk; });
+        exists = storage.artifactExists("fp", "art");
+        deleteFailure = collectException(storage.deleteArtifact("fp", "art")).msg;
+    });
+    assert(failure.canFind("No worker token"), failure);
+    assert(presented["presign-upload"] == "token_exe_1" && presented["presign-download"] == "token_exe_1");
+    assert(presented["download"] == "token_exe_1" && presented["head"] == "token_exe_1");
+    assert(presented["backend"] == "none", "The token must not reach the storage backend");
+    assert(downloaded == "bytes" && exists);
+    assert(deleteFailure.canFind("cannot delete"), deleteFailure);
+
+    // A refusal throws an authorization error from every call: no "missing artifact", and no
+    // silent fallback to the proxy upload
+    foreach (status; [401, 403])
+    {
+        refuseWith = status;
+        proxyUploads = 0;
+        Exception[] refusals;
+        runOffThread({
+            refusals ~= collectException(storage.artifactExists("fp", "art"));
+            refusals ~= collectException(storage.presignUpload("fp", "art"));
+            refusals ~= collectException(storage.presignDownload("fp", "art"));
+            refusals ~= collectException(storage.storeArtifactStream("fp", "art", (void delegate(const(ubyte)[]) sink) {
+                sink(cast(const(ubyte)[]) "x");
+            }));
+        });
+        assert(refusals.length == 4);
+        foreach (refusal; refusals)
+        {
+            auto refused = cast(ArtifactAuthException) refusal;
+            assert(refused !is null && refused.statusCode == status, format("HTTP %d: %s", status, refusal));
+        }
+        assert(proxyUploads == 0, "A refused presign must not fall back to the proxy route");
     }
 }

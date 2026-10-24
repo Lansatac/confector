@@ -1,0 +1,72 @@
+module confector.server.worker_auth;
+
+import vibe.vibe;
+import confector.core.state_stores : StateStores;
+import confector.core.worker_token : WorkerAuthException, WorkerTokenClaims, WorkerTokenScopeException, requireCurrentAttempt,
+    verifyWorkerToken, workerTokenHeader;
+import std.datetime.systime : Clock;
+import std.format : format;
+
+/**
+ * Checks the worker token of `req` against the server's signing `key`. Returns true and sets
+ * `claims` if the token is genuine and unexpired. Otherwise answers 401 with the reason, and
+ * returns false: the caller must not run the route. Call it before anything else about the
+ * request is looked at. Add it to every route a worker calls.
+ */
+bool authenticateWorker(string key, HTTPServerRequest req, HTTPServerResponse res, out WorkerTokenClaims claims)
+{
+    try
+    {
+        claims = verifyWorkerToken(key, req.headers.get(workerTokenHeader, ""), Clock.currTime.toUnixTime());
+        return true;
+    }
+    catch (WorkerAuthException e)
+    {
+        refuseWorker(req, res, e);
+        return false;
+    }
+}
+
+/**
+ * Runs `requireScope`, which checks that an authenticated worker's claims allow the request. If
+ * it throws WorkerAuthException, answers 403 with the reason and returns false.
+ */
+bool permitWorker(HTTPServerRequest req, HTTPServerResponse res, void delegate() requireScope)
+{
+    try
+    {
+        requireScope();
+        return true;
+    }
+    catch (WorkerAuthException e)
+    {
+        refuseWorker(req, res, e);
+        return false;
+    }
+}
+
+/**
+ * Throws WorkerTokenScopeException unless the token's attempt is the one its execution is on, so
+ * a worker from a superseded attempt cannot report or upload. An execution that does not exist
+ * is refused when `missingIsRefused`; otherwise the route is left to answer for it.
+ */
+void requireCurrentExecutionAttempt(StateStores stores, in WorkerTokenClaims claims, bool missingIsRefused)
+{
+    auto execution = stores.executions.get(claims.executionId);
+    if (execution.isNull)
+    {
+        if (missingIsRefused)
+            throw new WorkerTokenScopeException(format("Execution '%s' does not exist", claims.executionId));
+        return;
+    }
+    requireCurrentAttempt(claims, execution.get.value.attempts);
+}
+
+private void refuseWorker(HTTPServerRequest req, HTTPServerResponse res, WorkerAuthException e)
+{
+    logWarn("[auth] Refused %s %s (HTTP %d): %s", req.method, req.requestPath, e.statusCode, e.msg);
+    res.statusCode = e.statusCode;
+    Json err = Json.emptyObject;
+    err["error"] = Json(e.msg);
+    res.writeJsonBody(err);
+}

@@ -12,6 +12,9 @@
     "scheduler": {
       "callbackSecret": "dev-scheduler-secret"
     },
+    "workerTokens": {
+      "signingKey": "dev-worker-token-signing-key-not-for-production"
+    },
     "artifactStore": {
       "baseDirectory": "/artifacts"
     }

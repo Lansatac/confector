@@ -1375,6 +1375,10 @@ struct WorkOrder
     @optional @asName("payload") TaskExecutionPayload payload;
     @optional @asName("timeout_seconds") size_t timeoutSeconds = 900;
     @optional @asName("created_at") string createdAt;
+    /// The credential the worker presents to the server for this execution, in the
+    /// X-Confector-Worker-Token header (confector.core.worker_token). Issued when the work order is
+    /// received; absent from the stored execution. A work order without one cannot be run.
+    @optional @asName("worker_token") string workerToken;
 }
 
 /**

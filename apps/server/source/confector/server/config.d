@@ -2,6 +2,8 @@ module confector.server.config;
 
 import confector.config;
 import confector.core.work_orders : defaultMaxAttempts;
+import confector.core.worker_token : minimumSigningKeyLength;
+import std.format : format;
 import vibe.data.json : Json;
 
 /**
@@ -47,6 +49,19 @@ struct SchedulerConfig
 }
 
 /**
+ * Worker tokens. The server signs a token per execution with this key and checks it on every
+ * worker route. Required, with no default; a key that is guessable or shared lets anyone act as
+ * a worker.
+ */
+struct WorkerTokenConfig
+{
+    @Required
+    @Env("CONFECTOR_WORKER_TOKEN_SIGNING_KEY")
+    @Description("Secret key the server signs per-execution worker tokens with (required, at least 32 bytes), e.g. from openssl rand -hex 32")
+    string signingKey = "";
+}
+
+/**
  * The artifact store: artifacts are kept as files under a base directory. Required, with no
  * default; the server refuses to start without it (see requireArtifactStoreConfig).
  */
@@ -80,6 +95,7 @@ struct ServerConfig
     HttpConfig http;
     DocumentStoreConfig documentStore;
     SchedulerConfig scheduler;
+    WorkerTokenConfig workerTokens;
     ArtifactStoreConfig artifactStore;
     ExecutionConfig execution;
 }
@@ -119,6 +135,22 @@ void requireSchedulerConfig(in SchedulerConfig config)
         throw new Exception("[config] Required setting 'server.scheduler.callbackSecret' is missing "
             ~ "(server.scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): the server cannot start "
             ~ "without it, because scheduler callbacks would be unauthenticated.");
+}
+
+/**
+ * Throws, naming the setting, unless the worker token signing key is configured and long enough.
+ * Workers authenticate with tokens signed by it, so the server cannot run without it.
+ */
+void requireWorkerTokenConfig(in WorkerTokenConfig config)
+{
+    if (config.signingKey.length == 0)
+        throw new Exception("[config] Required setting 'server.workerTokens.signingKey' is missing "
+            ~ "(server.workerTokens.signingKey or CONFECTOR_WORKER_TOKEN_SIGNING_KEY): the server cannot start "
+            ~ "without it, because worker routes would be unauthenticated.");
+    if (config.signingKey.length < minimumSigningKeyLength)
+        throw new Exception(format("[config] Setting 'server.workerTokens.signingKey' is %d bytes: it must be at least %d "
+            ~ "(server.workerTokens.signingKey or CONFECTOR_WORKER_TOKEN_SIGNING_KEY).",
+            config.signingKey.length, minimumSigningKeyLength));
 }
 
 /**
@@ -177,6 +209,7 @@ unittest
     assert(cfg.http.bindAddress == "0.0.0.0");
     assert(cfg.documentStore.database == "");
     assert(cfg.scheduler.callbackSecret == "");
+    assert(cfg.workerTokens.signingKey == "");
     assert(cfg.artifactStore.baseDirectory == "");
     assert(cfg.execution.maxAttempts == 3, "Executions get three attempts unless the admin sets a limit");
 }
@@ -214,6 +247,31 @@ unittest
 
     config.callbackSecret = "s3cret";
     requireSchedulerConfig(config);
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    // The signing key is required and has no default; a short one is refused too
+    WorkerTokenConfig config;
+    auto missing = collectException(requireWorkerTokenConfig(config));
+    assert(missing !is null && missing.msg.canFind("server.workerTokens.signingKey")
+        && missing.msg.canFind("CONFECTOR_WORKER_TOKEN_SIGNING_KEY"), missing.msg);
+
+    config.signingKey = "too-short";
+    auto tooShort = collectException(requireWorkerTokenConfig(config));
+    assert(tooShort !is null && tooShort.msg.canFind("at least 32"), tooShort.msg);
+
+    config.signingKey = "0123456789abcdef0123456789abcdef";
+    requireWorkerTokenConfig(config);
+
+    // It is read from the configuration file
+    import vibe.data.json : parseJsonString;
+    auto registry = new ConfigRegistry(parseJsonString(`{"server": {"workerTokens": {"signingKey": "from-the-file"}}}`));
+    registerServerConfigDefinitions(registry);
+    assert(loadServerConfig(registry).workerTokens.signingKey == "from-the-file");
 }
 
 unittest
@@ -270,4 +328,22 @@ unittest
     auto cfg = loadServerConfig(registry);
     assert(cfg.artifactStore.baseDirectory == "/from/environment");
     assert(cfg.documentStore.database == "from_environment");
+}
+
+unittest
+{
+    import std.process : environment;
+
+    // The environment variable the error message names sets the signing key
+    enum keyVar = "CONFECTOR_WORKER_TOKEN_SIGNING_KEY";
+    const saved = environment.get(keyVar);
+    scope(exit)
+    {
+        if (saved is null) environment.remove(keyVar); else environment[keyVar] = saved;
+    }
+    environment[keyVar] = "key-from-the-environment-0123456789";
+
+    auto registry = new ConfigRegistry();
+    registerServerConfigDefinitions(registry);
+    assert(loadServerConfig(registry).workerTokens.signingKey == "key-from-the-environment-0123456789");
 }

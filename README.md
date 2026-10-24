@@ -64,6 +64,8 @@ Execution runtimes, version control providers, and storage backends are decouple
 
    The scheduler calls back into the server (cron triggers, VCS polling), and every callback must carry a shared secret in the `X-Confector-Scheduler-Secret` header. Set `server.scheduler.callbackSecret` (or `CONFECTOR_SCHEDULER_CALLBACK_SECRET`); the server checks it and the built-in local scheduler sends it. There is no default: the server will not start without it, and callbacks without the correct secret are refused with 401.
 
+   Workers authenticate with a signed, short-lived token per execution, carried in the work order and sent in the `X-Confector-Worker-Token` header on every call that execution makes (lease extension and acknowledgement, logs, completion, and artifact upload and download). The server signs and checks the tokens with `server.workerTokens.signingKey` (or `CONFECTOR_WORKER_TOKEN_SIGNING_KEY`), at least 32 bytes, for example the output of `openssl rand -hex 32`. There is no default: the server will not start without it, and worker requests without a valid token for that execution are refused with 401 (missing, altered or expired token) or 403 (a token for another execution or artifact). The runner needs no token setting: it takes each token from its work order. **`/queue/receive` is not yet authenticated: it hands out work orders, and the tokens in them, to any caller. Until worker pool credentials exist, do not expose the server to untrusted networks.**
+
 2. **Generate build files & compile:**
    ```bash
    mkdir build && cd build
