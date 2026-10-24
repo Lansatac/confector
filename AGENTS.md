@@ -7,7 +7,7 @@ do not cover.
 
 **Important:** much of the existing code was written by earlier agents and does **not** yet follow
 the principles below. When existing code and this document disagree, this document wins. Do not
-copy a pattern just because it already exists in the codebase. See "The current state of the code".
+copy a pattern just because it already exists in the codebase.
 
 ---
 
@@ -168,20 +168,19 @@ less true.
    transitively. Changing any declared input changes the fingerprint. A repository input
    contributes its *pinned revision* (for git, the commit SHA), not its URL or branch. Build
    configuration (steps, parameters, environment) is not part of the fingerprint; see "The input
-   model". *(Implemented: repository revisions reach the fingerprint, build configuration
-   does not, and the checkout step checks out the pinned revision; bead `confector-z7z.20.8`.)*
+   model".
 2. **Graph evaluation does not execute work, and execution does not decide what to build.**
 3. **Decision logic is pure; state is passed in explicitly.** No hidden global or mutable singleton
    state in decision logic.
 4. **Re-running a task invalidates everything downstream of it**, in every chain that shares its
-   inputs. *(Not yet implemented.)*
+   inputs.
 5. **Required configuration is never defaulted silently.**
 
 ---
 
 ## The input model
 
-Decided October 2026 (design record: bead `confector-z7z.13`).
+Decided October 2026.
 
 - **Inputs are named and typed.** A task declares a map of named inputs, each with a kind and a
   kind-specific spec. Kinds include *repository* (the primary kind), *value*, and *task output*.
@@ -214,7 +213,7 @@ Decided October 2026 (design record: bead `confector-z7z.13`).
 
 ## The caching contract
 
-Decided October 2026 (design record: bead `confector-z7z.1`).
+Decided October 2026.
 
 - **A cache hit means** an earlier execution of the same task — same project, same task, same
   resolved declared inputs — *succeeded*, and its declared artifacts still exist.
@@ -238,9 +237,7 @@ Decided October 2026 (design record: bead `confector-z7z.1`).
 
 ## What a build is
 
-Decided October 2026 (design record: bead `confector-z7z.14`), amended October 2026 so that chains
-pin inputs only (bead `confector-z7z.52`). A "build" used to conflate three things; they are now
-distinct:
+Decided October 2026. A "build" used to conflate three things; they are now distinct:
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
   its payload, optional pins, and the project definition it runs with. Immutable.
@@ -264,17 +261,20 @@ How they fit together:
   This is how an external build is made from exactly the source that was tested, including with
   a task added after the chain was created. A pin the chain lacks is resolved when first needed
   and then kept. A task no longer in the definition is simply not offered; its history stays.
-- **What a chain shows is derived**: the graphs of its requests' definitions over its pins, joined
-  with the executions for those fingerprints (with no request open, today's definition). An old
+- **The request is the unit of evaluation.** Each request is evaluated on its own: its graph is
+  its targets and their upstream tasks in its own definition, fingerprinted against its chain's
+  pins and the current rerun generations. Requests on one chain are never merged; two requests
+  that need the same fingerprint share its execution.
+- **Request state is derived from authoritative inputs**: the request, its chain's pins, the
+  ledgers and executions for its fingerprints, and the rerun generations. Each request records
+  its demand: for every task it covers, the task's fingerprint and how many executions had
+  stopped there when it was made. Evaluation reads the ledgers by id and settles demands from
+  those records. A small mutable *request state* document per request holds whether it is still
+  open, its cached task states and its outcome; it can always be rebuilt from those inputs.
+- **What a chain shows is derived for display**: the union of its requests' states (with no
+  request open, today's definition over its pins). It is never an input to a decision. An old
   chain's view can change when the definition changes; what actually ran stays in the execution
   records.
-- **Chain state is derived from authoritative inputs**: the chain, its requests, the ledgers and
-  executions for its fingerprints, and the rerun generations. Each request records its demand: for
-  every task it covers, the task's fingerprint and how many executions had stopped there when it
-  was made. Evaluation reads the ledgers by id and settles demands from those records. A small
-  mutable *chain state* document per chain holds the chain's request ids, the cached last
-  evaluation and a dirty marker so signals have somewhere durable to land; it can always be
-  rebuilt from those inputs.
 - **A configuration change does not trigger a rebuild** of a chain whose task already succeeded;
   re-run the task to apply it.
 - **Retry and rerun are different.** *Retry* runs a failed or cancelled task again in the same
@@ -287,7 +287,7 @@ How they fit together:
 
 ## Re-running a task
 
-Decided October 2026 (design record: bead `confector-z7z.15`). A rerun means "there was a
+Decided October 2026. A rerun means "there was a
 problem with that build; don't use it anymore." Where cases are ambiguous, choose what is least
 surprising given that meaning.
 
@@ -301,7 +301,7 @@ surprising given that meaning.
   visible.
 - **A rerun must pass.** Downstream tasks wait for the new generation to succeed; a failed rerun
   blocks rather than falling back to the earlier success. (An explicit "accept the previous
-  result" override may come later, bead `confector-z7z.22`.)
+  result" override may come later.)
 - **Stale work in flight is cancelled by default.** Downstream tasks already running from the
   superseded result are listed in the rerun prompt and cancelled unless the user chooses
   otherwise.
@@ -310,53 +310,56 @@ surprising given that meaning.
 
 ## Coordinating builds
 
-Decided October 2026 (design record: bead `confector-z7z.2`), amended October 2026 with the ledger
-and chain state (bead `confector-z7z.48`).
+Decided October 2026. *Principle:* the fewest moving parts that keep the caching contract.
+Correctness rests on reads by id and single-document compare-and-set; liveness rests on a periodic
+sweep, not on subscriptions.
 
 - **Three components, split along what-versus-how.** An *input resolver* turns a request into a
-  chain (resolving inputs, finding or creating the chain). A pure *chain evaluator* takes a chain's
-  state and pins, its requests' definitions, the rerun generations, and the ledgers of its
+  chain (resolving inputs, finding or creating the chain). A pure *request evaluator* takes one
+  request, its definition, its chain's pins, the rerun generations and the ledgers of its
   fingerprints, and returns each task's state plus the fingerprints that need an execution. An
   *execution dispatcher* claims each needed fingerprint, records the execution with the
-  definition of the request it runs for, and enqueues it.
+  request's definition, and enqueues it.
 - **All state is persisted; nothing lives only in memory.** Each fingerprint has a *ledger*
-  document, read by id, holding its active execution (at most one), its latest success, its latest
-  stopped execution with a sequence number, the chains waiting on the active execution, and the
-  chains still to be woken, each with the execution whose end it must see. At most one active execution per fingerprint is enforced with compare-and-set on the ledger, not
-  with locks. *Why:* multiple instances and serverless deployment must work, and a restart must
-  lose nothing.
-- **Decisions read only what the store guarantees fresh.** Reading by id and compare-and-set are
-  the only operations treated as current; listing and index queries may lag, so they are used for
-  discovery (history pages, finding dirty chains), never to decide whether something finished.
-- **Level-triggered, not event-sourced.** Every input — a trigger, a completion, a cancel, a
-  rerun, an expired lease — only signals that something changed. A signal marks the affected
-  chains dirty, through the ledger's waiting chains or directly; a chain stays dirty until a
-  re-evaluation commits. The handler re-evaluates the chain and dispatches whatever is missing.
-  Every step is idempotent, so a crash between saving state and enqueuing work is repaired by the
-  next evaluation, and a waiting chain cannot be forgotten.
-- **Every way an execution ends wakes its waiters.** Completion, failure, lost lease, dead letter
-  and cancel all finish the execution, then fold the result into the ledger and mark the waiting
-  chains dirty. A half-finished fold is completed by whoever next reads the ledger.
+  document, read by id, holding its active execution (at most one), its latest success, and its
+  latest stopped execution with a sequence number. At most one active execution per fingerprint
+  is enforced with compare-and-set on the ledger, not with locks. *Why:* multiple instances and
+  serverless deployment must work, and a restart must lose nothing.
+- **Correctness reads only what the store guarantees fresh.** Reading by id and compare-and-set
+  are the only operations treated as current. Index queries are used to find work (open
+  requests, history pages); if one lags, work is found a little later, never decided wrongly.
+- **Level-triggered, not event-sourced.** A trigger, a completion or an expired lease only means
+  "something changed"; the handler re-evaluates the open requests it may affect and dispatches
+  whatever is missing. Every step is idempotent, so a crash between saving state and enqueuing
+  work is repaired by the next evaluation.
+- **When an execution ends, the open requests of its project are re-evaluated.** Completion,
+  failure, lost lease and cancel all finish the execution, fold the result into the ledger, and
+  then re-evaluate that project's open requests. If that step is lost, the sweep does it. A
+  half-finished fold is completed by whoever next reads the ledger.
 - **Ordering uses sequence numbers, not clocks.** Whether a failure settles an earlier request is
   decided by the ledger's sequence numbers, never by comparing timestamps written by different
   instances.
 - **The control plane owns fingerprints.** Work orders carry an execution id; a worker's
   completion names that id, and the fingerprint comes from the control plane's own record.
-- **Infrastructure failures retry automatically; task failures do not.** A lost worker or expired
-  lease counts as an attempt, up to an admin-configured limit tracked on the execution. A task
-  that fails is retried only when a user asks.
-- **Expired leases, dirty chains and unfinished folds are found by a sweep that runs only while
-  such work exists.** The sweep is registered with the scheduler when executions are active or
-  anything awaits reconciliation, and removed when none is, keeping an idle installation free.
-  Scheduler calls may be duplicated or missed, and discovery may lag, so every dispatch and
-  completion re-asserts whether the sweep should exist and the sweep does not stop on a single
-  empty look.
-- **The dashboard reads chain state** from the chain state document. Add a cached summary only if
-  that proves too slow.
+- **The execution owns its lease.** A running execution records when its lease expires and which
+  attempt holds it; the worker's heartbeat extends the lease. The dispatch queue only delivers:
+  a duplicate message loses the compare-and-set that starts the execution and is dropped, and a
+  completion from a superseded attempt is rejected.
+- **Infrastructure failures retry automatically; task failures do not.** An expired lease counts
+  as an attempt, up to an admin-configured limit tracked on the execution. A task that fails is
+  retried only when a user asks.
+- **A task that cannot be dispatched fails its request** with the error recorded, rather than
+  being retried on every sweep. The user fixes the cause and retries.
+- **The sweep runs on a fixed schedule.** One scheduler entry, always registered: each run expires
+  lost leases, resends executions that were never sent, and re-evaluates every open request. An
+  idle run is one cheap query. Scheduler calls may be duplicated or missed; the sweep is
+  idempotent.
+- **The dashboard reads request state** documents. Add a cached summary only if that proves too
+  slow.
 
 ## Branches
 
-Decided October 2026 (design record: bead `confector-z7z.19`).
+Decided October 2026.
 
 - **Branches are tracked records**, independent of any one version-control system: repository,
   ref name, kind (branch, tag, or change request), head revision, and whether the branch still
@@ -374,7 +377,7 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
   One event makes one request: other repositories are paired by name, never as a cross product.
   A manual request asks for a ref per repository, prefilled from the defaults; cron and manual
   requests have no event, so their specs are concrete. (The notation is an implementation
-  choice, bead `confector-z7z.37.1`; examples here are illustrative.)
+  choice; examples here are illustrative.)
 - **Inputs supply defaults, not choices.** What a trigger or request does not specify comes from
   the input's own default ref spec (a fixed ref or *same name*, never an event spec, because a
   default cannot fire a trigger); with neither, loading the definition fails.
@@ -398,8 +401,7 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
 
 ## Cross-project dependencies
 
-Decided October 2026 (design record: bead `confector-z7z.55`); implementation deferred (bead
-`confector-z7z.21`).
+Decided October 2026; implementation deferred.
 
 - **Projects organize; they do not change how the graph works.** A task may take another
   project's task output as an input, and it behaves like any upstream task: fingerprints and
@@ -422,7 +424,7 @@ Decided October 2026 (design record: bead `confector-z7z.55`); implementation de
 
 ## Authentication and trust
 
-Decided October 2026 (design record: bead `confector-z7z.10`). The main threat today is
+Decided October 2026. The main threat today is
 unauthorized access to the server by anyone outside a closed team; untrusted contributors are
 handled by trust levels.
 
@@ -451,11 +453,11 @@ handled by trust levels.
 - **Plugins are never loaded at runtime from a request.** (A previous endpoint that did this was
   removed.)
 - **Eventual goal:** configurable worker isolation for untrusted builds (separate worker pools or
-  a fresh worker per execution), bead `confector-z7z.27`.
+  a fresh worker per execution).
 
 ## Backends and extensions
 
-Decided October 2026 (design record: bead `confector-z7z.3`).
+Decided October 2026.
 
 - **You pick and choose components when setting up the server.** Every backend is chosen by
   deployment configuration at startup; switching one is a configuration change and a restart,
@@ -494,12 +496,12 @@ Decided October 2026 (design record: bead `confector-z7z.3`).
 - **Installing an extension is running code:** admin-only, pinned by checksum. Running out of
   process isolates crashes, not security.
 - **Git is built in;** supporting another git host's webhooks is a data file, not code.
-- **Deferred:** a deployment builder for third-party backends (bead `confector-z7z.32`) and
-  sandboxed WebAssembly extensions (bead `confector-z7z.33`).
+- **Deferred:** a deployment builder for third-party backends and sandboxed WebAssembly
+  extensions.
 
 ## Retention
 
-Decided October 2026 (design record: bead `confector-z7z.43`).
+Decided October 2026.
 
 - **Retention is by reachability, not age.** Executions are shared across chains, so an old
   execution may be what today's build reuses. Policy decides which *chains* are retained;
@@ -518,8 +520,7 @@ Decided October 2026 (design record: bead `confector-z7z.43`).
 
 ## Pipeline definitions
 
-Decided October 2026 (design record: bead `confector-z7z.9`), amended October 2026 so that each
-request runs with the definition it was made with (bead `confector-z7z.52`).
+Decided October 2026.
 
 - **A project's definition is one document** — tasks, inputs, steps, triggers, outputs — with one
   schema, whether it is a YAML file or edited in the UI.
@@ -548,7 +549,7 @@ request runs with the definition it was made with (bead `confector-z7z.52`).
 
 ## Backend interfaces
 
-Decided October 2026 (design record: bead `confector-z7z.4`).
+Decided October 2026.
 
 - **The state store is a small document store; domain logic lives in the core.** Backends offer
   get, create, compare-and-set replace and remove, and index queries the core declares up front.
@@ -572,7 +573,7 @@ Decided October 2026 (design record: bead `confector-z7z.4`).
 
 ## Build steps
 
-Decided October 2026 (design record: bead `confector-z7z.6`).
+Decided October 2026.
 
 - **A step is a program.** The runner validates the step's configuration against its manifest's
   schema, runs the program, and sends a JSON request on stdin.
@@ -597,7 +598,7 @@ Decided October 2026 (design record: bead `confector-z7z.6`).
 
 ## Version control providers
 
-Decided October 2026 (design record: bead `confector-z7z.7`).
+Decided October 2026.
 
 - **A provider does four things.** On the control plane: list a repository's refs, resolve a ref
   selector to a pinned value, and parse webhooks. On the runner: check out a pinned value.
@@ -636,66 +637,24 @@ server and fails silently in a function.
 These are **undecided**. Do not settle them implicitly by writing code that assumes an answer. If
 your task depends on one, stop and ask the project owner. When one is decided, update this file.
 
-- **Releases and deployments.** Deferred, but do not close the door (bead `confector-z7z.40`).
+- **Releases and deployments.** Deferred, but do not close the door.
   Deploying is an ordinary task in the graph, so builds stay environment-free and a separate
   task configures and ships them. The direction: a *release* is a record cut from a chain that
   freezes the executions of chosen tasks and pins their artifacts, so later reruns never change
   it; tasks can declare which environment they deploy to, giving a view of what was most recently
-  deployed where. Deploy tasks will need a flag to never reuse cached results (bead
-  `confector-z7z.42`).
+  deployed where. Deploy tasks will need a flag to never reuse cached results.
 - **How far a rerun reaches.** "Re-running a task" says a rerun updates every chain that shares
   the task's inputs. For a widely shared task that rebuilds the history of every branch. Whether
   a rerun reaches only the requested chain, the chains confirmed in the prompt and open chains, or
-  all of them is undecided (design record: bead `confector-z7z.48`; decision bead below it).
+  all of them is undecided.
 - **Extensible input kinds.** Any external source (a package feed, an asset server, a network
   folder) should be able to be an input, pinned like a repository. Whether and how
-  extensions add input kinds is undecided (design record: bead `confector-z7z.54`); until then the
-  kinds are repository, value and task output.
+  extensions add input kinds is undecided; until then the kinds are repository, value and task
+  output.
 
 ---
 
-## The current state of the code
-
-Be aware of these so you do not spread them:
-
-- **Nothing starts builds yet.** The legacy build coordinator was deleted (bead
-  `confector-z7z.23.10`). Until request intake lands (bead `confector-z7z.23.7`) the run routes
-  answer 501 Not Implemented. A worker's completion finishes its execution, folds it into the
-  ledger and marks the waiting chains dirty (`confector.core.work_orders.recordOutcome`); if the
-  fold or the wake fails after the execution is terminal, the endpoint answers 500 and only the
-  sweep (bead `confector-z7z.49.5`) can repair it. The chain evaluator, execution dispatcher and fingerprint claims were
-  deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
-  designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
-  (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), and terminal executions fold
-  into it. The pure chain evaluator (`confector.core.chain_evaluator`), the
-  chain state document (`confector.core.chain_state`, bead `confector-z7z.49.2`), the execution
-  dispatcher (`confector.core.execution_dispatcher`) and the chain reconciler
-  (`confector.core.chain_reconciler`, bead `confector-z7z.49.3`) exist, but no route or sweep
-  calls the reconciler yet (beads `confector-z7z.23.7`, `confector-z7z.49.5`). Do not add a build
-  path outside the chain components. Chains are pins-only (`BuildChain.headline` and grow-only per-input `pins`;
-  `confector.core.chain_pins`) and requests reference stored definitions
-  (`confector.core.definition_store`; bead `confector-z7z.53.4`); nothing writes them yet (bead
-  `confector-z7z.53.2`). The build log routes answer 501 until the log store lands (bead
-  `confector-z7z.31.12`). Nothing in the project is kept for backward compatibility.
-- **Steps run in-process.** The runner's only working step is the built-in checkout
-  (`libs/runner_core` `steps/checkout.d`); bash and PowerShell throw `NotImplementedException`
-  (bead `confector-z7z.35.6`), and any other step type fails the task (bead
-  `confector-z7z.35.1`). Workers send no credential until per-execution tokens land (bead
-  `confector-z7z.30.1`).
-- **The data model** (`libs/api/source/confector/api/model.d`) has one canonical
-  form for each concept: a step is `{name, type, config}` (config is the step type's JSON object),
-  an output is `{id, path}`, a task is `{id, name, inputs, outputs, steps, timeout_seconds,
-  environment}`. **Do not add another alias.** If a representation is wrong, change it and update
-  its callers.
-- **There are no external consumers.** Do not add "backward compatibility" shims, re-export
-  modules, or deprecated fields. Change the code and its callers together.
-- **Backends are compiled in.** The server builds a typed `Backends` value at startup
-  (`apps/server` `backends.d`) and passes it explicitly; there is no plugin registry or runtime
-  loading, and each backend has one implementation for now (beads `confector-z7z.31.x`).
-- **In-memory test fakes do not always behave like the real backends.** Make fakes match the real
-  behavior, not the other way around.
-
-### Orientation
+## Orientation
 
 Each dub package is a directory with its own `dub.json` and a `source/` folder holding the full
 module path (for example `libs/core/source/confector/core/`).
@@ -726,6 +685,16 @@ Explore the code for anything more specific; file-level details change too often
   to the project owner instead. This file should state the project's intent, not an agent's.
 - **Change the existing thing, do not add a parallel one.** Adding a new field, function, or module
   alongside an old one that does nearly the same thing is how the data model got its aliases.
+  The data model (`libs/api/source/confector/api/model.d`) has one canonical form for each
+  concept; do not add another alias. If a representation is wrong, change it and its callers.
+- **There are no external consumers.** Do not add backward-compatibility shims, re-export
+  modules, deprecated fields, or migrations of stored data. Change the code and its callers
+  together.
+- **Make test fakes match the real backends**, not the other way around.
+- **Code does not reference beads.** Beads are not synced, so a bead id in code, comments or this
+  file means nothing to other readers. Keep comments minimal and useful: what the code does and
+  why, not its history.
+- **Do not record the state of the implementation here.** It goes stale; read the code.
 - **Test the pure core.** Graph evaluation, fingerprinting, and similar decision
   logic need unit tests. Because the logic is pure, tests should not need databases or servers.
 - **D conventions.** Use `immutable`, `const`, `pure`, and `@safe` / `@trusted` where they apply.
@@ -756,7 +725,7 @@ cd build && reggae -b ninja .. && ninja
 
 Targets: `server`, `runner` (plain `ninja` builds both).
 
-Outputs land in `build/out/server/` and `build/out/runner/`. Release builds should use LDC (bead `confector-z7z.45`).
+Outputs land in `build/out/server/` and `build/out/runner/`. Release builds should use LDC.
 
 **The server's views are not copied to the output directory, and that is correct.** The `.dt`
 templates in `apps/server/views` are compiled into the server binary (`render!("x.dt", ...)` is

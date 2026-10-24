@@ -101,7 +101,7 @@ stale docs and references; line endings.
   churn (each file keeps its own LF or CRLF).
 - Commit only the files for this work (`git add <paths>`; never `-A`): leave the user's unrelated
   uncommitted changes alone. If `.git/index.lock` exists, confirm no git process is running before
-  removing it. Message: what and why, the bead ids, which models implemented and reviewed when that
+  removing it. Message: what and why, which models implemented and reviewed when that
   is useful, plus the attribution line the system provides. No bead ids or bead details in the
   message (beads are local only).
 - `bd close <ids> --reason "..."`. Create follow-up beads for deferred findings and real bugs found
