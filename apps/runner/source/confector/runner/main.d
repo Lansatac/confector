@@ -3,6 +3,9 @@ module confector.runner.main;
 import confector.runner_core.worker : HttpWorkerConfig, HttpWorkerDaemon;
 import confector.runner_core.steps.builtin : BuiltinStepRunner;
 
+import confector.core.worker_pool_credential : minimumWorkerPoolCredentialLength;
+
+import std.format : format;
 import std.getopt;
 import std.stdio : writeln, writefln, stderr;
 
@@ -36,6 +39,41 @@ void printUsage()
     writeln("  --heartbeat-interval=<s  Heartbeat renewal interval in seconds (default: 15)");
     writeln("  --max-tasks=<count>      Maximum tasks to process before exiting (0 = infinite)");
     writeln("  --verbose                Enable verbose logging to console");
+    writeln();
+    writeln("Environment:");
+    writeln("  CONFECTOR_WORKER_POOL_CREDENTIAL  Worker pool credential the server admits receives with (required, at least 32 bytes)");
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    assert(workerPoolCredentialFromEnvironment("pool-credential-0123456789abcdef") == "pool-credential-0123456789abcdef");
+
+    // Unset, the worker refuses to start, naming the variable
+    auto unset = collectException(workerPoolCredentialFromEnvironment(""));
+    assert(unset !is null && unset.msg.canFind("CONFECTOR_WORKER_POOL_CREDENTIAL"), unset.msg);
+
+    // Too short, it refuses too, naming the variable and never repeating the value
+    auto tooShort = collectException(workerPoolCredentialFromEnvironment("too-short"));
+    assert(tooShort !is null && tooShort.msg.canFind("CONFECTOR_WORKER_POOL_CREDENTIAL")
+        && tooShort.msg.canFind("at least 32 bytes") && !tooShort.msg.canFind("too-short"), tooShort.msg);
+}
+
+/**
+ * The worker pool credential from the value of CONFECTOR_WORKER_POOL_CREDENTIAL. Throws, naming the
+ * variable, when it is unset: a worker without it could never receive work. The credential is read
+ * from the environment only, so it never appears in the process's arguments.
+ */
+string workerPoolCredentialFromEnvironment(string value)
+{
+    if (value.length == 0)
+        throw new Exception("CONFECTOR_WORKER_POOL_CREDENTIAL is not set: the worker cannot receive work without the worker pool credential of its server");
+    if (value.length < minimumWorkerPoolCredentialLength)
+        throw new Exception(format("CONFECTOR_WORKER_POOL_CREDENTIAL must be at least %d bytes, not %d: the worker cannot receive work with a credential that short",
+            minimumWorkerPoolCredentialLength, value.length));
+    return value;
 }
 
 int handleWorker(string[] args)
@@ -75,6 +113,17 @@ int handleWorker(string[] args)
         return 1;
     }
 
+    string workerPoolCredential;
+    try
+    {
+        workerPoolCredential = workerPoolCredentialFromEnvironment(environment.get("CONFECTOR_WORKER_POOL_CREDENTIAL", ""));
+    }
+    catch (Exception e)
+    {
+        stderr.writefln("Error: %s", e.msg);
+        return 1;
+    }
+
     printBanner();
     writefln("Starting remote worker '%s' targeting server '%s'...", workerId.length > 0 ? workerId : "auto-generated", serverUrl);
 
@@ -87,6 +136,7 @@ int handleWorker(string[] args)
     config.heartbeatIntervalSeconds = heartbeatInterval;
     config.maxTasksToProcess = maxTasks;
     config.verbose = verbose;
+    config.workerPoolCredential = workerPoolCredential;
 
     int exitCode = 0;
     try

@@ -12,6 +12,9 @@
     "scheduler": {
       "callbackSecret": "dev-scheduler-secret"
     },
+    "workerPool": {
+      "credential": "dev-worker-pool-credential-0123456789"
+    },
     "artifactStore": {
       "baseDirectory": "/artifacts"
     }

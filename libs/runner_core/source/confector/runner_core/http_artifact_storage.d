@@ -77,7 +77,13 @@ class HttpArtifactStorage : ArtifactStorage
         auto http = HTTP(url);
         http.method = method;
         http.addRequestHeader("Accept", "application/json");
-        if (toServer) http.addRequestHeader(workerTokenHeader, requireWorkerToken());
+        if (toServer)
+        {
+            http.addRequestHeader(workerTokenHeader, requireWorkerToken());
+            // The token never follows a redirect: a redirect is a failed request (uint.max turns
+            // following off; 0 would follow one)
+            http.maxRedirects = uint.max;
+        }
 
         char[] responseData;
         http.onReceive = (ubyte[] data) {
@@ -129,6 +135,9 @@ class HttpArtifactStorage : ArtifactStorage
         auto http = HTTP(url);
         http.method = HTTP.Method.head;
         http.addRequestHeader(workerTokenHeader, requireWorkerToken());
+        // The token never follows a redirect: a redirect is a failed request (uint.max turns
+        // following off; 0 would follow one)
+        http.maxRedirects = uint.max;
         http.perform();
         if (http.statusLine.code == 401 || http.statusLine.code == 403)
             throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token (HTTP %d)", http.statusLine.code));

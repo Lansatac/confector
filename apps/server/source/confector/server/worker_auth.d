@@ -2,10 +2,29 @@ module confector.server.worker_auth;
 
 import vibe.vibe;
 import confector.core.state_stores : StateStores;
+import confector.core.worker_pool_credential : matchesWorkerPoolCredential, workerPoolCredentialHeader;
 import confector.core.worker_token : WorkerAuthException, WorkerTokenClaims, WorkerTokenScopeException, requireCurrentAttempt,
     verifyWorkerToken, workerTokenHeader;
 import std.datetime.systime : Clock;
 import std.format : format;
+
+/**
+ * Checks that `req` presents the worker pool credential `expected` in the pool credential header.
+ * Returns true if it does. Otherwise answers 401, saying only which header is missing or wrong,
+ * and returns false: the caller must not run the route. Call it before anything else about the
+ * request is looked at.
+ */
+bool authenticateWorkerPool(string expected, HTTPServerRequest req, HTTPServerResponse res)
+{
+    const presented = req.headers.get(workerPoolCredentialHeader, "");
+    if (presented.length > 0 && matchesWorkerPoolCredential(expected, presented))
+        return true;
+    const reason = presented.length == 0
+        ? format("Missing %s header", workerPoolCredentialHeader)
+        : format("Invalid %s header", workerPoolCredentialHeader);
+    refuseWorker(req, res, new WorkerAuthException(HTTPStatus.unauthorized, reason));
+    return false;
+}
 
 /**
  * Checks the worker token of `req` against the server's signing `key`. Returns true and sets

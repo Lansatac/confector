@@ -1,6 +1,7 @@
 module confector.core.worker_token;
 
 import confector.api.model : InputKind, WorkOrder;
+import confector.core.constant_time : constantTimeEquals;
 import core.time : minutes;
 import std.base64 : Base64URLNoPadding;
 import std.digest.hmac : HMAC;
@@ -182,7 +183,7 @@ WorkerTokenClaims verifyWorkerToken(in char[] key, in char[] token, long now)
     const encoded = token[0 .. dot].idup;
 
     const presented = decodeBase64Url(token[dot + 1 .. $]);
-    if (!equalInConstantTime(presented, sign(key, encoded)))
+    if (!constantTimeEquals(presented, sign(key, encoded)))
         throw new WorkerTokenInvalidException("The worker token's signature does not match: it was altered or signed with another key");
 
     // The mac matched, so the claims are ones this server wrote; a fault here is a bug, not an attack
@@ -271,16 +272,6 @@ private ubyte[] sign(in char[] key, in char[] encodedClaims)
     hmac.put(cast(const(ubyte)[]) macLabel);
     hmac.put(cast(const(ubyte)[]) encodedClaims);
     return hmac.finish().dup;
-}
-
-// Compares without stopping at the first difference, so the time taken does not reveal how much
-// of a guessed mac was right. Unequal lengths are rejected at once; a mac's length is public.
-private bool equalInConstantTime(in ubyte[] a, in ubyte[] b) pure nothrow @safe @nogc
-{
-    if (a.length != b.length) return false;
-    uint difference = 0;
-    foreach (i; 0 .. a.length) difference |= a[i] ^ b[i];
-    return difference == 0;
 }
 
 version (unittest)

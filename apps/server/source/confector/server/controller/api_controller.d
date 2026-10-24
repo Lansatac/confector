@@ -8,8 +8,9 @@ import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
 import confector.api.dispatch_queue;
 import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, requireExecution, requireReceipt, requireSigningKey, workerTokenClaimsFor;
+import confector.core.worker_pool_credential : requireWorkerPoolCredential;
 import confector.server.scheduler_callback : schedulerCallback;
-import confector.server.worker_auth : authenticateWorker, permitWorker, requireCurrentExecutionAttempt;
+import confector.server.worker_auth : authenticateWorker, authenticateWorkerPool, permitWorker, requireCurrentExecutionAttempt;
 import confector.core.work_orders : completeExecution, defaultMaxAttempts, defaultPoolQueue, finishExecution;
 
 import std.format : format;
@@ -40,14 +41,15 @@ NotImplementedException logsNotImplemented()
  * The REST API, served under /api/v1. Every route is registered once, with the prefix; the route
  * helpers take paths relative to it.
  *
- * The routes a worker calls once it holds a work order (lease extension, release and
- * acknowledgement, logs, completion) need the worker token of that execution, signed with
- * `workerTokenKey`; receiving work mints it. Receiving work itself is not covered: a worker holds no
- * execution yet, and the credential that lets it receive is not built.
+ * Receiving work (/queue/receive) needs the worker pool credential, `workerPoolCredential`, which
+ * is checked before anything else. Receiving mints the worker token of each execution it hands out;
+ * the routes a worker calls once it holds a work order (lease extension, release and
+ * acknowledgement, logs, completion) need that token, signed with `workerTokenKey`.
  */
-URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
+URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
 {
     requireSigningKey(workerTokenKey);
+    requireWorkerPoolCredential(workerPoolCredential);
     auto router = new URLRouter();
 
     enum string apiPrefix = "/api/v1";
@@ -115,6 +117,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, uint 
         }
 
         postRoute("/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
+            if (!authenticateWorkerPool(workerPoolCredential, req, res)) return;
             try
             {
                 import core.time : seconds;
@@ -636,12 +639,15 @@ unittest
     auto queue = new InMemoryDispatchQueue();
 
     enum workerTokenKey = "0123456789abcdef0123456789abcdef";
-    auto router = apiRouter("test-scheduler-secret", workerTokenKey, defaultMaxAttempts, queue);
+    enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
+    auto router = apiRouter("test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue);
     assert(router !is null);
 
-    // A router needs a signing key
+    // A router needs a signing key and a worker pool credential of a usable length
     import std.exception : assertThrown;
-    assertThrown!Exception(apiRouter("test-scheduler-secret", "", defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter("test-scheduler-secret", "", workerPoolCredential, defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter("test-scheduler-secret", workerTokenKey, "", defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter("test-scheduler-secret", workerTokenKey, "too-short", defaultMaxAttempts, queue));
 
     // A scheduler callback without the scheduler secret is refused before its handler runs
     auto unauthReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
@@ -678,9 +684,10 @@ unittest
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryStream;
 
-    auto routerWithStores = apiRouter("test-scheduler-secret", workerTokenKey, defaultMaxAttempts, queue, stores);
+    auto routerWithStores = apiRouter("test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue, stores);
 
     import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, verifyWorkerToken, workerTokenHeader;
+    import confector.core.worker_pool_credential : workerPoolCredentialHeader;
 
     // The token of the execution a /executions/<id>/... path names, which every execution route
     // below presents unless a test says otherwise
@@ -705,6 +712,7 @@ unittest
         InetHeaderMap headers;
         headers["Content-Type"] = "application/json";
         if (token.length > 0) headers[workerTokenHeader] = token;
+        if (path == "/queue/receive") headers[workerPoolCredentialHeader] = workerPoolCredential;
         auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path),
             HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) body.dup, false));
         auto res = createTestHTTPServerResponse();
@@ -725,6 +733,7 @@ unittest
         InetHeaderMap headers;
         headers["Content-Type"] = "application/json";
         if (tokenForPath(path).length > 0) headers[workerTokenHeader] = tokenForPath(path);
+        if (path == "/queue/receive") headers[workerPoolCredentialHeader] = workerPoolCredential;
         auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path), method, headers,
             createMemoryStream(cast(ubyte[]) body.dup, false));
         auto sink = createMemoryOutputStream();
@@ -776,6 +785,45 @@ unittest
         queue.ensureQueue(defaultPoolQueue);
         queue.send(defaultPoolQueue, serializeToJson(dispatchMessageFor(id)));
         return id;
+    }
+
+    // Receiving needs the worker pool credential, checked before anything else: without it, or
+    // with a wrong one, the receive is refused with 401, names only the header, and hands out
+    // nothing; the queued execution stays queued
+    {
+        import vibe.stream.memory : createMemoryOutputStream;
+        import std.algorithm.searching : canFind;
+
+        struct Refusal { int status; string body; }
+        Refusal receiveWithCredential(string credential)
+        {
+            InetHeaderMap headers;
+            headers["Content-Type"] = "application/json";
+            if (credential.length > 0) headers[workerPoolCredentialHeader] = credential;
+            auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/queue/receive"),
+                HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) `{"worker_id": "w-pool", "max_messages": 10}`.dup, false));
+            auto sink = createMemoryOutputStream();
+            auto res = createTestHTTPServerResponse(sink);
+            routerWithStores.handleRequest(req, res);
+            res.finalize();
+            return Refusal(res.statusCode, cast(string) sink.data.idup);
+        }
+
+        const pending = queueExecution(stores, "fp_pool");
+        const missing = receiveWithCredential(null);
+        assert(missing.status == HTTPStatus.unauthorized && missing.body.canFind(workerPoolCredentialHeader ~ " header"), missing.body);
+        const wrong = receiveWithCredential(workerPoolCredential ~ "x");
+        assert(wrong.status == HTTPStatus.unauthorized && wrong.body.canFind("Invalid " ~ workerPoolCredentialHeader), wrong.body);
+        assert(!wrong.body.canFind(workerPoolCredential), "A refusal never repeats the credential");
+        const sameLength = receiveWithCredential(workerPoolCredential[0 .. $ - 1] ~ "X");
+        assert(sameLength.status == HTTPStatus.unauthorized && sameLength.body.canFind("Invalid " ~ workerPoolCredentialHeader),
+            sameLength.body);
+        assert(stores.executions.get(pending).get.status == ExecutionStatus.queued, "A refused receive hands out nothing");
+
+        // With the credential, the same receive delivers the queued execution
+        const accepted = receiveWithCredential(workerPoolCredential);
+        assert(accepted.status == HTTPStatus.ok && accepted.body.canFind(pending), accepted.body);
+        assert(stores.executions.get(pending).get.status == ExecutionStatus.running);
     }
 
     const executionId = queueExecution(stores, "fp_n1");
@@ -923,7 +971,7 @@ unittest
     auto failingStores = new StateStores(failingDocuments);
     const anotherId = queueExecution(failingStores, "fp_n1_again");
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
-    auto failingRouter = apiRouter("test-scheduler-secret", workerTokenKey, defaultMaxAttempts, queue, failingStores);
+    auto failingRouter = apiRouter("test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue, failingStores);
     InetHeaderMap failingHeaders;
     failingHeaders["Content-Type"] = "application/json";
     failingHeaders[workerTokenHeader] = tokenForPath("/executions/" ~ anotherId ~ "/complete", failingStores);

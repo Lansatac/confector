@@ -11,7 +11,7 @@ import confector.config;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_signing_key : SigningKeySource, generateWorkerSigningKey;
 import confector.server.backends : Backends, buildBackends;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig, requireWorkerPoolConfig, requireWorkerTokenConfig;
 
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
@@ -25,8 +25,10 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
 }
 
 /// Configures application URL routing over `backends` and `stores`, the state stores kept in
-/// its document store. Worker tokens are signed and checked with `workerTokenKey`.
-URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, string workerTokenKey, uint maxExecutionAttempts)
+/// its document store. Worker tokens are signed and checked with `workerTokenKey`; receiving work
+/// is admitted only with `workerPoolCredential`.
+URLRouter createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, string workerTokenKey,
+    string workerPoolCredential, uint maxExecutionAttempts)
 {
     auto router = new URLRouter();
 
@@ -43,7 +45,7 @@ URLRouter createRouter(Backends backends, StateStores stores, string schedulerCa
 
     // API endpoints. The artifact routes come first, so the API router never answers them.
     router.any("/api/v1/artifacts/*", artifactsRouter(backends.artifactStore, workerTokenKey, stores));
-    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, workerTokenKey, maxExecutionAttempts, backends.dispatchQueue, stores));
+    router.any("/api/v1/*", apiRouter(schedulerCallbackSecret, workerTokenKey, workerPoolCredential, maxExecutionAttempts, backends.dispatchQueue, stores));
 
     // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
     // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
@@ -127,6 +129,8 @@ void main()
     setLogLevel(configuredLogLevel);
 
     requireExecutionConfig(serverConfig.execution);
+    requireWorkerPoolConfig(serverConfig.workerPool);
+    requireWorkerTokenConfig(serverConfig.workerTokens);
 
     // A missing or invalid backend setting, or an unreachable MongoDB, ends startup here.
     // Constructing StateStores declares every collection, which needs the database.
@@ -141,7 +145,7 @@ void main()
         logInfo("[auth] Worker tokens are signed with the configured signing key.");
 
     auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret,
-        signingKey.key, serverConfig.execution.maxAttempts);
+        signingKey.key, serverConfig.workerPool.credential, serverConfig.execution.maxAttempts);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -183,7 +187,8 @@ unittest
     execution.status = ExecutionStatus.queued;
     execution.attempts = 1;
     testStores.executions.createIfAbsent(execution);
-    auto router = createRouter(backends, testStores, "test-scheduler-secret", testSigningKey, 3);
+    auto router = createRouter(backends, testStores, "test-scheduler-secret", testSigningKey,
+        "pool-credential-0123456789abcdef0123456789abcdef", 3);
 
     struct Answer { int status; string body; }
 

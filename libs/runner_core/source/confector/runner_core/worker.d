@@ -2,6 +2,7 @@ module confector.runner_core.worker;
 
 import confector.api.model;
 import confector.api.dispatch_queue : Lease;
+import confector.core.worker_pool_credential : requireWorkerPoolCredential, workerPoolCredentialHeader;
 import confector.core.worker_token : workerTokenHeader;
 import confector.runner_core.task_executor;
 import confector.runner_core.http_artifact_storage;
@@ -63,6 +64,9 @@ struct HttpWorkerConfig
     size_t heartbeatIntervalSeconds = 15;
     size_t maxTasksToProcess = 0; // 0 = continuous loop
     bool verbose = false;
+    /// The worker pool credential the server admits this worker's receives with. Required: the
+    /// client refuses to start without one of at least 32 bytes.
+    string workerPoolCredential = "";
 }
 
 /**
@@ -73,11 +77,15 @@ class HttpWorkerClient
 {
     private string m_serverUrl;
     private string m_workerId;
+    private string m_workerPoolCredential;
 
-    this(string serverUrl, string workerId = "")
+    /// Throws if `workerPoolCredential` is too short to be the pool's credential.
+    this(string serverUrl, string workerId, string workerPoolCredential)
     {
+        requireWorkerPoolCredential(workerPoolCredential);
         this.m_serverUrl = normalizeBaseUrl(serverUrl);
         this.m_workerId = workerId.length > 0 ? workerId : "worker_" ~ randomUUID().toString()[0 .. 8];
+        this.m_workerPoolCredential = workerPoolCredential;
     }
 
     @property string serverUrl() const pure nothrow @safe { return m_serverUrl; }
@@ -119,8 +127,10 @@ class HttpWorkerClient
     }
 
     /// Sends a request to the control plane. `workerToken`, the execution's token from its work
-    /// order, is sent in the worker token header; receiving work, which has no execution yet, sends none.
-    Json sendJson(string endpointPath, string method = "POST", in Json bodyJson = Json.undefined, string workerToken = "")
+    /// order, is sent in the worker token header. `workerPoolCredential` is sent in the pool
+    /// credential header, and only receiving work sends it; no other route is given it.
+    Json sendJson(string endpointPath, string method = "POST", in Json bodyJson = Json.undefined, string workerToken = "",
+        string workerPoolCredential = "")
     {
         string fullUrl = resolveEndpointUrl(endpointPath);
         auto http = HTTP(fullUrl);
@@ -134,6 +144,16 @@ class HttpWorkerClient
         if (workerToken.length > 0)
         {
             http.addRequestHeader(workerTokenHeader, workerToken);
+        }
+        if (workerPoolCredential.length > 0)
+        {
+            http.addRequestHeader(workerPoolCredentialHeader, workerPoolCredential);
+        }
+        // A credential is never sent to another location: a redirect is a failed request. Phobos
+        // follows redirects up to maxRedirects, so uint.max is what turns following off
+        if (workerToken.length > 0 || workerPoolCredential.length > 0)
+        {
+            http.maxRedirects = uint.max;
         }
 
         char[] responseData;
@@ -207,7 +227,7 @@ class HttpWorkerClient
         req["visibility_timeout"] = Json(visibilityTimeout);
         req["worker_id"] = Json(m_workerId);
 
-        Json res = sendJson("/queue/receive", "POST", req);
+        Json res = sendJson("/queue/receive", "POST", req, "", m_workerPoolCredential);
         if (res.type != Json.Type.array)
         {
             throw new Exception(format("Server returned %s from /queue/receive, not an array of leases", res.toString()));
@@ -330,7 +350,7 @@ class HttpWorkerDaemon
         if (steps is null) throw new Exception("A worker needs a step runner");
         this.m_config = config;
         this.m_steps = steps;
-        this.m_client = client !is null ? client : new HttpWorkerClient(config.serverUrl, config.workerId);
+        this.m_client = client !is null ? client : new HttpWorkerClient(config.serverUrl, config.workerId, config.workerPoolCredential);
     }
 
     @property const(HttpWorkerConfig) config() const pure nothrow @safe { return m_config; }
@@ -559,6 +579,8 @@ class HttpWorkerDaemon
 
 version (unittest)
 {
+    private enum testWorkerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
+
     /// The /queue/receive response holding one lease on a work order.
     private Json testLeases(string receipt, WorkOrder order)
     {
@@ -652,13 +674,27 @@ unittest
     mkdirRecurse(testDir);
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
-    auto client = new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1");
+    auto client = new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1", testWorkerPoolCredential);
     assert(client.resolveEndpointUrl("/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
     assert(client.resolveEndpointUrl("/api/v1/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
-    auto clientApiV1 = new HttpWorkerClient("http://127.0.0.1:9099/api/v1", "test_worker_1");
+    auto clientApiV1 = new HttpWorkerClient("http://127.0.0.1:9099/api/v1", "test_worker_1", testWorkerPoolCredential);
     assert(clientApiV1.resolveEndpointUrl("/queue/receive") == "http://127.0.0.1:9099/api/v1/queue/receive");
 
+    // A runner without a usable worker pool credential does not start: it could never receive work
+    import std.exception : assertThrown;
+    assertThrown!Exception(new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1", ""));
+    assertThrown!Exception(new HttpWorkerClient("http://127.0.0.1:9099", "test_worker_1", "too-short"));
+    HttpWorkerConfig unconfigured;
+    unconfigured.serverUrl = "http://127.0.0.1:9099";
+    assertThrown!Exception(new HttpWorkerDaemon(unconfigured, new ScriptedStepRunner()));
+
     auto router = new URLRouter();
+    // A redirect from the server is not followed, so a credential never goes to its target
+    router.post("/api/v1/queue/receive-redirect", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.statusCode = 302;
+        res.headers["Location"] = "http://127.0.0.1:19188/api/v1/queue/receive";
+        res.writeVoidBody();
+    });
     bool dequeueCalled = false;
     string[] loggedExecutions;
     string[] completedExecutions;
@@ -667,9 +703,12 @@ unittest
     string[] ackedReceipts;
     int rejectCompletion = 0;
     string[] presentedTokens;
+    string[] receivePoolCredentials;
+    string[] otherPoolCredentials;
     void recordToken(HTTPServerRequest req)
     {
         presentedTokens ~= req.headers.get(workerTokenHeader, "");
+        otherPoolCredentials ~= req.headers.get(workerPoolCredentialHeader, "");
     }
 
     WorkOrder mockOrder;
@@ -682,6 +721,7 @@ unittest
 
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCalled = true;
+        receivePoolCredentials ~= req.headers.get(workerPoolCredentialHeader, "");
         res.writeJsonBody(ackedReceipts.length == 0 ? mockLeases : Json.emptyArray);
     });
     router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -725,6 +765,25 @@ unittest
     config.maxTasksToProcess = 1;
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
+    config.workerPoolCredential = testWorkerPoolCredential;
+
+    // A redirect answer is a failed request with its status, and the credential is not sent to
+    // the location it names: the receive route the redirect points at is never reached
+    const receivesBeforeRedirect = receivePoolCredentials.length;
+    auto probe = new HttpWorkerClient("http://127.0.0.1:19188", "test_worker_1", testWorkerPoolCredential);
+    int redirectStatus = 0;
+    runOffThread({
+        try
+        {
+            probe.sendJson("/queue/receive-redirect", "POST", Json.emptyObject, "", testWorkerPoolCredential);
+        }
+        catch (ServerResponseException e)
+        {
+            redirectStatus = e.statusCode;
+        }
+    });
+    assert(redirectStatus == 302, format("A redirect answered %s", redirectStatus));
+    assert(receivePoolCredentials.length == receivesBeforeRedirect, "The credential was followed to the redirect target");
 
     auto steps = new ScriptedStepRunner();
     auto workerRunner = new HttpWorkerDaemon(config, steps);
@@ -732,6 +791,11 @@ unittest
 
     assert(workerRunner.tasksProcessed == 1);
     assert(dequeueCalled);
+    // Only receiving work presents the pool credential; the execution routes never do
+    assert(receivePoolCredentials.length >= 1);
+    foreach (presented; receivePoolCredentials) assert(presented == testWorkerPoolCredential, "Receive presented '" ~ presented ~ "'");
+    assert(otherPoolCredentials.length >= 3);
+    foreach (presented; otherPoolCredentials) assert(presented.length == 0, "A non-receive route presented the pool credential");
     assert(steps.stepsRun == 1, "The worker ran the task's step with the step runner it was given");
     assert(completedExecutions == ["exe_mock_1"], "The completion names the work order's execution");
     assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("Reported %s", reported));
@@ -850,6 +914,7 @@ unittest
     config.workerId = "test_builtin_worker";
     config.workspaceDir = buildPath(testDir, "ws");
     config.heartbeatIntervalSeconds = 0;
+    config.workerPoolCredential = testWorkerPoolCredential;
     auto worker = new HttpWorkerDaemon(config, new BuiltinStepRunner());
 
     WorkOrder order;
@@ -959,6 +1024,7 @@ unittest
     config.maxTasksToProcess = 2;
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
+    config.workerPoolCredential = testWorkerPoolCredential;
 
     auto workerRunner = new HttpWorkerDaemon(config, new ScriptedStepRunner());
     runOffThread({ workerRunner.run(); });

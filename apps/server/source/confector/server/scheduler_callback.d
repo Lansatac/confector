@@ -3,21 +3,7 @@ module confector.server.scheduler_callback;
 import vibe.vibe;
 import std.format : format;
 import confector.api.scheduler : schedulerSecretHeader;
-
-/**
- * Compares two strings without stopping at the first difference, so the time taken does not
- * reveal how much of a guessed secret was right. Unequal lengths are rejected at once; the
- * length of the configured secret is not treated as confidential.
- */
-bool constantTimeEquals(in char[] a, in char[] b) pure nothrow @safe @nogc
-{
-    if (a.length != b.length)
-        return false;
-    uint difference = 0;
-    foreach (i; 0 .. a.length)
-        difference |= cast(uint)(a[i] ^ b[i]);
-    return difference == 0;
-}
+import confector.core.constant_time : constantTimeEquals;
 
 /**
  * Wraps a scheduler callback so that the handler runs only when the request carries the scheduler
@@ -57,11 +43,6 @@ private void rejectSchedulerCallback(HTTPServerResponse res, string message)
 unittest
 {
     import std.exception : assertThrown;
-
-    assert(constantTimeEquals("abc", "abc"));
-    assert(!constantTimeEquals("abc", "abd"));
-    assert(!constantTimeEquals("abc", "abcd"));
-    assert(!constantTimeEquals("", "abc"));
 
     bool ran = false;
     void delegate(HTTPServerRequest, HTTPServerResponse) inner = (req, res) { ran = true; res.statusCode = HTTPStatus.ok; };

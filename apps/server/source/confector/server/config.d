@@ -2,6 +2,8 @@ module confector.server.config;
 
 import confector.config;
 import confector.core.work_orders : defaultMaxAttempts;
+import confector.core.worker_pool_credential : minimumWorkerPoolCredentialLength;
+import confector.core.worker_token : minimumSigningKeyLength;
 import std.format : format;
 import vibe.data.json : Json;
 
@@ -45,6 +47,20 @@ struct SchedulerConfig
     @Env("CONFECTOR_SCHEDULER_CALLBACK_SECRET")
     @Description("Secret the scheduler sends in the X-Confector-Scheduler-Secret header on every callback (required)")
     string callbackSecret = "";
+}
+
+/**
+ * The worker pool credential: the one credential every runner presents to receive work from
+ * /queue/receive. Required, with no default, and never generated: workers must be given it, so
+ * the server cannot invent it. The server refuses to start without one of at least 32 bytes (see
+ * requireWorkerPoolConfig).
+ */
+struct WorkerPoolConfig
+{
+    @Required
+    @Env("CONFECTOR_WORKER_POOL_CREDENTIAL")
+    @Description("Credential every runner presents in the X-Confector-Worker-Pool-Credential header to receive work (required, at least 32 bytes, e.g. from openssl rand -hex 32)")
+    string credential = "";
 }
 
 /**
@@ -93,6 +109,7 @@ struct ServerConfig
     HttpConfig http;
     DocumentStoreConfig documentStore;
     SchedulerConfig scheduler;
+    WorkerPoolConfig workerPool;
     WorkerTokenConfig workerTokens;
     ArtifactStoreConfig artifactStore;
     ExecutionConfig execution;
@@ -133,6 +150,37 @@ void requireSchedulerConfig(in SchedulerConfig config)
         throw new Exception("[config] Required setting 'server.scheduler.callbackSecret' is missing "
             ~ "(server.scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): the server cannot start "
             ~ "without it, because scheduler callbacks would be unauthenticated.");
+}
+
+/**
+ * Throws, naming the setting and its environment variable, unless the worker pool credential is
+ * configured and at least minimumWorkerPoolCredentialLength bytes long. Without it /queue/receive
+ * could not admit any runner, so the server cannot start. The credential is never in the message.
+ */
+void requireWorkerPoolConfig(in WorkerPoolConfig config)
+{
+    if (config.credential.length == 0)
+        throw new Exception("[config] Required setting 'server.workerPool.credential' is missing "
+            ~ "(server.workerPool.credential or CONFECTOR_WORKER_POOL_CREDENTIAL): the server cannot start "
+            ~ "without it, because runners could not receive work.");
+    if (config.credential.length < minimumWorkerPoolCredentialLength)
+        throw new Exception(format("[config] Setting 'server.workerPool.credential' (or CONFECTOR_WORKER_POOL_CREDENTIAL) "
+            ~ "must be at least %d bytes, not %d: the server cannot start with a credential that short. "
+            ~ "Generate one with openssl rand -hex 32.", minimumWorkerPoolCredentialLength, config.credential.length));
+}
+
+/**
+ * Throws, naming the setting and its environment variable, if a configured worker token signing key
+ * is shorter than minimumSigningKeyLength. Unset, the installation's key is used, so only a set key
+ * is checked here.
+ */
+void requireWorkerTokenConfig(in WorkerTokenConfig config)
+{
+    if (config.signingKey.length > 0 && config.signingKey.length < minimumSigningKeyLength)
+        throw new Exception(format("[config] Setting 'server.workerTokens.signingKey' (or CONFECTOR_WORKER_TOKEN_SIGNING_KEY) "
+            ~ "must be at least %d bytes when set, not %d: the server cannot start with a signing key that short. "
+            ~ "Generate one with openssl rand -hex 32, or unset it to use the installation's key.",
+            minimumSigningKeyLength, config.signingKey.length));
 }
 
 /**
@@ -192,6 +240,7 @@ unittest
     assert(cfg.documentStore.database == "");
     assert(cfg.scheduler.callbackSecret == "");
     assert(cfg.workerTokens.signingKey == "");
+    assert(cfg.workerPool.credential == "");
     assert(cfg.artifactStore.baseDirectory == "");
     assert(cfg.execution.maxAttempts == 3, "Executions get three attempts unless the admin sets a limit");
 }
@@ -215,6 +264,71 @@ unittest
     config.maxAttempts = 0;
     auto message = collectException(requireExecutionConfig(config));
     assert(message !is null && message.msg.canFind("server.execution.maxAttempts"));
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : assertThrown, collectException;
+    import std.process : environment;
+    import vibe.data.json : parseJsonString;
+
+    // The credential is required: missing, or too short to be a secret, the server does not start
+    enum credentialVar = "CONFECTOR_WORKER_POOL_CREDENTIAL";
+    const saved = environment.get(credentialVar);
+    scope(exit)
+    {
+        if (saved is null) environment.remove(credentialVar); else environment[credentialVar] = saved;
+    }
+    environment.remove(credentialVar);
+
+    WorkerPoolConfig config;
+    auto missing = collectException(requireWorkerPoolConfig(config));
+    assert(missing !is null && missing.msg.canFind("server.workerPool.credential")
+        && missing.msg.canFind("CONFECTOR_WORKER_POOL_CREDENTIAL"), missing.msg);
+
+    // A short credential names the setting and its variable, and never repeats the credential
+    config.credential = "too-short";
+    auto tooShort = collectException(requireWorkerPoolConfig(config));
+    assert(tooShort !is null && tooShort.msg.canFind("server.workerPool.credential")
+        && tooShort.msg.canFind("CONFECTOR_WORKER_POOL_CREDENTIAL") && tooShort.msg.canFind("at least 32 bytes")
+        && !tooShort.msg.canFind("too-short"), tooShort.msg);
+
+    config.credential = "0123456789abcdef0123456789abcdef";
+    requireWorkerPoolConfig(config);
+
+    // The environment variable the messages name sets the credential
+    environment[credentialVar] = "pool-credential-from-the-environment-0123";
+    auto registry = new ConfigRegistry();
+    registerServerConfigDefinitions(registry);
+    assert(loadServerConfig(registry).workerPool.credential == "pool-credential-from-the-environment-0123");
+
+    // The environment variable overrides the value in the configuration file
+    auto fileRegistry = new ConfigRegistry(parseJsonString(`{"server": {"workerPool": {"credential": "pool-credential-from-the-file-0123"}}}`));
+    registerServerConfigDefinitions(fileRegistry);
+    assert(loadServerConfig(fileRegistry).workerPool.credential == "pool-credential-from-the-environment-0123",
+        "CONFECTOR_WORKER_POOL_CREDENTIAL overrides the file");
+
+    // Without the variable, the file's value is used
+    environment.remove(credentialVar);
+    assert(loadServerConfig(fileRegistry).workerPool.credential == "pool-credential-from-the-file-0123");
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    // A configured signing key is checked for length, naming the setting; unset, nothing is checked
+    WorkerTokenConfig config;
+    requireWorkerTokenConfig(config);
+    config.signingKey = "0123456789abcdef0123456789abcdef";
+    requireWorkerTokenConfig(config);
+
+    config.signingKey = "short-key";
+    auto tooShort = collectException(requireWorkerTokenConfig(config));
+    assert(tooShort !is null && tooShort.msg.canFind("server.workerTokens.signingKey")
+        && tooShort.msg.canFind("CONFECTOR_WORKER_TOKEN_SIGNING_KEY") && !tooShort.msg.canFind("short-key"), tooShort.msg);
 }
 
 unittest

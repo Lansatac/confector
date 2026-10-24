@@ -144,22 +144,9 @@ interface ConfigAccessor
 
                         static if (is(MemberType == struct) && !is(MemberType == Json) && !is(MemberType == Duration))
                         {
-                            Json resolved = getJson(memberKey);
-                            if (resolved.type == Json.Type.object)
-                            {
-                                try
-                                {
-                                    __traits(getMember, result, member) = coerceJson!MemberType(resolved);
-                                }
-                                catch (Exception e)
-                                {
-                                    __traits(getMember, result, member) = getScope(memberKey).bind!MemberType();
-                                }
-                            }
-                            else
-                            {
-                                __traits(getMember, result, member) = getScope(memberKey).bind!MemberType();
-                            }
+                            // Bound field by field, so each field's environment variable overrides
+                            // the file, even when the file holds the whole struct
+                            __traits(getMember, result, member) = getScope(memberKey).bind!MemberType();
                         }
                         else
                         {
