@@ -35,17 +35,23 @@ Default to the cheapest agent that can do the job; the reviewer is always at lea
 | Work | Implementer | Reviewer |
 |---|---|---|
 | Well specified, self-contained, tests are the spec, few files (bug fixes, small features, plumbing, config, docs) | `implementer` (haiku) | sonnet |
-| Multi-file but well specified: wiring, audits, interface changes with clear acceptance | `implementer-medium` (sonnet) | opus if it touches correctness-critical code, else sonnet |
-| Concurrency, CAS or crash-recovery protocols, security design, cross-cutting refactors, anything needing design judgment | `implementer-medium` first; `implementer-strong` (opus) only on escalation | opus |
+| Multi-file but well specified: wiring, audits, interface changes with clear acceptance | `implementer` (haiku) | opus if it touches correctness-critical code, else sonnet |
+| Concurrency, CAS or crash-recovery protocols, security work whose design is already decided | `implementer` (haiku) | opus |
+| Cross-cutting refactors, or anything still needing design judgment the bead and design fields do not settle | `implementer-medium` (sonnet) | opus |
 
-**Every first implementation attempt starts with at most `implementer-medium`.** Never start a bead
-with `implementer-strong`, however hard it looks: use `implementer-medium` and the strongest
-reviewer, and escalate to `implementer-strong` only under "Escalating" below. The one exception is
-an explicit instruction from the user to use the strong implementer.
+**Most beads start on haiku; the reviewer is the backstop.** A haiku implementer with a stronger
+reviewer and one fix round is usually cheaper than a stronger implementer. Use `implementer-medium`
+first only for the last row. Never start a bead with `implementer-strong`, however hard it looks:
+escalate to it only under "Escalating" below. The one exception is an explicit instruction from
+the user to use the strong implementer.
 
-Pass `model` on the Agent call to override an agent's default. When a cheap implementer's first
-attempt shows it is out of its depth (it guesses at design, or the reviewer finds structural
-problems), switch to `implementer-strong` for the rework instead of looping.
+Haiku tends to miss project conventions rather than design: briefs to it should say explicitly to
+reuse existing facilities (crypto, RNG, store patterns, test helpers) before writing new code, and
+that bead ids must not appear in code or comments.
+
+Pass `model` on the Agent call to override an agent's default. When an implementer's first attempt
+shows it is out of its depth (it guesses at design, or the reviewer finds structural problems),
+hand the rework to the next model up instead of looping.
 
 ## 3. Brief the implementer
 
