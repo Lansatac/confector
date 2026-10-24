@@ -65,7 +65,9 @@ directory, and `git apply --3way` in the main tree.
 
 ## 4. Review
 
-Always review, with a stronger model than the implementer, via `subagent_type: reviewer`. Give it the
+Always review, with a stronger model than the implementer, via `subagent_type: reviewer`. The
+reviewer defaults to sonnet, which is right for haiku `implementer` work; pass `model: opus` for the
+opus rows of the table. Give it the
 bead id, the design context, and where the changes are (working tree or worktree path). It is
 read-only and reports ranked findings with file:line, a failure scenario and a severity. Ask it
 specifically to check: acceptance criteria; whether tests fail without the change; fail-fast and
