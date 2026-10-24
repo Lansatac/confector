@@ -660,13 +660,14 @@ Be aware of these so you do not spread them:
 
 - **Nothing starts builds yet.** The legacy build coordinator was deleted (bead
   `confector-z7z.23.10`). Until request intake lands (bead `confector-z7z.23.7`) the run routes
-  answer 501 Not Implemented, and a worker's completion only finishes its execution
-  (`confector.core.work_orders.completeExecution`) until the ledger fold lands (bead
-  `confector-z7z.49.4`). The chain evaluator, execution dispatcher and fingerprint claims were
+  answer 501 Not Implemented. A worker's completion finishes its execution, folds it into the
+  ledger and marks the waiting chains dirty (`confector.core.work_orders.recordOutcome`); if the
+  fold or the wake fails after the execution is terminal, the endpoint answers 500 and only the
+  sweep (bead `confector-z7z.49.5`) can repair it. The chain evaluator, execution dispatcher and fingerprint claims were
   deleted too (bead `confector-z7z.51.1`); they are rewritten from the ledger and pins-only
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
-  (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing folds into it yet
-  (bead `confector-z7z.49.4`). The pure chain evaluator (`confector.core.chain_evaluator`), the
+  (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), and terminal executions fold
+  into it. The pure chain evaluator (`confector.core.chain_evaluator`), the
   chain state document (`confector.core.chain_state`, bead `confector-z7z.49.2`), the execution
   dispatcher (`confector.core.execution_dispatcher`) and the chain reconciler
   (`confector.core.chain_reconciler`, bead `confector-z7z.49.3`) exist, but no route or sweep
