@@ -533,6 +533,98 @@ TaskEditorForm taskEditorForm(in TaskNode task) @trusted
     return form;
 }
 
+/**
+ * Validates the editor's form and returns `task` with the form's inputs, steps, outputs,
+ * environment and timeout. `task` supplies the id and name, which the form does not hold. This is
+ * the task editor's whole validation; a project's saved task graph is checked with it too
+ * (`validateTaskGraph`), so both accept and refuse the same tasks.
+ *
+ * Throws: TaskFormException listing every problem.
+ */
+TaskNode parseTaskForm(TaskNode task, in TaskEditorForm form, in string[] registeredRepositories, in string[] otherTaskIds) @safe
+{
+    import std.array : join;
+
+    string[] problems;
+    bool inputsValid = true;
+    try task.inputs = parseTaskInputRows(task.id, form.inputRows, registeredRepositories, otherTaskIds);
+    catch (TaskFormException e)
+    {
+        problems ~= e.msg;
+        inputsValid = false;
+    }
+    // Checkout steps are checked against the declared inputs, or as far as the rows say
+    // when the inputs have problems of their own
+    try task.steps = parseTaskStepRows(form.stepRows, inputsValid ? task.inputs : shownRepositoryInputs(form.inputRows));
+    catch (TaskFormException e) problems ~= e.msg;
+    try task.outputs.artifacts = parseOutputDeclarations(form.outputsText);
+    catch (TaskFormException e) problems ~= e.msg;
+    try task.environment = parseEnvironment(form.environmentText);
+    catch (TaskFormException e) problems ~= e.msg;
+    try task.timeoutSeconds = parseTimeout(form.timeoutText);
+    catch (TaskFormException e) problems ~= e.msg;
+    if (problems.length > 0) throw new TaskFormException(problems.join("\n"));
+    return task;
+}
+
+/**
+ * Parses a project's submitted task graph: a JSON array of task definitions. This checks the
+ * structure only; `validateTaskGraph` checks what the tasks say.
+ *
+ * Throws: TaskFormException if the text is not a JSON array of tasks.
+ */
+TaskNode[] parseTaskGraphJson(string text) @trusted
+{
+    Json parsed;
+    try parsed = parseJsonString(text);
+    catch (Exception e) throw new TaskFormException(format("The task graph is not valid JSON (%s)", e.msg));
+    if (parsed.type != Json.Type.array) throw new TaskFormException("The task graph must be a JSON array of tasks");
+    try return deserializeJson!(TaskNode[])(parsed);
+    catch (Exception e) throw new TaskFormException(format("The task graph does not match the task format (%s)", e.msg));
+}
+
+/**
+ * Validates a project's task graph with the task editor's rules (`parseTaskForm`): every task
+ * needs an id and passes the editor's checks, against the project's other tasks and the registered
+ * repositories. The tasks must then form a graph with unique ids and no cycles. Every problem is
+ * reported, labelled by task.
+ *
+ * Throws: TaskFormException listing every problem.
+ */
+TaskNode[] validateTaskGraph(TaskNode[] tasks, in string[] registeredRepositories) @trusted
+{
+    import std.array : join;
+    import std.string : lineSplitter;
+
+    string[] problems;
+    TaskNode[] validated;
+    foreach (i, task; tasks)
+    {
+        if (task.id.length == 0)
+        {
+            problems ~= format("Task %s needs an id", i + 1);
+            continue;
+        }
+        string[] otherTaskIds;
+        foreach (other; tasks)
+        {
+            if (other.id != task.id) otherTaskIds ~= other.id;
+        }
+        try validated ~= parseTaskForm(task, taskEditorForm(task), registeredRepositories, otherTaskIds);
+        catch (TaskFormException e)
+        {
+            foreach (line; e.msg.lineSplitter) problems ~= format("Task '%s': %s", task.id, line);
+        }
+    }
+    if (problems.length == 0)
+    {
+        try new TaskGraph(validated);
+        catch (DAGValidationException e) problems ~= e.msg;
+    }
+    if (problems.length > 0) throw new TaskFormException(problems.join("\n"));
+    return validated;
+}
+
 unittest
 {
     import std.exception : collectExceptionMsg;
@@ -763,6 +855,96 @@ unittest
     assert(!problems.canFind("Output line 4"), problems);
 }
 
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectExceptionMsg;
+
+    TaskNode engineTask()
+    {
+        TaskNode task;
+        task.id = "engine";
+        task.inputs["src"] = repositoryInput("game");
+        task.steps = [BuildStep("Fetch", "checkout", Json(["input": Json("src")]))];
+        task.outputs.artifacts = [OutputArtifactDecl("engine", "out/engine.zip")];
+        task.timeoutSeconds = 600;
+        return task;
+    }
+
+    TaskNode appTask()
+    {
+        TaskNode task;
+        task.id = "app";
+        task.inputs["eng"] = taskOutputInput("engine", "engine");
+        task.steps = [BuildStep("Run", "bash", Json(["script": Json("make")]))];
+        return task;
+    }
+
+    string rejection(TaskNode[] tasks, string[] repositories = ["game"])
+    {
+        return collectExceptionMsg!TaskFormException(validateTaskGraph(tasks, repositories));
+    }
+
+    // A valid graph passes unchanged, and survives its JSON text
+    TaskNode[] graph = [engineTask(), appTask()];
+    assert(validateTaskGraph(graph, ["game"]) == graph);
+    assert(parseTaskGraphJson(serializeToJson(graph).toString()) == graph);
+
+    // The graph text must be a JSON array of tasks
+    assert(collectExceptionMsg!TaskFormException(parseTaskGraphJson("[")).canFind("not valid JSON"));
+    assert(collectExceptionMsg!TaskFormException(parseTaskGraphJson(`{"id": "app"}`)).canFind("must be a JSON array of tasks"));
+    assert(collectExceptionMsg!TaskFormException(parseTaskGraphJson(`[{"name": "no id"}]`)).canFind("does not match the task format"));
+
+    // Each task is checked with the editor's rules: a step type, a step config, an output id, an
+    // output path, an upstream task, a repository, a timeout and an environment variable
+    TaskNode docker = appTask();
+    docker.steps = [BuildStep("Image", "docker:build", Json.emptyObject)];
+    assert(rejection([engineTask(), docker]).canFind("Task 'app': Step 1 (Image): step type 'docker:build' is not a built-in step type"));
+
+    TaskNode scalarConfig = appTask();
+    scalarConfig.steps = [BuildStep("Run", "bash", Json("make"))];
+    assert(rejection([engineTask(), scalarConfig]).canFind("Task 'app': Step 1 (Run): the config must be a JSON object"));
+
+    TaskNode noOutputId = engineTask();
+    noOutputId.outputs.artifacts = [OutputArtifactDecl("", "out/engine.zip")];
+    assert(rejection([noOutputId, appTask()]).canFind("Task 'engine': Output line 1"));
+
+    TaskNode escapingOutput = engineTask();
+    escapingOutput.outputs.artifacts = [OutputArtifactDecl("engine", "../engine.zip")];
+    assert(rejection([escapingOutput, appTask()]).canFind("the path must be relative to the working directory"));
+
+    TaskNode unknownUpstream = appTask();
+    unknownUpstream.inputs["eng"] = taskOutputInput("ghost", "engine");
+    assert(rejection([engineTask(), unknownUpstream]).canFind("Task 'app': Input 'eng': task 'ghost' is not in this project"));
+
+    assert(rejection(graph, ["other"]).canFind("Task 'engine': Input 'src': repository 'game' is not registered"));
+
+    TaskNode zeroTimeout = engineTask();
+    zeroTimeout.timeoutSeconds = 0;
+    assert(rejection([zeroTimeout, appTask()]).canFind("Task 'engine': Timeout: '0' is not a positive whole number"));
+
+    TaskNode badVariable = engineTask();
+    badVariable.environment = ["A B": "1"];
+    assert(rejection([badVariable, appTask()]).canFind("Task 'engine': Environment line 1"));
+
+    // Graph-level problems: a missing id, a duplicated id and a cycle
+    TaskNode anonymous = appTask();
+    anonymous.id = "";
+    assert(rejection([engineTask(), anonymous]).canFind("Task 2 needs an id"));
+    assert(rejection([engineTask(), engineTask()]).canFind("Duplicate task id defined in graph: 'engine'"));
+
+    TaskNode second = appTask();
+    second.id = "second";
+    second.inputs["back"] = taskOutputInput("app");
+    TaskNode cyclic = engineTask();
+    cyclic.inputs["loop"] = taskOutputInput("second");
+    assert(rejection([cyclic, second, appTask()]).canFind("Cyclic dependency detected"));
+
+    // Every problem is reported together, labelled by task
+    auto both = rejection([noOutputId, docker]);
+    assert(both.canFind("Task 'engine': Output line 1") && both.canFind("Task 'app': Step 1 (Image)"), both);
+}
+
 URLRouter dashboardRouter(StateStores stores)
 {
     auto router = new URLRouter();
@@ -778,6 +960,13 @@ URLRouter dashboardRouter(StateStores stores)
         string[][] stepIssues = taskStepRowIssues(form.stepRows, shownRepositoryInputs(form.inputRows));
         const stepTypes = builtinStepTypes;
         res.render!("project/task-editor.dt", project, task, repositories, form, stepIssues, stepTypes, formError);
+    }
+
+    // Renders the project editor with the task graph text as submitted, or as stored. `formError`
+    // is shown at the top when a save was rejected.
+    void renderProjectEditor(HTTPServerResponse res, ProjectRecord project, string tasksJson, string formError)
+    {
+        res.render!("project/project-editor.dt", project, tasksJson, formError);
     }
 
     // Home / Dashboard
@@ -879,14 +1068,15 @@ URLRouter dashboardRouter(StateStores stores)
             stores.projects.get(projId).tryValue(project);
         }
         string tasksJson = serializeToJson(project.tasks).toString();
-        res.render!("project/project-editor.dt", project, tasksJson);
+        renderProjectEditor(res, project, tasksJson, "");
     });
 
     router.post("/projects/save", (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.form.get("id", "");
+        string tasksJsonText = req.form.get("tasks_json", "");
+        ProjectRecord project;
         try
         {
-            ProjectRecord project;
             if (stores !is null && projId.length > 0)
             {
                 stores.projects.get(projId).tryValue(project);
@@ -896,15 +1086,13 @@ URLRouter dashboardRouter(StateStores stores)
             project.name = req.form.get("name", project.name.length > 0 ? project.name : "Project");
             project.description = req.form.get("description", project.description);
 
-            string tasksJsonText = req.form.get("tasks_json", "[]");
-            Json parsed = parseJsonString(tasksJsonText);
-            if (parsed.type == Json.Type.array)
+            // Checked with the task editor's rules, against the repositories registered now
+            string[] registeredRepositories;
+            if (stores !is null)
             {
-                project.tasks = deserializeJson!(TaskNode[])(parsed);
+                foreach (r; stores.repositories.list()) registeredRepositories ~= r.name;
             }
-
-            // Validate DAG
-            auto graph = new TaskGraph(project.tasks);
+            project.tasks = validateTaskGraph(parseTaskGraphJson(tasksJsonText), registeredRepositories);
 
             project.updatedAt = Clock.currTime.toISOString();
             if (stores !is null)
@@ -912,10 +1100,21 @@ URLRouter dashboardRouter(StateStores stores)
                 stores.projects.put(project);
             }
         }
+        catch (TaskFormException e)
+        {
+            // Nothing was saved: show the problems, with the submitted text kept
+            res.statusCode = HTTPStatus.badRequest;
+            renderProjectEditor(res, project, tasksJsonText, e.msg);
+            return;
+        }
         catch (Exception e)
         {
             logError("Failed to save project: %s", e.msg);
+            res.statusCode = HTTPStatus.internalServerError;
+            renderProjectEditor(res, project, tasksJsonText, "Failed to save project: " ~ e.msg);
+            return;
         }
+
         res.redirect("/projects/details?id=" ~ projId);
     });
 
@@ -1006,7 +1205,6 @@ URLRouter dashboardRouter(StateStores stores)
             );
             form.stepRows = taskStepRowsFromForm(req.form.getAll("step_name"), req.form.getAll("step_type"), req.form.getAll("step_config"));
 
-            string[] problems;
             string[] registeredRepositories;
             if (stores !is null)
             {
@@ -1017,29 +1215,7 @@ URLRouter dashboardRouter(StateStores stores)
             {
                 if (t.id != task.id) otherTaskIds ~= t.id;
             }
-            bool inputsValid = true;
-            try task.inputs = parseTaskInputRows(task.id, form.inputRows, registeredRepositories, otherTaskIds);
-            catch (TaskFormException e)
-            {
-                problems ~= e.msg;
-                inputsValid = false;
-            }
-            // Checkout steps are checked against the declared inputs, or as far as the rows say
-            // when the inputs have problems of their own
-            try task.steps = parseTaskStepRows(form.stepRows, inputsValid ? task.inputs : shownRepositoryInputs(form.inputRows));
-            catch (TaskFormException e) problems ~= e.msg;
-            try task.outputs.artifacts = parseOutputDeclarations(form.outputsText);
-            catch (TaskFormException e) problems ~= e.msg;
-            try task.environment = parseEnvironment(form.environmentText);
-            catch (TaskFormException e) problems ~= e.msg;
-            try task.timeoutSeconds = parseTimeout(form.timeoutText);
-            catch (TaskFormException e) problems ~= e.msg;
-            if (problems.length > 0)
-            {
-                import std.array : join;
-
-                throw new TaskFormException(problems.join("\n"));
-            }
+            task = parseTaskForm(task, form, registeredRepositories, otherTaskIds);
 
             // Replace existing or append
             bool updated = false;
@@ -1339,6 +1515,50 @@ unittest
     assert(rejected.body.canFind(`"type":""`) && rejected.body.canFind(`"name":"Typeless"`), rejected.body);
     assert(rejected.body.canFind(`value="0"`), rejected.body);
     assert(storedTask("package") == stored, "Nothing was saved");
+
+    // Saving the project's task graph checks every task with the editor's rules. A valid graph is
+    // stored and redirected to; a rejected one stores nothing, reports the problem and keeps the
+    // submitted text.
+    string[2][] graphFields(string tasksJson)
+    {
+        return [["id", "proj_dash_1"], ["name", "Dashboard Project"], ["description", ""], ["tasks_json", tasksJson]];
+    }
+
+    auto storedProjectTasks = stores.projects.get("proj_dash_1").get.tasks;
+    auto graphSaved = request(HTTPMethod.POST, "/projects/save", graphFields(serializeToJson(storedProjectTasks).toString()));
+    assert(graphSaved.status == HTTPStatus.found, format("HTTP %s: %s", graphSaved.status, graphSaved.body));
+    assert(stores.projects.get("proj_dash_1").get.tasks == storedProjectTasks);
+
+    auto notAnArray = request(HTTPMethod.POST, "/projects/save", graphFields(`{"id": "lone"}`));
+    assert(notAnArray.status == HTTPStatus.badRequest && notAnArray.body.canFind("must be a JSON array of tasks"), notAnArray.body);
+
+    auto unknownStep = request(HTTPMethod.POST, "/projects/save",
+        graphFields(`[{"id": "lone", "steps": [{"name": "Image", "type": "docker:build"}]}]`));
+    assert(unknownStep.status == HTTPStatus.badRequest, format("HTTP %s", unknownStep.status));
+    assert(unknownStep.body.canFind("Step 1 (Image)")
+        && unknownStep.body.canFind("is not a built-in step type"), unknownStep.body);
+    assert(unknownStep.body.canFind("docker:build"), "The submitted text is shown again");
+
+    auto missingOutputId = request(HTTPMethod.POST, "/projects/save",
+        graphFields(`[{"id": "lone", "outputs": {"artifacts": [{"id": "", "path": "out/lone.zip"}]}}]`));
+    assert(missingOutputId.status == HTTPStatus.badRequest && missingOutputId.body.canFind("write each output as id: path"),
+        missingOutputId.body);
+
+    auto invalidJson = request(HTTPMethod.POST, "/projects/save", graphFields("[{"));
+    assert(invalidJson.status == HTTPStatus.badRequest && invalidJson.body.canFind("not valid JSON"), invalidJson.body);
+
+    TaskNode loopA;
+    loopA.id = "loop_a";
+    loopA.inputs["b"] = taskOutputInput("loop_b");
+    TaskNode loopB;
+    loopB.id = "loop_b";
+    loopB.inputs["a"] = taskOutputInput("loop_a");
+    auto cyclic = request(HTTPMethod.POST, "/projects/save", graphFields(serializeToJson([loopA, loopB]).toString()));
+    assert(cyclic.status == HTTPStatus.badRequest && cyclic.body.canFind("Cyclic dependency detected"), cyclic.body);
+
+    assert(stores.projects.get("proj_dash_1").get.tasks == storedProjectTasks, "Nothing was saved by a rejected graph");
+    auto editPage = request(HTTPMethod.GET, "/projects/edit?id=proj_dash_1");
+    assert(editPage.status == HTTPStatus.ok && editPage.body.canFind("Edit Project"), editPage.body);
 
     // Running a project fails loudly until request intake lands
     auto runReq = createTestHTTPServerRequest(URL("http://localhost/projects/run"), HTTPMethod.POST);

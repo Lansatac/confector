@@ -22,6 +22,11 @@ block maincontent
     div#project-canvas-container.dag-visualizer
       canvas#dag-editor-canvas(width="800", height="220")
 
+    - if (formError.length > 0)
+      div.alert.alert-danger#project-form-error(style="margin-top: 20px; white-space: pre-line;")
+        strong The project was not saved:
+        div #{formError}
+
     form#project-form(action="/projects/save", method="POST", style="margin-top: 20px;")
       div.grid-2col
         div.card
