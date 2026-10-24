@@ -1033,17 +1033,14 @@ URLRouter dashboardRouter(StateStores stores)
         }
         catch (Exception e)
         {
+            // Nothing was saved: say so rather than redirecting as if the project exists
             logError("Failed to add project: %s", e.msg);
+            res.statusCode = HTTPStatus.internalServerError;
+            res.writeBody("Failed to add project: " ~ e.msg, "text/plain");
+            return;
         }
 
-        if (projId.length > 0)
-        {
-            res.redirect("/projects/details?id=" ~ projId);
-        }
-        else
-        {
-            res.redirect("/projects/");
-        }
+        res.redirect("/projects/details?id=" ~ projId);
     });
 
     router.get("/projects/details", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -1129,6 +1126,10 @@ URLRouter dashboardRouter(StateStores stores)
         }
         catch (Exception e)
         {
+            logError("Failed to delete project: %s", e.msg);
+            res.statusCode = HTTPStatus.internalServerError;
+            res.writeBody("Failed to delete project: " ~ e.msg, "text/plain");
+            return;
         }
         res.redirect("/projects/");
     });
@@ -1284,6 +1285,9 @@ URLRouter dashboardRouter(StateStores stores)
         catch (Exception e)
         {
             logError("Failed to delete task: %s", e.msg);
+            res.statusCode = HTTPStatus.internalServerError;
+            res.writeBody("Failed to delete task: " ~ e.msg, "text/plain");
+            return;
         }
         res.redirect("/projects/details?id=" ~ projId);
     });
@@ -1362,8 +1366,10 @@ unittest
     import std.uri : encodeComponent;
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+    import confector.testing.memory_document_store : InterleavingDocumentStore;
 
-    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto documents = new InterleavingDocumentStore(new InMemoryDocumentStore());
+    auto stores = new StateStores(documents);
     auto router = dashboardRouter(stores);
 
     ProjectRecord p;
@@ -1559,6 +1565,26 @@ unittest
     assert(stores.projects.get("proj_dash_1").get.tasks == storedProjectTasks, "Nothing was saved by a rejected graph");
     auto editPage = request(HTTPMethod.GET, "/projects/edit?id=proj_dash_1");
     assert(editPage.status == HTTPStatus.ok && editPage.body.canFind("Edit Project"), editPage.body);
+
+    // A failed write is a server error that names the failure, and nothing is changed
+    documents.beforeNextWrite = () { throw new Exception("store unavailable"); };
+    auto failedAdd = request(HTTPMethod.POST, "/projects/add", [["id", "proj_failed"], ["name", "Failed"]]);
+    assert(failedAdd.status == HTTPStatus.internalServerError && failedAdd.body.canFind("Failed to add project: store unavailable"),
+        failedAdd.body);
+    assert(stores.projects.get("proj_failed").isNull, "A project that failed to save does not exist");
+
+    documents.beforeNextWrite = () { throw new Exception("store unavailable"); };
+    auto failedDelete = request(HTTPMethod.POST, "/projects/delete", [["id", "proj_dash_1"]]);
+    assert(failedDelete.status == HTTPStatus.internalServerError
+        && failedDelete.body.canFind("Failed to delete project: store unavailable"), failedDelete.body);
+    assert(!stores.projects.get("proj_dash_1").isNull, "A project that failed to delete still exists");
+
+    documents.beforeNextWrite = () { throw new Exception("store unavailable"); };
+    auto failedTaskDelete = request(HTTPMethod.POST, "/projects/tasks/delete",
+        [["project_id", "proj_dash_1"], ["task_id", "test_node_1"]]);
+    assert(failedTaskDelete.status == HTTPStatus.internalServerError
+        && failedTaskDelete.body.canFind("Failed to delete task: store unavailable"), failedTaskDelete.body);
+    assert(stores.projects.get("proj_dash_1").get.tasks == storedProjectTasks, "A task that failed to delete is kept");
 
     // Running a project fails loudly until request intake lands
     auto runReq = createTestHTTPServerRequest(URL("http://localhost/projects/run"), HTTPMethod.POST);

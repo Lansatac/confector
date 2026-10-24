@@ -7,6 +7,8 @@ import std.process : thisProcessID;
 import std.random : unpredictableSeed;
 import std.stdio : File;
 
+import vibe.core.log : logWarn;
+
 import confector.api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;
 
 /**
@@ -90,7 +92,10 @@ class LocalArtifactStorage : ArtifactStorage
             {
                 if (exists(tempPath))
                 {
-                    try { remove(tempPath); } catch (Exception) {}
+                    // Best effort: the write has already failed and that error is what the caller
+                    // needs. A leftover temporary file is harmless, so the failure is only logged.
+                    try remove(tempPath);
+                    catch (Exception e) logWarn("[artifact-local] Failed to remove temporary file '%s': %s", tempPath, e.msg);
                 }
             }
 
@@ -191,7 +196,9 @@ class LocalArtifactStorage : ArtifactStorage
                     }
                 }
             }
-            catch (Exception) {}
+            // Best effort: the artifact is already removed, and an empty directory left behind is
+            // harmless, so the failure is only logged.
+            catch (Exception e) logWarn("[artifact-local] Failed to remove empty directory '%s': %s", parentDir, e.msg);
         }
     }
 

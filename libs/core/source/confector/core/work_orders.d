@@ -196,10 +196,16 @@ ReceivedWorkOrder[] receiveWork(StateStores stores, DispatchQueue queue, string 
     {
         ++handled;
         logError("[work_orders] Poison dispatch message on receipt '%s' of queue '%s' %s: %s", lease.receipt, queueName, reason, lease.message.toString());
+        bool acknowledged = true;
         try queue.ack(queueName, lease.receipt);
-        catch (Exception ackError) logError("[work_orders] Failed to acknowledge the poison message on receipt '%s': %s", lease.receipt, ackError.msg);
-        throw new PoisonMessageException(format("Dispatch message %s on queue '%s' %s; it was acknowledged and dropped",
-            lease.message.toString(), queueName, reason), cause);
+        catch (Exception ackError)
+        {
+            acknowledged = false;
+            logError("[work_orders] Failed to acknowledge the poison message on receipt '%s': %s", lease.receipt, ackError.msg);
+        }
+        const outcome = acknowledged ? "it was acknowledged and dropped" : "it could not be acknowledged, so it will be delivered again";
+        throw new PoisonMessageException(format("Dispatch message %s on queue '%s' %s; %s",
+            lease.message.toString(), queueName, reason, outcome), cause);
     }
 
     try

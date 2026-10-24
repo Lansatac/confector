@@ -7,6 +7,7 @@
 	"dependencies": {
 		"confector:api": {
 			"path": "../../.."
-		}
+		},
+		"vibe-core": "~>2.9"
 	}
 }
