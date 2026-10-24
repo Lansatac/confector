@@ -512,7 +512,7 @@ unittest
     // 11. Edges come only from task_output inputs; other input kinds add none
     TaskNode a; a.id = "A";
     TaskNode b; b.id = "B";
-    b.inputs["src"] = repositoryInput("A", "main"); // repository id coincides with a task id
+    b.inputs["src"] = repositoryInput("A"); // repository id coincides with a task id
     b.inputs["v"] = valueInput("A");
     auto graph = new TaskGraph([a, b]);
     assert(graph.getDependencies("B").length == 0);

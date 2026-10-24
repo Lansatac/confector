@@ -1,22 +1,24 @@
 module confector.core.input_resolution;
 
 /**
- * Pure whole-DAG input resolution (design records: beads confector-z7z.13 and confector-z7z.52;
- * AGENTS.md, "The input model"). Turns every declared external input (repository and value) of
- * every task in a graph into a ResolvedInput, and computes every task's fingerprint from a graph,
- * the pins it is evaluated against and the current rerun generations.
+ * Pure whole-DAG input resolution (design records: beads confector-z7z.13, confector-z7z.52 and
+ * confector-z7z.56; AGENTS.md, "The input model"). Turns every declared external input (repository
+ * and value) of every task in a graph into a ResolvedInput, and computes every task's fingerprint
+ * from a graph, the pins it is evaluated against and the current rerun generations.
  *
- * - `unpinnedRepositoryInputs` lists the distinct repository inputs in the graph that given pins
- *   do not cover.
+ * - `unpinnedRepositoryInputs` lists the repository inputs in the graph that given pins do not
+ *   cover.
  * - `resolveGraphInputs` pins every task's repository and value inputs from given pins.
  * - `graphResolution` computes every task's fingerprint from the graph, its pins and the
  *   current rerun generations; `completeGraphResolution` is the same for callers that hold
  *   every generation.
  *
- * Repository inputs are identified by their declaration (repository id and ref selector), not
- * by the task or input name that declares them, so every task declaring the same repository at
- * the same ref sees one pinned value. Pins are keyed the same way; build keys with
- * `repositoryInput(repositoryId, refSelector)`.
+ * Repository inputs are pinned per task input: pins are keyed by (task id, input name)
+ * (`InputKey`) and record the repository, the ref the request chose and its revision
+ * (`PinnedInput`; confector.core.chain_pins). Only the revision reaches a fingerprint, never the
+ * ref (AGENTS.md, invariant 1), so two inputs at one revision through different refs hash alike.
+ * Which ref an input is built from is the trigger's or request's choice, or the input's default
+ * (bead confector-z7z.53.2); nothing here chooses a ref.
  *
  * Rerun generations (bead confector-z7z.15) are read by the shell in
  * confector.core.rerun_generations.
@@ -32,7 +34,8 @@ import std.algorithm.sorting : sort;
 import std.format : format;
 
 /**
- * A declared input could not be resolved: no pin covers it, or its pin is not a usable value.
+ * A declared input could not be resolved: no pin covers it, its pin is not a usable value, or its
+ * declaration is malformed.
  */
 class InputResolutionException : Exception
 {
@@ -77,83 +80,31 @@ struct GraphResolution
 alias RerunGenerations = ulong[string];
 
 /**
- * Returns the key that identifies a repository input: its declaration reduced to the kind,
- * repository id and ref selector, so fields that do not belong to the repository kind cannot
- * make two declarations of the same repository at the same ref distinct.
- *
- * Throws: InputResolutionException if `decl` is not a repository input.
- */
-InputDecl repositoryInputKey(in InputDecl decl) pure @safe
-{
-    if (decl.kind != InputKind.repository)
-    {
-        throw new InputResolutionException(format("Input of kind '%s' is not a repository input", cast(string) decl.kind));
-    }
-    return repositoryInput(decl.spec.repository, decl.spec.refSelector);
-}
-
-/**
- * Returns the key under which an external input is pinned (on a chain, `BuildChain.pins`, or with
- * a request, `BuildRequest.pins`): its kind plus its kind-specific key, so every task declaring
- * the same input shares one pin. For a repository input it is `repositoryInputKey`: the
- * repository id and ref selector.
- *
- * Only external inputs are pinned this way. A value input is pinned by its own declaration, and
- * a task output input by its upstream task's fingerprint; neither has a pin key. A new kind of
- * external input gets its own case here.
- *
- * Throws: InputResolutionException if `decl` is not an external input, or is a repository input
- * naming no repository or no ref selector.
- */
-InputDecl pinKey(in InputDecl decl) pure @safe
-{
-    final switch (decl.kind)
-    {
-        case InputKind.repository:
-            if (decl.spec.repository.length == 0 || decl.spec.refSelector.length == 0)
-            {
-                throw new InputResolutionException(format(
-                    "A repository input is pinned by repository and ref selector, and repository '%s' at ref '%s' lacks one",
-                    decl.spec.repository, decl.spec.refSelector));
-            }
-            return repositoryInputKey(decl);
-        case InputKind.value:
-        case InputKind.taskOutput:
-            throw new InputResolutionException(format(
-                "Input of kind '%s' is not an external input; only external inputs are pinned", cast(string) decl.kind));
-    }
-}
-
-/**
- * Returns the distinct repository inputs declared anywhere in `graph` that `knownPins` does not
- * already pin, sorted by repository id and then ref selector. The shell resolves each exactly
- * once and passes the results to `resolveGraphInputs`; pre-supplied pins are never resolved
+ * Returns the repository inputs declared anywhere in `graph` that `pins` does not pin, as
+ * (task, input) keys sorted by task and then input name. The shell binds each to a ref and
+ * resolves it (confector.core.chain_pins.pinsForBindings); pre-supplied pins are never resolved
  * live.
  *
- * Throws: InputResolutionException if a key of `knownPins` is not a repository input, or a
- * repository input names no repository or has an empty ref selector (see
- * `requireRepositorySpec`).
+ * Throws: InputResolutionException if a repository input is malformed (see
+ * `requireRepositorySpec`), an entry of `pins` is not stored under its own key, or a pin names
+ * another repository than the input it pins declares (a chain pinned the input when it named
+ * another repository; adding a pin cannot fix that).
  */
-InputDecl[] unpinnedRepositoryInputs(const TaskGraph graph, in InputPin[InputDecl] knownPins) @trusted
+InputKey[] unpinnedRepositoryInputs(const TaskGraph graph, in PinnedInput[InputKey] pins) @trusted
 {
-    const known = normalizePins(knownPins, "pre-supplied");
+    requireKeyed(pins);
 
-    bool[InputDecl] pending;
+    InputKey[] result;
     foreach (taskId; graph.allTaskIds())
     {
         foreach (name, decl; graph.getTask(taskId).inputs)
         {
             if (decl.kind != InputKind.repository) continue;
             requireRepositorySpec(taskId, name, decl);
-            const key = repositoryInputKey(decl);
-            if (key !in known) pending[key] = true;
+            if (pinOf(taskId, name, decl, pins) is null) result ~= InputKey(taskId, name);
         }
     }
-
-    InputDecl[] result = pending.keys;
-    result.sort!((a, b) => a.spec.repository != b.spec.repository
-        ? a.spec.repository < b.spec.repository
-        : a.spec.refSelector < b.spec.refSelector);
+    result.sort!((a, b) => a.taskId != b.taskId ? a.taskId < b.taskId : a.input < b.input);
     return result;
 }
 
@@ -162,27 +113,20 @@ InputDecl[] unpinnedRepositoryInputs(const TaskGraph graph, in InputPin[InputDec
  * by input name:
  *
  * - a value input pins to its value;
- * - a repository input pins to `knownPins[key]` if present, otherwise to
- *   `resolvedPins[key]`, where `key` is `repositoryInputKey` of its declaration. A
- *   pre-supplied pin always takes precedence; a resolver result for the same key is ignored.
- *   Pins for repository inputs the graph does not declare are ignored.
+ * - a repository input pins to the revision of `pins[InputKey(task, input)]`; its ref is not
+ *   part of the resolved input. Pins for inputs the graph does not declare are ignored.
  *
  * Task output inputs are not resolved here: they pin to upstream fingerprints, which depend on
  * rerun generations, so they are pinned only by `graphResolution`.
  * Every task of the graph has an entry. Pure: performs no I/O.
  *
- * Throws: InputResolutionException if a repository input has no pin in either map, if a pin
- * used is undefined or null, if a key of either map is not a repository input, or if a
- * repository input names no repository or has an empty ref selector.
+ * Throws: InputResolutionException if a repository input has no pin or an empty one, its pin
+ * names another repository, an entry of `pins` is not stored under its own key, or a repository
+ * input is malformed.
  */
-ResolvedInput[][string] resolveGraphInputs(
-    const TaskGraph graph,
-    in InputPin[InputDecl] knownPins,
-    in InputPin[InputDecl] resolvedPins
-) @trusted
+ResolvedInput[][string] resolveGraphInputs(const TaskGraph graph, in PinnedInput[InputKey] pins) @trusted
 {
-    const known = normalizePins(knownPins, "pre-supplied");
-    const resolved = normalizePins(resolvedPins, "resolver");
+    requireKeyed(pins);
 
     ResolvedInput[][string] result;
     foreach (taskId; graph.allTaskIds())
@@ -200,29 +144,21 @@ ResolvedInput[][string] resolveGraphInputs(
             }
             if (decl.kind != InputKind.repository) continue;
             requireRepositorySpec(taskId, name, decl);
-            const key = repositoryInputKey(decl);
 
-            string source = "pre-supplied";
-            auto pin = key in known;
-            if (pin is null)
-            {
-                source = "resolver";
-                pin = key in resolved;
-            }
+            auto pin = pinOf(taskId, name, decl, pins);
             if (pin is null)
             {
                 throw new InputResolutionException(format(
-                    "Task '%s' input '%s' (repository '%s' at ref '%s') was neither pinned up front nor resolved",
-                    taskId, name, decl.spec.repository, decl.spec.refSelector), taskId, name);
+                    "Task '%s' input '%s' (repository '%s') is not pinned", taskId, name, decl.spec.repository), taskId, name);
             }
-            if (pin.pinned.type == Json.Type.undefined || pin.pinned.type == Json.Type.null_)
+            if (pin.pin.pinned.type == Json.Type.undefined || pin.pin.pinned.type == Json.Type.null_)
             {
                 throw new InputResolutionException(format(
-                    "Task '%s' input '%s' (repository '%s' at ref '%s') has an empty %s pinned value",
-                    taskId, name, decl.spec.repository, decl.spec.refSelector, source), taskId, name);
+                    "Task '%s' input '%s' (repository '%s' at %s '%s') has an empty pinned value",
+                    taskId, name, decl.spec.repository, cast(string) pin.ref_.kind, pin.ref_.name), taskId, name);
             }
 
-            external ~= ResolvedInput(name, InputKind.repository, pin.pinned.clone, cast(string[string]) pin.info.dup);
+            external ~= ResolvedInput(name, InputKind.repository, pin.pin.pinned.clone, cast(string[string]) pin.pin.info.dup);
         }
         result[taskId] = external;
     }
@@ -231,9 +167,11 @@ ResolvedInput[][string] resolveGraphInputs(
 
 /**
  * Throws InputResolutionException unless repository input `name` of task `taskId` names a
- * repository and a ref selector. There is no default ref: an empty selector is a definition
- * error, never "HEAD", "main" or the repository's default branch, because a guessed ref would
- * silently pin a revision nobody chose.
+ * repository, its visibility filter and default ref spec are well formed, and the default is
+ * `same [else ...]` or a fixed ref: never `event`, since an input's default cannot make events
+ * fire a trigger (only a trigger's own spec does). An input needs no default: the trigger or
+ * request chooses its ref, and a request that cannot is refused when the definition loads (bead
+ * confector-z7z.53.2), never defaulted to "HEAD", "main" or the repository's default branch.
  */
 void requireRepositorySpec(string taskId, string name, in InputDecl decl) pure @safe
 {
@@ -242,22 +180,31 @@ void requireRepositorySpec(string taskId, string name, in InputDecl decl) pure @
         throw new InputResolutionException(format(
             "Task '%s' repository input '%s' names no repository", taskId, name), taskId, name);
     }
-    if (decl.spec.refSelector.length == 0)
+    try requireWellFormed(decl.spec.branches, decl.spec.defaultRef);
+    catch (InvalidRefSpecException e)
+    {
+        throw new InputResolutionException(format("Task '%s' input '%s' (repository '%s'): %s", taskId, name,
+            decl.spec.repository, e.msg), taskId, name);
+    }
+    if (decl.spec.defaultRef.kind == RefSpecKind.event)
     {
         throw new InputResolutionException(format(
-            "Task '%s' input '%s' (repository '%s') has no ref selector; there is no default ref, so the task must name one",
-            taskId, name, decl.spec.repository), taskId, name);
+            "Task '%s' input '%s' (repository '%s') has the default ref spec '%s'; an input's default cannot fire a trigger, so it is same [else <ref>|else skip] or a fixed ref",
+            taskId, name, decl.spec.repository, decl.spec.defaultRef.toString()), taskId, name);
     }
 }
 
 /**
  * Computes every task's resolved inputs, base fingerprint and fingerprint from `graph`, its
- * repository `pins` (keyed like `resolveGraphInputs`'s, by `repositoryInputKey`) and the current
- * rerun `generations` (design records: beads confector-z7z.15 and confector-z7z.52), in
- * topological order: value inputs pin to their values, repository inputs to `pins`, and task
+ * `pins` (keyed by task and input, as `resolveGraphInputs` takes them) and the current rerun
+ * `generations` (design records: beads confector-z7z.15 and confector-z7z.52), in topological
+ * order: value inputs pin to their values, repository inputs to their pins' revisions, and task
  * output inputs to upstream fingerprints. A task's resolved inputs are what its work order
  * carries. Generations are shared, live state, so bumping a task's generation changes its
  * fingerprint and every downstream one wherever the task's base is used.
+ *
+ * A pure function of the project, the graph, the pinned revisions and the generations: the refs
+ * pins were made from are never hashed (AGENTS.md, invariant 1).
  *
  * Bases depend on upstream fingerprints, so generations become known a level at a time. A task
  * whose base has no generation in `generations` is put in `unread` (task id to base): it has
@@ -266,19 +213,17 @@ void requireRepositorySpec(string taskId, string name, in InputDecl decl) pure @
  * shell reads the generations of `unread` and calls again
  * (confector.core.rerun_generations.readGraphResolution). Pure.
  *
- * Throws: InputResolutionException if a repository input of any task in `graph` has no pin or
- * an empty one, names no repository or ref selector, or a key of `pins` is not a repository
- * input (see `resolveGraphInputs`).
+ * Throws: InputResolutionException as `resolveGraphInputs` does.
  */
 GraphResolution graphResolution(
     string projectId,
     const TaskGraph graph,
-    in InputPin[InputDecl] pins,
+    in PinnedInput[InputKey] pins,
     in RerunGenerations generations,
     out string[string] unread
 ) @trusted
 {
-    auto external = resolveGraphInputs(graph, pins, null);
+    auto external = resolveGraphInputs(graph, pins);
 
     GraphResolution result;
     foreach (taskId; graph.topologicalSort())
@@ -324,7 +269,7 @@ GraphResolution graphResolution(
 GraphResolution completeGraphResolution(
     string projectId,
     const TaskGraph graph,
-    in InputPin[InputDecl] pins,
+    in PinnedInput[InputKey] pins,
     in RerunGenerations generations
 ) @trusted
 {
@@ -339,45 +284,54 @@ GraphResolution completeGraphResolution(
     return result;
 }
 
-/// Re-keys `pins` by repositoryInputKey. Throws if a key is not an external input, or if two
-/// keys that normalize alike carry different pins. Incomplete keys are reported where a task
-/// uses them (requireRepositorySpec), naming the task.
-private InputPin[InputDecl] normalizePins(in InputPin[InputDecl] pins, string source) @trusted
+/// Throws unless every entry of `pins` is stored under its own key.
+private void requireKeyed(in PinnedInput[InputKey] pins) @trusted
 {
-    import confector.core.fingerprinter : canonicalPinned;
-
-    InputPin[InputDecl] result;
-    foreach (decl, pin; pins)
+    foreach (key, pin; pins)
     {
-        if (decl.kind != InputKind.repository)
+        if (key != inputKey(pin))
         {
             throw new InputResolutionException(format(
-                "A %s pin is keyed by an input of kind '%s'; only external inputs are pinned",
-                source, cast(string) decl.kind));
+                "A pin of task '%s' input '%s' is stored under task '%s' input '%s'", pin.taskId, pin.input, key.taskId, key.input),
+                key.taskId, key.input);
         }
-        const key = repositoryInputKey(decl);
-        if (auto existing = key in result)
-        {
-            if (existing.pinned.type == Json.Type.undefined || pin.pinned.type == Json.Type.undefined
-                || canonicalPinned(existing.pinned) != canonicalPinned(pin.pinned))
-            {
-                throw new InputResolutionException(format(
-                    "Conflicting %s pins for repository '%s' at ref '%s'", source, key.spec.repository, key.spec.refSelector));
-            }
-            continue;
-        }
-        result[key] = InputPin(pin.pinned.clone, cast(string[string]) pin.info.dup);
     }
-    return result;
+}
+
+/// The pin of repository input `name` of task `taskId`, or null; throws if it names another
+/// repository than `decl` declares.
+private const(PinnedInput)* pinOf(string taskId, string name, in InputDecl decl, in PinnedInput[InputKey] pins) @trusted
+{
+    auto pin = InputKey(taskId, name) in pins;
+    if (pin !is null && pin.repositoryId != decl.spec.repository)
+    {
+        throw new InputResolutionException(format(
+            "Task '%s' input '%s' declares repository '%s', but it is pinned to repository '%s'; a pin never changes, so this needs another chain",
+            taskId, name, decl.spec.repository, pin.repositoryId), taskId, name);
+    }
+    return pin;
 }
 
 version (unittest)
 {
     import std.algorithm.searching : canFind;
 
-    private InputPin pinOf(string sha, string[string] info = null)
+    private enum RepositoryRef mainBranch = RepositoryRef(RefKind.branch, "main");
+
+    /// Pins of the given inputs, all of repository `repository` at `ref_`, revision `sha`.
+    private PinnedInput[InputKey] pinsAt(string repository, RepositoryRef ref_, string sha, InputKey[] keys...)
     {
-        return InputPin(Json(sha), info);
+        PinnedInput[InputKey] pins;
+        foreach (key; keys) pins[key] = PinnedInput(key.taskId, key.input, repository, ref_, InputPin(Json(sha)));
+        return pins;
+    }
+
+    /// `into` with `more` added.
+    private PinnedInput[InputKey] plus(PinnedInput[InputKey] into, in PinnedInput[InputKey] more)
+    {
+        auto result = into.dup;
+        foreach (key, pin; more) result[key] = cast(PinnedInput) pin;
+        return result;
     }
 
     private const(ResolvedInput) inputNamed(in GraphResolution r, string taskId, string name)
@@ -391,7 +345,7 @@ version (unittest)
 
     /// `graphResolution` with every base `generations` lacks read at generation 0, the way the
     /// shell reads them a level at a time.
-    private GraphResolution atGenerations(string projectId, const TaskGraph graph, in InputPin[InputDecl] pins,
+    private GraphResolution atGenerations(string projectId, const TaskGraph graph, in PinnedInput[InputKey] pins,
         RerunGenerations generations = null)
     {
         for (;;)
@@ -403,25 +357,23 @@ version (unittest)
         }
     }
 
-    /// The pins a shell evaluates against: `resolved`, overridden by the pre-supplied `known`.
-    private InputPin[InputDecl] merged(in InputPin[InputDecl] known, in InputPin[InputDecl] resolved)
+    /// Evaluates `graph` in project "p" over `pins`, with no task ever rerun.
+    private GraphResolution evaluate(const TaskGraph graph, in PinnedInput[InputKey] pins)
     {
-        InputPin[InputDecl] pins;
-        foreach (decl, pin; resolved) pins[decl] = InputPin(pin.pinned.clone, cast(string[string]) pin.info.dup);
-        foreach (decl, pin; known) pins[decl] = InputPin(pin.pinned.clone, cast(string[string]) pin.info.dup);
-        return pins;
-    }
-
-    /// Evaluates `graph` in project "p" over `known` and `resolved` pins, with no task ever rerun.
-    private GraphResolution evaluate(const TaskGraph graph, in InputPin[InputDecl] known, in InputPin[InputDecl] resolved)
-    {
-        return atGenerations("p", graph, merged(known, resolved));
+        return atGenerations("p", graph, pins);
     }
 
     /// The fingerprint of a task never rerun.
     private string firstFingerprint(string projectId, string taskId, in ResolvedInput[] inputs)
     {
         return computeFingerprint(computeBaseFingerprint(projectId, taskId, inputs), 0);
+    }
+
+    private bool throwsA(E)(scope void delegate() action)
+    {
+        try action();
+        catch (E) return true;
+        return false;
     }
 }
 
@@ -430,23 +382,24 @@ unittest
     // The whole DAG is resolved, including tasks that are not targets of anything, and
     // task_output inputs pin to upstream fingerprints in topological order.
     TaskNode compile; compile.id = "compile";
-    compile.inputs["src"] = repositoryInput("game", "main");
+    compile.inputs["src"] = repositoryInput("game");
     compile.inputs["flavor"] = valueInput("internal");
     TaskNode test; test.id = "test";
     test.inputs["bin"] = taskOutputInput("compile", "binaries");
-    test.inputs["src"] = repositoryInput("game", "main");
+    test.inputs["src"] = repositoryInput("game");
     TaskNode package_; package_.id = "package";
     package_.inputs["bin"] = taskOutputInput("compile", "binaries");
     package_.inputs["report"] = taskOutputInput("test");
     TaskNode lint; lint.id = "lint"; // no inputs at all
 
     auto graph = new TaskGraph([package_, lint, test, compile]);
-    InputPin[InputDecl] none;
-    auto pending = unpinnedRepositoryInputs(graph, none);
-    assert(pending == [repositoryInput("game", "main")]);
+    PinnedInput[InputKey] none;
+    assert(unpinnedRepositoryInputs(graph, none) == [InputKey("compile", "src"), InputKey("test", "src")],
+        "Each repository input is listed per task input, in a deterministic order");
 
-    InputPin[InputDecl] resolved = [repositoryInput("game", "main"): pinOf("aaa111")];
-    auto r = evaluate(graph, none, resolved);
+    auto pins = pinsAt("game", mainBranch, "aaa111", InputKey("compile", "src"), InputKey("test", "src"));
+    assert(unpinnedRepositoryInputs(graph, pins).length == 0);
+    auto r = evaluate(graph, pins);
 
     assert(r.inputs.length == 4 && r.fingerprints.length == 4, "Every task must be resolved and fingerprinted");
     assert(r.inputs["lint"].length == 0);
@@ -463,136 +416,125 @@ unittest
     // Each task's inputs are sorted by name
     assert(r.inputs["compile"][0].name == "flavor" && r.inputs["compile"][1].name == "src");
 
-    // Build configuration is not an input: changing steps leaves every fingerprint unchanged
+    // Build configuration is not an input: changing steps, the filter or the default ref spec
+    // leaves every fingerprint unchanged
     TaskNode compileSteps = compile;
     compileSteps.steps = [BuildStep("Build", "bash", Json(["script": Json("dub build --build=release")]))];
-    assert(evaluate(new TaskGraph([package_, lint, test, compileSteps]), none, resolved).fingerprints
-        == r.fingerprints);
+    compileSteps.inputs["src"] = repositoryInput("game", RefSpec.fromString("same else main"), BranchFilter.fromString("+:release/*"));
+    assert(evaluate(new TaskGraph([package_, lint, test, compileSteps]), pins).fingerprints == r.fingerprints);
 
     // A new revision changes the repository's tasks and everything downstream, but not lint
-    InputPin[InputDecl] newer = [repositoryInput("game", "main"): pinOf("bbb222")];
-    auto r2 = evaluate(graph, none, newer);
+    auto newer = pinsAt("game", mainBranch, "bbb222", InputKey("compile", "src"), InputKey("test", "src"));
+    auto r2 = evaluate(graph, newer);
     foreach (id; ["compile", "test", "package"]) assert(r2.fingerprints[id] != r.fingerprints[id]);
     assert(r2.fingerprints["lint"] == r.fingerprints["lint"]);
 }
 
 unittest
 {
-    // A shared repository input resolves once, and all tasks agree on its pinned value,
-    // whatever name each task gives the input. A different ref is a distinct input.
-    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game", "main");
-    TaskNode b; b.id = "b"; b.inputs["code"] = repositoryInput("game", "main");
-    b.inputs["engine"] = repositoryInput("engine", "stable");
-    TaskNode c; c.id = "c"; c.inputs["src"] = repositoryInput("game", "release");
-    c.inputs["engine"] = repositoryInput("engine", "stable");
+    // Invariant 1: only the revision is hashed, never the ref. Two pins at one revision through
+    // different refs give the same fingerprints; another revision changes them
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
+    TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
+    auto graph = new TaskGraph([compile, test]);
+    const key = InputKey("compile", "src");
+
+    auto onMain = evaluate(graph, pinsAt("game", mainBranch, "aaa111", key));
+    auto onFeature = evaluate(graph, pinsAt("game", RepositoryRef(RefKind.branch, "feature/x"), "aaa111", key));
+    auto onTag = evaluate(graph, pinsAt("game", RepositoryRef(RefKind.tag, "v1.0"), "aaa111", key));
+    auto onPull = evaluate(graph, pinsAt("game", RepositoryRef(RefKind.changeRequest, "pull/12"), "aaa111", key));
+    auto direct = evaluate(graph, pinsAt("game", RepositoryRef(RefKind.revision, "aaa111"), "aaa111", key));
+    foreach (other; [onFeature, onTag, onPull, direct])
+    {
+        assert(other.fingerprints == onMain.fingerprints && other.bases == onMain.bases, "The ref is never hashed");
+        assert(other.inputs == onMain.inputs);
+    }
+    auto moved = evaluate(graph, pinsAt("game", mainBranch, "bbb222", key));
+    assert(moved.fingerprints["compile"] != onMain.fingerprints["compile"] && moved.fingerprints["test"] != onMain.fingerprints["test"]);
+
+    // Display info is carried into the resolved input but never hashed
+    auto withInfo = pinsAt("game", mainBranch, "aaa111", key);
+    withInfo[key].pin.info = ["subject": "Fix the build"];
+    auto informed = evaluate(graph, withInfo);
+    assert(inputNamed(informed, "compile", "src").info.length == 1 && inputNamed(informed, "compile", "src").info["subject"] == "Fix the build");
+    assert(informed.fingerprints == onMain.fingerprints);
+}
+
+unittest
+{
+    // One repository at two refs in one closure: each input gets its own pin, and inputs bound
+    // to one ref share its revision whatever each task names its input
+    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game");
+    TaskNode b; b.id = "b"; b.inputs["code"] = repositoryInput("game");
+    b.inputs["engine"] = repositoryInput("engine");
+    TaskNode c; c.id = "c"; c.inputs["src"] = repositoryInput("game");
+    c.inputs["stable"] = repositoryInput("game");
     auto graph = new TaskGraph([a, b, c]);
 
-    InputPin[InputDecl] none;
-    auto pending = unpinnedRepositoryInputs(graph, none);
-    assert(pending == [
-        repositoryInput("engine", "stable"),
-        repositoryInput("game", "main"),
-        repositoryInput("game", "release"),
-    ], "Each distinct repository input must be listed once, in a deterministic order");
-
-    InputPin[InputDecl] resolved = [
-        repositoryInput("engine", "stable"): pinOf("eee555"),
-        repositoryInput("game", "main"): pinOf("aaa111"),
-        repositoryInput("game", "release"): pinOf("ccc333"),
-    ];
-    auto r = evaluate(graph, none, resolved);
+    auto pins = plus(plus(pinsAt("game", mainBranch, "aaa111", InputKey("a", "src"), InputKey("b", "code"), InputKey("c", "src")),
+        pinsAt("game", RepositoryRef(RefKind.branch, "release"), "ccc333", InputKey("c", "stable"))),
+        pinsAt("engine", RepositoryRef(RefKind.branch, "stable"), "eee555", InputKey("b", "engine")));
+    auto r = evaluate(graph, pins);
     assert(inputNamed(r, "a", "src").pinned == Json("aaa111"));
     assert(inputNamed(r, "b", "code").pinned == Json("aaa111"));
     assert(inputNamed(r, "b", "engine").pinned == Json("eee555"));
-    assert(inputNamed(r, "c", "engine").pinned == Json("eee555"));
-    assert(inputNamed(r, "c", "src").pinned == Json("ccc333"));
+    assert(inputNamed(r, "c", "src").pinned == Json("aaa111"));
+    assert(inputNamed(r, "c", "stable").pinned == Json("ccc333"));
+
+    // Pins for inputs the graph does not declare are ignored
+    auto extra = plus(pins, pinsAt("tools", mainBranch, "ttt999", InputKey("gone", "src"), InputKey("a", "unused")));
+    assert(evaluate(graph, extra).fingerprints == r.fingerprints);
 }
 
 unittest
 {
-    // Pre-supplied pins take precedence over live resolution, and are not listed for resolving
-    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game", "main");
-    a.inputs["engine"] = repositoryInput("engine", "stable");
+    // Pinned values are opaque, so a provider may pin to an object
+    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("depot");
     auto graph = new TaskGraph([a]);
-
-    InputPin[InputDecl] known = [repositoryInput("game", "main"): pinOf("from-trigger")];
-    assert(unpinnedRepositoryInputs(graph, known) == [repositoryInput("engine", "stable")]);
-
-    InputPin[InputDecl] resolved = [
-        repositoryInput("game", "main"): pinOf("from-resolver"),
-        repositoryInput("engine", "stable"): pinOf("eee555"),
-    ];
-    auto r = evaluate(graph, known, resolved);
-    assert(inputNamed(r, "a", "src").pinned == Json("from-trigger"));
-    assert(inputNamed(r, "a", "engine").pinned == Json("eee555"));
-
-    // Everything pinned up front needs no resolution at all
-    known[repositoryInput("engine", "stable")] = pinOf("eee000");
-    assert(unpinnedRepositoryInputs(graph, known).length == 0);
-    InputPin[InputDecl] none;
-    auto r2 = evaluate(graph, known, none);
-    assert(inputNamed(r2, "a", "engine").pinned == Json("eee000"));
-
-    // Pins for repositories the graph does not use are ignored
-    known[repositoryInput("tools", "main")] = pinOf("ttt999");
-    assert(evaluate(graph, known, none).fingerprints == r2.fingerprints);
-}
-
-unittest
-{
-    // Display info is carried into the resolved input but never hashed; pinned values are
-    // opaque, so a provider may pin to an object
-    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("depot", "//game/main");
-    auto graph = new TaskGraph([a]);
-    InputPin[InputDecl] none;
-
     Json changelist = Json.emptyObject;
     changelist["server"] = "perforce:1666";
     changelist["change"] = 4242;
-    InputPin[InputDecl] plain = [repositoryInput("depot", "//game/main"): InputPin(changelist)];
-    InputPin[InputDecl] withInfo = [repositoryInput("depot", "//game/main"):
-        InputPin(changelist, ["description": "Fix the build"])];
-
-    auto r1 = evaluate(graph, none, plain);
-    auto r2 = evaluate(graph, none, withInfo);
-    assert(inputNamed(r2, "a", "src").info.length == 1 && inputNamed(r2, "a", "src").info["description"] == "Fix the build");
-    assert(inputNamed(r2, "a", "src").pinned == changelist);
-    assert(r1.fingerprints == r2.fingerprints);
+    PinnedInput[InputKey] pins = [InputKey("a", "src"):
+        PinnedInput("a", "src", "depot", RepositoryRef(RefKind.branch, "//game/main"), InputPin(changelist))];
+    assert(inputNamed(evaluate(graph, pins), "a", "src").pinned == changelist);
 }
 
 unittest
 {
-    // An unresolvable repository input fails loudly, naming the task and input
+    // An unpinned repository input fails loudly, naming the task and input
     TaskNode a; a.id = "a"; a.inputs["v"] = valueInput("x");
-    TaskNode b; b.id = "b"; b.inputs["src"] = repositoryInput("game", "main");
+    TaskNode b; b.id = "b"; b.inputs["src"] = repositoryInput("game");
     b.inputs["a"] = taskOutputInput("a");
-    auto graph = new TaskGraph([a, b]);
-    InputPin[InputDecl] none;
+    TaskNode c; c.id = "c"; c.inputs["src"] = repositoryInput("game");
+    auto graph = new TaskGraph([a, b, c]);
+    PinnedInput[InputKey] none;
 
     try
     {
-        evaluate(graph, none, none);
+        evaluate(graph, none);
         assert(false, "expected InputResolutionException");
     }
     catch (InputResolutionException ex)
     {
-        assert(ex.taskId == "b" && ex.inputName == "src");
-        assert(ex.msg.canFind("'game'") && ex.msg.canFind("'main'"));
+        assert((ex.taskId == "b" || ex.taskId == "c") && ex.inputName == "src");
+        assert(ex.msg.canFind("'game'"));
     }
 
-    // A pin for the same repository at another ref does not cover it
-    InputPin[InputDecl] otherRef = [repositoryInput("game", "release"): pinOf("ccc333")];
+    // Another task's pin of the same repository does not cover an input: pins are per input
+    auto onlyC = pinsAt("game", mainBranch, "aaa111", InputKey("c", "src"));
+    assert(unpinnedRepositoryInputs(graph, onlyC) == [InputKey("b", "src")]);
     bool threw = false;
-    try evaluate(graph, otherRef, none);
-    catch (InputResolutionException) threw = true;
+    try evaluate(graph, onlyC);
+    catch (InputResolutionException ex) threw = ex.taskId == "b" && ex.inputName == "src";
     assert(threw);
 
     // An undefined or null pin is not a value
     foreach (bad; [Json.undefined, Json(null)])
     {
-        InputPin[InputDecl] badPins = [repositoryInput("game", "main"): InputPin(bad)];
+        auto badPins = pinsAt("game", mainBranch, "aaa111", InputKey("b", "src"), InputKey("c", "src"));
+        badPins[InputKey("b", "src")].pin.pinned = bad;
         threw = false;
-        try evaluate(graph, none, badPins);
+        try evaluate(graph, badPins);
         catch (InputResolutionException ex) threw = ex.taskId == "b" && ex.inputName == "src";
         assert(threw, "An empty pinned value must throw");
     }
@@ -600,52 +542,54 @@ unittest
 
 unittest
 {
-    // Pins must be keyed by repository inputs; anything else is a caller error
-    TaskNode a; a.id = "a"; a.inputs["v"] = valueInput("x");
+    // A pin of another repository than the input declares is refused, not used and not listed
+    // as missing: pins never change, so it needs another chain
+    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game");
     auto graph = new TaskGraph([a]);
-    InputPin[InputDecl] none;
-    InputPin[InputDecl] valuePin = [valueInput("x"): pinOf("y")];
+    auto fork = pinsAt("game-fork", mainBranch, "aaa111", InputKey("a", "src"));
+    foreach (attempt; [{ unpinnedRepositoryInputs(graph, fork); }, { evaluate(graph, fork); }])
+    {
+        bool threw = false;
+        try attempt();
+        catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src" && ex.msg.canFind("'game-fork'");
+        assert(threw);
+    }
 
-    bool threw = false;
-    try evaluate(graph, valuePin, none);
-    catch (InputResolutionException) threw = true;
-    assert(threw, "A pre-supplied pin keyed by a value input must throw");
-
-    threw = false;
-    try unpinnedRepositoryInputs(graph, valuePin);
-    catch (InputResolutionException) threw = true;
-    assert(threw);
-
-    // Keys that differ only in fields outside the repository kind are the same input
-    InputDecl noisy = repositoryInput("game", "main");
-    noisy.spec.value = "stray";
-    TaskNode b; b.id = "b"; b.inputs["src"] = noisy;
-    auto g2 = new TaskGraph([b]);
-    InputPin[InputDecl] known = [repositoryInput("game", "main"): pinOf("aaa111")];
-    assert(unpinnedRepositoryInputs(g2, known).length == 0);
-    assert(inputNamed(evaluate(g2, known, none), "b", "src").pinned == Json("aaa111"));
+    // A pin stored under another key than its own is a caller's mistake
+    PinnedInput[InputKey] misfiled = [InputKey("a", "src"): PinnedInput("b", "src", "game", mainBranch, InputPin(Json("aaa111")))];
+    assert(throwsA!InputResolutionException({ unpinnedRepositoryInputs(graph, misfiled); }));
+    assert(throwsA!InputResolutionException({ evaluate(graph, misfiled); }));
 }
 
 unittest
 {
-    // A repository input must name a repository and a ref selector; there is no default ref,
-    // and a pre-supplied pin does not excuse an empty selector
-    foreach (bad; [repositoryInput("game", ""), repositoryInput("", "main")])
+    // A repository input must name a repository; it needs no default ref spec, but a malformed
+    // filter or default is refused, naming the task and input
+    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("");
+    auto graph = new TaskGraph([a]);
+    PinnedInput[InputKey] pins = [InputKey("a", "src"): PinnedInput("a", "src", "", mainBranch, InputPin(Json("aaa111")))];
+    bool threw = false;
+    try unpinnedRepositoryInputs(graph, null);
+    catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
+    assert(threw, "An input without a repository must not be listed for resolving");
+    threw = false;
+    try evaluate(graph, pins);
+    catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
+    assert(threw, "An input without a repository must not resolve, even when pinned");
+
+    requireRepositorySpec("a", "src", repositoryInput("game"));
+    requireRepositorySpec("a", "src", repositoryInput("game", RefSpec.fromString("same else main"), BranchFilter.fromString("+:*")));
+    requireRepositorySpec("a", "src", repositoryInput("game", RefSpec.fromString("same else skip")));
+    requireRepositorySpec("a", "src", repositoryInput("game", RefSpec.fromString("main")));
+    foreach (malformed; [repositoryInput("game", RefSpec.fromString("event +:* else main")), repositoryInput("game", RefSpec.fromString("event +:*")),
+        repositoryInput("game", RefSpec(RefSpecKind.fixed)), repositoryInput("game", RefSpec(RefSpecKind.same, BranchFilter.init, "x")),
+        repositoryInput("game", RefSpec.init, BranchFilter([BranchRule(false, "x")])),
+        repositoryInput("game", RefSpec.init, BranchFilter([BranchRule(true, "two words")]))])
     {
-        TaskNode a; a.id = "a"; a.inputs["src"] = bad;
-        auto graph = new TaskGraph([a]);
-        InputPin[InputDecl] none;
-        InputPin[InputDecl] pinned = [bad: pinOf("aaa111")];
-
-        bool threw = false;
-        try unpinnedRepositoryInputs(graph, none);
-        catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
-        assert(threw, "An incomplete repository input must not be listed for resolving");
-
         threw = false;
-        try evaluate(graph, pinned, none);
-        catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
-        assert(threw, "An incomplete repository input must not resolve, even when pinned");
+        try requireRepositorySpec("a", "src", malformed);
+        catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src" && ex.msg.canFind("'game'");
+        assert(threw);
     }
 }
 
@@ -654,7 +598,7 @@ unittest
     // graphResolution pins repository and value inputs as resolveGraphInputs does, and task
     // outputs to upstream fingerprints; the project is part of every fingerprint
     TaskNode compile; compile.id = "compile";
-    compile.inputs["src"] = repositoryInput("game", "main");
+    compile.inputs["src"] = repositoryInput("game");
     compile.inputs["flavor"] = valueInput("internal");
     compile.steps = [BuildStep("Build", "bash", Json(["script": Json("dub build")]))];
     TaskNode test; test.id = "test";
@@ -662,9 +606,9 @@ unittest
     TaskNode lint; lint.id = "lint";
     auto graph = new TaskGraph([test, lint, compile]);
 
-    InputPin[InputDecl] none;
-    InputPin[InputDecl] pins = [repositoryInput("game", "main"): pinOf("aaa111", ["ref": "refs/heads/main"])];
-    auto external = resolveGraphInputs(graph, none, pins);
+    auto pins = pinsAt("game", mainBranch, "aaa111", InputKey("compile", "src"));
+    pins[InputKey("compile", "src")].pin.info = ["ref": "refs/heads/main"];
+    auto external = resolveGraphInputs(graph, pins);
     assert(external.length == 3 && external["test"].length == 0, "Task outputs are not resolved before evaluation");
 
     auto resolution = atGenerations("p", graph, pins);
@@ -685,35 +629,31 @@ unittest
 {
     // Every repository input of the graph must be pinned: graphResolution fails loudly, naming the
     // task and input, rather than fingerprinting a task without its revision
-    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game", "main");
+    TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game");
     a.inputs["v"] = valueInput("x");
     TaskNode b; b.id = "b"; b.inputs["a"] = taskOutputInput("a");
-    TaskNode tools; tools.id = "tools"; tools.inputs["src"] = repositoryInput("tools", "main");
+    TaskNode tools; tools.id = "tools"; tools.inputs["src"] = repositoryInput("tools");
     auto graph = new TaskGraph([a, b, tools]);
     RerunGenerations generations;
 
-    InputPin[InputDecl] partial = [repositoryInput("game", "main"): pinOf("aaa111")];
+    auto partial = pinsAt("game", mainBranch, "aaa111", InputKey("a", "src"));
     bool threw = false;
     string[string] unread;
     try graphResolution("p", graph, partial, generations, unread);
     catch (InputResolutionException ex) threw = ex.taskId == "tools" && ex.inputName == "src" && ex.msg.canFind("'tools'");
     assert(threw, "An unpinned repository input must throw");
 
-    // A pin for another ref, or an empty pin, does not cover it either
-    InputPin[InputDecl] otherRef = [repositoryInput("game", "main"): pinOf("aaa111"), repositoryInput("tools", "release"): pinOf("ttt111")];
-    threw = false;
-    try atGenerations("p", graph, otherRef);
-    catch (InputResolutionException ex) threw = ex.taskId == "tools";
-    assert(threw);
-    InputPin[InputDecl] empty = [repositoryInput("game", "main"): pinOf("aaa111"), repositoryInput("tools", "main"): InputPin(Json(null))];
+    // An empty pin does not cover it either
+    auto empty = plus(partial, pinsAt("tools", mainBranch, "ttt111", InputKey("tools", "src")));
+    empty[InputKey("tools", "src")].pin.pinned = Json(null);
     threw = false;
     try atGenerations("p", graph, empty);
     catch (InputResolutionException ex) threw = ex.taskId == "tools" && ex.inputName == "src";
     assert(threw);
 
     // Fully pinned, a new revision changes the repository's tasks and everything downstream only
-    InputPin[InputDecl] atA = [repositoryInput("game", "main"): pinOf("aaa111"), repositoryInput("tools", "main"): pinOf("ttt111")];
-    InputPin[InputDecl] atB = [repositoryInput("game", "main"): pinOf("bbb222"), repositoryInput("tools", "main"): pinOf("ttt111")];
+    auto atA = plus(pinsAt("game", mainBranch, "aaa111", InputKey("a", "src")), pinsAt("tools", mainBranch, "ttt111", InputKey("tools", "src")));
+    auto atB = plus(pinsAt("game", mainBranch, "bbb222", InputKey("a", "src")), pinsAt("tools", mainBranch, "ttt111", InputKey("tools", "src")));
     auto first = atGenerations("p", graph, atA);
     auto second = atGenerations("p", graph, atB);
     assert(second.fingerprints["a"] != first.fingerprints["a"] && second.fingerprints["b"] != first.fingerprints["b"]);
@@ -725,13 +665,13 @@ unittest
     // Rerun generations: bases become known a level at a time, and a generation that has not
     // been read leaves its task and everything downstream without a fingerprint, never at
     // generation 0
-    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game", "main");
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
     TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
-    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game", "main");
+    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game");
     TaskNode release; release.id = "release"; release.inputs["tested"] = taskOutputInput("test");
     release.inputs["linted"] = taskOutputInput("lint");
     auto graph = new TaskGraph([compile, test, lint, release]);
-    InputPin[InputDecl] pins = [repositoryInput("game", "main"): pinOf("aaa111")];
+    auto pins = pinsAt("game", mainBranch, "aaa111", InputKey("compile", "src"), InputKey("lint", "src"));
 
     RerunGenerations generations;
     string[string] unread;
@@ -777,31 +717,34 @@ unittest
 {
     // Bumping a task's generation changes its fingerprint and every downstream fingerprint,
     // wherever the task's base is used, and nothing else
-    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game", "main");
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
     TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
     TaskNode report; report.id = "report"; report.inputs["results"] = taskOutputInput("test");
-    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game", "main");
-    TaskNode docs; docs.id = "docs"; docs.inputs["src"] = repositoryInput("game", "main");
+    TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game");
+    TaskNode docs; docs.id = "docs"; docs.inputs["src"] = repositoryInput("game");
     TaskNode publish; publish.id = "publish"; publish.inputs["bin"] = taskOutputInput("compile");
     publish.inputs["docs"] = taskOutputInput("docs");
-    InputPin[InputDecl] atA = [repositoryInput("game", "main"): pinOf("aaa111")];
-    InputPin[InputDecl] atB = [repositoryInput("game", "main"): pinOf("bbb222")];
+    auto keys = [InputKey("compile", "src"), InputKey("lint", "src"), InputKey("docs", "src")];
+    auto atA = pinsAt("game", mainBranch, "aaa111", keys);
+    auto atB = pinsAt("game", mainBranch, "bbb222", keys);
+    // Another branch at revision aaa111 shares every base with branch main at aaa111
+    auto featureAtA = pinsAt("game", RepositoryRef(RefKind.branch, "feature/x"), "aaa111", keys);
 
-    // Two graphs over the same pins (two definitions, or two branches at one revision) share
-    // compile's base even with different task sets; other pins do not
+    // Two graphs over the same revisions (two definitions, or two branches at one revision) share
+    // compile's base even with different task sets; other revisions do not
     auto graphOne = new TaskGraph([compile, test, report, lint]);
     auto graphTwo = new TaskGraph([compile, docs, publish]);
     auto graphOther = new TaskGraph([compile, test]);
 
     auto one = atGenerations("p", graphOne, atA);
-    auto two = atGenerations("p", graphTwo, atA);
+    auto two = atGenerations("p", graphTwo, featureAtA);
     auto other = atGenerations("p", graphOther, atB);
     assert(one.bases["compile"] == two.bases["compile"] && one.fingerprints["compile"] == two.fingerprints["compile"]);
     assert(other.bases["compile"] != one.bases["compile"]);
 
     RerunGenerations rerun = [one.bases["compile"]: 1];
     auto oneAfter = atGenerations("p", graphOne, atA, rerun.dup);
-    auto twoAfter = atGenerations("p", graphTwo, atA, rerun.dup);
+    auto twoAfter = atGenerations("p", graphTwo, featureAtA, rerun.dup);
     auto otherAfter = atGenerations("p", graphOther, atB, rerun.dup);
 
     // The rerun task keeps its base and gets a new fingerprint; downstream tasks get new bases
@@ -831,26 +774,16 @@ unittest
 
 unittest
 {
-    // Only external inputs have a pin key; a repository input's is its repository and ref
-    // selector, whatever stray fields its declaration carries
-    InputDecl noisy = repositoryInput("game", "main");
-    noisy.spec.value = "stray";
-    noisy.spec.task = "stray";
-    assert(pinKey(noisy) == repositoryInput("game", "main"));
-    assert(pinKey(repositoryInput("game", "release")) != pinKey(repositoryInput("game", "main")));
-
-    foreach (notExternal; [valueInput("x"), taskOutputInput("compile")])
-    {
-        bool threw = false;
-        try pinKey(notExternal);
-        catch (InputResolutionException ex) threw = ex.msg.canFind("not an external input");
-        assert(threw, "Value and task output inputs are not pinned on a chain");
-    }
-    foreach (incomplete; [repositoryInput("game", ""), repositoryInput("", "main")])
-    {
-        bool threw = false;
-        try pinKey(incomplete);
-        catch (InputResolutionException) threw = true;
-        assert(threw, "An incomplete repository input has no pin key");
-    }
+    // Fingerprints of existing fixtures are unchanged by the per-input pin model: a task's
+    // fingerprint is computed exactly as before from its project, id and pinned inputs. The
+    // golden values were computed independently of this code from the fingerprint encoding
+    // (length-prefixed fields: project, task, then each input's name and canonical pinned value;
+    // then base and generation).
+    TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
+    compile.inputs["flavor"] = valueInput("internal");
+    auto r = evaluate(new TaskGraph([compile]), pinsAt("game", mainBranch, "aaa111", InputKey("compile", "src")));
+    assert(r.fingerprints["compile"] == firstFingerprint("p", "compile",
+        [ResolvedInput("flavor", InputKind.value, Json("internal")), ResolvedInput("src", InputKind.repository, Json("aaa111"))]));
+    assert(r.bases["compile"] == "68b033733fe1db7d9d632012f71a89b89269d8900822228daa5550205e3d6874");
+    assert(r.fingerprints["compile"] == "5bae3031d22368d1487a300a508b19ac5ae543a90039b05bac1269ffc836ba75");
 }

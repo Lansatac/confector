@@ -191,9 +191,10 @@ Decided October 2026 (design record: bead `confector-z7z.13`).
   project. An input may carry a *branch filter* (which refs the task may be built from) and a
   *default ref spec*, but it does not choose the ref: the trigger or request does (see
   "Branches"), and the default applies only when they say nothing.
-- **Declared, then resolved, then hashed.** Resolution is its own step: it turns every declared
-  input in the whole DAG into a pinned value (branch to commit, and so on) once, when a build
-  chain is created, so every task in the chain sees the same revisions. Pinned values can come
+- **Declared, then resolved, then hashed.** Resolution is its own step: it turns the repository
+  inputs a request needs into pinned values (ref to revision), each distinct repository and ref
+  once, and records them per task input on the chain, so every task in the chain sees the same
+  revisions. A pin the chain lacks is resolved when first needed and then kept. Pinned values can come
   from querying the repository, from the trigger payload, or from an existing chain. Fingerprints
   are computed only from resolved values.
 - **Each provider defines its own pinned value.** The core treats it as opaque. For git it is the
@@ -362,15 +363,18 @@ Decided October 2026 (design record: bead `confector-z7z.19`).
 - **A branch spec chooses which branches are tracked** — include/exclude patterns such as
   `+:*` and `-:experimental/*`. It is set on the repository and can be overridden per project.
 - **The trigger or request chooses the ref of every repository.** A trigger targets a task and
-  gives a *ref spec* per repository in that task's closure (optionally per input, so one closure
-  can use a repository at two refs): an event pattern (`A1: *`), which makes pushes to that
-  repository fire the trigger; *same name* as the event's branch; or a fixed ref (`B1: main`).
-  Each non-fixed spec can add `else <ref>` or `else skip` for when the name does not exist.
+  gives a *ref spec* for each repository in that task's closure (optionally per input, so one
+  closure can use a repository at two refs). A spec is one of: an *event* spec, a branch
+  pattern such as "any branch of repository A1", which makes pushes to that repository fire the
+  trigger; *same name* as the event's branch; or a fixed ref such as B1's `main`. A non-fixed
+  spec can name a fallback ref, or say to skip the build, for when the name does not exist.
   One event makes one request: other repositories are paired by name, never as a cross product.
   A manual request asks for a ref per repository, prefilled from the defaults; cron and manual
-  requests have no event, so their specs are concrete.
+  requests have no event, so their specs are concrete. (The notation is an implementation
+  choice, bead `confector-z7z.37.1`; examples here are illustrative.)
 - **Inputs supply defaults, not choices.** What a trigger or request does not specify comes from
-  the input's own default ref spec; with neither, loading the definition fails.
+  the input's own default ref spec (a fixed ref or *same name*, never an event spec, because a
+  default cannot fire a trigger); with neither, loading the definition fails.
 - **Builds carry a headline ref.** A chain records one ref (the event's, or the manual request's
   choice for the primary repository) that groups its history; a project with no repositories has
   one history. A request joins a chain by pin agreement, not by headline, so triggers on
@@ -660,7 +664,7 @@ Be aware of these so you do not spread them:
   designs (beads `confector-z7z.49.x`, `confector-z7z.53.x`). The fingerprint ledger exists
   (`confector.core.fingerprint_ledger`, bead `confector-z7z.49.1`), but nothing dispatches through
   it or folds into it yet (beads `confector-z7z.49.3`, `confector-z7z.49.4`). Do not add a build path outside the
-  chain components. Chains are pins-only (`BuildChain.branch` and grow-only `pins`;
+  chain components. Chains are pins-only (`BuildChain.headline` and grow-only per-input `pins`;
   `confector.core.chain_pins`) and requests reference stored definitions
   (`confector.core.definition_store`; bead `confector-z7z.53.4`); nothing writes them yet (bead
   `confector-z7z.53.2`). The build log routes answer 501 until the log store lands (bead

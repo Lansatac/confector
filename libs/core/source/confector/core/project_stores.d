@@ -196,6 +196,11 @@ final class TrackedBranchStore
         {
             throw new InvalidStateTransitionException("A tracked branch needs a repository id and a ref name");
         }
+        if (branch.kind == RefKind.revision)
+        {
+            throw new InvalidStateTransitionException(format("Tracked branch '%s' '%s' is a revision; only branches, tags and change requests are tracked",
+                branch.repositoryId, branch.refName));
+        }
         if (branch.head.pinned.type == Json.Type.undefined || branch.head.pinned.type == Json.Type.null_)
         {
             throw new InvalidStateTransitionException(format("Tracked branch '%s' %s '%s' needs a head",
@@ -240,7 +245,7 @@ unittest
     project.name = "Game";
     TaskNode compile;
     compile.id = "compile";
-    compile.inputs["src"] = repositoryInput("game", "main");
+    compile.inputs["src"] = repositoryInput("game");
     project.tasks = [compile];
     assert(projects.put(project).version_ == 1);
 
@@ -331,5 +336,9 @@ unittest
     headless.refName = "dev";
     headless.head = InputPin.init;
     assert(throwsA!InvalidStateTransitionException({ branches.create(headless); }));
+    auto revision = main;
+    revision.kind = RefKind.revision;
+    revision.refName = "aaa111";
+    assert(throwsA!InvalidStateTransitionException({ branches.create(revision); }), "A revision is not a tracked branch");
     assert(throwsA!DocumentConflictException({ branches.create(main); }));
 }

@@ -198,8 +198,8 @@ ResolvedInput[] pinInputs(
                 auto resolved = name in resolvedRepositories;
                 if (resolved is null || resolved.kind != InputKind.repository)
                 {
-                    throw new Exception(format("Task '%s' repository input '%s' (repository '%s' at ref '%s') has not been resolved",
-                        task.id, name, decl.spec.repository, decl.spec.refSelector));
+                    throw new Exception(format("Task '%s' repository input '%s' (repository '%s') has not been resolved",
+                        task.id, name, decl.spec.repository));
                 }
                 input.pinned = resolved.pinned.clone;
                 input.info = cast(string[string]) resolved.info.dup;
@@ -341,7 +341,7 @@ unittest
     // A repository input contributes its resolved pinned revision, not its declaration
     TaskNode task;
     task.id = "compile";
-    task.inputs["src"] = repositoryInput("game", "main");
+    task.inputs["src"] = repositoryInput("game");
 
     ResolvedInput[string] atA = ["src": ResolvedInput("src", InputKind.repository, Json("aaa111"))];
     ResolvedInput[string] atB = ["src": ResolvedInput("src", InputKind.repository, Json("ccc333"))];
@@ -361,7 +361,7 @@ unittest
     // An unresolved repository input is an error, never fingerprinted from its declaration
     TaskNode task;
     task.id = "compile";
-    task.inputs["src"] = repositoryInput("game", "main");
+    task.inputs["src"] = repositoryInput("game");
 
     bool threw = false;
     try pinInputs(task, null);

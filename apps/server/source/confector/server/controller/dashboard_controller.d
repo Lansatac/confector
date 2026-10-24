@@ -55,7 +55,10 @@ struct TaskInputRow
     /// An `InputKind` wire value: "repository", "value" or "task_output".
     string kind;
     string repository;
-    string refSelector;
+    /// A repository input's visibility filter and default ref spec, in their text forms
+    /// (`BranchFilter`, `RefSpec`); both optional.
+    string branches;
+    string defaultRef;
     string value;
     string task;
     string artifact;
@@ -78,7 +81,8 @@ TaskInputRow[] taskInputRows(in InputDecl[string] inputs) pure @safe
         row.name = name;
         row.kind = cast(string) decl.kind;
         row.repository = decl.spec.repository;
-        row.refSelector = decl.spec.refSelector;
+        row.branches = decl.spec.branches.toString();
+        row.defaultRef = decl.spec.defaultRef.toString();
         row.value = decl.spec.value;
         row.task = decl.spec.task;
         row.artifact = decl.spec.artifact;
@@ -93,11 +97,12 @@ TaskInputRow[] taskInputRows(in InputDecl[string] inputs) pure @safe
  * Throws: TaskFormException if the fields do not all have the same length.
  */
 TaskInputRow[] taskInputRowsFromForm(
-    in string[] names, in string[] kinds, in string[] repositories, in string[] refSelectors,
+    in string[] names, in string[] kinds, in string[] repositories, in string[] branches, in string[] defaultRefs,
     in string[] values, in string[] tasks, in string[] artifacts
 ) pure @safe
 {
-    foreach (fieldLength; [kinds.length, repositories.length, refSelectors.length, values.length, tasks.length, artifacts.length])
+    foreach (fieldLength; [kinds.length, repositories.length, branches.length, defaultRefs.length, values.length, tasks.length,
+        artifacts.length])
     {
         if (fieldLength != names.length)
         {
@@ -107,7 +112,7 @@ TaskInputRow[] taskInputRowsFromForm(
     TaskInputRow[] rows;
     foreach (i; 0 .. names.length)
     {
-        rows ~= TaskInputRow(names[i], kinds[i], repositories[i], refSelectors[i], values[i], tasks[i], artifacts[i]);
+        rows ~= TaskInputRow(names[i], kinds[i], repositories[i], branches[i], defaultRefs[i], values[i], tasks[i], artifacts[i]);
     }
     return rows;
 }
@@ -116,9 +121,10 @@ TaskInputRow[] taskInputRowsFromForm(
  * Validates the editor's input rows and turns them into the task's declared inputs.
  *
  * Rows with no content at all are ignored. Every other row must have a unique name and the
- * fields its kind needs: a repository input must name a registered repository and a ref
- * selector (there is no default ref); a value input a value; a task output input another task
- * of the project. All problems are reported together, one per line.
+ * fields its kind needs: a repository input must name a registered repository, and its optional
+ * branch filter and default ref spec must be well formed (the input does not choose the ref: a
+ * trigger or request does); a value input a value; a task output input another task of the
+ * project. All problems are reported together, one per line.
  *
  * Throws: TaskFormException listing every problem.
  */
@@ -140,12 +146,13 @@ InputDecl[string] parseTaskInputRows(
     {
         const name = row.name.strip();
         const repository = row.repository.strip();
-        const refSelector = row.refSelector.strip();
+        const branches = row.branches.strip();
+        const defaultRef = row.defaultRef.strip();
         const value = row.value.strip();
         const task = row.task.strip();
         const artifact = row.artifact.strip();
 
-        if (name.length == 0 && repository.length == 0 && refSelector.length == 0
+        if (name.length == 0 && repository.length == 0 && branches.length == 0 && defaultRef.length == 0
             && value.length == 0 && task.length == 0 && artifact.length == 0)
         {
             continue;
@@ -169,8 +176,18 @@ InputDecl[string] parseTaskInputRows(
             case "repository":
                 if (repository.length == 0) fail("choose a repository");
                 else if (!registeredRepositories.canFind(repository)) fail(format("repository '%s' is not registered", repository));
-                if (refSelector.length == 0) fail("a ref selector is required (for example a branch or tag name); there is no default ref");
-                decl = repositoryInput(repository, refSelector);
+                RefSpec parsedDefault;
+                BranchFilter parsedBranches;
+                try parsedBranches = BranchFilter.fromString(branches);
+                catch (InvalidRefSpecException e) fail(e.msg);
+                try parsedDefault = RefSpec.fromString(defaultRef);
+                catch (InvalidRefSpecException e) fail(e.msg);
+                if (parsedDefault.kind == RefSpecKind.event)
+                {
+                    fail(format("the default ref spec '%s' cannot be an event spec (only a trigger fires on events); use a ref such as main, or same else main",
+                        defaultRef));
+                }
+                decl = repositoryInput(repository, parsedDefault, parsedBranches);
                 break;
             case "value":
                 if (value.length == 0) fail("needs a value");
@@ -206,7 +223,7 @@ InputDecl[string] shownRepositoryInputs(in TaskInputRow[] rows) pure @safe
     {
         if (row.kind == InputKind.repository && row.name.strip().length > 0)
         {
-            shown[row.name.strip()] = repositoryInput(row.repository, row.refSelector);
+            shown[row.name.strip()] = repositoryInput(row.repository);
         }
     }
     return shown;
@@ -547,7 +564,7 @@ unittest
     // A task's form holds every field of the task the editor edits
     TaskNode task;
     task.id = "package";
-    task.inputs["src"] = repositoryInput("game", "main");
+    task.inputs["src"] = repositoryInput("game", RefSpec.fromString("same else main"));
     task.steps = [BuildStep("Fetch", "checkout", Json(["input": Json("src")]))];
     task.outputs.artifacts = [OutputArtifactDecl("game", "out/game.zip")];
     task.environment = ["MODE": "release"];
@@ -562,45 +579,67 @@ unittest
     import std.exception : assertThrown, collectExceptionMsg;
     import std.algorithm.searching : canFind;
 
-    // Round trip: declared inputs of every kind survive rendering and saving the form.
+    // Round trip: declared inputs of every kind survive rendering and saving the form, a
+    // repository input's filter and default ref spec included.
     InputDecl[string] existing = [
-        "src": repositoryInput("game", "main"),
-        "lib": repositoryInput("game", "release"),
+        "src": repositoryInput("game", RefSpec.fromString("same else main"), BranchFilter.fromString("+:* -:experimental/*")),
+        "lib": repositoryInput("game"),
         "flavor": valueInput("external"),
         "eng": taskOutputInput("build-engine", "engine.zip"),
         "setup": taskOutputInput("setup"),
     ];
     auto rows = taskInputRows(existing);
     assert(rows.length == 5 && rows[0].name == "eng");
+    assert(rows[4].name == "src" && rows[4].branches == "+:* -:experimental/*" && rows[4].defaultRef == "same else main");
+    assert(rows[2].name == "lib" && rows[2].branches == "" && rows[2].defaultRef == "");
     assert(parseTaskInputRows("package", rows, ["game"], ["build-engine", "setup"]) == existing);
-    assert(shownRepositoryInputs(rows) == ["src": repositoryInput("game", "main"), "lib": repositoryInput("game", "release")]);
+    assert(shownRepositoryInputs(rows) == ["src": repositoryInput("game"), "lib": repositoryInput("game")]);
 
     // Fully blank rows are ignored; removed rows are gone.
-    assert(parseTaskInputRows("package", [TaskInputRow("", "value", "", "", "", "", "")], [], []).length == 0);
+    assert(parseTaskInputRows("package", [TaskInputRow("", "value", "", "", "", "", "", "")], [], []).length == 0);
     assert(parseTaskInputRows("package", rows[0 .. 1], [], ["build-engine"]).length == 1);
 
     // Form fields zip into rows; mismatched lengths are rejected.
-    assert(taskInputRowsFromForm(["a"], ["value"], [""], [""], ["v"], [""], [""]) == [TaskInputRow("a", "value", "", "", "v", "", "")]);
-    assertThrown!TaskFormException(taskInputRowsFromForm(["a"], [], [""], [""], ["v"], [""], [""]));
+    assert(taskInputRowsFromForm(["a"], ["value"], [""], [""], [""], ["v"], [""], [""]) == [TaskInputRow("a", "value", "", "", "", "v", "", "")]);
+    assertThrown!TaskFormException(taskInputRowsFromForm(["a"], [], [""], [""], [""], ["v"], [""], [""]));
+    assertThrown!TaskFormException(taskInputRowsFromForm(["a"], ["value"], [""], [""], [], ["v"], [""], [""]));
 
-    // An empty ref selector or repository is rejected, not defaulted.
-    auto noRef = collectExceptionMsg!TaskFormException(parseTaskInputRows("t",
-        [TaskInputRow("src", "repository", "game", "  ", "", "", "")], ["game"], []));
-    assert(noRef.canFind("src") && noRef.canFind("ref selector"));
+    // A repository input needs no default ref spec or filter: the trigger or request chooses
+    // the ref. Spaces are trimmed and the text forms normalized.
+    assert(parseTaskInputRows("t", [TaskInputRow("src", "repository", "game", "  ", "", "", "", "")], ["game"], [])
+        == ["src": repositoryInput("game")]);
+    assert(parseTaskInputRows("t", [TaskInputRow("src", "repository", "game", " +:release/*  ", " same  else  main ", "", "", "")], ["game"], [])
+        == ["src": repositoryInput("game", RefSpec.fromString("same else main"), BranchFilter.fromString("+:release/*"))]);
+
+    // A malformed filter or default ref spec is rejected on save, naming the input and the text.
+    auto badSpecs = collectExceptionMsg!TaskFormException(parseTaskInputRows("t", [
+        TaskInputRow("src", "repository", "game", "release/*", "", "", "", ""),
+        TaskInputRow("lib", "repository", "game", "", "same else", "", "", ""),
+        TaskInputRow("doc", "repository", "game", "-:experimental/*", "main develop", "", "", ""),
+        TaskInputRow("evt", "repository", "game", "", "event +:*", "", "", ""),
+    ], ["game"], []));
+    foreach (fragment; ["Input 'src': Branch filter 'release/*'", "Input 'lib': Ref spec 'same else'",
+        "Input 'evt': the default ref spec 'event +:*' cannot be an event spec",
+        "Input 'doc': Branch filter '-:experimental/*'", "Input 'doc': Ref spec 'main develop'"])
+    {
+        assert(badSpecs.canFind(fragment), fragment ~ "\n" ~ badSpecs);
+    }
+
+    // An empty or unknown repository is rejected, not defaulted.
     auto noRepo = collectExceptionMsg!TaskFormException(parseTaskInputRows("t",
-        [TaskInputRow("src", "repository", "", "main", "", "", "")], ["game"], []));
+        [TaskInputRow("src", "repository", "", "", "main", "", "", "")], ["game"], []));
     assert(noRepo.canFind("choose a repository"));
     assert(collectExceptionMsg!TaskFormException(parseTaskInputRows("t",
-        [TaskInputRow("src", "repository", "gone", "main", "", "", "")], ["game"], [])).canFind("not registered"));
+        [TaskInputRow("src", "repository", "gone", "", "main", "", "", "")], ["game"], [])).canFind("not registered"));
 
     // Other mistakes, all reported together.
     auto many = collectExceptionMsg!TaskFormException(parseTaskInputRows("t", [
-        TaskInputRow("", "value", "", "", "x", "", ""),
-        TaskInputRow("v", "value", "", "", "", "", ""),
-        TaskInputRow("o", "task_output", "", "", "", "t", ""),
-        TaskInputRow("p", "task_output", "", "", "", "ghost", ""),
-        TaskInputRow("q", "nonsense", "", "", "", "", ""),
-        TaskInputRow("v", "value", "", "", "dup", "", ""),
+        TaskInputRow("", "value", "", "", "", "x", "", ""),
+        TaskInputRow("v", "value", "", "", "", "", "", ""),
+        TaskInputRow("o", "task_output", "", "", "", "", "t", ""),
+        TaskInputRow("p", "task_output", "", "", "", "", "ghost", ""),
+        TaskInputRow("q", "nonsense", "", "", "", "", "", ""),
+        TaskInputRow("v", "value", "", "", "", "dup", "", ""),
     ], [], ["up"]));
     foreach (fragment; ["needs a name", "needs a value", "its own output", "'ghost' is not in this project", "unknown input kind", "used by another"])
     {
@@ -614,7 +653,7 @@ unittest
     import std.algorithm.searching : canFind;
 
     InputDecl[string] inputs = [
-        "src": repositoryInput("game", "main"),
+        "src": repositoryInput("game"),
         "flavor": valueInput("external"),
     ];
 
@@ -959,7 +998,8 @@ URLRouter dashboardRouter(StateStores stores)
                 req.form.getAll("input_name"),
                 req.form.getAll("input_kind"),
                 req.form.getAll("input_repository"),
-                req.form.getAll("input_ref"),
+                req.form.getAll("input_branches"),
+                req.form.getAll("input_default"),
                 req.form.getAll("input_value"),
                 req.form.getAll("input_task"),
                 req.form.getAll("input_artifact")
@@ -1156,7 +1196,7 @@ unittest
     TaskNode tNode1;
     tNode1.id = "test_node_1";
     tNode1.steps = [BuildStep("Echo", "bash", Json(["script": Json("echo dashboard test 1")]))];
-    tNode1.inputs["repo_main"] = repositoryInput("repo_main", "main");
+    tNode1.inputs["repo_main"] = repositoryInput("repo_main", RefSpec.fromString("main"));
     TaskNode tNode2;
     tNode2.id = "test_node_2";
     tNode2.inputs["test_node_1"] = taskOutputInput("test_node_1");
@@ -1193,6 +1233,7 @@ unittest
     assert(details.status == HTTPStatus.ok && details.body.canFind("test_node_2"), details.body);
     auto taskPage = request(HTTPMethod.GET, "/tasks/details?project_id=proj_dash_1&task_id=test_node_1");
     assert(taskPage.status == HTTPStatus.ok && taskPage.body.canFind("echo dashboard test 1"), taskPage.body);
+    assert(taskPage.body.canFind("repo_main: repo_main (default: main)"), "A repository input shows its default ref spec");
     auto editor = request(HTTPMethod.GET, "/projects/tasks/edit?project_id=proj_dash_1&task_id=test_node_1");
     assert(editor.status == HTTPStatus.ok && editor.body.canFind("echo dashboard test 1"), editor.body);
     assert(!editor.body.canFind("trigger"), "The editor has no triggers tab");
@@ -1205,7 +1246,8 @@ unittest
         foreach (row; form.inputRows)
         {
             fields ~= [["input_name", row.name], ["input_kind", row.kind], ["input_repository", row.repository],
-                ["input_ref", row.refSelector], ["input_value", row.value], ["input_task", row.task], ["input_artifact", row.artifact]];
+                ["input_branches", row.branches], ["input_default", row.defaultRef], ["input_value", row.value], ["input_task", row.task],
+                ["input_artifact", row.artifact]];
         }
         foreach (row; form.stepRows)
         {
@@ -1226,9 +1268,9 @@ unittest
     // definition
     string[2][] checkoutTask = [
         ["project_id", "proj_dash_1"], ["task_id", "package"], ["name", "Package"],
-        ["input_name", "src"], ["input_kind", "repository"], ["input_repository", "repo_main"], ["input_ref", "main"],
-        ["input_value", ""], ["input_task", ""], ["input_artifact", ""],
-        ["input_name", "bin"], ["input_kind", "task_output"], ["input_repository", ""], ["input_ref", ""],
+        ["input_name", "src"], ["input_kind", "repository"], ["input_repository", "repo_main"], ["input_branches", "+:* -:experimental/*"],
+        ["input_default", "same else main"], ["input_value", ""], ["input_task", ""], ["input_artifact", ""],
+        ["input_name", "bin"], ["input_kind", "task_output"], ["input_repository", ""], ["input_branches", ""], ["input_default", ""],
         ["input_value", ""], ["input_task", "test_node_1"], ["input_artifact", ""],
         ["step_name", "Fetch"], ["step_type", "checkout"], ["step_config", `{"input": "src", "target_dir": "game", "depth": 1}`],
         ["step_name", "Zip"], ["step_type", "bash"], ["step_config", `{"script": "zip -r out/game.zip game"}`],
@@ -1240,7 +1282,8 @@ unittest
     assert(saved.status == HTTPStatus.found, format("HTTP %s: %s", saved.status, saved.body));
     auto stored = storedTask("package");
     assert(stored.name == "Package");
-    assert(stored.inputs == ["src": repositoryInput("repo_main", "main"), "bin": taskOutputInput("test_node_1")]);
+    assert(stored.inputs == ["src": repositoryInput("repo_main", RefSpec.fromString("same else main"), BranchFilter.fromString("+:* -:experimental/*")),
+        "bin": taskOutputInput("test_node_1")]);
     assert(stored.steps == [
         BuildStep("Fetch", "checkout", Json(["input": Json("src"), "target_dir": Json("game"), "depth": Json(1)])),
         BuildStep("Zip", "bash", Json(["script": Json("zip -r out/game.zip game")])),

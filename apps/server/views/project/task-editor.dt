@@ -62,7 +62,7 @@ block maincontent
 
         div#tab-inputs.tab-pane
           h3 Inputs
-          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Name everything this task depends on. A repository input is a registered repository at a ref (a branch, tag or other ref selector; there is no default). A task output input depends on an upstream task, and optionally one of its artifacts. A value input is a literal value. Checkout steps pick a repository input by name.
+          p(style="color: #666; margin-bottom: 15px; font-size: 0.9em;") Name everything this task depends on. A repository input is a registered repository; the build request chooses its ref. It may narrow which refs are allowed with a branch filter (for example +:* -:experimental/*) and give a default ref spec for when the request names none (a ref such as main, or same else main). A task output input depends on an upstream task, and optionally one of its artifacts. A value input is a literal value. Checkout steps pick a repository input by name.
           div#inputs-container
           div(style="margin-top: 6px;")
             button.btn.btn-outline.btn-sm#add-input-btn(type="button", onclick="addInputRow()") + Add Input
@@ -159,14 +159,14 @@ block maincontent
       var row = kindSelect.closest('.input-row');
       if (!row) return;
       var kind = kindSelect.value;
-      var visible = { repository: ['repo', 'ref'], task_output: ['task', 'artifact'], value: ['value'] }[kind] || [];
-      var all = ['repo', 'ref', 'task', 'artifact', 'value'];
+      var visible = { repository: ['repo', 'branches', 'default'], task_output: ['task', 'artifact'], value: ['value'] }[kind] || [];
+      var all = ['repo', 'branches', 'default', 'task', 'artifact', 'value'];
       for (var i = 0; i < all.length; i++) {
         var field = row.querySelector('.input-field-' + all[i]);
         if (field) field.style.display = visible.indexOf(all[i]) !== -1 ? '' : 'none';
       }
       // Required in the browser only where the field applies; the server checks again.
-      var needs = { repo: 'repository', ref: 'repository', task: 'task_output', value: 'value' };
+      var needs = { repo: 'repository', task: 'task_output', value: 'value' };
       for (var key in needs) {
         var control = row.querySelector('.input-field-' + key + ' select, .input-field-' + key + ' input');
         if (control) control.required = (needs[key] === kind);
@@ -210,7 +210,10 @@ block maincontent
         return { value: r.name, label: r.name + (r.address ? ' (' + r.address + ')' : '') };
       });
       row.appendChild(inputField('input-field-repo', 'Repository', selectControl('input_repository', repoOptions, d.repository, '-- Select a repository --')));
-      row.appendChild(inputField('input-field-ref', 'Ref selector (required)', textControl('input_ref', d.refSelector, 'e.g. main, v1.2.0')));
+      // The input does not choose the ref, the build request does: the input may narrow which
+      // refs are allowed and give a default ref spec for when the request says nothing.
+      row.appendChild(inputField('input-field-branches', 'Branch filter (optional)', textControl('input_branches', d.branches, 'e.g. +:* -:experimental/*')));
+      row.appendChild(inputField('input-field-default', 'Default ref (optional)', textControl('input_default', d.defaultRef, 'e.g. main, same else main')));
 
       var taskOptions = (availableTasks || []).map(function(t) {
         return { value: t.id, label: t.id + (t.name && t.name !== t.id ? ' (' + t.name + ')' : '') };

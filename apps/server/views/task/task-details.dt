@@ -49,7 +49,9 @@ block maincontent
                 div(style="display: flex; flex-wrap: wrap; gap: 6px;")
                   - foreach(inputName, decl; taskNode.inputs)
                     - if (decl.kind == InputKind.repository)
-                      span.badge.badge-info #{inputName}: #{decl.spec.repository} @ #{decl.spec.refSelector}
+                      - string defaultText = decl.spec.defaultRef.toString();
+                      - string branchesText = decl.spec.branches.toString();
+                      span.badge.badge-info #{inputName}: #{decl.spec.repository}#{defaultText.length > 0 ? " (default: " ~ defaultText ~ ")" : ""}#{branchesText.length > 0 ? " [" ~ branchesText ~ "]" : ""}
               - else
                 span.text-muted None
           tr

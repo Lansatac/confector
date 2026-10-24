@@ -19,7 +19,7 @@ module confector.core.rerun_generations;
 
 import confector.core.dag : TaskGraph;
 import confector.core.input_resolution : GraphResolution, RerunGenerations, graphResolution;
-import confector.api.model : InputDecl, InputPin;
+import confector.api.model : InputKey, PinnedInput;
 import confector.api.document_store;
 
 import vibe.data.json : Json;
@@ -184,7 +184,7 @@ final class RerunGenerationStore
  * Throws: Exception if `read` returns no generation for a base it was asked for; whatever
  * `read` and `graphResolution` throw.
  */
-GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in InputPin[InputDecl] pins,
+GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in PinnedInput[InputKey] pins,
     scope RerunGenerationReader read)
 {
     import std.algorithm.sorting : sort;
@@ -223,17 +223,22 @@ version (unittest)
     /// compile -> test -> report plus an independent lint.
     private TaskGraph sampleGraph()
     {
-        TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game", "main");
+        TaskNode compile; compile.id = "compile"; compile.inputs["src"] = repositoryInput("game");
         TaskNode test; test.id = "test"; test.inputs["bin"] = taskOutputInput("compile");
         TaskNode report; report.id = "report"; report.inputs["results"] = taskOutputInput("test");
-        TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game", "main");
+        TaskNode lint; lint.id = "lint"; lint.inputs["src"] = repositoryInput("game");
         return new TaskGraph([compile, test, report, lint]);
     }
 
-    /// The sample graph's repository pinned at revision `sha`.
-    private InputPin[InputDecl] pinsAt(string sha)
+    /// The sample graph's repository inputs pinned to branch main at revision `sha`.
+    private PinnedInput[InputKey] pinsAt(string sha)
     {
-        return [repositoryInput("game", "main"): InputPin(Json(sha))];
+        PinnedInput[InputKey] pins;
+        foreach (task; ["compile", "lint"])
+        {
+            pins[InputKey(task, "src")] = PinnedInput(task, "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json(sha)));
+        }
+        return pins;
     }
 }
 
@@ -405,7 +410,7 @@ unittest
     // Unpinned inputs fail loudly before any generation is read
     size_t reads;
     RerunGenerationReader counting = (in string[] bases) { ++reads; return new RerunGenerationStore(new InMemoryDocumentStore()).read(bases); };
-    InputPin[InputDecl] unpinned;
+    PinnedInput[InputKey] unpinned;
     threw = false;
     try readGraphResolution("p", sampleGraph(), unpinned, counting);
     catch (Exception ex) threw = ex.msg.canFind("'game'");

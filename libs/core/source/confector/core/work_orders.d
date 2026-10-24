@@ -429,7 +429,7 @@ version (unittest)
         execution.fingerprint = fingerprint;
         execution.status = ExecutionStatus.queued;
         execution.definition.id = "compile";
-        execution.definition.inputs["src"] = repositoryInput("game", "main");
+        execution.definition.inputs["src"] = repositoryInput("game");
         execution.definition.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
         execution.definition.environment = ["MODE": "release"];
         execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];

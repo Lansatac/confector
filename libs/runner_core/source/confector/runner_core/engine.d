@@ -80,7 +80,7 @@ unittest
 
     TaskNode task;
     task.id = "package";
-    task.inputs["src"] = repositoryInput("game", "main");
+    task.inputs["src"] = repositoryInput("game");
     task.inputs["bin"] = taskOutputInput("compile", "binaries");
     task.inputs["flavor"] = valueInput("external");
 
@@ -451,7 +451,7 @@ unittest
 
     TaskNode task;
     task.id = "compile";
-    task.inputs["src"] = repositoryInput("game", "main");
+    task.inputs["src"] = repositoryInput("game");
     task.inputs["flavor"] = valueInput("internal");
     task.steps = [shellStep("Capture", "echo captured")];
 

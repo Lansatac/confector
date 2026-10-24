@@ -159,7 +159,7 @@ version (unittest)
         TaskNode compile;
         compile.id = "compile";
         compile.name = "Compile";
-        compile.inputs["src"] = repositoryInput("game", "main");
+        compile.inputs["src"] = repositoryInput("game");
         compile.steps = [BuildStep("Build", "bash", Json(["script": Json("make"), "jobs": Json(4)]))];
         compile.outputs.artifacts = [OutputArtifactDecl("bin", "out/*")];
         TaskNode test;
@@ -198,7 +198,7 @@ unittest
     renamed.tasks[1].name = "Compile the game";
     assert(definitionId(renamed) != id);
     auto repinned = sampleDefinition();
-    repinned.tasks[1].inputs["src"] = repositoryInput("game", "release");
+    repinned.tasks[1].inputs["src"] = repositoryInput("game", RefSpec.fromString("release"));
     assert(definitionId(repinned) != id);
     auto restepped = sampleDefinition();
     restepped.tasks[1].steps[0].config["script"] = "make release";

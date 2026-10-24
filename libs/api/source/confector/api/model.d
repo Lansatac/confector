@@ -2,6 +2,8 @@ module confector.api.model;
 
 import vibe.data.serialization : asName = name, optional;
 
+import std.format : format;
+
 /**
  * What made a build request (`BuildTrigger.type`).
  */
@@ -28,12 +30,359 @@ enum InputKind : string
     taskOutput = "task_output"
 }
 
+// The ref grammar (design record: bead confector-z7z.56; AGENTS.md, "Branches"). Branch filters
+// and ref specs are plain data with a compact text form, which is also how they are stored
+// (vibe.d serializes a type with `toString` and `fromString` as a string). Tokens are separated by
+// whitespace, so neither a pattern nor a ref name can contain whitespace.
+
+/**
+ * A branch filter or ref spec whose text is not well formed.
+ */
+class InvalidRefSpecException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * One rule of a branch filter: include (`+:`) or exclude (`-:`) the refs whose name matches
+ * `pattern`. In a pattern `*` matches any run of characters, `/` included; every other character
+ * matches only itself, case-sensitively.
+ */
+struct BranchRule
+{
+    bool include;
+    string pattern;
+}
+
+/**
+ * Which refs of a repository may be used (a visibility filter): include/exclude rules written
+ * `+:<pattern>` and `-:<pattern>`, for example `+:* -:experimental/*`. A ref is visible when it
+ * matches at least one include rule and no exclude rule (`refVisible`); the order of the rules
+ * does not matter. The empty filter (no rules, the text "") hides nothing. A filter with rules
+ * must have an include rule: one of only exclude rules would hide every ref, so it is refused.
+ *
+ * Text form: the rules separated by spaces, as written.
+ */
+struct BranchFilter
+{
+    BranchRule[] rules;
+
+    /// Whether the filter has no rules, and so hides nothing.
+    bool isEmpty() const pure nothrow @safe
+    {
+        return rules.length == 0;
+    }
+
+    /// The filter's text form: its rules separated by single spaces; "" for the empty filter.
+    string toString() const pure @safe
+    {
+        import std.array : join;
+
+        string[] parts;
+        foreach (rule; rules) parts ~= (rule.include ? "+:" : "-:") ~ rule.pattern;
+        return parts.join(" ");
+    }
+
+    /**
+     * Parses a filter's text form. Blank text is the empty filter.
+     *
+     * Throws: InvalidRefSpecException if a token is not `+:<pattern>` or `-:<pattern>` with a
+     * pattern, or the filter has rules but no include rule.
+     */
+    static BranchFilter fromString(string text) pure @safe
+    {
+        import std.array : split;
+
+        BranchFilter filter;
+        foreach (token; text.split())
+        {
+            filter.rules ~= parseBranchRule(token, format("Branch filter '%s'", text));
+        }
+        requireInclude(filter, format("Branch filter '%s'", text));
+        return filter;
+    }
+}
+
+/**
+ * Whether ref `refName` passes `filter`: the empty filter passes every ref; otherwise the ref
+ * must match an include rule and no exclude rule. Pure.
+ */
+bool refVisible(in BranchFilter filter, string refName) pure nothrow @safe
+{
+    if (filter.isEmpty) return true;
+    bool included = false;
+    foreach (rule; filter.rules)
+    {
+        if (!globMatches(rule.pattern, refName)) continue;
+        if (!rule.include) return false;
+        included = true;
+    }
+    return included;
+}
+
+/// Whether `name` matches `pattern`, in which `*` matches any run of characters and every other
+/// character matches itself.
+private bool globMatches(string pattern, string name) pure nothrow @safe
+{
+    // Iterative wildcard matching with backtracking to the last star: linear in practice.
+    size_t p = 0, n = 0;
+    ptrdiff_t star = -1;
+    size_t afterStar = 0;
+    while (n < name.length)
+    {
+        if (p < pattern.length && pattern[p] == '*')
+        {
+            star = p++;
+            afterStar = n;
+        }
+        else if (p < pattern.length && pattern[p] == name[n])
+        {
+            ++p;
+            ++n;
+        }
+        else if (star >= 0)
+        {
+            p = star + 1;
+            n = ++afterStar;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    while (p < pattern.length && pattern[p] == '*') ++p;
+    return p == pattern.length;
+}
+
+private BranchRule parseBranchRule(string token, lazy string what) pure @safe
+{
+    import std.algorithm.searching : startsWith;
+
+    if (!token.startsWith("+:") && !token.startsWith("-:"))
+    {
+        throw new InvalidRefSpecException(format("%s: '%s' is not a rule; write +:<pattern> to include refs or -:<pattern> to exclude them",
+            what, token));
+    }
+    if (token.length == 2)
+    {
+        throw new InvalidRefSpecException(format("%s: rule '%s' has no pattern", what, token));
+    }
+    return BranchRule(token[0] == '+', token[2 .. $]);
+}
+
+private void requireInclude(in BranchFilter filter, lazy string what) pure @safe
+{
+    if (filter.isEmpty) return;
+    foreach (rule; filter.rules)
+    {
+        if (rule.include) return;
+    }
+    throw new InvalidRefSpecException(format("%s has only exclude rules, which would hide every ref; add an include rule such as +:*",
+        what));
+}
+
+/**
+ * The kinds of ref spec (design record: bead confector-z7z.56).
+ */
+enum RefSpecKind : string
+{
+    /// No spec: the text "". An input without a default ref spec has this.
+    none = "none",
+    /// `event <rules> [else <ref>|else skip]`: events on refs passing the rules fire the trigger,
+    /// and the other repositories are paired by the event ref's name.
+    event = "event",
+    /// `same [else <ref>|else skip]`: the ref with the event's name in this repository.
+    same = "same",
+    /// `<ref>`: a fixed branch, tag or revision, resolved live.
+    fixed = "fixed"
+}
+
+/**
+ * What an `event` or `same` ref spec uses when the name it looks for does not exist or is hidden.
+ */
+enum RefFallback : string
+{
+    /// No `else`: the request is skipped, as with `else skip`, but nothing was said.
+    none = "none",
+    /// `else <ref>`: use `RefSpec.fallbackRef`.
+    ref_ = "ref",
+    /// `else skip`: make no request.
+    skip = "skip"
+}
+
+/**
+ * Which ref of a repository a build uses (design record: bead confector-z7z.56; AGENTS.md,
+ * "Branches"): given by a trigger or a request, or as an input's default. Its text form is the
+ * grammar
+ *
+ *     event <rules> [else <ref> | else skip]
+ *     same [else <ref> | else skip]
+ *     <ref>
+ *
+ * where `<rules>` are one or more branch filter rules (`+:release/*`, at least one an include
+ * rule) and `<ref>` is a single token naming a branch, tag or revision as the provider accepts it.
+ * The words `event`, `same`, `else` and `skip` are reserved, and a `<ref>` never contains `*`: a
+ * pattern is spelled `event +:<pattern>`, never as a bare `<ref>` or an `else <ref>`. A ref named
+ * like a reserved word cannot be written in a ref spec. The empty text is
+ * `RefSpecKind.none`. Only the fields of the spec's kind are set; `fromString` and `toString`
+ * convert between the two forms, and every well-formed spec reads back equal.
+ */
+struct RefSpec
+{
+    RefSpecKind kind;
+    /// event: the refs whose events fire the trigger.
+    BranchFilter rules;
+    /// fixed: the ref.
+    string refName;
+    /// event and same: what applies when the name does not exist or is hidden.
+    RefFallback fallback;
+    /// fallback `ref_`: the ref used then.
+    string fallbackRef;
+
+    /// The spec's text form, with single spaces; "" for `RefSpecKind.none`.
+    string toString() const pure @safe
+    {
+        string fallbackText()
+        {
+            final switch (fallback)
+            {
+                case RefFallback.none: return "";
+                case RefFallback.ref_: return " else " ~ fallbackRef;
+                case RefFallback.skip: return " else skip";
+            }
+        }
+
+        final switch (kind)
+        {
+            case RefSpecKind.none: return "";
+            case RefSpecKind.event: return "event " ~ rules.toString() ~ fallbackText();
+            case RefSpecKind.same: return "same" ~ fallbackText();
+            case RefSpecKind.fixed: return refName;
+        }
+    }
+
+    /**
+     * Parses a spec's text form. Blank text is `RefSpecKind.none`.
+     *
+     * Throws: InvalidRefSpecException naming the text and the problem: an `event` spec without
+     * rules or without an include rule, an `else` without exactly one ref or `skip` after it, a
+     * fixed ref of more than one token or with an `else`, or a ref that is a reserved word or
+     * looks like a rule.
+     */
+    static RefSpec fromString(string text) pure @safe
+    {
+        import std.array : split;
+        import std.algorithm.searching : countUntil;
+
+        const what = format("Ref spec '%s'", text);
+        auto tokens = text.split();
+        RefSpec spec;
+        if (tokens.length == 0) return spec;
+
+        void parseFallback(string[] rest)
+        {
+            if (rest.length == 0) return;
+            if (rest.length != 2 || rest[0] != "else")
+            {
+                throw new InvalidRefSpecException(format("%s: expected 'else <ref>' or 'else skip' after the spec, not '%-(%s %)'",
+                    what, rest));
+            }
+            if (rest[1] == "skip")
+            {
+                spec.fallback = RefFallback.skip;
+                return;
+            }
+            requireRefToken(rest[1], what);
+            spec.fallback = RefFallback.ref_;
+            spec.fallbackRef = rest[1];
+        }
+
+        switch (tokens[0])
+        {
+            case "event":
+                spec.kind = RefSpecKind.event;
+                auto end = tokens.countUntil("else");
+                auto ruleTokens = end < 0 ? tokens[1 .. $] : tokens[1 .. end];
+                if (ruleTokens.length == 0)
+                {
+                    throw new InvalidRefSpecException(format("%s: an event spec needs at least one rule, such as +:*", what));
+                }
+                foreach (token; ruleTokens) spec.rules.rules ~= parseBranchRule(token, what);
+                requireInclude(spec.rules, what);
+                parseFallback(end < 0 ? null : tokens[end .. $]);
+                break;
+            case "same":
+                spec.kind = RefSpecKind.same;
+                parseFallback(tokens[1 .. $]);
+                break;
+            case "else":
+            case "skip":
+                throw new InvalidRefSpecException(format("%s: '%s' cannot start a spec; write event, same or a ref", what, tokens[0]));
+            default:
+                if (tokens.length != 1)
+                {
+                    throw new InvalidRefSpecException(format("%s: a fixed ref is a single token and takes no else", what));
+                }
+                requireRefToken(tokens[0], what);
+                spec.kind = RefSpecKind.fixed;
+                spec.refName = tokens[0];
+                break;
+        }
+        return spec;
+    }
+}
+
+/// Throws InvalidRefSpecException if `token` cannot be a ref in a ref spec: a reserved word, text
+/// that looks like a branch filter rule, or a pattern (anything containing `*`).
+private void requireRefToken(string token, lazy string what) pure @safe
+{
+    import std.algorithm.searching : canFind, startsWith;
+
+    if (["event", "same", "else", "skip"].canFind(token))
+    {
+        throw new InvalidRefSpecException(format("%s: '%s' is a reserved word, not a ref", what, token));
+    }
+    if (token.startsWith("+:") || token.startsWith("-:"))
+    {
+        throw new InvalidRefSpecException(format("%s: '%s' is a rule, not a ref", what, token));
+    }
+    if (token.canFind('*'))
+    {
+        throw new InvalidRefSpecException(format("%s: '%s' is a pattern, not a ref; a pattern needs event: write event +:%s",
+            what, token, token));
+    }
+}
+
+/**
+ * Throws InvalidRefSpecException unless `filter` and `spec` are well formed: what their text forms
+ * would accept. For values built in code rather than parsed.
+ */
+void requireWellFormed(in BranchFilter filter, in RefSpec spec) pure @safe
+{
+    const filterText = filter.toString();
+    if (BranchFilter.fromString(filterText) != filter)
+    {
+        throw new InvalidRefSpecException(format("Branch filter '%s' is not well formed", filterText));
+    }
+    const specText = spec.toString();
+    if (RefSpec.fromString(specText) != spec)
+    {
+        throw new InvalidRefSpecException(format("Ref spec '%s' is not well formed", specText));
+    }
+}
+
 /**
  * Kind-specific part of an input declaration. Only the fields belonging to the
  * input's kind are set:
  *
- * - `repository`: `repository` (repository id) and `ref` (ref selector string,
- *   interpreted by the provider's resolver).
+ * - `repository`: `repository` (repository id), and optionally `branches` (a visibility filter:
+ *   which refs of the repository the task may be built from) and `default` (the ref spec used
+ *   when the trigger or request gives none for the input). The input never chooses the ref
+ *   itself: the trigger or request does (design record: bead confector-z7z.56; AGENTS.md,
+ *   "Branches"). Both are stored in their text forms; "" is the empty filter and no default.
  * - `value`: `value`.
  * - `task_output`: `task` (upstream task id) and `artifact` (id of one of that task's
  *   declared output artifacts, staged into the workspace before the task runs).
@@ -42,7 +391,8 @@ enum InputKind : string
 struct InputSpec
 {
     @optional string repository;
-    @optional @asName("ref") string refSelector;
+    @optional BranchFilter branches;
+    @optional @asName("default") RefSpec defaultRef;
     @optional string value;
     @optional string task;
     @optional string artifact;
@@ -59,13 +409,16 @@ struct InputDecl
     @optional InputSpec spec;
 }
 
-/// Declares a repository input: repository `repositoryId` at the ref selected by `refSelector`.
-InputDecl repositoryInput(string repositoryId, string refSelector) pure nothrow @safe
+/// Declares a repository input of repository `repositoryId`, with default ref spec `defaultRef`
+/// (none unless given) and visibility filter `branches` (empty, hiding nothing, unless given).
+InputDecl repositoryInput(string repositoryId, RefSpec defaultRef = RefSpec.init, BranchFilter branches = BranchFilter.init)
+    pure nothrow @safe
 {
     InputDecl decl;
     decl.kind = InputKind.repository;
     decl.spec.repository = repositoryId;
-    decl.spec.refSelector = refSelector;
+    decl.spec.defaultRef = defaultRef;
+    decl.spec.branches = branches;
     return decl;
 }
 
@@ -398,31 +751,105 @@ struct BuildTrigger
 }
 
 /**
- * An external input together with its pinned value: an entry of a chain's pins
- * (`BuildChain.pins`) or of the pins supplied with a request (`BuildRequest.pins`).
+ * Names one declared input of one task: the key a pin is stored under (design record: bead
+ * confector-z7z.56). Pins are per input, not per repository, so one closure can use a repository
+ * at two refs.
  */
-struct PinnedInput
+struct InputKey
 {
-    /// The input it pins, reduced to its pin key (`confector.core.input_resolution.pinKey`): its
-    /// kind plus its kind-specific key. For a repository input, the repository id and ref
-    /// selector, so it pins that repository at that ref for every task that declares it.
-    InputDecl input;
-    InputPin pin;
+    @asName("task_id") string taskId;
+    /// The input's name on the task (its key in `TaskNode.inputs`).
+    string input;
 }
 
 /**
- * The branch a build belongs to (design record: bead confector-z7z.19): a ref of the triggering
- * repository, identified as a tracked branch is (`TrackedBranch`: repository, kind and ref name).
- * It is part of a chain's identity, so each branch has its own build history. A request made by
- * hand names the branch it builds, as the UI's branch switcher does.
+ * A concrete ref of a repository: its kind and its name as the provider reports it, for example
+ * a branch `main`, a tag `v1.2`, a change request `pull/12`, or a revision named directly.
  */
-struct BranchContext
+struct RepositoryRef
 {
-    /// The repository's id (`RepositoryRecord.name`).
-    @asName("repository_id") string repositoryId;
     RefKind kind;
-    /// The ref's name as the provider reports it, e.g. `main` or `pull/123`.
-    @asName("ref_name") string refName;
+    string name;
+}
+
+/**
+ * A repository input of one task pinned to a revision (design record: bead confector-z7z.56): an
+ * entry of a chain's pins (`BuildChain.pins`) or of the pins supplied with a request
+ * (`BuildRequest.pins`). It records the repository, the ref the input was built from and that
+ * ref's revision. Two pins of one input agree only when repository, ref (kind and name) and
+ * revision (the pinned value, as canonical JSON) all agree; display info is never compared. Only
+ * the revision is ever hashed into a fingerprint, never the ref (AGENTS.md, invariant 1).
+ */
+struct PinnedInput
+{
+    /// The task and input it pins (see `InputKey`).
+    @asName("task_id") string taskId;
+    string input;
+    /// The repository the input declares (`InputSpec.repository`).
+    @asName("repository_id") string repositoryId;
+    /// The ref the request chose for the input.
+    @asName("ref") RepositoryRef ref_;
+    /// The ref's revision when it was pinned (git: the commit SHA), with display info.
+    InputPin pin;
+}
+
+/// The key `pin` is stored under.
+InputKey inputKey(in PinnedInput pin) pure nothrow @safe
+{
+    return InputKey(pin.taskId, pin.input);
+}
+
+/**
+ * Kinds of headline ref (`HeadlineRef`): a ref kind, or the one history of a project with no
+ * repositories.
+ */
+enum HeadlineKind : string
+{
+    branch = "branch",
+    tag = "tag",
+    changeRequest = "change_request",
+    revision = "revision",
+    /// The headline of every chain of a project with no repositories, which has one history.
+    /// Never the default value of the type, so a headline left unset is refused, not taken for
+    /// this.
+    default_ = "default"
+}
+
+/**
+ * The ref that groups chains into a history (design record: bead confector-z7z.56): the event's
+ * ref, or for a manual request the ref chosen for the primary (else the first) repository. It is
+ * for display and history only: a request joins a chain by pin agreement, never by headline, and
+ * two chains with one headline are possible and harmless. A project with no repositories has the
+ * headline `default` (`defaultHeadline`), with no name and no repository.
+ *
+ * Otherwise `name` is the ref's name; `repositoryId` is set only for a change request (a pull
+ * request number means nothing without its repository), never for a branch, tag or revision, whose
+ * history is the name's across repositories.
+ */
+struct HeadlineRef
+{
+    HeadlineKind kind;
+    @optional string name;
+    @optional @asName("repository_id") string repositoryId;
+}
+
+/// The headline `default` of a project with no repositories.
+HeadlineRef defaultHeadline() pure nothrow @safe
+{
+    return HeadlineRef(HeadlineKind.default_);
+}
+
+/// The headline for ref `ref_` of repository `repositoryId`, which it keeps only for a change
+/// request.
+HeadlineRef headlineOf(string repositoryId, in RepositoryRef ref_) pure nothrow @safe
+{
+    final switch (ref_.kind)
+    {
+        case RefKind.branch: return HeadlineRef(HeadlineKind.branch, ref_.name);
+        case RefKind.tag: return HeadlineRef(HeadlineKind.tag, ref_.name);
+        case RefKind.revision: return HeadlineRef(HeadlineKind.revision, ref_.name);
+        case RefKind.changeRequest: return HeadlineRef(HeadlineKind.changeRequest, ref_.name, repositoryId);
+    }
 }
 
 /**
@@ -485,10 +912,10 @@ struct BuildRequest
     BuildIntent intent;
     BuildTrigger trigger;
     /// Pins supplied with the request, from the trigger payload or a user ("build against these
-    /// revisions"), at most one per input, sorted by pin key. Resolution takes them as given
-    /// instead of resolving those inputs live, so they choose which chain the request joins; the
-    /// chain holds them before the request is recorded. The request is evaluated against the
-    /// chain's pins, not these.
+    /// revisions"), at most one per task input, sorted by (task, input). Resolution takes them as
+    /// given instead of resolving those inputs live, so they choose which chain the request joins;
+    /// the chain holds identical pins (repository, ref and revision) before the request is
+    /// recorded. The request is evaluated against the chain's pins, not these.
     @optional PinnedInput[] pins;
     /// The id of the stored definition the request runs with (a hash of the `ProjectDefinition`'s
     /// content). Every task the request runs uses it, structure and build configuration alike.
@@ -529,11 +956,12 @@ struct ChainEvent
 }
 
 /**
- * A build chain: what the UI calls a build (beads confector-z7z.14 and confector-z7z.52): the
- * pinned inputs of one branch context of one project, and nothing else. It holds no tasks, edges
- * or build configuration; those come from each request's definition. Its identity (id, project,
- * number, branch, creation time) never changes; pins are only added and, once set, never change;
- * labels change and events are only appended. Requests refer to it by id.
+ * A build chain: what the UI calls a build (beads confector-z7z.14, confector-z7z.52 and
+ * confector-z7z.56): the pinned inputs of one build of one project, and nothing else. It holds no
+ * tasks, edges or build configuration; those come from each request's definition. Its identity
+ * (id, project, number, headline, creation time) never changes; pins are only added and, once set,
+ * never change; labels change and events are only appended. Requests refer to it by id, and join
+ * it by pin agreement.
  */
 struct BuildChain
 {
@@ -541,12 +969,13 @@ struct BuildChain
     @asName("project_id") string projectId;
     /// Canonical per-project number ("build #123"), allocated when the chain is created.
     ulong number;
-    /// The branch the chain builds, part of its identity: a request joins only a chain of its own
-    /// branch context.
-    BranchContext branch;
-    /// The pinned value of every external input the chain's requests have needed, at most one per
-    /// input, sorted by pin key. The authoritative input to fingerprinting: the tasks of every
-    /// request's definition on the chain are fingerprinted against these.
+    /// The ref that groups the chain into a history (see `HeadlineRef`). Required. Not part of
+    /// how requests find the chain: they join by pin agreement.
+    HeadlineRef headline;
+    /// The pin of every repository input the chain's requests have needed: per task input, its
+    /// repository, ref and revision, at most one per input, sorted by (task, input). The
+    /// authoritative input to fingerprinting: the tasks of every request's definition on the chain
+    /// are fingerprinted against these.
     @optional PinnedInput[] pins;
     @asName("created_at") string createdAt;
     /// User-editable labels, separate from the number.
@@ -676,14 +1105,18 @@ struct FingerprintLedger
 }
 
 /**
- * Kinds of ref a tracked branch can be (bead confector-z7z.19).
+ * Kinds of ref (beads confector-z7z.19 and confector-z7z.56): of a tracked branch, of a pin's ref
+ * (`RepositoryRef`) and of a headline.
  */
 enum RefKind : string
 {
     branch = "branch",
     tag = "tag",
     /// A pull request, merge request, code review or shelf, as its provider exposes it.
-    changeRequest = "change_request"
+    changeRequest = "change_request",
+    /// A revision named directly (git: a full commit SHA), as a fixed ref spec may name one. The
+    /// ref of a pin or a headline only: never a tracked branch's kind.
+    revision = "revision"
 }
 
 /**
@@ -847,8 +1280,8 @@ unittest
 {
     TaskNode node;
     node.id = "test-node";
-    node.inputs["src"] = repositoryInput("repo1", "main");
-    node.inputs["lib"] = repositoryInput("repo1", "release");
+    node.inputs["src"] = repositoryInput("repo1");
+    node.inputs["lib"] = repositoryInput("repo1", RefSpec.fromString("release"));
     node.inputs["engine"] = taskOutputInput("build-engine", "engine.zip");
     node.inputs["order"] = taskOutputInput("setup");
     node.inputs["flavor"] = valueInput("external");
@@ -897,20 +1330,40 @@ unittest
 
 unittest
 {
-    // Inputs round-trip through JSON as a map keyed by name, with snake_case kinds.
+    // Inputs round-trip through JSON as a map keyed by name, with snake_case kinds; a repository
+    // input's filter and default ref spec are stored in their text forms
     TaskNode node;
     node.id = "package";
-    node.inputs["src"] = repositoryInput("game", "main");
+    node.inputs["src"] = repositoryInput("game", RefSpec.fromString("same  else main"), BranchFilter.fromString("+:* -:experimental/*"));
+    node.inputs["tools"] = repositoryInput("tools");
     node.inputs["engine"] = taskOutputInput("build-engine", "engine.zip");
     node.inputs["flavor"] = valueInput("external");
 
     auto json = serializeToJson(node);
     assert(json["inputs"]["src"]["kind"].get!string == "repository");
-    assert(json["inputs"]["src"]["spec"]["ref"].get!string == "main");
+    assert(json["inputs"]["src"]["spec"]["default"].get!string == "same else main");
+    assert(json["inputs"]["src"]["spec"]["branches"].get!string == "+:* -:experimental/*");
+    assert(json["inputs"]["tools"]["spec"]["default"].get!string == "", "No default is the empty text");
+    assert(json["inputs"]["tools"]["spec"]["branches"].get!string == "");
     assert(json["inputs"]["engine"]["kind"].get!string == "task_output");
 
     auto back = deserializeJson!TaskNode(json);
     assert(back.inputs == node.inputs);
+    assert(roundTrip(node).inputs == node.inputs);
+
+    // Hand-written inputs: the filter and default may be left out; a malformed one fails loudly
+    auto written = deserializeJson!InputDecl(`{"kind": "repository", "spec": {"repository": "game"}}`);
+    assert(written == repositoryInput("game"));
+    assert(written.spec.defaultRef.kind == RefSpecKind.none && written.spec.branches.isEmpty);
+    foreach (malformed; [`{"kind": "repository", "spec": {"repository": "game", "default": "same else"}}`,
+                         `{"kind": "repository", "spec": {"repository": "game", "branches": "experimental/*"}}`,
+                         `{"kind": "repository", "spec": {"repository": "game", "branches": "-:experimental/*"}}`])
+    {
+        bool threw = false;
+        try deserializeJson!InputDecl(malformed);
+        catch (Exception) threw = true;
+        assert(threw, malformed);
+    }
 }
 
 version (unittest)
@@ -933,7 +1386,7 @@ unittest
     request.targets = ["internal", "tests"];
     request.intent = BuildIntent.build;
     request.trigger = BuildTrigger(TriggerType.gitPush, "rule-1", ["ref": "refs/heads/main", "revision": "aaa111"]);
-    request.pins = [PinnedInput(repositoryInput("game", "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    request.pins = [PinnedInput("compile", "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
     request.definitionId = "d1";
     request.definitionSource = DefinitionSource(DefinitionLocation.repository, "ci-config", "main", "game.yaml", Json("ccc333"));
     request.requestedBy = "webhook:github";
@@ -943,7 +1396,9 @@ unittest
     assert(json["intent"].get!string == "build");
     assert(json["trigger"]["type"].get!string == "git_push");
     assert(json["trigger"]["rule_id"].get!string == "rule-1");
-    assert(json["pins"][0]["input"]["spec"]["ref"].get!string == "main");
+    assert(json["pins"][0]["task_id"].get!string == "compile" && json["pins"][0]["input"].get!string == "src");
+    assert(json["pins"][0]["repository_id"].get!string == "game");
+    assert(json["pins"][0]["ref"]["kind"].get!string == "branch" && json["pins"][0]["ref"]["name"].get!string == "main");
     assert(json["pins"][0]["pin"]["pinned"].get!string == "aaa111");
     assert(json["definition_id"].get!string == "d1");
     assert(json["definition_source"]["location"].get!string == "repository");
@@ -977,7 +1432,7 @@ unittest
     // A project definition round-trips its tasks
     TaskNode compile;
     compile.id = "compile";
-    compile.inputs["src"] = repositoryInput("game", "main");
+    compile.inputs["src"] = repositoryInput("game", RefSpec.fromString("main"));
     compile.steps = [BuildStep("Build", "bash", Json(["script": Json("make")]))];
     auto definition = ProjectDefinition([compile]);
     assert(serializeToJson(definition)["tasks"][0]["id"].get!string == "compile");
@@ -987,23 +1442,26 @@ unittest
 
 unittest
 {
-    // A build chain round-trips its number, branch, pins, labels and history
+    // A build chain round-trips its number, headline, pins, labels and history
     BuildChain chain;
     chain.id = "c1";
     chain.projectId = "game";
     chain.number = 123;
-    chain.branch = BranchContext("game", RefKind.changeRequest, "pull/12");
-    chain.pins = [PinnedInput(repositoryInput("game", "pull/12"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    chain.headline = headlineOf("game", RepositoryRef(RefKind.changeRequest, "pull/12"));
+    chain.pins = [
+        PinnedInput("compile", "src", "game", RepositoryRef(RefKind.changeRequest, "pull/12"), InputPin(Json("aaa111"), ["subject": "Fix the build"])),
+        PinnedInput("compile", "stable", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222"))),
+    ];
     chain.createdAt = "2026-10-15T14:02:01Z";
     chain.labels = ["release candidate"];
     chain.events = [ChainEvent(ChainEventKind.rerun, "r2", "release", "base-fingerprint", 1)];
 
     auto json = serializeToJson(chain);
     assert(json["number"].get!long == 123);
-    assert(json["branch"]["repository_id"].get!string == "game");
-    assert(json["branch"]["kind"].get!string == "change_request");
-    assert(json["branch"]["ref_name"].get!string == "pull/12");
-    assert(json["pins"][0]["input"]["spec"]["repository"].get!string == "game");
+    assert(json["headline"]["repository_id"].get!string == "game");
+    assert(json["headline"]["kind"].get!string == "change_request");
+    assert(json["headline"]["name"].get!string == "pull/12");
+    assert(json["pins"][0]["repository_id"].get!string == "game" && json["pins"][1]["ref"]["name"].get!string == "main");
     assert(json["pins"][0]["pin"]["info"]["subject"].get!string == "Fix the build");
     assert(json["events"][0]["kind"].get!string == "rerun");
     assert(json["events"][0]["request_id"].get!string == "r2");
@@ -1043,12 +1501,13 @@ unittest
     auto pinned = deserializeJson!BuildRequest(`{
         "id": "r2", "project_id": "game", "chain_id": "c2", "targets": ["internal"],
         "intent": "build", "trigger": {"type": "git_push", "rule_id": "rule-1", "payload": {"ref": "main"}},
-        "pins": [{"input": {"kind": "repository", "spec": {"repository": "game", "ref": "main"}},
+        "pins": [{"task_id": "compile", "input": "src", "repository_id": "game", "ref": {"kind": "branch", "name": "main"},
                   "pin": {"pinned": "aaa111"}}],
         "definition_id": "d1", "definition_source": {"location": "confector"},
         "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z"
     }`);
-    assert(pinned.pins.length == 1 && pinned.pins[0].input == repositoryInput("game", "main"));
+    assert(pinned.pins.length == 1 && inputKey(pinned.pins[0]) == InputKey("compile", "src"));
+    assert(pinned.pins[0].repositoryId == "game" && pinned.pins[0].ref_ == RepositoryRef(RefKind.branch, "main"));
     assert(pinned.pins[0].pin.pinned == Json("aaa111") && pinned.pins[0].pin.info.length == 0);
     assert(pinned.trigger.payload == ["ref": "main"]);
 
@@ -1064,21 +1523,27 @@ unittest
 
     auto chain = deserializeJson!BuildChain(`{
         "id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z",
-        "branch": {"repository_id": "game", "kind": "branch", "ref_name": "main"}
+        "headline": {"kind": "branch", "name": "main"}
     }`);
-    assert(chain.number == 7 && chain.branch == BranchContext("game", RefKind.branch, "main"));
+    assert(chain.number == 7 && chain.headline == HeadlineRef(HeadlineKind.branch, "main"));
     assert(chain.pins.length == 0 && chain.labels.length == 0 && chain.events.length == 0);
 
-    // A chain without a branch context is malformed
-    bool branchlessThrew = false;
+    // The headline of a project with no repositories
+    auto unpinned = deserializeJson!BuildChain(`{
+        "id": "c2", "project_id": "docs", "number": 1, "created_at": "2026-10-15T14:02:01Z", "headline": {"kind": "default"}
+    }`);
+    assert(unpinned.headline == defaultHeadline() && unpinned.headline.name.length == 0);
+
+    // A chain without a headline is malformed
+    bool headlessThrew = false;
     try deserializeJson!BuildChain(`{"id": "c1", "project_id": "game", "number": 7, "created_at": "2026-10-15T14:02:01Z"}`);
-    catch (Exception) branchlessThrew = true;
-    assert(branchlessThrew, "A chain without a branch must not deserialize");
+    catch (Exception) headlessThrew = true;
+    assert(headlessThrew, "A chain without a headline must not deserialize");
 
     // A rerun event without the optional fields of other kinds still reads
     auto withEvent = deserializeJson!BuildChain(`{
         "id": "c1", "project_id": "game", "number": 7,
-        "branch": {"repository_id": "game", "kind": "branch", "ref_name": "main"},
+        "headline": {"kind": "tag", "name": "v1"},
         "created_at": "2026-10-15T14:02:01Z", "labels": ["rc"],
         "events": [{"kind": "rerun", "request_id": "r2", "task_id": "compile", "base": "b", "generation": 2}]
     }`);
@@ -1114,7 +1579,7 @@ unittest
     execution.status = ExecutionStatus.succeeded;
     execution.attempts = 2;
     execution.definition.id = "compile";
-    execution.definition.inputs["src"] = repositoryInput("game", "main");
+    execution.definition.inputs["src"] = repositoryInput("game", RefSpec.fromString("main"));
     execution.definition.steps = [BuildStep("Checkout", "checkout", Json(["input": Json("src")])),
         BuildStep("Compile", "bash", Json(["script": Json("make")]))];
     execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
@@ -1195,4 +1660,126 @@ unittest
     auto unrevoked = deserializeJson!ApiToken(`{"secret_hash": "h", "name": "ci", "owner": "jason", "role": "viewer", "created_at": "2026-10-15T14:02:00Z"}`);
     assert(unrevoked.role == Role.viewer && unrevoked.revokedAt.length == 0);
     assert(ApiToken.init.role == Role.none, "An unset role grants nothing");
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+
+    // Branch filters: include/exclude rules in their text form; a ref is visible when an include
+    // rule matches and no exclude rule does, whatever the order
+    auto filter = BranchFilter.fromString("  +:*   -:experimental/* ");
+    assert(filter.rules == [BranchRule(true, "*"), BranchRule(false, "experimental/*")]);
+    assert(filter.toString() == "+:* -:experimental/*");
+    assert(BranchFilter.fromString(filter.toString()) == filter);
+    assert(refVisible(filter, "main") && refVisible(filter, "feature/a/b") && refVisible(filter, "experimental"));
+    assert(!refVisible(filter, "experimental/x") && !refVisible(filter, "experimental/x/y"), "* matches across slashes");
+    auto reversed = BranchFilter.fromString("-:experimental/* +:*");
+    assert(!refVisible(reversed, "experimental/x") && refVisible(reversed, "main"), "Order does not matter");
+
+    auto releases = BranchFilter.fromString("+:release/* +:main -:release/*-rc");
+    assert(refVisible(releases, "main") && refVisible(releases, "release/1.2"));
+    assert(!refVisible(releases, "release/1.2-rc") && !refVisible(releases, "mainline") && !refVisible(releases, "dev"));
+    assert(refVisible(BranchFilter.fromString("+:v*.*"), "v1.2") && !refVisible(BranchFilter.fromString("+:v*.*"), "v12"));
+    assert(refVisible(BranchFilter.fromString("+:a*b*c"), "aXbYbZc") && !refVisible(BranchFilter.fromString("+:a*b*c"), "aXcYb"));
+    assert(!refVisible(BranchFilter.fromString("+:Main"), "main"), "Matching is case-sensitive");
+
+    // The empty filter hides nothing
+    assert(BranchFilter.fromString("").isEmpty && BranchFilter.fromString(" ").isEmpty && BranchFilter.init.toString() == "");
+    assert(refVisible(BranchFilter.init, "anything/at/all"));
+
+    // Malformed filters fail loudly, naming the filter
+    foreach (malformed; ["main", "+:", "-:", "*", "+main", "-:experimental/*", "-:a -:b"])
+    {
+        bool threw = false;
+        try BranchFilter.fromString(malformed);
+        catch (InvalidRefSpecException e) threw = e.msg.canFind(malformed);
+        assert(threw, malformed);
+    }
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+
+    // Ref specs: the three forms, each with the fallbacks it allows, read back equal
+    auto event = RefSpec.fromString("event +:* -:experimental/* else main");
+    assert(event.kind == RefSpecKind.event && event.rules == BranchFilter.fromString("+:* -:experimental/*"));
+    assert(event.fallback == RefFallback.ref_ && event.fallbackRef == "main" && event.refName.length == 0);
+
+    auto skipping = RefSpec.fromString("event +:release/* else skip");
+    assert(skipping.fallback == RefFallback.skip && skipping.fallbackRef.length == 0);
+    assert(RefSpec.fromString("event +:*").fallback == RefFallback.none);
+
+    auto same = RefSpec.fromString("same else develop");
+    assert(same.kind == RefSpecKind.same && same.fallback == RefFallback.ref_ && same.fallbackRef == "develop");
+    assert(RefSpec.fromString("same").fallback == RefFallback.none);
+    assert(RefSpec.fromString("same else skip").fallback == RefFallback.skip);
+
+    auto fixed = RefSpec.fromString(" refs/tags/v1.2 ");
+    assert(fixed.kind == RefSpecKind.fixed && fixed.refName == "refs/tags/v1.2" && fixed.fallback == RefFallback.none);
+    assert(RefSpec.fromString("0123456789abcdef0123456789abcdef01234567").refName.length == 40, "A revision is a fixed ref");
+
+    auto none = RefSpec.fromString("   ");
+    assert(none.kind == RefSpecKind.none && none == RefSpec.init && none.toString() == "");
+
+    foreach (text; ["event +:* -:experimental/* else main", "event +:release/* else skip", "event +:*", "same",
+        "same else develop", "same else skip", "main", "event +:feat/* else main", ""])
+    {
+        auto spec = RefSpec.fromString(text);
+        assert(spec.toString() == text, text);
+        assert(RefSpec.fromString(spec.toString()) == spec, text);
+        requireWellFormed(BranchFilter.init, spec);
+    }
+    assert(RefSpec.fromString("same   else\tmain").toString() == "same else main", "Whitespace is normalized");
+
+    // A pattern is never a ref: it needs event, and the message says how to write it
+    foreach (pattern; ["*", "release/*", "same else release/*", "event +:* else feat/*"])
+    {
+        bool hinted = false;
+        try RefSpec.fromString(pattern);
+        catch (InvalidRefSpecException e) hinted = e.msg.canFind("a pattern needs event: write event +:");
+        assert(hinted, pattern);
+    }
+
+    // Malformed specs fail loudly, naming the spec
+    foreach (malformed; [
+        "event", "event else main", "event -:experimental/*", "event main", "event +:* else", "event +:* else a b",
+        "event +:* otherwise main", "same else", "same main", "same else skip now", "same else event",
+        "same else +:x", "else main", "skip", "main else develop", "main develop", "+:main", "-:main",
+        "same else same", "*", "release/*", "same else release/*", "event +:* else feat/*",
+    ])
+    {
+        bool threw = false;
+        try RefSpec.fromString(malformed);
+        catch (InvalidRefSpecException e) threw = e.msg.canFind("'" ~ malformed ~ "'");
+        assert(threw, malformed);
+    }
+
+    // A spec or filter built in code must be one its text form accepts
+    bool threw = false;
+    try requireWellFormed(BranchFilter.init, RefSpec(RefSpecKind.fixed, BranchFilter.init, "two words"));
+    catch (InvalidRefSpecException) threw = true;
+    assert(threw);
+    threw = false;
+    try requireWellFormed(BranchFilter([BranchRule(false, "x")]), RefSpec.init);
+    catch (InvalidRefSpecException) threw = true;
+    assert(threw);
+    threw = false;
+    try requireWellFormed(BranchFilter.init, RefSpec(RefSpecKind.same, BranchFilter.init, "stray"));
+    catch (InvalidRefSpecException) threw = true;
+    assert(threw, "A field of another kind is not well formed");
+}
+
+unittest
+{
+    // Headlines: a change request keeps its repository, other refs do not; `default` is a
+    // distinguished value and never the value of an unset headline
+    assert(headlineOf("game", RepositoryRef(RefKind.branch, "main")) == HeadlineRef(HeadlineKind.branch, "main"));
+    assert(headlineOf("game", RepositoryRef(RefKind.tag, "v1")) == HeadlineRef(HeadlineKind.tag, "v1"));
+    assert(headlineOf("game", RepositoryRef(RefKind.revision, "abc")) == HeadlineRef(HeadlineKind.revision, "abc"));
+    assert(headlineOf("game", RepositoryRef(RefKind.changeRequest, "pull/12")) == HeadlineRef(HeadlineKind.changeRequest, "pull/12", "game"));
+    assert(defaultHeadline().kind == HeadlineKind.default_ && HeadlineRef.init.kind != HeadlineKind.default_);
+    assert(serializeToJson(defaultHeadline())["kind"].get!string == "default");
+    assert(roundTrip(defaultHeadline()) == defaultHeadline());
 }
