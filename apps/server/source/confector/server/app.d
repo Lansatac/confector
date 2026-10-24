@@ -9,8 +9,9 @@ import vibe.vibe;
 
 import confector.config;
 import confector.core.state_stores : StateStores;
+import confector.core.worker_signing_key : SigningKeySource, generateWorkerSigningKey;
 import confector.server.backends : Backends, buildBackends;
-import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig, requireWorkerTokenConfig;
+import confector.server.config : ServerConfig, registerServerConfigDefinitions, loadServerConfig, requireExecutionConfig;
 
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.controller.artifacts_controller : artifactsRouter;
@@ -126,7 +127,6 @@ void main()
     setLogLevel(configuredLogLevel);
 
     requireExecutionConfig(serverConfig.execution);
-    requireWorkerTokenConfig(serverConfig.workerTokens);
 
     // A missing or invalid backend setting, or an unreachable MongoDB, ends startup here.
     // Constructing StateStores declares every collection, which needs the database.
@@ -134,8 +134,14 @@ void main()
     auto stores = new StateStores(backends.documentStore);
     logInfo("[state] State is kept in MongoDB database '%s'.", serverConfig.documentStore.database);
 
+    auto signingKey = stores.workerSigningKeys.resolve(serverConfig.workerTokens.signingKey, () => generateWorkerSigningKey());
+    if (signingKey.source == SigningKeySource.generated)
+        logWarn("[auth] Generated the worker token signing key and stored it in the document store. Backups and exports of the store now hold the key; set server.workerTokens.signingKey to use a key of your own.");
+    else if (signingKey.source == SigningKeySource.configured)
+        logInfo("[auth] Worker tokens are signed with the configured signing key.");
+
     auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret,
-        serverConfig.workerTokens.signingKey, serverConfig.execution.maxAttempts);
+        signingKey.key, serverConfig.execution.maxAttempts);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {

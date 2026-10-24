@@ -15,6 +15,7 @@ import confector.core.definition_store : DefinitionStore;
 import confector.core.fingerprint_ledger : LedgerStore;
 import confector.core.project_stores : ProjectStore, RepositoryStore, TrackedBranchStore;
 import confector.core.rerun_generations : RerunGenerationStore;
+import confector.core.worker_signing_key : WorkerSigningKeyStore;
 import confector.api.document_store : DocumentStore;
 
 /**
@@ -37,6 +38,7 @@ final class StateStores
     RepositoryStore repositories;
     TrackedBranchStore trackedBranches;
     ApiTokenStore apiTokens;
+    WorkerSigningKeyStore workerSigningKeys;
 
     private DocumentStore m_store;
 
@@ -60,6 +62,7 @@ final class StateStores
         repositories = new RepositoryStore(store);
         trackedBranches = new TrackedBranchStore(store);
         apiTokens = new ApiTokenStore(store);
+        workerSigningKeys = new WorkerSigningKeyStore(store);
     }
 
     /// The DocumentStore the stores are kept in.

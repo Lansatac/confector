@@ -2,7 +2,6 @@ module confector.server.config;
 
 import confector.config;
 import confector.core.work_orders : defaultMaxAttempts;
-import confector.core.worker_token : minimumSigningKeyLength;
 import std.format : format;
 import vibe.data.json : Json;
 
@@ -49,15 +48,14 @@ struct SchedulerConfig
 }
 
 /**
- * Worker tokens. The server signs a token per execution with this key and checks it on every
- * worker route. Required, with no default; a key that is guessable or shared lets anyone act as
- * a worker.
+ * Worker tokens. The server signs a token per execution and checks it on every worker route. The
+ * key is optional: unset, the server uses the installation's key, generated once and kept in the
+ * document store (see WorkerSigningKeyStore). A configured key overrides it.
  */
 struct WorkerTokenConfig
 {
-    @Required
     @Env("CONFECTOR_WORKER_TOKEN_SIGNING_KEY")
-    @Description("Secret key the server signs per-execution worker tokens with (required, at least 32 bytes), e.g. from openssl rand -hex 32")
+    @Description("Secret key the server signs per-execution worker tokens with, overriding the installation's key kept in the document store (optional; when set, at least 32 bytes, e.g. from openssl rand -hex 32)")
     string signingKey = "";
 }
 
@@ -135,22 +133,6 @@ void requireSchedulerConfig(in SchedulerConfig config)
         throw new Exception("[config] Required setting 'server.scheduler.callbackSecret' is missing "
             ~ "(server.scheduler.callbackSecret or CONFECTOR_SCHEDULER_CALLBACK_SECRET): the server cannot start "
             ~ "without it, because scheduler callbacks would be unauthenticated.");
-}
-
-/**
- * Throws, naming the setting, unless the worker token signing key is configured and long enough.
- * Workers authenticate with tokens signed by it, so the server cannot run without it.
- */
-void requireWorkerTokenConfig(in WorkerTokenConfig config)
-{
-    if (config.signingKey.length == 0)
-        throw new Exception("[config] Required setting 'server.workerTokens.signingKey' is missing "
-            ~ "(server.workerTokens.signingKey or CONFECTOR_WORKER_TOKEN_SIGNING_KEY): the server cannot start "
-            ~ "without it, because worker routes would be unauthenticated.");
-    if (config.signingKey.length < minimumSigningKeyLength)
-        throw new Exception(format("[config] Setting 'server.workerTokens.signingKey' is %d bytes: it must be at least %d "
-            ~ "(server.workerTokens.signingKey or CONFECTOR_WORKER_TOKEN_SIGNING_KEY).",
-            config.signingKey.length, minimumSigningKeyLength));
 }
 
 /**
@@ -251,23 +233,7 @@ unittest
 
 unittest
 {
-    import std.algorithm.searching : canFind;
-    import std.exception : collectException;
-
-    // The signing key is required and has no default; a short one is refused too
-    WorkerTokenConfig config;
-    auto missing = collectException(requireWorkerTokenConfig(config));
-    assert(missing !is null && missing.msg.canFind("server.workerTokens.signingKey")
-        && missing.msg.canFind("CONFECTOR_WORKER_TOKEN_SIGNING_KEY"), missing.msg);
-
-    config.signingKey = "too-short";
-    auto tooShort = collectException(requireWorkerTokenConfig(config));
-    assert(tooShort !is null && tooShort.msg.canFind("at least 32"), tooShort.msg);
-
-    config.signingKey = "0123456789abcdef0123456789abcdef";
-    requireWorkerTokenConfig(config);
-
-    // It is read from the configuration file
+    // The signing key is read from the configuration file (its length is checked where it is used)
     import vibe.data.json : parseJsonString;
     auto registry = new ConfigRegistry(parseJsonString(`{"server": {"workerTokens": {"signingKey": "from-the-file"}}}`));
     registerServerConfigDefinitions(registry);

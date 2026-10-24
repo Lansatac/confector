@@ -440,7 +440,8 @@ handled by trust levels.
 - **Workers hold one token per execution.** It is signed, short-lived, and carried in the work
   order, and it allows only what that execution needs: reporting its own logs and completion,
   uploading its own artifacts, downloading the artifacts its inputs name, and fetching its
-  secrets.
+  secrets. The signing key is generated once per installation and kept in the document store
+  unless one is configured; a random per-installation key is not a guessable default.
 - **Webhooks and scheduler callbacks are verified** — by the provider's signature, or by a secret
   the scheduler sends.
 - **Secrets come from a secret store backend at run time.** Tasks declare secrets by name; the
