@@ -22,8 +22,10 @@ import confector.backends.artifact.local : LocalArtifactStorage;
 import confector.backends.document_store.mongo : MongoDocumentStore;
 import confector.backends.queue.mongo : MongoDispatchQueue;
 import confector.backends.scheduler.local : LocalScheduler;
+import confector.server.authenticator : Authenticator;
 import confector.server.config : HttpConfig, ServerConfig, requireArtifactStoreConfig, requireDocumentStoreConfig,
     requireSchedulerConfig;
+import confector.server.trusted_proxy_authenticator : TrustedProxyAuthenticator;
 
 /**
  * The server's backends. Every field is set once built.
@@ -38,6 +40,17 @@ struct Backends
     Scheduler scheduler;
     /// Holds artifact bytes.
     ArtifactStorage artifactStore;
+    /// Says who made each request (confector.server.authenticator).
+    Authenticator authenticator;
+}
+
+/**
+ * Builds the authenticator `config` configures: the trusted proxy. Throws, naming the setting, when
+ * it is not configured, since the server refuses to start without an authenticator.
+ */
+Authenticator buildAuthenticator(in ServerConfig config)
+{
+    return new TrustedProxyAuthenticator(config.auth.trustedProxy);
 }
 
 /**
@@ -92,6 +105,8 @@ Backends buildBackends(in ServerConfig config)
     // The local backends first: they are cheap and fail without a database.
     backends.artifactStore = new LocalArtifactStorage(config.artifactStore.baseDirectory);
     backends.scheduler = new LocalScheduler(config.scheduler.callbackSecret, serverBaseUrl(config.http));
+    // Before any database is contacted: a server without an authenticator never starts
+    backends.authenticator = buildAuthenticator(config);
     backends.documentStore = new MongoDocumentStore(
         new MongoConnection(config.documentStore.connectionString), config.documentStore.database);
     backends.dispatchQueue = new MongoDispatchQueue(
@@ -144,7 +159,7 @@ version (unittest)
         }
 
         Restore restore;
-        foreach (name; ["CONFECTOR_MONGO_URI", "CONFECTOR_SCHEDULER_CALLBACK_SECRET",
+        foreach (name; ["CONFECTOR_MONGO_URI", "CONFECTOR_SCHEDULER_CALLBACK_SECRET", "CONFECTOR_AUTH_PROXY_SECRET",
             keyToDefaultEnvVar("server.documentStore.database"), keyToDefaultEnvVar("server.artifactStore.baseDirectory")])
         {
             restore.saved[name] = environment.get(name);
@@ -213,4 +228,32 @@ unittest
         ~ `"scheduler": {"callbackSecret": "s3cret"}, "artifactStore": {"baseDirectory": `
         ~ Json(notADirectory).toString() ~ `}}}`);
     assert(failure.canFind(notADirectory) && failure.canFind("not a directory"), failure);
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+    import std.file : exists, rmdirRecurse;
+
+    auto environmentGuard = withoutBackendEnvironment();
+
+    // Every other setting is valid, yet startup fails without an authenticator, before the database is contacted
+    const artifactDirectory = missingTempPath("authenticator");
+    scope(exit) if (exists(artifactDirectory)) rmdirRecurse(artifactDirectory);
+    auto failure = startupFailure(`{"server": {"documentStore": {"connectionString": "mongodb://unreachable.invalid:1", "database": "confector"}, `
+        ~ `"scheduler": {"callbackSecret": "s3cret"}, "artifactStore": {"baseDirectory": ` ~ Json(artifactDirectory).toString() ~ `}}}`);
+    assert(failure.canFind("authenticator"), failure);
+
+    auto direct = collectException(buildAuthenticator(ServerConfig.init));
+    assert(direct !is null && direct.msg.canFind("authenticator"), "No authenticator may be built without configuration");
+}
+
+unittest
+{
+    auto environmentGuard = withoutBackendEnvironment();
+
+    // With the trusted proxy's secret configured, the trusted proxy is the server's authenticator
+    auto config = configFrom(`{"server": {"auth": {"trustedProxy": {"secret": "0123456789abcdef0123456789abcdef"}}}}`);
+    assert(cast(TrustedProxyAuthenticator) buildAuthenticator(config) !is null);
 }

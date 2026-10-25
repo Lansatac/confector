@@ -7,9 +7,11 @@ import std.datetime.systime : Clock;
 import std.string : strip;
 import std.uri : encodeComponent;
 
-import confector.api.model : ProjectRecord, RepositoryRecord, projectUsesRepository, repositoryIds;
+import confector.api.model : ProjectRecord, RepositoryRecord, Role, projectUsesRepository, repositoryIds;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
+import confector.server.authenticator : Authenticator;
+import confector.server.route_access : AuthorizedRoutes;
 
 /// View model for repository listing.
 struct RepositoryViewModel
@@ -30,11 +32,12 @@ struct ConnectedProjectViewModel
 }
 
 /**
- * Creates the URL router for the /repositories endpoints.
+ * Creates the routes for the /repositories pages. Viewing them needs the viewer role; adding and
+ * editing repositories needs admin, as repository records are configuration.
  */
-URLRouter repositoryRouter(StateStores stores)
+AuthorizedRoutes repositoryRouter(Authenticator authenticator, StateStores stores)
 {
-    auto router = new URLRouter();
+    auto router = new AuthorizedRoutes(authenticator);
 
     // 1. Repositories list view
     void handleIndex(HTTPServerRequest req, HTTPServerResponse res)
@@ -68,7 +71,7 @@ URLRouter repositoryRouter(StateStores stores)
         res.render!("repository/repositories.dt", repoViews, repos, totalConnectedProjects);
     }
 
-    router.get("/repositories/", &handleIndex);
+    router.get("/repositories/", Role.viewer, &handleIndex);
 
     // 2. Add repository view
     void handleAddForm(HTTPServerRequest req, HTTPServerResponse res)
@@ -77,7 +80,7 @@ URLRouter repositoryRouter(StateStores stores)
         res.render!("repository/add-repo.dt", errorMessage);
     }
 
-    router.get("/repositories/add", &handleAddForm);
+    router.get("/repositories/add", Role.admin, &handleAddForm);
 
     // 3. Post add repository
     void handleAddSubmit(HTTPServerRequest req, HTTPServerResponse res)
@@ -110,7 +113,7 @@ URLRouter repositoryRouter(StateStores stores)
         res.redirect("/repositories/details?name=" ~ encodeComponent(name));
     }
 
-    router.post("/repositories/add", &handleAddSubmit);
+    router.post("/repositories/add", Role.admin, &handleAddSubmit);
 
     // 3.5. Post edit repository
     void handleEditSubmit(HTTPServerRequest req, HTTPServerResponse res)
@@ -137,7 +140,7 @@ URLRouter repositoryRouter(StateStores stores)
         res.redirect("/repositories/details?name=" ~ encodeComponent(name));
     }
 
-    router.post("/repositories/edit", &handleEditSubmit);
+    router.post("/repositories/edit", Role.admin, &handleEditSubmit);
 
     // 4. Repository details view
     void handleDetails(HTTPServerRequest req, HTTPServerResponse res)
@@ -196,7 +199,7 @@ URLRouter repositoryRouter(StateStores stores)
         res.render!("repository/repository-details.dt", repo, repoName, repoAddress, repoCreatedAt, errorMessage, connectedProjects);
     }
 
-    router.get("/repositories/details", &handleDetails);
+    router.get("/repositories/details", Role.viewer, &handleDetails);
 
     return router;
 }
@@ -212,7 +215,8 @@ unittest
     r1.createdAt = "2026-10-04T12:00:00Z";
     stores.repositories.put(r1);
 
-    auto router = repositoryRouter(stores);
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    auto router = repositoryRouter(new FixedAuthenticator(testIdentity(Role.admin)), stores);
     assert(router !is null);
 
     // A registration without a name and address is redirected back to the form and stores nothing

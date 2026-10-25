@@ -5,19 +5,22 @@ import confector.api.model : ArtifactNotFoundException, ArtifactStorage, Invalid
 import confector.core.state_stores : StateStores;
 import confector.core.worker_token : WorkerTokenClaims, WorkerTokenScopeException, requireInputArtifact, requireSigningKey, requireUpload;
 import confector.server.worker_auth : authenticateWorker, permitWorker, requireCurrentExecutionAttempt;
+import confector.server.authenticator : Authenticator;
+import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
 import std.array : Appender;
 
 /**
- * Creates the URL router for the artifact endpoints workers use, under /api/v1/artifacts: presigned
+ * Creates the routes for the artifact endpoints workers use, under /api/v1/artifacts: presigned
  * URLs where `storage` supports them, and server-proxied upload, existence check and download
  * otherwise (the runner's HttpArtifactStorage is the client).
  *
- * Every route needs the worker token of an execution (signed with `workerTokenKey`), and the
- * token must allow the artifact: uploads and presigned upload URLs for the execution's own
- * fingerprint, and only while the token's attempt is the execution's current one; existence checks, downloads and presigned download URLs for the artifacts its
- * inputs name. No token may delete: retention removes artifacts, not workers.
+ * No user identity reaches these routes: each is excluded from authentication and checks the
+ * worker token itself. The token is signed with `workerTokenKey`, and it must allow the artifact:
+ * uploads and presigned upload URLs for the execution's own fingerprint, and only while the token's
+ * attempt is the execution's current one; existence checks, downloads and presigned download URLs for
+ * the artifacts its inputs name. No token may delete: retention removes artifacts, not workers.
  */
-URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateStores stores)
+AuthorizedRoutes artifactsRouter(Authenticator authenticator, ArtifactStorage storage, string workerTokenKey, StateStores stores)
 {
     if (storage is null)
         throw new Exception("The artifact routes need an artifact store");
@@ -25,7 +28,7 @@ URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateS
         throw new Exception("The artifact routes need the state stores, to check an upload's execution attempt");
     requireSigningKey(workerTokenKey);
 
-    auto router = new URLRouter();
+    auto router = new AuthorizedRoutes(authenticator);
 
     // A failed storage call answers with a short message (none for HEAD); the detail, which can
     // name server paths, is only logged.
@@ -78,7 +81,7 @@ URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateS
     void presignRoute(string path, string field, string delegate(string, string) presign,
         void delegate(in WorkerTokenClaims, string, string) requireScope)
     {
-        router.get(path, (HTTPServerRequest req, HTTPServerResponse res) {
+        router.excluded(HTTPMethod.GET, path, ExcludedBy.workerToken, (HTTPServerRequest req, HTTPServerResponse res) {
             WorkerTokenClaims claims;
             if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             string fingerprint = req.query.get("fingerprint", "");
@@ -112,7 +115,7 @@ URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateS
 
     // POST /api/v1/artifacts/:fingerprint/:artifactId/upload
     // Server-proxied upload: the worker sends the artifact bytes, the server stores them.
-    router.post("/api/v1/artifacts/:fingerprint/:artifactId/upload", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.excluded(HTTPMethod.POST, "/api/v1/artifacts/:fingerprint/:artifactId/upload", ExcludedBy.workerToken, (HTTPServerRequest req, HTTPServerResponse res) {
         import vibe.stream.operations : readAll;
 
         WorkerTokenClaims claims;
@@ -141,7 +144,7 @@ URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateS
 
     // HEAD /api/v1/artifacts/_head/:fingerprint/:artifactId
     // Checks that an artifact exists. URLRouter routes a HEAD request to the GET route.
-    router.get("/api/v1/artifacts/_head/:fingerprint/:artifactId", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.excluded(HTTPMethod.GET, "/api/v1/artifacts/_head/:fingerprint/:artifactId", ExcludedBy.workerToken, (HTTPServerRequest req, HTTPServerResponse res) {
         // Every branch writes the response: an unwritten one falls through to later routes.
         WorkerTokenClaims claims;
         if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
@@ -160,7 +163,7 @@ URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateS
 
     // GET /api/v1/artifacts/:fingerprint/:artifactId/download
     // Server-proxied download: the server sends the artifact bytes to the worker.
-    router.get("/api/v1/artifacts/:fingerprint/:artifactId/download", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.excluded(HTTPMethod.GET, "/api/v1/artifacts/:fingerprint/:artifactId/download", ExcludedBy.workerToken, (HTTPServerRequest req, HTTPServerResponse res) {
         WorkerTokenClaims claims;
         if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
         string fingerprint = req.params["fingerprint"];
@@ -183,7 +186,7 @@ URLRouter artifactsRouter(ArtifactStorage storage, string workerTokenKey, StateS
 
     // DELETE /api/v1/artifacts/:fingerprint/:artifactId
     // A worker token never allows deleting: a cache entry outlives the execution that wrote it.
-    router.delete_("/api/v1/artifacts/:fingerprint/:artifactId", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.excluded(HTTPMethod.DELETE, "/api/v1/artifacts/:fingerprint/:artifactId", ExcludedBy.workerToken, (HTTPServerRequest req, HTTPServerResponse res) {
         WorkerTokenClaims claims;
         if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
         permitWorker(req, res, {
@@ -198,6 +201,8 @@ unittest
 {
     import confector.api.model : ExecutionStatus, TaskExecution;
     import confector.backends.artifact.local : LocalArtifactStorage;
+    import confector.server.authenticator : FixedAuthenticator, Identity;
+    import std.typecons : Nullable;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.core.worker_token : InputArtifact, WorkerTokenClaims, mintWorkerToken, workerTokenHeader;
     import std.algorithm.searching : canFind;
@@ -223,7 +228,8 @@ unittest
     execution.status = ExecutionStatus.queued;
     execution.attempts = 2;
     stores.executions.createIfAbsent(execution);
-    auto router = artifactsRouter(storage, signingKey, stores);
+    // The worker routes answer the same with or without a user identity: they never consult it
+    auto router = artifactsRouter(new FixedAuthenticator(Nullable!Identity.init), storage, signingKey, stores);
 
     // The token of an execution with fingerprint "fp1", whose one input names artifact
     // "in.zip" of upstream fingerprint "fp_up"
@@ -353,7 +359,9 @@ unittest
 
     // A router needs a signing key
     import std.exception : assertThrown;
-    assertThrown!Exception(artifactsRouter(storage, "", stores));
-    assertThrown!Exception(artifactsRouter(storage, "short", stores));
-    assertThrown!Exception(artifactsRouter(storage, signingKey, null));
+    auto nobody = new FixedAuthenticator(Nullable!Identity.init);
+    assertThrown!Exception(artifactsRouter(nobody, storage, "", stores));
+    assertThrown!Exception(artifactsRouter(nobody, storage, "short", stores));
+    assertThrown!Exception(artifactsRouter(nobody, storage, signingKey, null));
+    assertThrown!Exception(artifactsRouter(null, storage, signingKey, stores));
 }

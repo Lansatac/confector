@@ -11,6 +11,8 @@ import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, require
 import confector.core.worker_pool_credential : requireWorkerPoolCredential;
 import confector.server.scheduler_callback : schedulerCallback;
 import confector.server.worker_auth : authenticateWorker, authenticateWorkerPool, permitWorker, requireCurrentExecutionAttempt;
+import confector.server.authenticator : Authenticator;
+import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
 import confector.core.work_orders : completeExecution, defaultMaxAttempts, defaultPoolQueue, finishExecution;
 
 import std.format : format;
@@ -38,42 +40,56 @@ NotImplementedException logsNotImplemented()
 }
 
 /**
- * The REST API, served under /api/v1. Every route is registered once, with the prefix; the route
- * helpers take paths relative to it.
+ * The REST API, served under /api/v1. Every route is registered once, with the prefix and its access
+ * (see confector.server.route_access); the route helpers take paths relative to it.
  *
  * Receiving work (/queue/receive) needs the worker pool credential, `workerPoolCredential`, which
  * is checked before anything else. Receiving mints the worker token of each execution it hands out;
  * the routes a worker calls once it holds a work order (lease extension, release and
- * acknowledgement, logs, completion) need that token, signed with `workerTokenKey`.
+ * acknowledgement, logs, completion) need that token, signed with `workerTokenKey`. Neither is
+ * reached by a user identity.
  */
-URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
+AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential, uint maxExecutionAttempts, DispatchQueue queue = null, StateStores stores = null)
 {
     requireSigningKey(workerTokenKey);
     requireWorkerPoolCredential(workerPoolCredential);
-    auto router = new URLRouter();
+    auto router = new AuthorizedRoutes(authenticator);
 
     enum string apiPrefix = "/api/v1";
 
-    void postRoute(H)(string path, H handler)
+    void postRoute(H)(string path, Role role, H handler)
     {
-        router.post(apiPrefix ~ path, handler);
+        router.post(apiPrefix ~ path, role, handler);
     }
 
     // Routes the scheduler calls back into. Each one requires the scheduler secret; see
     // scheduler_callback.d. Add every new scheduler callback through this helper.
     void schedulerRoute(H)(string path, H handler)
     {
-        postRoute(path, schedulerCallback(schedulerCallbackSecret, handler));
+        router.excluded(HTTPMethod.POST, apiPrefix ~ path, ExcludedBy.schedulerSecret,
+            schedulerCallback(schedulerCallbackSecret, handler));
     }
 
-    void getRoute(H)(string path, H handler)
+    // Routes a worker calls with the token of its execution. Each one checks the token itself.
+    void workerRoute(H)(HTTPMethod method, string path, H handler)
     {
-        router.get(apiPrefix ~ path, handler);
+        router.excluded(method, apiPrefix ~ path, ExcludedBy.workerToken, handler);
     }
 
-    void deleteRoute(H)(string path, H handler)
+    // The route that receives work. It checks the worker pool credential itself.
+    void poolRoute(H)(string path, H handler)
     {
-        router.delete_(apiPrefix ~ path, handler);
+        router.excluded(HTTPMethod.POST, apiPrefix ~ path, ExcludedBy.workerPoolCredential, handler);
+    }
+
+    void getRoute(H)(string path, Role role, H handler)
+    {
+        router.get(apiPrefix ~ path, role, handler);
+    }
+
+    void deleteRoute(H)(string path, Role role, H handler)
+    {
+        router.delete_(apiPrefix ~ path, role, handler);
     }
 
     // A stub route answers 501 Not Implemented, naming the bead that implements it.
@@ -116,7 +132,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
             res.writeJsonBody(err);
         }
 
-        postRoute("/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
+        poolRoute("/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
             if (!authenticateWorkerPool(workerPoolCredential, req, res)) return;
             try
             {
@@ -184,7 +200,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         });
 
         // A lease's routes need the token issued with that lease
-        postRoute("/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
+        workerRoute(HTTPMethod.POST, "/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
             WorkerTokenClaims claims;
             if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             try
@@ -202,7 +218,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
             }
         });
 
-        postRoute("/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
+        workerRoute(HTTPMethod.POST, "/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
             WorkerTokenClaims claims;
             if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             try
@@ -224,7 +240,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
             }
         });
 
-        postRoute("/queue/release", (HTTPServerRequest req, HTTPServerResponse res) {
+        workerRoute(HTTPMethod.POST, "/queue/release", (HTTPServerRequest req, HTTPServerResponse res) {
             WorkerTokenClaims claims;
             if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
             try
@@ -262,11 +278,11 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
 
     // An execution's log: reading it, and the lines its worker streams. Not implemented until
     // the log store lands (see logsNotImplemented). Only the execution's own token posts lines.
-    getRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/executions/:execution_id/logs", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         writeNotImplemented(res, logsNotImplemented());
     });
 
-    postRoute("/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+    workerRoute(HTTPMethod.POST, "/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         WorkerTokenClaims claims;
         if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
         if (!requireStores(res)) return;
@@ -282,7 +298,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
     // that does not match it is rejected. A completion finishes the execution, folds it into its
     // fingerprint's ledger and wakes the chains waiting on it; see
     // confector.core.work_orders.completeExecution. The worker acknowledges its own work order.
-    postRoute("/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+    workerRoute(HTTPMethod.POST, "/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         import confector.core.work_orders : InvalidCompletionException, OutcomeNotFoldedException, StaleCompletionException,
             UnknownExecutionException;
 
@@ -339,7 +355,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
 
     // Starting a build of a project fails loudly until request intake lands (see
     // buildsNotImplemented). The scheduler calls the second route for cron trigger rules.
-    postRoute("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects/run", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         writeNotImplemented(res, buildsNotImplemented());
     });
 
@@ -348,7 +364,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
     });
 
     // Projects REST API
-    getRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             auto projects = stores !is null ? stores.projects.list() : [];
@@ -363,7 +379,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         }
     });
 
-    postRoute("/projects", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             ProjectRecord proj = deserializeJson!ProjectRecord(req.json);
@@ -393,7 +409,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         }
     });
 
-    getRoute("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects/:id", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -419,7 +435,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         }
     });
 
-    deleteRoute("/projects/:id", (HTTPServerRequest req, HTTPServerResponse res) {
+    deleteRoute("/projects/:id", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -448,7 +464,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
     });
 
     // Project Tasks API
-    getRoute("/projects/:id/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects/:id/tasks", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -474,7 +490,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         }
     });
 
-    postRoute("/projects/:id/tasks", (HTTPServerRequest req, HTTPServerResponse res) {
+    postRoute("/projects/:id/tasks", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -527,7 +543,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         }
     });
 
-    getRoute("/projects/:id/tasks/:taskId", (HTTPServerRequest req, HTTPServerResponse res) {
+    getRoute("/projects/:id/tasks/:taskId", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -565,7 +581,7 @@ URLRouter apiRouter(string schedulerCallbackSecret, string workerTokenKey, strin
         }
     });
 
-    deleteRoute("/projects/:id/tasks/:taskId", (HTTPServerRequest req, HTTPServerResponse res) {
+    deleteRoute("/projects/:id/tasks/:taskId", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.params["id"];
@@ -627,8 +643,10 @@ unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
+    import confector.server.authenticator : FixedAuthenticator, Identity, testIdentity;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
+    import std.typecons : Nullable;
 
     string testDir = "test_api_controller_run";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -640,14 +658,29 @@ unittest
 
     enum workerTokenKey = "0123456789abcdef0123456789abcdef";
     enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
-    auto router = apiRouter("test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue);
+    auto admin = new FixedAuthenticator(testIdentity(Role.admin));
+    auto router = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue);
     assert(router !is null);
 
-    // A router needs a signing key and a worker pool credential of a usable length
+    // A router needs an authenticator, a signing key and a worker pool credential of a usable length
     import std.exception : assertThrown;
-    assertThrown!Exception(apiRouter("test-scheduler-secret", "", workerPoolCredential, defaultMaxAttempts, queue));
-    assertThrown!Exception(apiRouter("test-scheduler-secret", workerTokenKey, "", defaultMaxAttempts, queue));
-    assertThrown!Exception(apiRouter("test-scheduler-secret", workerTokenKey, "too-short", defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter(null, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", "", workerPoolCredential, defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, "", defaultMaxAttempts, queue));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, "too-short", defaultMaxAttempts, queue));
+
+    // A user route refuses a request without an identity, and one whose role is too low
+    auto nobodyRouter = apiRouter(new FixedAuthenticator(Nullable!Identity.init), "test-scheduler-secret",
+        workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue);
+    auto unidentifiedRes = createTestHTTPServerResponse();
+    nobodyRouter.handleRequest(createTestHTTPServerRequest(URL("http://localhost/api/v1/projects"), HTTPMethod.GET), unidentifiedRes);
+    assert(unidentifiedRes.statusCode == HTTPStatus.unauthorized);
+
+    auto viewerRouter = apiRouter(new FixedAuthenticator(testIdentity(Role.viewer)), "test-scheduler-secret",
+        workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue);
+    auto tooLowRes = createTestHTTPServerResponse();
+    viewerRouter.handleRequest(createTestHTTPServerRequest(URL("http://localhost/api/v1/projects"), HTTPMethod.POST), tooLowRes);
+    assert(tooLowRes.statusCode == HTTPStatus.forbidden);
 
     // A scheduler callback without the scheduler secret is refused before its handler runs
     auto unauthReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
@@ -684,7 +717,7 @@ unittest
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryStream;
 
-    auto routerWithStores = apiRouter("test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue, stores);
+    auto routerWithStores = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue, stores);
 
     import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, verifyWorkerToken, workerTokenHeader;
     import confector.core.worker_pool_credential : workerPoolCredentialHeader;
@@ -971,7 +1004,7 @@ unittest
     auto failingStores = new StateStores(failingDocuments);
     const anotherId = queueExecution(failingStores, "fp_n1_again");
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
-    auto failingRouter = apiRouter("test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue, failingStores);
+    auto failingRouter = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, queue, failingStores);
     InetHeaderMap failingHeaders;
     failingHeaders["Content-Type"] = "application/json";
     failingHeaders[workerTokenHeader] = tokenForPath("/executions/" ~ anotherId ~ "/complete", failingStores);

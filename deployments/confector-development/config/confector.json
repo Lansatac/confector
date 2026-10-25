@@ -17,6 +17,16 @@
     },
     "artifactStore": {
       "baseDirectory": "/artifacts"
+    },
+    "auth": {
+      "trustedProxy": {
+        "secret": "dev-proxy-secret-0123456789abcdef",
+        "roles": {
+          "admins": ["dev@example.com"],
+          "members": ["dev-members"],
+          "viewers": ["dev-viewers"]
+        }
+      }
     }
   }
 }

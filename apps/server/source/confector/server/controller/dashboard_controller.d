@@ -7,6 +7,8 @@ import confector.api.model;
 import confector.core.document_collection : tryValue;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;
+import confector.server.authenticator : Authenticator;
+import confector.server.route_access : AuthorizedRoutes;
 import confector.server.controller.api_controller : buildsNotImplemented;
 
 import std.algorithm : canFind;
@@ -945,9 +947,13 @@ unittest
     assert(both.canFind("Task 'engine': Output line 1") && both.canFind("Task 'app': Step 1 (Image)"), both);
 }
 
-URLRouter dashboardRouter(StateStores stores)
+/**
+ * Creates the routes for the dashboard pages. Viewing a page needs the viewer role; the editor
+ * pages and every action that changes a project, task or build need member.
+ */
+AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores)
 {
-    auto router = new URLRouter();
+    auto router = new AuthorizedRoutes(authenticator);
 
     // Renders the task editor showing `form`: the task's own fields, or what was submitted when
     // the editor is shown again after a rejected save. `formError` is shown at the top of the
@@ -970,7 +976,7 @@ URLRouter dashboardRouter(StateStores stores)
     }
 
     // Home / Dashboard
-    router.get("/", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         auto projects = stores !is null ? stores.projects.list() : [];
 
         DashboardProjectViewModel[] dashboardProjects;
@@ -1000,16 +1006,16 @@ URLRouter dashboardRouter(StateStores stores)
     });
 
     // Projects Management
-    router.get("/projects/", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/projects/", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         auto projects = stores !is null ? stores.projects.list() : [];
         res.render!("project/projects.dt", projects);
     });
 
-    router.get("/projects/add", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/projects/add", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         res.render!("project/add-project.dt");
     });
 
-    router.post("/projects/add", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/projects/add", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = "";
         try
         {
@@ -1043,7 +1049,7 @@ URLRouter dashboardRouter(StateStores stores)
         res.redirect("/projects/details?id=" ~ projId);
     });
 
-    router.get("/projects/details", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/projects/details", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("id", "");
         ProjectRecord project;
         bool found = stores !is null && stores.projects.get(projId).tryValue(project);
@@ -1057,7 +1063,7 @@ URLRouter dashboardRouter(StateStores stores)
         res.render!("project/project-details.dt", project, tasksJson);
     });
 
-    router.get("/projects/edit", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/projects/edit", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("id", "");
         ProjectRecord project;
         if (stores !is null)
@@ -1068,7 +1074,7 @@ URLRouter dashboardRouter(StateStores stores)
         renderProjectEditor(res, project, tasksJson, "");
     });
 
-    router.post("/projects/save", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/projects/save", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.form.get("id", "");
         string tasksJsonText = req.form.get("tasks_json", "");
         ProjectRecord project;
@@ -1115,7 +1121,7 @@ URLRouter dashboardRouter(StateStores stores)
         res.redirect("/projects/details?id=" ~ projId);
     });
 
-    router.post("/projects/delete", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/projects/delete", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
             string projId = req.form.get("id", "");
@@ -1135,13 +1141,13 @@ URLRouter dashboardRouter(StateStores stores)
     });
 
     // Task Editor within Project
-    router.get("/projects/tasks/add", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/projects/tasks/add", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("project_id", "");
         if (projId.length == 0) projId = req.query.get("id", "");
         res.redirect("/projects/tasks/edit?project_id=" ~ projId);
     });
 
-    router.get("/projects/tasks/edit", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/projects/tasks/edit", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.query.get("project_id", "");
         if (projId.length == 0) projId = req.query.get("id", "");
         string taskId = req.query.get("task_id", "");
@@ -1169,7 +1175,7 @@ URLRouter dashboardRouter(StateStores stores)
         renderTaskEditor(res, project, task, taskEditorForm(task), "");
     });
 
-    router.post("/projects/tasks/save", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/projects/tasks/save", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.form.get("project_id", "");
         ProjectRecord project;
         TaskNode task;
@@ -1261,7 +1267,7 @@ URLRouter dashboardRouter(StateStores stores)
         res.redirect("/projects/details?id=" ~ projId);
     });
 
-    router.post("/projects/tasks/delete", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/projects/tasks/delete", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = req.form.get("project_id", "");
         string taskId = req.form.get("task_id", "");
         try
@@ -1294,12 +1300,12 @@ URLRouter dashboardRouter(StateStores stores)
 
     // Run a project, or a task and its upstream tasks. Not implemented until request intake
     // (see buildsNotImplemented): the request fails loudly.
-    router.post("/projects/run", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/projects/run", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         throw new HTTPStatusException(HTTPStatus.notImplemented, buildsNotImplemented().msg);
     });
 
     // Task Details View (Static definition, configuration, steps and dependencies)
-    router.get("/tasks/details", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.get("/tasks/details", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) {
         string projectId = req.query.get("project_id", "");
         if (projectId.length == 0) projectId = req.query.get("project", "");
         string taskId = req.query.get("task_id", "");
@@ -1370,7 +1376,8 @@ unittest
 
     auto documents = new InterleavingDocumentStore(new InMemoryDocumentStore());
     auto stores = new StateStores(documents);
-    auto router = dashboardRouter(stores);
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    auto router = dashboardRouter(new FixedAuthenticator(testIdentity(Role.admin)), stores);
 
     ProjectRecord p;
     p.id = "proj_dash_1";

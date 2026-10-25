@@ -5,6 +5,7 @@ import confector.core.work_orders : defaultMaxAttempts;
 import confector.core.worker_pool_credential : minimumWorkerPoolCredentialLength;
 import confector.core.worker_token : minimumSigningKeyLength;
 import std.format : format;
+import std.uni : sicmp;
 import vibe.data.json : Json;
 
 /**
@@ -76,6 +77,67 @@ struct WorkerTokenConfig
 }
 
 /**
+ * The identity headers an authenticating proxy sets. The groups header holds comma-separated group
+ * names.
+ */
+struct ProxyHeadersConfig
+{
+    @Description("Header holding the authenticated user's subject (default X-Forwarded-User)")
+    string user = "X-Forwarded-User";
+
+    @Description("Header holding the user's email address (default X-Forwarded-Email)")
+    string email = "X-Forwarded-Email";
+
+    @Description("Header holding the user's comma-separated group names (default X-Forwarded-Groups)")
+    string groups = "X-Forwarded-Groups";
+}
+
+/**
+ * The emails and group names, as the proxy sends them, that hold each global role. An identity
+ * that matches several roles holds the highest; one that matches none holds no role and is refused
+ * everywhere a role is needed.
+ */
+struct RoleMappingConfig
+{
+    @Description("Emails and group names that hold the admin role")
+    string[] admins;
+
+    @Description("Emails and group names that hold the member role")
+    string[] members;
+
+    @Description("Emails and group names that hold the viewer role")
+    string[] viewers;
+}
+
+/**
+ * The trusted proxy: an authenticating proxy (such as oauth2-proxy) signs users in, sets their
+ * identity headers and sends `secret` in `secretHeader` on every request. The server reads the
+ * identity headers only from a request carrying that secret, compared in constant time. The secret
+ * is required, with no default; the server refuses to start without it (see requireTrustedProxyConfig).
+ */
+struct TrustedProxyConfig
+{
+    @Description("Header the proxy sends the shared secret in (default X-Confector-Proxy-Secret)")
+    string secretHeader = "X-Confector-Proxy-Secret";
+
+    @Required
+    @Env("CONFECTOR_AUTH_PROXY_SECRET")
+    @Description("Shared secret the proxy sends in the secret header on every request (required, at least 32 bytes, e.g. from openssl rand -hex 32)")
+    string secret = "";
+
+    ProxyHeadersConfig headers;
+    RoleMappingConfig roles;
+}
+
+/**
+ * Authentication: who makes each request. The trusted proxy is the only authenticator for now.
+ */
+struct AuthConfig
+{
+    TrustedProxyConfig trustedProxy;
+}
+
+/**
  * The artifact store: artifacts are kept as files under a base directory. Required, with no
  * default; the server refuses to start without it (see requireArtifactStoreConfig).
  */
@@ -113,6 +175,7 @@ struct ServerConfig
     WorkerTokenConfig workerTokens;
     ArtifactStoreConfig artifactStore;
     ExecutionConfig execution;
+    AuthConfig auth;
 }
 
 /**
@@ -181,6 +244,58 @@ void requireWorkerTokenConfig(in WorkerTokenConfig config)
             ~ "must be at least %d bytes when set, not %d: the server cannot start with a signing key that short. "
             ~ "Generate one with openssl rand -hex 32, or unset it to use the installation's key.",
             minimumSigningKeyLength, config.signingKey.length));
+}
+
+/// The fewest bytes the trusted proxy's shared secret may have.
+enum size_t minimumProxySecretLength = 32;
+
+/**
+ * Throws, naming the setting and its environment variable, unless the trusted proxy is configured:
+ * a secret of at least minimumProxySecretLength bytes, header names that are not empty, and no empty
+ * entry in the role mapping. Without one the server has no authenticator and cannot start. The
+ * secret is never in the message.
+ */
+void requireTrustedProxyConfig(in TrustedProxyConfig config)
+{
+    if (config.secret.length == 0)
+        throw new Exception("[config] Required setting 'server.auth.trustedProxy.secret' is missing "
+            ~ "(server.auth.trustedProxy.secret or CONFECTOR_AUTH_PROXY_SECRET): the server cannot start without "
+            ~ "an authenticator, and the trusted proxy cannot check a request without the secret.");
+    if (config.secret.length < minimumProxySecretLength)
+        throw new Exception(format("[config] Setting 'server.auth.trustedProxy.secret' (or CONFECTOR_AUTH_PROXY_SECRET) "
+            ~ "must be at least %d bytes, not %d: the server cannot start with a secret that short. "
+            ~ "Generate one with openssl rand -hex 32.", minimumProxySecretLength, config.secret.length));
+
+    requireHeaderName("server.auth.trustedProxy.secretHeader", config.secretHeader);
+    requireHeaderName("server.auth.trustedProxy.headers.user", config.headers.user);
+    requireHeaderName("server.auth.trustedProxy.headers.email", config.headers.email);
+    requireHeaderName("server.auth.trustedProxy.headers.groups", config.headers.groups);
+    foreach (identityHeader; [config.headers.user, config.headers.email, config.headers.groups])
+    {
+        if (sicmp(identityHeader, config.secretHeader) == 0)
+            throw new Exception(format("[config] Setting 'server.auth.trustedProxy.secretHeader' names the identity header '%s' "
+                ~ "(server.auth.trustedProxy.headers): the secret and the identity must arrive in different headers.",
+                identityHeader));
+    }
+    requireNoEmptyEntry("server.auth.trustedProxy.roles.admins", config.roles.admins);
+    requireNoEmptyEntry("server.auth.trustedProxy.roles.members", config.roles.members);
+    requireNoEmptyEntry("server.auth.trustedProxy.roles.viewers", config.roles.viewers);
+}
+
+private void requireHeaderName(string setting, string header)
+{
+    if (header.length == 0)
+        throw new Exception("[config] Setting '" ~ setting ~ "' is empty: the trusted proxy needs a header name to read.");
+}
+
+private void requireNoEmptyEntry(string setting, in string[] entries)
+{
+    foreach (entry; entries)
+    {
+        if (entry.length == 0)
+            throw new Exception("[config] Setting '" ~ setting ~ "' holds an empty entry, which would match requests "
+                ~ "that send no value for it.");
+    }
 }
 
 /**
@@ -426,4 +541,74 @@ unittest
     auto registry = new ConfigRegistry();
     registerServerConfigDefinitions(registry);
     assert(loadServerConfig(registry).workerTokens.signingKey == "key-from-the-environment-0123456789");
+}
+
+unittest
+{
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    // The trusted proxy has the header defaults, and needs a secret of at least 32 bytes, without an empty
+    // header name or role entry
+    TrustedProxyConfig config;
+    assert(config.secretHeader == "X-Confector-Proxy-Secret");
+    assert(config.headers.user == "X-Forwarded-User" && config.headers.email == "X-Forwarded-Email"
+        && config.headers.groups == "X-Forwarded-Groups");
+
+    auto missing = collectException(requireTrustedProxyConfig(config));
+    assert(missing !is null && missing.msg.canFind("server.auth.trustedProxy.secret")
+        && missing.msg.canFind("CONFECTOR_AUTH_PROXY_SECRET"), missing.msg);
+
+    config.secret = "too-short";
+    auto tooShort = collectException(requireTrustedProxyConfig(config));
+    assert(tooShort !is null && tooShort.msg.canFind("at least 32 bytes") && !tooShort.msg.canFind("too-short"),
+        tooShort.msg);
+
+    config.secret = "0123456789abcdef0123456789abcdef";
+    requireTrustedProxyConfig(config);
+
+    config.headers.user = "";
+    assert(collectException(requireTrustedProxyConfig(config)).msg.canFind("server.auth.trustedProxy.headers.user"));
+    config.headers.user = "X-Forwarded-User";
+
+    config.roles.viewers = ["guest@example.com", ""];
+    assert(collectException(requireTrustedProxyConfig(config)).msg.canFind("server.auth.trustedProxy.roles.viewers"));
+    config.roles.viewers = [];
+
+    // The secret header may not be an identity header, whatever its case
+    config.secretHeader = "x-forwarded-USER";
+    auto collision = collectException(requireTrustedProxyConfig(config));
+    assert(collision !is null && collision.msg.canFind("server.auth.trustedProxy.secretHeader")
+        && collision.msg.canFind("X-Forwarded-User") && !collision.msg.canFind(config.secret), collision.msg);
+    config.secretHeader = "X-Confector-Proxy-Secret";
+    requireTrustedProxyConfig(config);
+}
+
+unittest
+{
+    import std.process : environment;
+    import vibe.data.json : parseJsonString;
+
+    // The secret is read from the file, with the environment variable overriding it; a role mapping and a
+    // partly given header section keep the defaults they do not set
+    enum secretVar = "CONFECTOR_AUTH_PROXY_SECRET";
+    const savedSecret = environment.get(secretVar);
+    scope(exit)
+    {
+        if (savedSecret is null) environment.remove(secretVar); else environment[secretVar] = savedSecret;
+    }
+    environment.remove(secretVar);
+
+    auto registry = new ConfigRegistry(parseJsonString(`{"server": {"auth": {"trustedProxy": {`
+        ~ `"secret": "secret-from-the-file-0123456789abcdef", `
+        ~ `"roles": {"admins": ["ada@example.com"], "viewers": ["readers"]}, `
+        ~ `"headers": {"user": "X-User"}}}}}`));
+    registerServerConfigDefinitions(registry);
+    auto proxy = loadServerConfig(registry).auth.trustedProxy;
+    assert(proxy.secret == "secret-from-the-file-0123456789abcdef");
+    assert(proxy.roles.admins == ["ada@example.com"] && proxy.roles.members.length == 0 && proxy.roles.viewers == ["readers"]);
+    assert(proxy.headers.user == "X-User" && proxy.headers.email == "X-Forwarded-Email");
+
+    environment[secretVar] = "secret-from-the-environment-0123456789";
+    assert(loadServerConfig(registry).auth.trustedProxy.secret == "secret-from-the-environment-0123456789");
 }
