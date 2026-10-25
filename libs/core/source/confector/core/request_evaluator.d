@@ -59,7 +59,7 @@ module confector.core.request_evaluator;
  */
 
 import confector.core.build_stores : ExecutionStore;
-import confector.core.chain_pins : pinMap;
+import confector.core.chain_pins : bindingMap, pinMap;
 import confector.core.dag : TaskGraph;
 import confector.core.definition_store : definitionId;
 import confector.core.fingerprint_ledger : LedgerStore;
@@ -218,7 +218,8 @@ TaskDemand[] requestDemands(in GraphResolution closure, in ulong[string] stopSeq
  */
 string[] requestFingerprints(in BuildChain chain, in DefinedRequest entry, in RerunGenerations generations) @trusted
 {
-    const resolution = completeGraphResolution(chain.projectId, closureOf(chain, entry), pinMap(chain.pins), generations);
+    const resolution = completeGraphResolution(chain.projectId, closureOf(chain, entry), bindingMap(entry.request.bindings),
+        pinMap(chain.pins), generations);
     string[] fingerprints;
     foreach (fingerprint; resolution.fingerprints.byValue) fingerprints ~= fingerprint;
     return fingerprints.sort().release;
@@ -233,7 +234,8 @@ string[] requestFingerprints(in BuildChain chain, in DefinedRequest entry, in Re
  */
 RerunGenerations readRequestGenerations(in BuildChain chain, in DefinedRequest entry, scope RerunGenerationReader read) @trusted
 {
-    const resolution = readGraphResolution(chain.projectId, closureOf(chain, entry), pinMap(chain.pins), read);
+    const resolution = readGraphResolution(chain.projectId, closureOf(chain, entry), bindingMap(entry.request.bindings),
+        pinMap(chain.pins), read);
     RerunGenerations generations;
     foreach (taskId, base; resolution.bases) generations[base] = resolution.generations[taskId];
     return generations;
@@ -290,7 +292,7 @@ RequestEvaluation evaluateRequest(
 {
     const request = entry.request;
     auto graph = closureOf(chain, entry);
-    const resolution = completeGraphResolution(chain.projectId, graph, pinMap(chain.pins), generations);
+    const resolution = completeGraphResolution(chain.projectId, graph, bindingMap(request.bindings), pinMap(chain.pins), generations);
 
     string[] demanded;
     foreach (ref demand; request.demands) demanded ~= demand.taskId;
@@ -621,9 +623,27 @@ private void requireEvaluable(bool condition, lazy string message) @trusted
 version (unittest)
 {
     import confector.core.fingerprint_ledger : withClaim, withFold;
+    import confector.core.chain_pins : inputKeyLess;
     import confector.core.input_resolution : InputResolutionException;
 
     import vibe.data.json : Json;
+
+    import std.algorithm.sorting : sort;
+
+    /// Every repository input of `graph` bound to branch main, sorted by input, as a request records them.
+    private InputBinding[] mainBindings(const TaskGraph graph)
+    {
+        InputBinding[] bindings;
+        foreach (taskId; graph.allTaskIds())
+        {
+            foreach (name, decl; graph.getTask(taskId).inputs)
+            {
+                if (decl.kind == InputKind.repository) bindings ~= InputBinding(taskId, name, RepositoryRef(RefKind.branch, "main"));
+            }
+        }
+        bindings.sort!((a, b) => inputKeyLess(inputKey(a), inputKey(b)));
+        return bindings;
+    }
 
     /// compile -> test -> report, compile -> package, and lint; compile and lint build repository game.
     private ProjectDefinition sampleDefinition()
@@ -643,10 +663,7 @@ version (unittest)
         chain.projectId = "p";
         chain.number = 1;
         chain.headline = HeadlineRef(HeadlineKind.branch, "main");
-        foreach (task; ["compile", "lint"])
-        {
-            chain.pins ~= PinnedInput(task, "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")));
-        }
+        chain.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")))];
         chain.createdAt = "2026-10-20T10:00:00Z";
         return chain;
     }
@@ -683,7 +700,8 @@ version (unittest)
     /// The fingerprints of the tasks a request with `targets` covers in `definition`, now.
     private GraphResolution closureAt(ref World w, in string[] targets, ProjectDefinition definition = sampleDefinition())
     {
-        return readGraphResolution(w.chain.projectId, closureGraph(definition, targets), pinMap(w.chain.pins), readerOf(w));
+        auto graph = closureGraph(definition, targets);
+        return readGraphResolution(w.chain.projectId, graph, bindingMap(mainBindings(graph)), pinMap(w.chain.pins), readerOf(w));
     }
 
     private string fingerprintOf(ref World w, string taskId)
@@ -707,6 +725,7 @@ version (unittest)
         request.projectId = w.chain.projectId;
         request.chainId = w.chain.id;
         request.targets = targets;
+        request.bindings = mainBindings(closureGraph(definition, targets));
         request.intent = BuildIntent.build;
         request.trigger.type = TriggerType.manual;
         request.definitionId = definitionId(definition);
@@ -1247,7 +1266,8 @@ unittest
     assert(throwsWith!RequestEvaluationException("was not read", { requestDemands(closure, [compileAt: 2UL]); }));
     string[string] unread;
     RerunGenerations none;
-    auto partial = graphResolution("p", closureGraph(sampleDefinition(), ["test"]), pinMap(w.chain.pins), none, unread);
+    auto testGraph = closureGraph(sampleDefinition(), ["test"]);
+    auto partial = graphResolution("p", testGraph, bindingMap(mainBindings(testGraph)), pinMap(w.chain.pins), none, unread);
     assert(throwsWith!RequestEvaluationException("rerun generation", { requestDemands(partial, null); }));
     assert(throwsWith!RequestEvaluationException("'nope'", { closureGraph(sampleDefinition(), ["nope"]); }));
 

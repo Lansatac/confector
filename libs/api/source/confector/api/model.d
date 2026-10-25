@@ -753,9 +753,8 @@ struct BuildTrigger
 }
 
 /**
- * Names one declared input of one task: the key a pin is stored under (design record: bead
- * confector-z7z.56). Pins are per input, not per repository, so one closure can use a repository
- * at two refs.
+ * Names one declared input of one task. A request binds each repository input to a ref
+ * (`InputBinding`), per input, so one closure can use a repository at two refs.
  */
 struct InputKey
 {
@@ -775,30 +774,54 @@ struct RepositoryRef
 }
 
 /**
- * A repository input of one task pinned to a revision (design record: bead confector-z7z.56): an
- * entry of a chain's pins (`BuildChain.pins`) or of the pins supplied with a request
- * (`BuildRequest.pins`). It records the repository, the ref the input was built from and that
- * ref's revision. Two pins of one input agree only when repository, ref (kind and name) and
- * revision (the pinned value, as canonical JSON) all agree; display info is never compared. Only
- * the revision is ever hashed into a fingerprint, never the ref (AGENTS.md, invariant 1).
+ * A ref of a repository: the key a pin is stored under. A chain pins each (repository, ref)
+ * once, whichever tasks and inputs are bound to it.
  */
-struct PinnedInput
+struct RepositoryAt
 {
-    /// The task and input it pins (see `InputKey`).
-    @asName("task_id") string taskId;
-    string input;
-    /// The repository the input declares (`InputSpec.repository`).
+    string repositoryId;
+    RepositoryRef ref_;
+}
+
+/**
+ * A repository ref pinned to a revision: an entry of a chain's pins (`BuildChain.pins`) or of the
+ * pins supplied with a request (`BuildRequest.pins`). Two pins of one (repository, ref) agree
+ * only when their revisions (the pinned value, as canonical JSON) agree; display info is never
+ * compared. Only the revision is ever hashed into a fingerprint, never the ref (AGENTS.md,
+ * invariant 1).
+ */
+struct RepositoryPin
+{
     @asName("repository_id") string repositoryId;
-    /// The ref the request chose for the input.
     @asName("ref") RepositoryRef ref_;
     /// The ref's revision when it was pinned (git: the commit SHA), with display info.
     InputPin pin;
 }
 
 /// The key `pin` is stored under.
-InputKey inputKey(in PinnedInput pin) pure nothrow @safe
+RepositoryAt repositoryAt(in RepositoryPin pin) pure nothrow @safe
 {
-    return InputKey(pin.taskId, pin.input);
+    return RepositoryAt(pin.repositoryId, pin.ref_);
+}
+
+/**
+ * The ref a request bound one repository input to: from the trigger's or request's ref spec for
+ * the input, else the input's default (AGENTS.md, "Branches"). The input's repository is the one
+ * its declaration names. Per request: another request on the chain may bind the same input
+ * elsewhere.
+ */
+struct InputBinding
+{
+    @asName("task_id") string taskId;
+    /// The input's name on the task (its key in `TaskNode.inputs`).
+    string input;
+    @asName("ref") RepositoryRef ref_;
+}
+
+/// The input `binding` binds.
+InputKey inputKey(in InputBinding binding) pure nothrow @safe
+{
+    return InputKey(binding.taskId, binding.input);
 }
 
 /**
@@ -936,11 +959,15 @@ struct BuildRequest
     BuildIntent intent;
     BuildTrigger trigger;
     /// Pins supplied with the request, from the trigger payload or a user ("build against these
-    /// revisions"), at most one per task input, sorted by (task, input). Resolution takes them as
-    /// given instead of resolving those inputs live, so they choose which chain the request joins;
-    /// the chain holds identical pins (repository, ref and revision) before the request is
+    /// revisions"), at most one per (repository, ref), sorted by repository, ref kind and ref
+    /// name. Resolution takes them as given instead of resolving those refs live, so they choose
+    /// which chain the request joins; the chain holds identical pins before the request is
     /// recorded. The request is evaluated against the chain's pins, not these.
-    @optional PinnedInput[] pins;
+    @optional RepositoryPin[] pins;
+    /// The ref each repository input of the request's targets and their upstream tasks is bound
+    /// to, at most one per input, sorted by (task, input). Each bound (repository, ref) is pinned
+    /// on the chain before the request is recorded.
+    @optional InputBinding[] bindings;
     /// The id of the stored definition the request runs with (a hash of the `ProjectDefinition`'s
     /// content). Every task the request runs uses it, structure and build configuration alike.
     @asName("definition_id") string definitionId;
@@ -984,8 +1011,7 @@ struct ChainEvent
 }
 
 /**
- * A build chain: what the UI calls a build (beads confector-z7z.14, confector-z7z.52 and
- * confector-z7z.56): the pinned inputs of one build of one project, and nothing else. It holds no
+ * A build chain: what the UI calls a build: the pinned repository refs of one build of one project, and nothing else. It holds no
  * tasks, edges or build configuration; those come from each request's definition. Its identity
  * (id, project, number, headline, creation time) never changes; pins are only added and, once set,
  * never change; labels change and events are only appended. Requests refer to it by id, and join
@@ -1000,11 +1026,11 @@ struct BuildChain
     /// The ref that groups the chain into a history (see `HeadlineRef`). Required. Not part of
     /// how requests find the chain: they join by pin agreement.
     HeadlineRef headline;
-    /// The pin of every repository input the chain's requests have needed: per task input, its
-    /// repository, ref and revision, at most one per input, sorted by (task, input). The
-    /// authoritative input to fingerprinting: the tasks of every request's definition on the chain
-    /// are fingerprinted against these.
-    @optional PinnedInput[] pins;
+    /// The pin of every repository ref the chain's requests have needed: its revision, at most
+    /// one per (repository, ref), sorted by repository, ref kind and ref name. The authoritative
+    /// input to fingerprinting: the tasks of every request's definition on the chain are
+    /// fingerprinted against these, each input at the ref its request bound it to.
+    @optional RepositoryPin[] pins;
     @asName("created_at") string createdAt;
     /// User-editable labels, separate from the number.
     @optional string[] labels;
@@ -1491,7 +1517,8 @@ unittest
     request.targets = ["internal", "tests"];
     request.intent = BuildIntent.build;
     request.trigger = BuildTrigger(TriggerType.gitPush, "rule-1", ["ref": "refs/heads/main", "revision": "aaa111"]);
-    request.pins = [PinnedInput("compile", "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    request.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111"), ["subject": "Fix the build"]))];
+    request.bindings = [InputBinding("compile", "src", RepositoryRef(RefKind.branch, "main"))];
     request.definitionId = "d1";
     request.definitionSource = DefinitionSource(DefinitionLocation.repository, "ci-config", "main", "game.yaml", Json("ccc333"));
     request.demands = [TaskDemand("compile", "fp-compile", "b-compile", 1, 2), TaskDemand("internal", "fp-internal", "b-internal"),
@@ -1503,10 +1530,11 @@ unittest
     assert(json["intent"].get!string == "build");
     assert(json["trigger"]["type"].get!string == "git_push");
     assert(json["trigger"]["rule_id"].get!string == "rule-1");
-    assert(json["pins"][0]["task_id"].get!string == "compile" && json["pins"][0]["input"].get!string == "src");
     assert(json["pins"][0]["repository_id"].get!string == "game");
     assert(json["pins"][0]["ref"]["kind"].get!string == "branch" && json["pins"][0]["ref"]["name"].get!string == "main");
     assert(json["pins"][0]["pin"]["pinned"].get!string == "aaa111");
+    assert(json["bindings"][0]["task_id"].get!string == "compile" && json["bindings"][0]["input"].get!string == "src");
+    assert(json["bindings"][0]["ref"]["kind"].get!string == "branch" && json["bindings"][0]["ref"]["name"].get!string == "main");
     assert(json["definition_id"].get!string == "d1");
     assert(json["definition_source"]["location"].get!string == "repository");
     assert(json["definition_source"]["repository_id"].get!string == "ci-config");
@@ -1560,8 +1588,8 @@ unittest
     chain.number = 123;
     chain.headline = headlineOf("game", RepositoryRef(RefKind.changeRequest, "pull/12"));
     chain.pins = [
-        PinnedInput("compile", "src", "game", RepositoryRef(RefKind.changeRequest, "pull/12"), InputPin(Json("aaa111"), ["subject": "Fix the build"])),
-        PinnedInput("compile", "stable", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222"))),
+        RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222"))),
+        RepositoryPin("game", RepositoryRef(RefKind.changeRequest, "pull/12"), InputPin(Json("aaa111"), ["subject": "Fix the build"])),
     ];
     chain.createdAt = "2026-10-15T14:02:01Z";
     chain.labels = ["release candidate"];
@@ -1572,8 +1600,8 @@ unittest
     assert(json["headline"]["repository_id"].get!string == "game");
     assert(json["headline"]["kind"].get!string == "change_request");
     assert(json["headline"]["name"].get!string == "pull/12");
-    assert(json["pins"][0]["repository_id"].get!string == "game" && json["pins"][1]["ref"]["name"].get!string == "main");
-    assert(json["pins"][0]["pin"]["info"]["subject"].get!string == "Fix the build");
+    assert(json["pins"][0]["repository_id"].get!string == "game" && json["pins"][0]["ref"]["name"].get!string == "main");
+    assert(json["pins"][1]["pin"]["info"]["subject"].get!string == "Fix the build");
     assert(json["events"][0]["kind"].get!string == "rerun");
     assert(json["events"][0]["request_id"].get!string == "r2");
     assert(json["events"][0]["task_id"].get!string == "release");
@@ -1605,7 +1633,7 @@ unittest
     assert(request.demands == [TaskDemand("internal", "fp1", "b1", 0, 0)], "A demand without a generation or stop_seq saw none");
     assert(request.intent == BuildIntent.retry && request.trigger.type == TriggerType.manual);
     assert(request.trigger.ruleId.length == 0 && request.trigger.payload.length == 0);
-    assert(request.pins.length == 0 && request.targets == ["internal"]);
+    assert(request.pins.length == 0 && request.bindings.length == 0 && request.targets == ["internal"]);
     assert(request.definitionSource.location == DefinitionLocation.confector
         && request.definitionSource.revision.type == Json.Type.null_);
     assert(request.definitionSource.repositoryId.length == 0 && request.definitionSource.path.length == 0);
@@ -1614,14 +1642,15 @@ unittest
     auto pinned = deserializeJson!BuildRequest(`{
         "id": "r2", "project_id": "game", "chain_id": "c2", "targets": ["internal"],
         "intent": "build", "trigger": {"type": "git_push", "rule_id": "rule-1", "payload": {"ref": "main"}},
-        "pins": [{"task_id": "compile", "input": "src", "repository_id": "game", "ref": {"kind": "branch", "name": "main"},
-                  "pin": {"pinned": "aaa111"}}],
+        "pins": [{"repository_id": "game", "ref": {"kind": "branch", "name": "main"}, "pin": {"pinned": "aaa111"}}],
+        "bindings": [{"task_id": "compile", "input": "src", "ref": {"kind": "branch", "name": "main"}}],
         "definition_id": "d1", "definition_source": {"location": "confector"},
         "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1", "stop_seq": 1}],
         "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z"
     }`);
-    assert(pinned.pins.length == 1 && inputKey(pinned.pins[0]) == InputKey("compile", "src"));
-    assert(pinned.pins[0].repositoryId == "game" && pinned.pins[0].ref_ == RepositoryRef(RefKind.branch, "main"));
+    assert(pinned.pins.length == 1 && repositoryAt(pinned.pins[0]) == RepositoryAt("game", RepositoryRef(RefKind.branch, "main")));
+    assert(pinned.bindings.length == 1 && inputKey(pinned.bindings[0]) == InputKey("compile", "src"));
+    assert(pinned.bindings[0].ref_ == RepositoryRef(RefKind.branch, "main"));
     assert(pinned.pins[0].pin.pinned == Json("aaa111") && pinned.pins[0].pin.info.length == 0);
     assert(pinned.trigger.payload == ["ref": "main"]);
 

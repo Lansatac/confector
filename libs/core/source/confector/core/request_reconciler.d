@@ -630,7 +630,7 @@ unittest
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
     auto chain = sampleChain("c1");
-    chain.pins[1].repositoryId = "tools";
+    chain.pins ~= RepositoryPin("tools", chain.pins[0].ref_, chain.pins[0].pin);
     RepositoryRecord game;
     game.name = "game";
     game.address = gameAddress;

@@ -7,17 +7,18 @@ module confector.api.input_resolver;
  *
  * Resolution is split along the functional-core/imperative-shell line. A request binds each
  * repository input it needs to a ref (from the trigger's or request's ref spec, else the input's
- * default; bead confector-z7z.53.2); the pure core lists the distinct (repository, ref) pairs
- * (confector.core.chain_pins.refsToResolve); the shell calls a RepositoryResolver once for each
- * and hands the results back to the core (confector.core.chain_pins.pinsForBindings), which pins
- * every input bound to that ref to the same revision. Resolvers do the I/O; the core never does.
+ * default); the pure core lists the distinct (repository, ref) pairs the
+ * chain does not pin yet (confector.core.chain_pins.refsToResolve); the shell calls a
+ * RepositoryResolver once for each and hands the results back to the core
+ * (confector.core.chain_pins.pinsForRefs), which pins each (repository, ref) once, so every input
+ * bound to that ref sees the same revision. Resolvers do the I/O; the core never does.
  */
 
 import confector.api.model : InputPin, RepositoryRecord, RepositoryRef;
 
 /**
  * A ref as a resolver resolved it: the concrete ref (kind and normalized name) and its revision
- * now. `ref_` is the ref actually resolved, which callers pin (`PinnedInput.ref_`), never the ref
+ * now. `ref_` is the ref actually resolved, which callers pin (`RepositoryPin.ref_`), never the ref
  * they asked for.
  */
 struct ResolvedRef

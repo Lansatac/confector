@@ -19,7 +19,7 @@ module confector.core.rerun_generations;
 
 import confector.core.dag : TaskGraph;
 import confector.core.input_resolution : GraphResolution, RerunGenerations, graphResolution;
-import confector.api.model : InputKey, PinnedInput;
+import confector.api.model : InputKey, RepositoryAt, RepositoryPin, RepositoryRef;
 import confector.api.document_store;
 
 import vibe.data.json : Json;
@@ -176,16 +176,17 @@ final class RerunGenerationStore
 }
 
 /**
- * Computes the fingerprints of `graph` over `pins` at the current rerun generations: reads, with
- * `read`, the generations of the bases `graphResolution` reports unread until none are left.
+ * Computes the fingerprints of `graph`, its repository inputs bound by `bindings`, over `pins` at
+ * the current rerun generations: reads, with `read`, the generations of the bases
+ * `graphResolution` reports unread until none are left.
  * Bases depend on upstream fingerprints, so each round reads one more level of the graph; a graph
  * needs at most as many reads as its longest path has tasks.
  *
  * Throws: Exception if `read` returns no generation for a base it was asked for; whatever
  * `read` and `graphResolution` throw.
  */
-GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in PinnedInput[InputKey] pins,
-    scope RerunGenerationReader read)
+GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in RepositoryRef[InputKey] bindings,
+    in RepositoryPin[RepositoryAt] pins, scope RerunGenerationReader read)
 {
     import std.algorithm.sorting : sort;
 
@@ -193,7 +194,7 @@ GraphResolution readGraphResolution(string projectId, const TaskGraph graph, in 
     for (;;)
     {
         string[string] unread;
-        auto resolution = graphResolution(projectId, graph, pins, generations, unread);
+        auto resolution = graphResolution(projectId, graph, bindings, pins, generations, unread);
         if (unread.length == 0) return resolution;
 
         bool[string] distinct;
@@ -230,15 +231,18 @@ version (unittest)
         return new TaskGraph([compile, test, report, lint]);
     }
 
-    /// The sample graph's repository inputs pinned to branch main at revision `sha`.
-    private PinnedInput[InputKey] pinsAt(string sha)
+    /// The sample graph's repository inputs, bound to branch main.
+    private RepositoryRef[InputKey] mainBindings()
     {
-        PinnedInput[InputKey] pins;
-        foreach (task; ["compile", "lint"])
-        {
-            pins[InputKey(task, "src")] = PinnedInput(task, "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json(sha)));
-        }
-        return pins;
+        const main = RepositoryRef(RefKind.branch, "main");
+        return [InputKey("compile", "src"): main, InputKey("lint", "src"): main];
+    }
+
+    /// Repository game at branch main pinned to revision `sha`.
+    private RepositoryPin[RepositoryAt] pinsAt(string sha)
+    {
+        const main = RepositoryRef(RefKind.branch, "main");
+        return [RepositoryAt("game", main): RepositoryPin("game", main, InputPin(Json(sha)))];
     }
 }
 
@@ -376,23 +380,23 @@ unittest
     auto graph = sampleGraph();
     auto sameInputs = sampleGraph(); // another definition (say, on another branch) at the same revision
 
-    auto before = readGraphResolution("p", graph, pinsAt("aaa111"), reader);
+    auto before = readGraphResolution("p", graph, mainBindings, pinsAt("aaa111"), reader);
     assert(reads == 3, "compile and lint, then test, then report");
-    assert(readGraphResolution("p", sameInputs, pinsAt("aaa111"), reader).fingerprints == before.fingerprints);
-    auto otherBefore = readGraphResolution("p", graph, pinsAt("bbb222"), reader);
+    assert(readGraphResolution("p", sameInputs, mainBindings, pinsAt("aaa111"), reader).fingerprints == before.fingerprints);
+    auto otherBefore = readGraphResolution("p", graph, mainBindings, pinsAt("bbb222"), reader);
 
     assert(store.bump(before.bases["compile"]) == 1);
 
-    auto after = readGraphResolution("p", graph, pinsAt("aaa111"), reader);
+    auto after = readGraphResolution("p", graph, mainBindings, pinsAt("aaa111"), reader);
     foreach (id; ["compile", "test", "report"]) assert(after.fingerprints[id] != before.fingerprints[id], id);
     assert(after.fingerprints["lint"] == before.fingerprints["lint"]);
-    assert(readGraphResolution("p", sameInputs, pinsAt("aaa111"), reader).fingerprints == after.fingerprints);
-    assert(readGraphResolution("p", graph, pinsAt("bbb222"), reader).fingerprints == otherBefore.fingerprints);
+    assert(readGraphResolution("p", sameInputs, mainBindings, pinsAt("aaa111"), reader).fingerprints == after.fingerprints);
+    assert(readGraphResolution("p", graph, mainBindings, pinsAt("bbb222"), reader).fingerprints == otherBefore.fingerprints);
 
     // A downstream task's new base starts at generation 0 and can be rerun on its own
     assert(store.read([after.bases["test"]]) == [after.bases["test"]: 0UL]);
     store.bump(after.bases["test"]);
-    auto testRerun = readGraphResolution("p", graph, pinsAt("aaa111"), reader);
+    auto testRerun = readGraphResolution("p", graph, mainBindings, pinsAt("aaa111"), reader);
     assert(testRerun.fingerprints["compile"] == after.fingerprints["compile"]);
     assert(testRerun.fingerprints["test"] != after.fingerprints["test"]);
     assert(testRerun.fingerprints["report"] != after.fingerprints["report"]);
@@ -403,16 +407,16 @@ unittest
     // A reader that leaves out a base it was asked for fails loudly rather than defaulting
     RerunGenerationReader forgetful = (in string[] bases) { RerunGenerations none; return none; };
     bool threw = false;
-    try readGraphResolution("p", sampleGraph(), pinsAt("aaa111"), forgetful);
+    try readGraphResolution("p", sampleGraph(), mainBindings, pinsAt("aaa111"), forgetful);
     catch (Exception ex) threw = ex.msg.canFind("returned none");
     assert(threw);
 
     // Unpinned inputs fail loudly before any generation is read
     size_t reads;
     RerunGenerationReader counting = (in string[] bases) { ++reads; return new RerunGenerationStore(new InMemoryDocumentStore()).read(bases); };
-    PinnedInput[InputKey] unpinned;
+    RepositoryPin[RepositoryAt] unpinned;
     threw = false;
-    try readGraphResolution("p", sampleGraph(), unpinned, counting);
+    try readGraphResolution("p", sampleGraph(), mainBindings, unpinned, counting);
     catch (Exception ex) threw = ex.msg.canFind("'game'");
     assert(threw && reads == 0);
 }

@@ -9,7 +9,8 @@ module confector.core.request_fixtures;
 version (unittest):
 
 import confector.core.request_evaluator;
-import confector.core.chain_pins : pinMap;
+import confector.core.dag : TaskGraph;
+import confector.core.chain_pins : bindingMap, inputKeyLess, pinMap;
 import confector.core.request_reconciler : RequestReconciler;
 import confector.core.document_collection : Versioned;
 import confector.core.execution_dispatcher : Dispatched, ExecutionDispatcher;
@@ -20,6 +21,7 @@ import confector.core.state_stores : StateStores;
 import confector.api.model;
 import confector.testing.memory_document_store : InterleavingDocumentStore;
 
+import std.algorithm.sorting : sort;
 import std.format : format;
 import vibe.data.json : Json;
 
@@ -47,12 +49,24 @@ BuildChain sampleChain(string id)
     chain.projectId = "game";
     chain.number = 1;
     chain.headline = HeadlineRef(HeadlineKind.branch, "main");
-    foreach (task; ["compile", "lint"])
-    {
-        chain.pins ~= PinnedInput(task, "src", "game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")));
-    }
+    chain.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")))];
     chain.createdAt = "2026-10-20T10:00:00Z";
     return chain;
+}
+
+/// Every repository input of `graph` bound to branch main, sorted by input, as a request records them.
+InputBinding[] mainBindings(const TaskGraph graph)
+{
+    InputBinding[] bindings;
+    foreach (taskId; graph.allTaskIds())
+    {
+        foreach (name, decl; graph.getTask(taskId).inputs)
+        {
+            if (decl.kind == InputKind.repository) bindings ~= InputBinding(taskId, name, RepositoryRef(RefKind.branch, "main"));
+        }
+    }
+    bindings.sort!((a, b) => inputKeyLess(inputKey(a), inputKey(b)));
+    return bindings;
 }
 
 /// Creates chain `id` and registers repository game if it is not yet.
@@ -77,7 +91,8 @@ RerunGenerationReader readerOf(StateStores stores)
 GraphResolution closureNow(StateStores stores, in BuildChain chain, in string[] targets,
     ProjectDefinition definition = sampleDefinition())
 {
-    return readGraphResolution(chain.projectId, closureGraph(definition, targets), pinMap(chain.pins), readerOf(stores));
+    auto graph = closureGraph(definition, targets);
+    return readGraphResolution(chain.projectId, graph, bindingMap(mainBindings(graph)), pinMap(chain.pins), readerOf(stores));
 }
 
 /// The fingerprint, now, of task `taskId` of chain `chainId`.
@@ -104,6 +119,7 @@ BuildRequest recordRequest(StateStores stores, string chainId, string id, string
     request.projectId = chain.projectId;
     request.chainId = chain.id;
     request.targets = targets;
+    request.bindings = mainBindings(closureGraph(definition, targets));
     request.intent = BuildIntent.build;
     request.trigger.type = TriggerType.manual;
     request.definitionId = stores.definitions.put(definition);
