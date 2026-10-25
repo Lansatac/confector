@@ -50,6 +50,7 @@ import confector.api.document_store : DocumentConflictException;
 import confector.api.model;
 
 import std.format : format;
+import vibe.core.log : logError;
 
 /**
  * A reconcile could not finish: some executions could not be dispatched or recorded. Every
@@ -249,6 +250,49 @@ final class RequestReconciler
         }
         return evaluateRequest(chain, entry, generations, summaries);
     }
+}
+
+/// What reconciling the open requests of one project did.
+struct ProjectReconciliation
+{
+    /// Requests reconciled without error, whether or not the reconcile changed them.
+    size_t reconciled;
+    /// Requests whose reconcile failed, and one for a listing of the project's open requests that failed.
+    size_t errors;
+}
+
+/**
+ * Reconciles every open request of `projectId` at the clock `now`, each on its own. A request
+ * whose reconcile fails is logged with its error and counted, and the others are still reconciled;
+ * a request left open is reconciled again by a later call. Used when an execution of the project
+ * ends, and by the coordination sweep.
+ */
+ProjectReconciliation reconcileOpenRequests(StateStores stores, string projectId, string now)
+{
+    ProjectReconciliation result;
+    RequestState[] open;
+    try open = stores.requestStates.listOpen(projectId);
+    catch (Exception e)
+    {
+        logError("[reconcile] Could not list the open requests of project '%s': %s", projectId, e.toString());
+        result.errors += 1;
+        return result;
+    }
+    auto reconciler = new RequestReconciler(stores, new ExecutionDispatcher(stores, () => now));
+    foreach (state; open)
+    {
+        try
+        {
+            reconciler.reconcile(state.requestId);
+            result.reconciled += 1;
+        }
+        catch (Exception e)
+        {
+            logError("[reconcile] Could not reconcile request '%s' of project '%s': %s", state.requestId, projectId, e.toString());
+            result.errors += 1;
+        }
+    }
+    return result;
 }
 
 version (unittest)

@@ -7,6 +7,7 @@ import std.process : environment;
 
 import vibe.vibe;
 
+import confector.api.scheduler : Schedule, ScheduleEntry, Scheduler;
 import confector.config;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_signing_key : SigningKeySource, generateWorkerSigningKey;
@@ -26,12 +27,27 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
     res.render!("error.dt", req, error);
 }
 
+/// The scheduler entry that runs the coordination sweep (confector.core.sweep), and the endpoint it calls.
+enum string coordinationSweepEntryId = "coordination-sweep";
+enum string coordinationSweepPath = "/api/v1/sweeps/coordination";
+
+/**
+ * Upserts the coordination sweep's entry: one call every minute. The server does this on every
+ * start, and upserting again keeps exactly one entry, so nothing is unregistered. A scheduler that
+ * cannot hold the entry throws, which ends startup: without the sweep, lost work is never repaired.
+ */
+void registerCoordinationSweep(Scheduler scheduler)
+{
+    scheduler.upsert(ScheduleEntry(coordinationSweepEntryId, Schedule.recurring("* * * * *"), coordinationSweepPath, ""));
+}
+
 /// Configures application URL routing over `backends` and `stores`, the state stores kept in
 /// its document store. Worker tokens are signed and checked with `workerTokenKey`; receiving work
-/// is admitted only with `workerPoolCredential`. Every route is registered with its access, and
-/// user requests are authenticated by `backends.authenticator`.
+/// is admitted only with `workerPoolCredential`, and an execution's lease expires after
+/// `maxAttempts` lost leases. Every route is registered with its access, and user requests are
+/// authenticated by `backends.authenticator`.
 AuthorizedRoutes createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, string workerTokenKey,
-    string workerPoolCredential)
+    string workerPoolCredential, uint maxAttempts)
 {
     auto authenticator = backends.authenticator;
     auto router = new AuthorizedRoutes(authenticator);
@@ -49,7 +65,7 @@ AuthorizedRoutes createRouter(Backends backends, StateStores stores, string sche
 
     // API endpoints and the artifact routes workers use
     router.include(artifactsRouter(authenticator, backends.artifactStore, workerTokenKey, stores));
-    router.include(apiRouter(authenticator, schedulerCallbackSecret, workerTokenKey, workerPoolCredential, stores));
+    router.include(apiRouter(authenticator, schedulerCallbackSecret, workerTokenKey, workerPoolCredential, maxAttempts, stores));
 
     // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
     // and request state (beads confector-z7z.23.7 and confector-z7z.49.x)
@@ -148,8 +164,9 @@ void main()
     else if (signingKey.source == SigningKeySource.configured)
         logInfo("[auth] Worker tokens are signed with the configured signing key.");
 
+    registerCoordinationSweep(backends.scheduler);
     auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret,
-        signingKey.key, serverConfig.workerPool.credential);
+        signingKey.key, serverConfig.workerPool.credential, serverConfig.execution.maxAttempts);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -165,6 +182,7 @@ void main()
 unittest
 {
     import confector.api.model : ExecutionStatus, TaskExecution;
+    import confector.core.work_orders : defaultMaxAttempts;
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
@@ -194,7 +212,7 @@ unittest
     execution.attempts = 1;
     testStores.executions.createIfAbsent(execution);
     auto router = createRouter(backends, testStores, "test-scheduler-secret", testSigningKey,
-        "pool-credential-0123456789abcdef0123456789abcdef");
+        "pool-credential-0123456789abcdef0123456789abcdef", defaultMaxAttempts);
 
     struct Answer { int status; string body; }
 
@@ -262,6 +280,7 @@ unittest
 
 unittest
 {
+    import confector.core.work_orders : defaultMaxAttempts;
     import std.algorithm : map, sort;
     import std.array : array, join;
     import std.format : format;
@@ -285,7 +304,7 @@ unittest
     AuthorizedRoutes routesAs(Nullable!Identity identity)
     {
         backends.authenticator = new FixedAuthenticator(identity);
-        return createRouter(backends, testStores, "test-scheduler-secret", signingKey, poolCredential);
+        return createRouter(backends, testStores, "test-scheduler-secret", signingKey, poolCredential, defaultMaxAttempts);
     }
 
     // The route table: every route as "METHOD path access", where access is the role a user needs or
@@ -315,6 +334,7 @@ unittest
         "POST /api/v1/executions/:execution_id/complete worker-token",
         "POST /api/v1/projects/run member",
         "POST /api/v1/projects/:id/run scheduler-secret",
+        "POST /api/v1/sweeps/coordination scheduler-secret",
         "GET /api/v1/projects viewer",
         "POST /api/v1/projects member",
         "GET /api/v1/projects/:id viewer",
@@ -459,4 +479,31 @@ unittest
     write(arrayFile, `[{"server": {"http": {"port": 9124}}}]`);
     auto notObject = collectException(loadConfigRegistry(arrayDir));
     assert(notObject !is null && notObject.msg.canFind(arrayFile), "A non-object file must throw, naming it");
+}
+
+unittest
+{
+    // Startup registers the coordination sweep as one recurring entry, and registering it again
+    // keeps exactly one entry. The scheduler is a recording stub, so no thread or call is made
+    static final class RecordingScheduler : Scheduler
+    {
+        ScheduleEntry[string] entries;
+
+        void upsert(ScheduleEntry entry) { entries[entry.id] = entry; }
+        void remove(string id) { entries.remove(id); }
+        ScheduleEntry[] list()
+        {
+            ScheduleEntry[] held;
+            foreach (entry; entries.byValue) held ~= entry;
+            return held;
+        }
+    }
+
+    auto scheduler = new RecordingScheduler();
+    registerCoordinationSweep(scheduler);
+    registerCoordinationSweep(scheduler);
+    auto entries = scheduler.list();
+    assert(entries.length == 1, "Registering the sweep again keeps one entry");
+    assert(entries[0].id == coordinationSweepEntryId && entries[0].path == "/api/v1/sweeps/coordination");
+    assert(entries[0].when.isRecurring && entries[0].when.cronExpression == "* * * * *");
 }

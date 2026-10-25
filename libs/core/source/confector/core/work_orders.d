@@ -25,16 +25,14 @@ module confector.core.work_orders;
  * fingerprint's ledger. Every way an execution ends goes through `recordOutcome`, so failed and
  * cancelled executions are folded the same way. The terminal compare-and-set and the fold are
  * separate writes: a crash between them leaves a finished execution that nothing has folded yet,
- * which `LedgerStore.settle` completes. A sweep that does this for every such execution does not
- * exist yet. Then the open requests of the execution's project are reconciled; a reconcile that
- * fails is logged and left to a later one.
+ * which `LedgerStore.settle` completes on the next read of the ledger. Then the open requests of the
+ * execution's project are reconciled; a reconcile that fails is logged and left to a later one.
  */
 
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
-import confector.core.execution_dispatcher : ExecutionDispatcher;
 import confector.api.model;
-import confector.core.request_reconciler : RequestReconciler;
+import confector.core.request_reconciler : reconcileOpenRequests;
 import confector.core.state_stores : StateStores;
 import confector.api.document_store : DocumentConflictException;
 
@@ -43,7 +41,6 @@ import std.datetime.systime : Clock, SysTime;
 import std.datetime.timezone : UTC;
 import std.format : format;
 import std.typecons : Nullable, nullable;
-import vibe.core.log : logError;
 
 /// How many times a write that loses a compare-and-set to a concurrent writer of the same
 /// execution re-reads and retries. Every lost attempt means another write succeeded, so this is
@@ -395,7 +392,12 @@ private void requireLeaseDuration(Duration lease)
     }
 }
 
-private void requireAttemptLimit(uint maxAttempts)
+/**
+ * Checks that an attempt limit is usable: an execution needs at least one attempt.
+ *
+ * Throws: Exception if `maxAttempts` is 0.
+ */
+void requireAttemptLimit(uint maxAttempts)
 {
     if (maxAttempts == 0)
     {
@@ -432,8 +434,8 @@ class SupersededAttemptException : StaleCompletionException
 /**
  * A completion finished its execution, but folding the outcome into the fingerprint's ledger
  * failed (`next` is the failure). The outcome is recorded and final, so resending the completion
- * is rejected as stale. Nothing repairs the fold automatically yet: it needs a sweep that settles
- * ledgers (`LedgerStore.settle`).
+ * is rejected as stale. The next read of the ledger settles the fold (`LedgerStore.settle`), which
+ * the coordination sweep does for every open request.
  */
 class OutcomeNotFoldedException : Exception
 {
@@ -674,7 +676,7 @@ private TaskExecution recordOutcome(StateStores stores, string executionId, Exec
         {
             throw new OutcomeNotFoldedException(executionId, format(
                 "Execution '%s' (fingerprint %s) finished %s, but folding it into its ledger failed: %s; "
-                ~ "the outcome is recorded, so a resent completion is rejected as stale; a sweep must settle the ledger",
+                ~ "the outcome is recorded, so a resent completion is rejected as stale; the next read of the ledger settles it",
                 executionId, finished.fingerprint, finished.status, e.msg), e);
         }
         reconcileOpenRequests(stores, finished.projectId, now);
@@ -684,32 +686,6 @@ private TaskExecution recordOutcome(StateStores stores, string executionId, Exec
         executionId, maxWriteAttempts));
 }
 
-/**
- * Reconciles the open requests of `projectId` after one of its executions ended, so the requests
- * waiting on it advance now rather than at the next sweep. Each request is reconciled on its own:
- * a failure is logged and left to a later reconcile, and does not undo the outcome, which is
- * already recorded and folded.
- */
-private void reconcileOpenRequests(StateStores stores, string projectId, string now)
-{
-    RequestState[] open;
-    try open = stores.requestStates.listOpen(projectId);
-    catch (Exception e)
-    {
-        logError("[work_orders] Could not list the open requests of project '%s': %s", projectId, e.toString());
-        return;
-    }
-    auto reconciler = new RequestReconciler(stores, new ExecutionDispatcher(stores, () => now));
-    foreach (state; open)
-    {
-        try reconciler.reconcile(state.requestId);
-        catch (Exception e)
-        {
-            logError("[work_orders] Could not reconcile request '%s' after an execution of project '%s' ended; a later reconcile will retry it: %s",
-                state.requestId, projectId, e.toString());
-        }
-    }
-}
 
 
 version (unittest)

@@ -14,8 +14,9 @@ import confector.server.scheduler_callback : schedulerCallback;
 import confector.server.worker_auth : authenticateWorker, authenticateWorkerPool, permitWorker, requireCurrentExecutionAttempt;
 import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
+import confector.core.sweep : sweepCoordination;
 import confector.core.work_orders : InvalidLeaseRequestException, LeaseAnswer, UnknownExecutionException, claimWork, completeExecution,
-    finishExecution, heartbeatExecution, leaseOfSeconds, releaseExecution;
+    finishExecution, heartbeatExecution, leaseOfSeconds, releaseExecution, requireAttemptLimit;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -51,10 +52,12 @@ NotImplementedException logsNotImplemented()
  * completion) need that token, signed with `workerTokenKey`. Neither is reached by a user
  * identity.
  */
-AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential, StateStores stores = null)
+AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential,
+    uint maxAttempts, StateStores stores = null)
 {
     requireSigningKey(workerTokenKey);
     requireWorkerPoolCredential(workerPoolCredential);
+    requireAttemptLimit(maxAttempts);
     auto router = new AuthorizedRoutes(authenticator);
 
     enum string apiPrefix = "/api/v1";
@@ -347,8 +350,8 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         catch (OutcomeNotFoldedException e)
         {
             // The execution is finished and final; only the ledger fold failed. Say
-            // so loudly (500) rather than report success: resending is answered 409, and the fold
-            // is repaired by a sweep that settles ledgers (not yet built).
+            // so loudly (500) rather than report success: resending is answered 409, and the next
+            // read of the ledger completes the fold.
             logError("[api] The completion of execution '%s' was recorded but not folded: %s", executionId, e.msg);
             writeError(res, HTTPStatus.internalServerError, e.msg);
         }
@@ -367,6 +370,17 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
 
     schedulerRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
         writeNotImplemented(res, buildsNotImplemented());
+    });
+
+    // One tick of the coordination sweep, which the server registers to run every minute (see
+    // confector.core.sweep). The summary answers the call. A tick that logged an error answers 500,
+    // and keeps doing so until the failing item is fixed: a permanently broken request is seen on
+    // every tick. Ticks are idempotent, so the scheduler's retries are safe.
+    schedulerRoute("/sweeps/coordination", (HTTPServerRequest req, HTTPServerResponse res) {
+        if (!requireStores(res)) return;
+        auto summary = sweepCoordination(stores, maxAttempts);
+        if (summary.errors > 0) res.statusCode = HTTPStatus.internalServerError;
+        res.writeJsonBody(summary);
     });
 
     // Projects REST API
@@ -649,6 +663,7 @@ unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.server.authenticator : FixedAuthenticator, Identity, testIdentity;
+    import confector.core.work_orders : defaultMaxAttempts;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
     import std.typecons : Nullable;
@@ -663,25 +678,26 @@ unittest
     enum workerTokenKey = "0123456789abcdef0123456789abcdef";
     enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
     auto admin = new FixedAuthenticator(testIdentity(Role.admin));
-    auto router = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential);
+    auto router = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts);
     assert(router !is null);
 
     // A router needs an authenticator, a signing key and a worker pool credential of a usable length
     import std.exception : assertThrown;
-    assertThrown!Exception(apiRouter(null, "test-scheduler-secret", workerTokenKey, workerPoolCredential));
-    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", "", workerPoolCredential));
-    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, ""));
-    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, "too-short"));
+    assertThrown!Exception(apiRouter(null, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", "", workerPoolCredential, defaultMaxAttempts));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, "", defaultMaxAttempts));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, "too-short", defaultMaxAttempts));
+    assertThrown!Exception(apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, 0));
 
     // A user route refuses a request without an identity, and one whose role is too low
     auto nobodyRouter = apiRouter(new FixedAuthenticator(Nullable!Identity.init), "test-scheduler-secret",
-        workerTokenKey, workerPoolCredential);
+        workerTokenKey, workerPoolCredential, defaultMaxAttempts);
     auto unidentifiedRes = createTestHTTPServerResponse();
     nobodyRouter.handleRequest(createTestHTTPServerRequest(URL("http://localhost/api/v1/projects"), HTTPMethod.GET), unidentifiedRes);
     assert(unidentifiedRes.statusCode == HTTPStatus.unauthorized);
 
     auto viewerRouter = apiRouter(new FixedAuthenticator(testIdentity(Role.viewer)), "test-scheduler-secret",
-        workerTokenKey, workerPoolCredential);
+        workerTokenKey, workerPoolCredential, defaultMaxAttempts);
     auto tooLowRes = createTestHTTPServerResponse();
     viewerRouter.handleRequest(createTestHTTPServerRequest(URL("http://localhost/api/v1/projects"), HTTPMethod.POST), tooLowRes);
     assert(tooLowRes.statusCode == HTTPStatus.forbidden);
@@ -724,7 +740,7 @@ unittest
     import std.array : replace;
     import std.string : indexOf;
 
-    auto routerWithStores = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, stores);
+    auto routerWithStores = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
 
     import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, verifyWorkerToken, workerTokenHeader;
     import confector.core.worker_pool_credential : workerPoolCredentialHeader;
@@ -1080,7 +1096,7 @@ unittest
     const anotherId = queueExecution(failingStores, "fp_n1_again");
     assert(!claimWork(failingStores, "w-failing", 1.hours).isNull);
     failingDocuments.beforeNextWrite = () { throw new Exception("store unavailable"); };
-    auto failingRouter = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, failingStores);
+    auto failingRouter = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, failingStores);
     InetHeaderMap failingHeaders;
     failingHeaders["Content-Type"] = "application/json";
     failingHeaders[workerTokenHeader] = tokenForPath("/executions/" ~ anotherId ~ "/complete", failingStores);
@@ -1121,5 +1137,103 @@ unittest
         auto noStoresRes = createTestHTTPServerResponse();
         router.handleRequest(noStoresReq, noStoresRes);
         assert(noStoresRes.statusCode == HTTPStatus.internalServerError, route);
+    }
+}
+
+unittest
+{
+    // The coordination sweep is a scheduler route: it runs one tick, on the server's clock, only
+    // with the scheduler secret. A tick expires a lease that ran out long ago, and the summary of
+    // what it did answers the call
+    import confector.api.model : ExecutionStatus, TaskExecution;
+    import confector.api.scheduler : schedulerSecretHeader;
+    import confector.core.work_orders : defaultMaxAttempts, startExecution;
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import core.time : minutes;
+    import std.algorithm.searching : findSplit;
+    import vibe.data.json : parseJsonString;
+    import vibe.stream.memory : createMemoryOutputStream;
+
+    enum workerTokenKey = "0123456789abcdef0123456789abcdef";
+    enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto router = apiRouter(new FixedAuthenticator(testIdentity(Role.admin)), "test-scheduler-secret",
+        workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
+
+    TaskExecution execution;
+    execution.id = "exe_sweep";
+    execution.projectId = "proj";
+    execution.taskId = "compile";
+    execution.fingerprint = "fp_sweep";
+    execution.status = ExecutionStatus.queued;
+    execution.createdAt = "2000-01-01T00:00:00Z";
+    stores.executions.create(execution);
+    assert(!startExecution(stores.executions, "exe_sweep", "w1", 1.minutes, "2000-01-01T00:00:00Z").isNull);
+
+    // Without the secret, or with another one, the tick does not run
+    assert(sweepTick(router, "").status == HTTPStatus.unauthorized);
+    assert(sweepTick(router, "wrong-secret").status == HTTPStatus.unauthorized);
+    assert(stores.executions.get("exe_sweep").get.status == ExecutionStatus.running, "A refused tick changes nothing");
+
+    // With the secret it runs: the expired lease is requeued and the summary says so
+    auto answered = sweepTick(router, "test-scheduler-secret");
+    assert(answered.status == HTTPStatus.ok, answered.body);
+    assert(parseJsonString(answered.body)["leasesRequeued"].get!long == 1, answered.body);
+    assert(parseJsonString(answered.body)["errors"].get!long == 0, answered.body);
+    assert(stores.executions.get("exe_sweep").get.status == ExecutionStatus.queued);
+}
+
+unittest
+{
+    // A tick that logged an error answers 500 with its summary. Here an open request whose record
+    // is missing cannot be reconciled, so every tick answers 500 until it is fixed
+    import confector.api.model : BuildRequest, ProjectRecord;
+    import confector.core.work_orders : defaultMaxAttempts;
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import vibe.data.json : parseJsonString;
+
+    enum workerTokenKey = "0123456789abcdef0123456789abcdef";
+    enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    ProjectRecord proj;
+    proj.id = "proj";
+    stores.projects.put(proj);
+    BuildRequest ghost;
+    ghost.id = "ghost";
+    ghost.projectId = "proj";
+    stores.requestStates.createFor(ghost);
+    auto router = apiRouter(new FixedAuthenticator(testIdentity(Role.admin)), "test-scheduler-secret",
+        workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
+
+    auto answered = sweepTick(router, "test-scheduler-secret");
+    assert(answered.status == HTTPStatus.internalServerError, answered.body);
+    assert(parseJsonString(answered.body)["errors"].get!long == 1, answered.body);
+    assert(parseJsonString(answered.body)["requestsReconciled"].get!long == 0, answered.body);
+    assert(sweepTick(router, "test-scheduler-secret").status == HTTPStatus.internalServerError, "It stays 500 until fixed");
+}
+
+version (unittest)
+{
+    /// What the sweep route answered: its status and its JSON body.
+    private struct SweepAnswer { int status; string body; }
+
+    /// Calls the sweep route of `router` as the scheduler, presenting `secret` (none when empty).
+    private SweepAnswer sweepTick(AuthorizedRoutes router, string secret)
+    {
+        import std.algorithm.searching : findSplit;
+        import vibe.stream.memory : createMemoryOutputStream;
+        import confector.api.scheduler : schedulerSecretHeader;
+
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/sweeps/coordination"), HTTPMethod.POST);
+        if (secret.length > 0) req.headers[schedulerSecretHeader] = secret;
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
+        router.handleRequest(req, res);
+        res.finalize();
+        // The sink holds the status line and headers before the body
+        auto written = cast(string) sink.data.idup;
+        return SweepAnswer(res.statusCode, written.findSplit("\r\n\r\n")[2]);
     }
 }
