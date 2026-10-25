@@ -3,8 +3,18 @@ server {
   server_name localhost development "";
 
   location / {
+    # Development runs as a fixed admin identity: every request through this proxy is the dev user,
+    # whatever the client sent. proxy_set_header replaces a header of the same name that the client
+    # sent, so a client cannot add a second one. The secret must equal server.auth.trustedProxy.secret
+    # in config/confector.json, and the email must be one of its roles.admins.
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header Host $host;
+
+    proxy_set_header X-Confector-Proxy-Secret "dev-proxy-secret-0123456789abcdef";
+    proxy_set_header X-Forwarded-User "dev";
+    proxy_set_header X-Forwarded-Email "dev@confector.localhost";
+    # An empty value drops a groups header the client sent; the dev identity has no groups.
+    proxy_set_header X-Forwarded-Groups "";
 
     proxy_pass http://development;
   }

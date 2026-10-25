@@ -22,7 +22,7 @@
       "trustedProxy": {
         "secret": "dev-proxy-secret-0123456789abcdef",
         "roles": {
-          "admins": ["dev@example.com"],
+          "admins": ["dev@confector.localhost"],
           "members": ["dev-members"],
           "viewers": ["dev-viewers"]
         }
