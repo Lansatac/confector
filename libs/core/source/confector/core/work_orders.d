@@ -26,12 +26,15 @@ module confector.core.work_orders;
  * cancelled executions are folded the same way. The terminal compare-and-set and the fold are
  * separate writes: a crash between them leaves a finished execution that nothing has folded yet,
  * which `LedgerStore.settle` completes. A sweep that does this for every such execution does not
- * exist yet.
+ * exist yet. Then the open requests of the execution's project are reconciled; a reconcile that
+ * fails is logged and left to a later one.
  */
 
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
+import confector.core.execution_dispatcher : ExecutionDispatcher;
 import confector.api.model;
+import confector.core.request_reconciler : RequestReconciler;
 import confector.core.state_stores : StateStores;
 import confector.api.document_store : DocumentConflictException;
 
@@ -40,6 +43,7 @@ import std.datetime.systime : Clock, SysTime;
 import std.datetime.timezone : UTC;
 import std.format : format;
 import std.typecons : Nullable, nullable;
+import vibe.core.log : logError;
 
 /// How many times a write that loses a compare-and-set to a concurrent writer of the same
 /// execution re-reads and retries. Every lost attempt means another write succeeded, so this is
@@ -581,8 +585,8 @@ ExecutionStatus reportedExecutionStatus(ExecutionStatus status) pure @safe
  * fingerprint and task: a `result` naming a different task is rejected. Only the attempt that
  * holds the execution (`result.attempt`) may complete it.
  *
- * A completion finishes the execution and folds it into the fingerprint's ledger; nothing is
- * cached anywhere else and no request is re-evaluated here.
+ * A completion finishes the execution, folds it into the fingerprint's ledger and reconciles the
+ * open requests of its project; nothing is cached anywhere else.
  * Log lines are not part of a completion: the worker streams them to the execution's log as it
  * runs.
  *
@@ -673,17 +677,46 @@ private TaskExecution recordOutcome(StateStores stores, string executionId, Exec
                 ~ "the outcome is recorded, so a resent completion is rejected as stale; a sweep must settle the ledger",
                 executionId, finished.fingerprint, finished.status, e.msg), e);
         }
+        reconcileOpenRequests(stores, finished.projectId, now);
         return finished;
     }
     throw new Exception(format("Could not record the outcome of execution '%s': it lost %s compare-and-sets in a row",
         executionId, maxWriteAttempts));
 }
 
+/**
+ * Reconciles the open requests of `projectId` after one of its executions ended, so the requests
+ * waiting on it advance now rather than at the next sweep. Each request is reconciled on its own:
+ * a failure is logged and left to a later reconcile, and does not undo the outcome, which is
+ * already recorded and folded.
+ */
+private void reconcileOpenRequests(StateStores stores, string projectId, string now)
+{
+    RequestState[] open;
+    try open = stores.requestStates.listOpen(projectId);
+    catch (Exception e)
+    {
+        logError("[work_orders] Could not list the open requests of project '%s': %s", projectId, e.toString());
+        return;
+    }
+    auto reconciler = new RequestReconciler(stores, new ExecutionDispatcher(stores, () => now));
+    foreach (state; open)
+    {
+        try reconciler.reconcile(state.requestId);
+        catch (Exception e)
+        {
+            logError("[work_orders] Could not reconcile request '%s' after an execution of project '%s' ended; a later reconcile will retry it: %s",
+                state.requestId, projectId, e.toString());
+        }
+    }
+}
+
 
 version (unittest)
 {
-    import confector.core.request_fixtures : createChain, fingerprintNow, intake, reconcilerOf, taskOf;
+    import confector.core.request_fixtures : beforeWrite, createChain, fingerprintNow, intake, reconcilerOf, taskOf;
     import confector.core.fingerprint_ledger : ClaimOutcome, FoldOutcome;
+    import confector.api.document_store : IndexQuery, QueryPage;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import core.time : minutes;
     import std.algorithm.searching : canFind;
@@ -1273,7 +1306,7 @@ unittest
 
     // A completion is recorded on the execution named in the route; its outcome, exit code,
     // error and artifacts (stamped with the execution's fingerprint) are kept. Nothing else is
-    // written: no cache entry, no request re-evaluation
+    // written: no cache entry; the open requests of its project are reconciled after the fold
     TaskExecutionResult failed;
     failed.taskId = "compile";
     failed.attempt = 1;
@@ -1349,7 +1382,7 @@ version (unittest)
 unittest
 {
     // Requests A and B share a fingerprint and B lost the claim: A's execution ending in any way
-    // (success, failure, cancel) folds into the ledger; B then reconciles against the outcome
+    // (success, failure, cancel) folds into the ledger, and the completion advances both requests
     foreach (status; [ExecutionStatus.succeeded, ExecutionStatus.failed, ExecutionStatus.cancelled])
     {
         auto stores = new StateStores(new InMemoryDocumentStore());
@@ -1368,11 +1401,13 @@ unittest
         assert(ledger.lastSuccessExecutionId == (status == ExecutionStatus.succeeded ? id : ""));
         assert(ledger.lastStoppedExecutionId == (status == ExecutionStatus.succeeded ? "" : id));
 
-        auto reconciled = reconcilerOf(stores).reconcile("rb");
-        assert(reconciled.committed && reconciled.state.outcome != RequestOutcome.open);
         const expected = status == ExecutionStatus.succeeded ? RequestTaskStatus.succeeded
             : status == ExecutionStatus.failed ? RequestTaskStatus.failed : RequestTaskStatus.cancelled;
-        assert(taskOf(reconciled.state, "compile").status == expected);
+        foreach (requestId; ["ra", "rb"])
+        {
+            const state = stores.requestStates.get(requestId).get.value;
+            assert(state.outcome != RequestOutcome.open && taskOf(state, "compile").status == expected, requestId);
+        }
     }
 }
 
@@ -1425,4 +1460,95 @@ unittest
     try completeExecution(stores, "exe_unclaimed", result, fixedNow());
     catch (StaleCompletionException) stale = true;
     assert(stale);
+}
+
+unittest
+{
+    // A completion whose wake is lost (the reconcile's write of the request state fails) still
+    // succeeds: the outcome is recorded and folded, and the request stays open until a later
+    // reconcile advances it
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "a");
+    intake(stores, "a", "ra", ["compile"], "2026-10-20T10:00:00Z");
+    reconcilerOf(stores).reconcile("ra");
+    const fingerprint = fingerprintNow(stores, "a", "compile");
+    const id = stores.ledgers.get(fingerprint).get.activeExecutionId;
+    assert(!startExecution(stores.executions, id, "w1", testLease, fixedNow()).isNull);
+
+    // The completion's writes: the terminal compare-and-set, the fold, then the reconcile's commit
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto racing = new StateStores(interleaving);
+    bool wakeLost = false;
+    beforeWrite(interleaving, 3, () { wakeLost = true; throw new Exception("The wake's write is lost"); });
+    const done = completeExecution(racing, id, succeededAt(1), fixedNow());
+    assert(wakeLost, "The wake's write was attempted and failed");
+    assert(done.status == ExecutionStatus.succeeded, "The completion succeeds");
+    assert(stores.ledgers.get(fingerprint).get.lastSuccessExecutionId == id, "The outcome is folded");
+    assert(stores.requestStates.get("ra").get.outcome == RequestOutcome.open, "The lost wake leaves the request open");
+
+    // A later reconcile, as the sweep runs it, advances the request
+    auto reconciled = reconcilerOf(stores).reconcile("ra");
+    assert(reconciled.committed && reconciled.state.outcome == RequestOutcome.succeeded);
+    assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.succeeded);
+}
+
+version (unittest)
+{
+    /// A document store whose index queries fail while `failQueries` is set.
+    private final class QueryFailingStore : InMemoryDocumentStore
+    {
+        bool failQueries;
+
+        override QueryPage query(string collection, const IndexQuery lookup)
+        {
+            if (failQueries) throw new Exception("The index is unavailable");
+            return super.query(collection, lookup);
+        }
+    }
+
+    /// Request "ra" over chain "a", reconciled, with its compile execution running as attempt 1.
+    /// Returns the execution's id.
+    private string runningRequest(StateStores stores)
+    {
+        createChain(stores, "a");
+        intake(stores, "a", "ra", ["compile"], "2026-10-20T10:00:00Z");
+        reconcilerOf(stores).reconcile("ra");
+        const fingerprint = fingerprintNow(stores, "a", "compile");
+        const id = stores.ledgers.get(fingerprint).get.activeExecutionId;
+        assert(!startExecution(stores.executions, id, "w1", testLease, fixedNow()).isNull);
+        return id;
+    }
+}
+
+unittest
+{
+    // A wake whose listing of open requests fails is logged, and the completion still succeeds:
+    // the outcome is recorded and folded, and the request stays open until a later reconcile
+    auto documents = new QueryFailingStore();
+    auto stores = new StateStores(documents);
+    const id = runningRequest(stores);
+
+    documents.failQueries = true;
+    const done = completeExecution(stores, id, succeededAt(1), fixedNow());
+    assert(done.status == ExecutionStatus.succeeded, "The completion succeeds");
+    assert(stores.ledgers.get(fingerprintNow(stores, "a", "compile")).get.lastSuccessExecutionId == id, "The outcome is folded");
+    assert(stores.requestStates.get("ra").get.outcome == RequestOutcome.open, "The wake did not run");
+
+    documents.failQueries = false;
+    auto reconciled = reconcilerOf(stores).reconcile("ra");
+    assert(reconciled.committed && reconciled.state.outcome == RequestOutcome.succeeded);
+}
+
+unittest
+{
+    // A lease expiry that fails the execution (the attempt limit is reached) takes the same
+    // terminal path as a completion, so its wake advances the open request with no reconcile
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = runningRequest(stores);
+
+    auto lost = expireLease(stores, id, 1, later(2.minutes));
+    assert(lost.disposition == LostLeaseDisposition.failed);
+    const state = stores.requestStates.get("ra").get.value;
+    assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
 }

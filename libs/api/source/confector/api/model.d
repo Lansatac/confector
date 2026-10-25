@@ -1090,24 +1090,10 @@ struct TaskExecution
 }
 
 /**
- * One chain to mark dirty because an execution it waited on ended: written by the ledger's fold
- * (FingerprintLedger.pendingNotify) and removed once the chain has been marked. It names the
- * execution as well as the chain, so a chain waiting on two executions in turn at one fingerprint
- * gets a notice for each, and clearing the first never clears the second.
- */
-struct LedgerNotice
-{
-    @asName("chain_id") string chainId;
-    /// The execution whose end the chain must see.
-    @asName("execution_id") string executionId;
-}
-
-/**
  * The fingerprint ledger (design record: bead confector-z7z.48; AGENTS.md, "Coordinating
  * builds"): one document per fingerprint, with the fingerprint as its id, read by id and changed
  * only by compare-and-set (confector.core.fingerprint_ledger). It is the linearization point for
- * one fingerprint: at most one active execution, the latest success and stop, and the chains
- * waiting on the active execution.
+ * one fingerprint: at most one active execution, and the latest success and stop.
  */
 struct FingerprintLedger
 {
@@ -1129,10 +1115,6 @@ struct FingerprintLedger
     /// How many executions have ever been claimed at this fingerprint. The nth has the
     /// deterministic id `executionIdFor(fingerprint, n)`.
     @optional @asName("execution_seq") ulong executionSeq;
-    /// Chains waiting on the active execution. Empty when there is none.
-    @optional string[] subscribers;
-    /// Chains still to be marked dirty because an execution they waited on ended.
-    @optional @asName("pending_notify") LedgerNotice[] pendingNotify;
 }
 
 /**

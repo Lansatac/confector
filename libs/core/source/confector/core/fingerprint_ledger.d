@@ -18,8 +18,8 @@ module confector.core.fingerprint_ledger;
  *    decided F needs an execution (0 if it found no ledger). The claim moves the ledger from "no
  *    active execution" to active = `executionIdFor(F, seen + 1)`. A loser learns the active
  *    execution or that an execution was created and finished since it read; either way it
- *    re-evaluates, and the chain reconciler's next pass subscribes it on the active execution
- *    (below) at the ledger version that pass reads.
+ *    re-evaluates, and the request waits on the active execution: it is reconciled again when
+ *    that execution ends (see below).
  * 2. `ExecutionStore.createIfAbsent` the queued TaskExecution with that id, carrying the
  *    definition, inputs and repository addresses of the request it is dispatched for.
  *
@@ -33,29 +33,13 @@ module confector.core.fingerprint_ledger;
  *   repairers and the original dispatcher converge on whichever record is written first.
  *   Once recorded, the queued execution waits for a worker to claim it (confector.core.work_orders).
  *
- * Ending an execution (bead confector-z7z.49.4): the terminal compare-and-set on the
- * TaskExecution stays the fence against duplicate or racing completions; only its winner goes
- * on. Then `fold` moves the ledger, in one compare-and-set, from active to idle: the outcome
- * becomes `lastSuccessExecutionId` or `lastStoppedExecutionId` (with `stopSeq` incremented),
- * and every subscriber becomes a LedgerNotice in `pendingNotify`. Then each noticed chain is
- * marked dirty, and `clearNotified` removes exactly the notices handled. A crash after the
- * terminal compare-and-set and before the fold leaves a ledger whose active execution is
- * terminal: `settle` completes the fold. A crash before the notices are cleared leaves them in
- * `pendingNotify` for the next drain (marking a chain dirty twice is harmless).
- *
- * Waiting: a chain that finds F active subscribes with `subscribe`, a compare-and-set at the
- * version it read, written even when the chain is already a subscriber. Subscribe and fold are
- * compare-and-sets on the same document, so either the fold takes the subscriber into
- * `pendingNotify` or the subscribe loses and the chain re-reads the ended execution: no wakeup
- * can be lost and no index is involved. A reconcile reads its ChainState first and the ledgers
- * after it, so a fold whose notice marks the chain dirty after the ChainState read makes the
- * reconcile's ChainState compare-and-set fail, and a fold before it is seen in the ledger read
- * or makes the subscribe's compare-and-set fail.
- *
- * The waiter limit (maxLedgerWaiters, counting `subscribers` and undrained `pendingNotify`
- * together): a chain whose subscribe throws LedgerWaiterLimitException must not commit its
- * reconcile; it leaves its ChainState dirty, so the sweep retries it and the error stays
- * visible until the waiters drain.
+ * Ending an execution: the terminal compare-and-set on the TaskExecution stays the fence against
+ * duplicate or racing completions; only its winner goes on. Then `fold` moves the ledger, in one
+ * compare-and-set, from active to idle: the outcome becomes `lastSuccessExecutionId` or
+ * `lastStoppedExecutionId` (with `stopSeq` incremented). A crash after the terminal
+ * compare-and-set and before the fold leaves a ledger whose active execution is terminal:
+ * `settle` completes the fold. The ender then reconciles the open requests of the execution's
+ * project (confector.core.work_orders); a reconcile that is lost is repaired by a later one.
  *
  * Reuse: `lastSuccessExecutionId` only names the latest success. Whether it is usable (its
  * artifacts may have expired) is on the execution record and decided by the caller, which
@@ -68,42 +52,12 @@ import confector.core.document_collection;
 import confector.api.document_store;
 import confector.api.model;
 
-import std.algorithm.searching : canFind;
 import std.conv : to;
 import std.format : format;
 import std.typecons : Nullable, nullable;
 
 /// The state store collection holding fingerprint ledgers, keyed by fingerprint.
 enum CollectionSpec fingerprintLedgersCollection = CollectionSpec("fingerprint_ledgers", null);
-
-/**
- * The most chains one ledger holds in `subscribers` and `pendingNotify` together. Subscribing
- * beyond it throws LedgerWaiterLimitException; a fold never fails on it, because it only moves
- * entries from one list to the other.
- *
- * Chosen so that a ledger stays under maxDocumentBytes in the worst case, every chain id
- * maxKeyBytes long (checked below; chain ids are printable ASCII without quotes or backslashes,
- * see requireChainId, so each byte serializes as one byte), while being far above the number of chains a small team's
- * branches keep waiting on one execution at once. Reaching it means either that many chains
- * really wait on one fingerprint, or that notices are not being drained; both need looking at,
- * so it fails loudly rather than degrading.
- */
-enum size_t maxLedgerWaiters = 200;
-
-// Worst case: every entry a notice (the larger kind) with a chain id of maxKeyBytes and a
-// 64-character execution id, plus the fingerprint (at most maxKeyBytes) and the fixed fields.
-private enum size_t worstNoticeBytes = `{"chain_id":"","execution_id":""},`.length + maxKeyBytes + 64;
-static assert(maxLedgerWaiters * worstNoticeBytes + maxKeyBytes + 1024 <= maxDocumentBytes,
-    "maxLedgerWaiters must keep a full ledger within maxDocumentBytes");
-
-/// Subscribing would take a ledger past maxLedgerWaiters. Nothing was written.
-class LedgerWaiterLimitException : Exception
-{
-    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
-    {
-        super(msg, file, line);
-    }
-}
 
 /**
  * The id of the `seq`th execution claimed at `fingerprint` (seq starts at 1): a hash of both,
@@ -146,52 +100,9 @@ FingerprintLedger withClaim(in FingerprintLedger ledger) @safe
 }
 
 /**
- * `ledger` with `chainId` waiting on its active execution.
- *
- * Throws: InvalidStateTransitionException if no execution is active or `chainId` is not a valid
- * chain id (see requireChainId); LedgerWaiterLimitException if it would take the ledger past
- * maxLedgerWaiters.
- */
-FingerprintLedger withSubscriber(in FingerprintLedger ledger, string chainId) @safe
-{
-    requireChainId(chainId);
-    requireValid(ledger.activeExecutionId.length > 0,
-        format("Chain '%s' cannot wait on fingerprint %s: no execution is active", chainId, ledger.fingerprint));
-    auto next = copyOf(ledger);
-    if (next.subscribers.canFind(chainId)) return next;
-    if (next.subscribers.length + next.pendingNotify.length >= maxLedgerWaiters)
-    {
-        throw new LedgerWaiterLimitException(format(
-            "Chain '%s' cannot wait on execution '%s' at fingerprint %s: %s chains wait on it and %s notices are undrained, and the limit is %s",
-            chainId, ledger.activeExecutionId, ledger.fingerprint, next.subscribers.length, next.pendingNotify.length,
-            maxLedgerWaiters));
-    }
-    next.subscribers ~= chainId;
-    return next;
-}
-
-/**
- * Checks that `chainId` can be held in a ledger: 1 to maxKeyBytes bytes of printable ASCII
- * (0x20 to 0x7E) other than `"` and backslash, so it serializes as itself and the ledger's
- * worst-case size (see maxLedgerWaiters) holds.
- *
- * Throws: InvalidStateTransitionException otherwise.
- */
-void requireChainId(string chainId) @safe
-{
-    requireValid(chainId.length > 0 && chainId.length <= maxKeyBytes,
-        format("A chain id of %s bytes cannot wait on a fingerprint; it must be 1 to %s", chainId.length, maxKeyBytes));
-    foreach (c; chainId)
-    {
-        requireValid(c >= 0x20 && c <= 0x7E && c != '"' && c != '\\',
-            format("Chain id '%s' cannot wait on a fingerprint: it must be printable ASCII without quotes or backslashes", chainId));
-    }
-}
-
-/**
  * `ledger` with the terminal outcome of its active execution `execution` folded in: no active
- * execution; the outcome recorded as the last success or, with `stopSeq` incremented, the last
- * stop; and every subscriber moved to `pendingNotify` as a notice of this execution.
+ * execution, and the outcome recorded as the last success or, with `stopSeq` incremented, the last
+ * stop.
  *
  * Throws: InvalidStateTransitionException if `execution` is not terminal or not the ledger's
  * active execution.
@@ -214,21 +125,6 @@ FingerprintLedger withFold(in FingerprintLedger ledger, in TaskExecution executi
         next.lastStoppedExecutionId = execution.id;
         next.stopSeq += 1;
     }
-    foreach (chainId; next.subscribers) next.pendingNotify ~= LedgerNotice(chainId, execution.id);
-    next.subscribers = null;
-    return next;
-}
-
-/// `ledger` without the notices in `handled`. Notices not in `handled` (written by a later
-/// fold) stay.
-FingerprintLedger withoutNotices(in FingerprintLedger ledger, in LedgerNotice[] handled) @safe
-{
-    auto next = copyOf(ledger);
-    next.pendingNotify = null;
-    foreach (notice; ledger.pendingNotify)
-    {
-        if (!handled.canFind(notice)) next.pendingNotify ~= notice;
-    }
     return next;
 }
 
@@ -238,7 +134,7 @@ enum ClaimOutcome
     /// The claim won: `executionId` is the new active execution, which the claimer records and
     /// sends.
     won,
-    /// Another execution is active: `executionId`. Wait on it (`subscribe`).
+    /// Another execution is active: `executionId`. The caller waits for it to end.
     active,
     /// No execution is active, but executions were claimed since the caller read the ledger
     /// (`ledger.executionSeq` moved), so its decision is stale. Re-evaluate with this ledger.
@@ -252,26 +148,6 @@ struct LedgerClaim
     /// won: the claimed execution; active: the execution that is active; superseded: empty.
     string executionId;
     /// The ledger after the claim (won) or as found (otherwise, after completing any fold).
-    Versioned!FingerprintLedger ledger;
-}
-
-/// What a subscribe did.
-enum SubscribeOutcome
-{
-    /// The chain was added to the subscribers.
-    subscribed,
-    /// The chain was already a subscriber. The ledger was still written at the version read (with
-    /// unchanged content), so a stale read is detected as for `subscribed`.
-    alreadySubscribed,
-    /// The ledger read has no active execution: nothing to wait on. Re-evaluate with it.
-    notActive
-}
-
-/// The result of `LedgerStore.subscribe`.
-struct LedgerSubscription
-{
-    SubscribeOutcome outcome;
-    /// The ledger after the subscribe (subscribed, alreadySubscribed) or as read (notActive).
     Versioned!FingerprintLedger ledger;
 }
 
@@ -328,7 +204,7 @@ final class LedgerStore
     /// succeeded, so this is reached only under sustained contention on one fingerprint. Higher
     /// than work_orders.maxWriteAttempts (10, for one execution, written by its worker and the
     /// control plane): like a counter or a rerun generation record (100), a ledger is shared by
-    /// every chain that needs the fingerprint, so many subscribers can contend on it at once.
+    /// every chain that needs the fingerprint, so many chains can contend on it at once.
     enum maxWriteAttempts = 100;
 
     private DocumentCollection!FingerprintLedger m_ledgers;
@@ -422,31 +298,6 @@ final class LedgerStore
     }
 
     /**
-     * Adds chain `chainId` to the subscribers of the ledger `read`, by compare-and-set at the
-     * version read, so it is woken when the active execution it saw ends. The compare-and-set is
-     * made even when the chain is already a subscriber, so a stale read is always detected. See
-     * SubscribeOutcome.
-     *
-     * Callers read the chain's ChainState first and the ledger after it (see the module
-     * documentation). A chain whose subscribe throws LedgerWaiterLimitException must leave its
-     * ChainState dirty (not commit its reconcile), so the sweep retries it and the error stays
-     * visible; undrained notices count toward the limit.
-     *
-     * Throws: DocumentConflictException if the ledger changed since `read`: re-read it (the
-     * execution may have ended) and decide again. LedgerWaiterLimitException at
-     * maxLedgerWaiters; InvalidStateTransitionException if `chainId` is not a valid chain id
-     * (checked first, whatever the ledger holds).
-     */
-    LedgerSubscription subscribe(in Versioned!FingerprintLedger read, string chainId)
-    {
-        requireFingerprint(read.fingerprint);
-        requireChainId(chainId);
-        if (read.activeExecutionId.length == 0) return LedgerSubscription(SubscribeOutcome.notActive, copyOf(read));
-        const outcome = read.subscribers.canFind(chainId) ? SubscribeOutcome.alreadySubscribed : SubscribeOutcome.subscribed;
-        return LedgerSubscription(outcome, m_ledgers.replace(read.fingerprint, withSubscriber(read.value, chainId), read.version_));
-    }
-
-    /**
      * Folds the outcome of `execution` into its fingerprint's ledger (see `withFold`). The
      * execution is identified by its id: its stored record is read by id and that record's
      * outcome is folded, never the status in `execution`, so a caller that lost the terminal
@@ -494,41 +345,11 @@ final class LedgerStore
             }
             catch (DocumentConflictException)
             {
-                // A subscriber or another fold landed: read it and fold again (or find it folded).
+                // Another write landed: read it and fold again (or find it folded).
             }
         }
         throw new Exception(format("Could not fold execution '%s' into fingerprint %s: %s attempts in a row lost a compare-and-set",
             execution.id, execution.fingerprint, maxWriteAttempts));
-    }
-
-    /**
-     * Removes the notices in `handled` from the `pendingNotify` of `fingerprint`'s ledger, once
-     * the caller has marked their chains dirty, and returns the ledger. Idempotent; notices a
-     * fold added meanwhile stay, even for the same chain, because they name another execution.
-     *
-     * Throws: InvalidStateTransitionException if the ledger does not exist; Exception if every
-     * one of maxWriteAttempts attempts lost a compare-and-set.
-     */
-    Versioned!FingerprintLedger clearNotified(string fingerprint, in LedgerNotice[] handled)
-    {
-        requireFingerprint(fingerprint);
-        foreach (attempt; 0 .. maxWriteAttempts)
-        {
-            auto current = get(fingerprint);
-            requireValid(!current.isNull, format("Fingerprint %s has no ledger, so it has no notices to clear", fingerprint));
-            auto next = withoutNotices(current.get.value, handled);
-            if (next.pendingNotify.length == current.get.pendingNotify.length) return current.get;
-            try
-            {
-                return m_ledgers.replace(fingerprint, next, current.get.version_);
-            }
-            catch (DocumentConflictException)
-            {
-                // A fold or another drain landed: read it and clear what is still there.
-            }
-        }
-        throw new Exception(format("Could not clear the notices of fingerprint %s: %s attempts in a row lost a compare-and-set",
-            fingerprint, maxWriteAttempts));
     }
 
     /**
@@ -580,8 +401,6 @@ private FingerprintLedger copyOf(in FingerprintLedger ledger) @safe
     copy.lastStoppedExecutionId = ledger.lastStoppedExecutionId;
     copy.stopSeq = ledger.stopSeq;
     copy.executionSeq = ledger.executionSeq;
-    copy.subscribers = ledger.subscribers.dup;
-    copy.pendingNotify = ledger.pendingNotify.dup;
     return copy;
 }
 
@@ -757,14 +576,12 @@ unittest
     auto documents = new InMemoryDocumentStore();
     auto before = storesOver(documents);
     const id = dispatch(before, "fp1", 0);
-    before.ledgers.subscribe(ledgerOf(before, "fp1"), "c1");
     finish(before, id, ExecutionStatus.failed); // ... and the process dies
 
     auto after = storesOver(documents.restart());
     auto retry = after.ledgers.claim("fp1", 1);
     assert(retry.outcome == ClaimOutcome.won && retry.executionId == executionIdFor("fp1", 2));
     assert(retry.ledger.lastStoppedExecutionId == id && retry.ledger.stopSeq == 1);
-    assert(retry.ledger.pendingNotify == [LedgerNotice("c1", id)], "The fold's notices are kept");
 
     // A claimer that decided before that execution existed is superseded, not active
     auto other = storesOver(new InMemoryDocumentStore());
@@ -819,110 +636,6 @@ unittest
     }
     assert(winners == 1);
     assert(ledgerOf(storesOver(documents), "shared").executionSeq == 1);
-}
-
-unittest
-{
-    // Subscribing: a compare-and-set at the version read. A stale read conflicts, even for a
-    // chain that is already a subscriber; an idle ledger has nothing to wait on
-    auto stores = storesOver(new InMemoryDocumentStore());
-    const id = dispatch(stores, "fp1", 0);
-    auto read = ledgerOf(stores, "fp1");
-
-    auto first = stores.ledgers.subscribe(read, "c1");
-    assert(first.outcome == SubscribeOutcome.subscribed && first.ledger.subscribers == ["c1"] && first.ledger.version_ == 2);
-    assert(throwsA!DocumentConflictException({ stores.ledgers.subscribe(read, "c2"); }), "A stale read loses");
-
-    auto again = stores.ledgers.subscribe(first.ledger, "c1");
-    assert(again.outcome == SubscribeOutcome.alreadySubscribed && again.ledger.subscribers == ["c1"]);
-    assert(again.ledger.version_ == 3, "Already subscribed still writes at the version read");
-    assert(throwsA!DocumentConflictException({ stores.ledgers.subscribe(first.ledger, "c1"); }),
-        "Already subscribed on a stale read conflicts");
-    auto second = stores.ledgers.subscribe(again.ledger, "c2");
-    assert(second.outcome == SubscribeOutcome.subscribed && second.ledger.subscribers == ["c1", "c2"]);
-
-    // Chain ids are plain printable ASCII without quotes or backslashes, at most maxKeyBytes
-    char[] tooLong = new char[maxKeyBytes + 1];
-    tooLong[] = 'c';
-    foreach (bad; ["", tooLong.idup, `c"1`, `c\1`, "c\n1", "c\x7F", "c\u00e91"])
-    {
-        assert(throwsA!InvalidStateTransitionException({ stores.ledgers.subscribe(second.ledger, bad); }));
-    }
-    assert(ledgerOf(stores, "fp1").version_ == second.ledger.version_);
-
-    auto folded = stores.ledgers.fold(finish(stores, id, ExecutionStatus.succeeded)).ledger;
-    auto idle = stores.ledgers.subscribe(folded, "c3");
-    assert(idle.outcome == SubscribeOutcome.notActive && idle.ledger.value == folded.value);
-    assert(ledgerOf(stores, "fp1").version_ == folded.version_, "Nothing is written to an idle ledger");
-    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.subscribe(folded, ""); }),
-        "The chain id is checked before the ledger, idle or not");
-}
-
-unittest
-{
-    // A chain that is already a subscriber, deciding on a stale ledger: the reconcile read the
-    // ledger, then the execution ended, its fold noticed the chain and the drain marked it dirty
-    // and cleared the notice, and only then did the reconcile read its (now dirty) ChainState.
-    // Its subscribe must not trust the stale read: the compare-and-set fails, the chain re-reads
-    // and finds the execution ended, instead of committing as if it still waited
-    auto stores = storesOver(new InMemoryDocumentStore());
-    const id = dispatch(stores, "fp1", 0);
-    stores.ledgers.subscribe(ledgerOf(stores, "fp1"), "c1");
-    auto stale = ledgerOf(stores, "fp1");
-
-    auto folded = stores.ledgers.fold(finish(stores, id, ExecutionStatus.succeeded)).ledger;
-    stores.ledgers.clearNotified("fp1", folded.pendingNotify);
-
-    assert(throwsA!DocumentConflictException({ stores.ledgers.subscribe(stale, "c1"); }),
-        "A subscriber's stale read is detected");
-    auto reread = ledgerOf(stores, "fp1");
-    assert(stores.ledgers.subscribe(reread, "c1").outcome == SubscribeOutcome.notActive);
-    assert(reread.lastSuccessExecutionId == id && reread.pendingNotify.length == 0 && reread.subscribers.length == 0);
-}
-
-unittest
-{
-    // Subscribe racing fold, the fold first: it lands between the subscriber's read and its
-    // compare-and-set, so the subscribe loses; the chain re-reads, finds the execution ended and
-    // re-evaluates. It is never left waiting on an idle ledger
-    auto documents = new InMemoryDocumentStore();
-    auto direct = storesOver(documents);
-    auto interleaving = new InterleavingDocumentStore(documents);
-    auto racing = storesOver(interleaving);
-
-    const id = dispatch(direct, "fp1", 0);
-    auto read = ledgerOf(racing, "fp1");
-    const done = finish(direct, id, ExecutionStatus.succeeded);
-
-    interleaving.beforeNextWrite = () { direct.ledgers.fold(done); };
-    assert(throwsA!DocumentConflictException({ racing.ledgers.subscribe(read, "c1"); }), "The subscribe loses to the fold");
-    auto reread = ledgerOf(racing, "fp1");
-    assert(reread.activeExecutionId.length == 0 && reread.lastSuccessExecutionId == id);
-    assert(racing.ledgers.subscribe(reread, "c1").outcome == SubscribeOutcome.notActive);
-    assert(ledgerOf(direct, "fp1").subscribers.length == 0 && ledgerOf(direct, "fp1").pendingNotify.length == 0);
-}
-
-unittest
-{
-    // Subscribe racing fold, the subscribe first: it lands between the fold's read and its
-    // compare-and-set, so the fold loses, re-reads and takes the new subscriber into its notices
-    auto documents = new InMemoryDocumentStore();
-    auto direct = storesOver(documents);
-    auto interleaving = new InterleavingDocumentStore(documents);
-    auto racing = storesOver(interleaving);
-
-    const id = dispatch(direct, "fp1", 0);
-    direct.ledgers.subscribe(ledgerOf(direct, "fp1"), "c0");
-    const done = finish(direct, id, ExecutionStatus.failed);
-
-    interleaving.beforeNextWrite = () {
-        assert(direct.ledgers.subscribe(ledgerOf(direct, "fp1"), "c1").outcome == SubscribeOutcome.subscribed);
-    };
-    auto folded = racing.ledgers.fold(done);
-    assert(folded.outcome == FoldOutcome.folded);
-    assert(folded.ledger.pendingNotify == [LedgerNotice("c0", id), LedgerNotice("c1", id)], "The late subscriber is in the fold");
-    assert(folded.ledger.subscribers.length == 0 && folded.ledger.activeExecutionId.length == 0);
-    assert(folded.ledger.stopSeq == 1 && folded.ledger.lastStoppedExecutionId == id);
 }
 
 unittest
@@ -1016,21 +729,17 @@ unittest
 unittest
 {
     // Crash after an execution's terminal compare-and-set, before its fold: the next reader,
-    // after a restart, completes the fold, and its subscribers become notices. Settling again
-    // writes nothing
+    // after a restart, completes the fold. Settling again writes nothing
     auto documents = new InMemoryDocumentStore();
     auto before = storesOver(documents);
     const id = dispatch(before, "fp1", 0);
-    before.ledgers.subscribe(ledgerOf(before, "fp1"), "c1");
-    before.ledgers.subscribe(ledgerOf(before, "fp1"), "c2");
     finish(before, id, ExecutionStatus.succeeded); // ... and the process dies
 
     auto after = storesOver(documents.restart());
     auto settled = after.ledgers.settle("fp1");
     assert(settled.activity == LedgerActivity.idle && settled.executionId.length == 0);
     auto ledger = settled.ledger.get;
-    assert(ledger.activeExecutionId.length == 0 && ledger.lastSuccessExecutionId == id && ledger.subscribers.length == 0);
-    assert(ledger.pendingNotify == [LedgerNotice("c1", id), LedgerNotice("c2", id)]);
+    assert(ledger.activeExecutionId.length == 0 && ledger.lastSuccessExecutionId == id);
 
     auto again = after.ledgers.settle("fp1");
     assert(again.activity == LedgerActivity.idle && again.ledger.get.version_ == ledger.version_);
@@ -1043,20 +752,19 @@ unittest
 unittest
 {
     // A reader settling races the ender's own fold: whichever lands second finds it folded, and
-    // the notices are written once
+    // the outcome is folded once
     auto documents = new InMemoryDocumentStore();
     auto direct = storesOver(documents);
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = storesOver(interleaving);
 
     const id = dispatch(direct, "fp1", 0);
-    direct.ledgers.subscribe(ledgerOf(direct, "fp1"), "c1");
     const done = finish(direct, id, ExecutionStatus.cancelled);
 
     interleaving.beforeNextWrite = () { assert(direct.ledgers.fold(done).outcome == FoldOutcome.folded); };
     auto settled = racing.ledgers.settle("fp1");
     assert(settled.activity == LedgerActivity.idle);
-    assert(settled.ledger.get.pendingNotify == [LedgerNotice("c1", id)] && settled.ledger.get.stopSeq == 1);
+    assert(settled.ledger.get.stopSeq == 1 && settled.ledger.get.lastStoppedExecutionId == id);
 }
 
 unittest
@@ -1123,104 +831,4 @@ unittest
     auto second = racing.executions.createIfAbsent(queuedExecution(claimed, "fp1", "def_second"));
     assert(second.version_ == 1 && second.definitionHash == "def_first");
     assert(direct.executions.get(claimed).get.definitionHash == "def_first");
-}
-
-unittest
-{
-    import std.algorithm.searching : canFind;
-
-    // The waiter limit: subscribing beyond maxLedgerWaiters fails loudly and writes nothing.
-    // Undrained notices count, so a drain that stops working is noticed; a fold never fails on it
-    auto stores = storesOver(new InMemoryDocumentStore());
-    const id = dispatch(stores, "fp1", 0);
-    foreach (i; 0 .. maxLedgerWaiters)
-    {
-        assert(stores.ledgers.subscribe(ledgerOf(stores, "fp1"), format("c%s", i)).outcome == SubscribeOutcome.subscribed);
-    }
-    auto full = ledgerOf(stores, "fp1");
-    bool limited = false;
-    try stores.ledgers.subscribe(full, "one_too_many");
-    catch (LedgerWaiterLimitException e) limited = e.msg.canFind("one_too_many") && e.msg.canFind(format("%s", maxLedgerWaiters));
-    assert(limited);
-    assert(ledgerOf(stores, "fp1").version_ == full.version_);
-    assert(stores.ledgers.subscribe(full, "c0").outcome == SubscribeOutcome.alreadySubscribed);
-
-    auto folded = stores.ledgers.fold(finish(stores, id, ExecutionStatus.succeeded)).ledger;
-    assert(folded.pendingNotify.length == maxLedgerWaiters);
-    const next = dispatch(stores, "fp1", 1);
-    assert(throwsA!LedgerWaiterLimitException({ stores.ledgers.subscribe(ledgerOf(stores, "fp1"), "late"); }),
-        "Undrained notices count towards the limit");
-    stores.ledgers.clearNotified("fp1", [LedgerNotice("c0", id)]);
-    assert(stores.ledgers.subscribe(ledgerOf(stores, "fp1"), "late").outcome == SubscribeOutcome.subscribed);
-    assert(ledgerOf(stores, "fp1").activeExecutionId == next);
-}
-
-unittest
-{
-    // A full ledger stays within maxDocumentBytes even when every chain id and the fingerprint
-    // are maxKeyBytes long
-    auto stores = storesOver(new InMemoryDocumentStore());
-    char[] longName(char fill, size_t number)
-    {
-        auto name = new char[maxKeyBytes];
-        name[] = fill;
-        const suffix = format("%s", number);
-        name[$ - suffix.length .. $] = suffix;
-        return name;
-    }
-
-    const fingerprint = longName('f', 0).idup;
-    const id = dispatch(stores, fingerprint, 0);
-    foreach (i; 0 .. maxLedgerWaiters)
-    {
-        stores.ledgers.subscribe(ledgerOf(stores, fingerprint), longName('c', i).idup);
-    }
-    auto folded = stores.ledgers.fold(finish(stores, id, ExecutionStatus.failed)).ledger;
-    assert(folded.pendingNotify.length == maxLedgerWaiters);
-}
-
-unittest
-{
-    // Draining notices: clearing removes exactly the notices handled, and is idempotent. A chain
-    // noticed for one execution and then subscribed to the next gets a second notice, which
-    // clearing the first leaves in place, so its second wakeup is not lost
-    auto stores = storesOver(new InMemoryDocumentStore());
-    const first = dispatch(stores, "fp1", 0);
-    stores.ledgers.subscribe(ledgerOf(stores, "fp1"), "c1");
-    stores.ledgers.subscribe(ledgerOf(stores, "fp1"), "c2");
-    stores.ledgers.fold(finish(stores, first, ExecutionStatus.failed));
-
-    const handled = ledgerOf(stores, "fp1").pendingNotify.dup; // the drainer marks c1 and c2 dirty
-    const second = dispatch(stores, "fp1", 1);
-    stores.ledgers.subscribe(ledgerOf(stores, "fp1"), "c1");
-    stores.ledgers.fold(finish(stores, second, ExecutionStatus.succeeded));
-    assert(ledgerOf(stores, "fp1").pendingNotify == [LedgerNotice("c1", first), LedgerNotice("c2", first), LedgerNotice("c1", second)]);
-
-    auto cleared = stores.ledgers.clearNotified("fp1", handled);
-    assert(cleared.pendingNotify == [LedgerNotice("c1", second)], "The second notice for c1 stays");
-    auto again = stores.ledgers.clearNotified("fp1", handled);
-    assert(again.version_ == cleared.version_, "Clearing again writes nothing");
-    assert(stores.ledgers.clearNotified("fp1", [LedgerNotice("c1", second)]).pendingNotify.length == 0);
-    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.clearNotified("fp_none", handled); }));
-}
-
-unittest
-{
-    // A fold landing between a drain's read and its compare-and-set: the drain loses, re-reads
-    // and clears only what it handled; the fold's new notice stays
-    auto documents = new InMemoryDocumentStore();
-    auto direct = storesOver(documents);
-    auto interleaving = new InterleavingDocumentStore(documents);
-    auto racing = storesOver(interleaving);
-
-    const first = dispatch(direct, "fp1", 0);
-    direct.ledgers.subscribe(ledgerOf(direct, "fp1"), "c1");
-    direct.ledgers.fold(finish(direct, first, ExecutionStatus.succeeded));
-    const second = dispatch(direct, "fp1", 1);
-    direct.ledgers.subscribe(ledgerOf(direct, "fp1"), "c3");
-    const done = finish(direct, second, ExecutionStatus.failed);
-
-    interleaving.beforeNextWrite = () { direct.ledgers.fold(done); };
-    auto cleared = racing.ledgers.clearNotified("fp1", [LedgerNotice("c1", first)]);
-    assert(cleared.pendingNotify == [LedgerNotice("c3", second)]);
 }
