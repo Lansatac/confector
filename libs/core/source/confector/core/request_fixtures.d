@@ -1,23 +1,22 @@
-module confector.core.chain_fixtures;
+module confector.core.request_fixtures;
 
 /**
- * Test fixtures shared by the unittests of the chain components (chain_state, execution_dispatcher,
- * chain_reconciler): a small project, chains, request intake, finishing executions, and the real
- * dispatcher and reconciler over a test queue. Compiled only for unittests.
+ * Test fixtures shared by the unittests of the request components (request_state,
+ * execution_dispatcher, request_reconciler): a small project, chains, request intake, finishing
+ * executions, and the real dispatcher and reconciler over a test queue. Compiled only for unittests.
  */
 
 version (unittest):
 
-import confector.core.chain_evaluator;
+import confector.core.request_evaluator;
 import confector.core.chain_pins : pinMap;
-import confector.core.chain_reconciler : ChainReconciler;
+import confector.core.request_reconciler : RequestReconciler;
 import confector.core.document_collection : Versioned;
 import confector.core.execution_dispatcher : Dispatched, ExecutionDispatcher;
 import confector.core.fingerprint_ledger : ClaimOutcome;
 import confector.core.input_resolution : GraphResolution;
 import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
 import confector.core.state_stores : StateStores;
-import confector.core.work_orders : foldAndNotify;
 import confector.api.dispatch_queue : DispatchQueue;
 import confector.api.model;
 import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
@@ -58,9 +57,8 @@ BuildChain sampleChain(string id)
     return chain;
 }
 
-/// Creates chain `id` without its state, as a resolver that crashed before creating it would, and
-/// registers repository game if it is not yet.
-BuildChain createChainOnly(StateStores stores, string id)
+/// Creates chain `id` and registers repository game if it is not yet.
+BuildChain createChain(StateStores stores, string id)
 {
     if (stores.repositories.get("game").isNull)
     {
@@ -70,14 +68,6 @@ BuildChain createChainOnly(StateStores stores, string id)
         stores.repositories.put(game);
     }
     return stores.chains.create(sampleChain(id)).value;
-}
-
-/// Creates chain `id` and its state, as the input resolver does.
-BuildChain createChain(StateStores stores, string id)
-{
-    auto chain = createChainOnly(stores, id);
-    stores.chainStates.createFor(chain);
-    return chain;
 }
 
 RerunGenerationReader readerOf(StateStores stores)
@@ -99,7 +89,7 @@ string fingerprintNow(StateStores stores, string chainId, string taskId)
 }
 
 /// Records request `id` as an intake does: its demands from the settled ledgers, then the
-/// request. It is not yet added to the chain's state (`intake` does both).
+/// request. Its state is not yet created (`intake` does both).
 BuildRequest recordRequest(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
     ProjectDefinition definition = sampleDefinition())
 {
@@ -126,44 +116,34 @@ BuildRequest recordRequest(StateStores stores, string chainId, string id, string
     return stores.requests.create(request).value;
 }
 
-BuildRequest intake(StateStores stores, string chainId, string id, string[] targets, string requestedAt)
+/// Records request `id` and creates its open state.
+BuildRequest intake(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
+    ProjectDefinition definition = sampleDefinition())
 {
-    auto request = recordRequest(stores, chainId, id, targets, requestedAt);
-    stores.chainStates.addRequest(request);
+    auto request = recordRequest(stores, chainId, id, targets, requestedAt, definition);
+    stores.requestStates.createFor(request);
     return request;
 }
 
-/// The chain's requests as its state names them, each with its definition, read by id.
-ChainRequest[] requestsOf(StateStores stores, in ChainState state)
-{
-    ChainRequest[] requests;
-    foreach (id; state.requestIds)
-    {
-        auto request = stores.requests.get(id).get.value;
-        requests ~= ChainRequest(request, stores.definitions.get(request.definitionId).get);
-    }
-    return requests;
-}
-
 /// Request `id` with its definition, read by id.
-ChainRequest chainRequest(StateStores stores, string id)
+DefinedRequest definedRequest(StateStores stores, string id)
 {
     auto request = stores.requests.get(id).get.value;
-    return ChainRequest(request, stores.definitions.get(request.definitionId).get);
+    return DefinedRequest(request, stores.definitions.get(request.definitionId).get);
 }
 
-/// Evaluates chain `read.chainId` from what the stores hold, all read by id, from the state `read`.
-ChainEvaluation evaluateFrom(StateStores stores, in Versioned!ChainState read)
+/// Evaluates request `requestId` from what the stores hold, all read by id.
+RequestEvaluation evaluateFrom(StateStores stores, string requestId)
 {
-    const chain = stores.chains.get(read.chainId).get.value;
-    auto requests = requestsOf(stores, read.value);
-    auto generations = readChainGenerations(chain, requests, readerOf(stores));
+    auto entry = definedRequest(stores, requestId);
+    const chain = stores.chains.get(entry.request.chainId).get.value;
+    auto generations = readRequestGenerations(chain, entry, readerOf(stores));
     LedgerSummary[string] summaries;
-    foreach (fingerprint; chainFingerprints(chain, requests, generations))
+    foreach (fingerprint; requestFingerprints(chain, entry, generations))
     {
         summaries[fingerprint] = readLedgerSummary(stores.ledgers, stores.executions, fingerprint);
     }
-    return evaluateChain(chain, requests, generations, summaries);
+    return evaluateRequest(chain, entry, generations, summaries);
 }
 
 /// A dispatcher over `stores` sending to `queue` (a fresh test queue if null), on the fixed clock.
@@ -173,27 +153,27 @@ ExecutionDispatcher dispatcherOf(StateStores stores, DispatchQueue queue = null)
 }
 
 /// A reconciler over `stores` sending to `queue` (a fresh test queue if null).
-ChainReconciler reconcilerOf(StateStores stores, DispatchQueue queue = null)
+RequestReconciler reconcilerOf(StateStores stores, DispatchQueue queue = null)
 {
-    return new ChainReconciler(stores, dispatcherOf(stores, queue));
+    return new RequestReconciler(stores, dispatcherOf(stores, queue));
 }
 
 /// Dispatches the execution `needed` asks for with the real dispatcher; its claim must win.
-Dispatched dispatch(StateStores stores, in NeededExecution needed, DispatchQueue queue = null)
+Dispatched dispatch(StateStores stores, in NeededExecution needed, string requestId, DispatchQueue queue = null)
 {
-    auto dispatched = dispatcherOf(stores, queue).dispatch(needed, chainRequest(stores, needed.requestId));
+    auto dispatched = dispatcherOf(stores, queue).dispatch(needed, definedRequest(stores, requestId));
     assert(dispatched.claim == ClaimOutcome.won, "The test dispatch's claim must win");
     return dispatched;
 }
 
-/// Reconciles chain `chainId` with the real reconciler and returns its state.
-Versioned!ChainState reconcile(StateStores stores, string chainId, DispatchQueue queue = null)
+/// Reconciles request `requestId` with the real reconciler and returns its state.
+Versioned!RequestState reconcile(StateStores stores, string requestId, DispatchQueue queue = null)
 {
-    return reconcilerOf(stores, queue).reconcile(chainId).state;
+    return reconcilerOf(stores, queue).reconcile(requestId).state;
 }
 
 /// Ends the active execution of `taskId`'s current fingerprint in chain `chain` with `status`:
-/// the terminal compare-and-set, the fold, and the drain marking its waiters dirty.
+/// the terminal compare-and-set and the fold.
 void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionStatus status)
 {
     const fingerprint = closureNow(stores, chain, [taskId]).fingerprints[taskId];
@@ -203,14 +183,14 @@ void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionSta
     ended.status = status;
     ended.finishedAt = "2026-10-20T11:00:00Z";
     stores.executions.update(current, ended);
-    foldAndNotify(stores, ended);
+    stores.ledgers.fold(ended);
 }
 
-ChainTaskState taskOf(in ChainState state, string taskId)
+RequestTaskState taskOf(in RequestState state, string taskId)
 {
     foreach (ref task; state.tasks)
     {
-        if (task.taskId == taskId) return cast(ChainTaskState) task;
+        if (task.taskId == taskId) return cast(RequestTaskState) task;
     }
     assert(false, format("task '%s' has no state", taskId));
 }

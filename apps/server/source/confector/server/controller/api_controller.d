@@ -296,8 +296,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
     // A worker's completion of an execution. It names the execution only: the fingerprint and
     // task come from the execution record (design record: bead confector-z7z.2), and anything
     // that does not match it is rejected. A completion finishes the execution, folds it into its
-    // fingerprint's ledger and wakes the chains waiting on it; see
-    // confector.core.work_orders.completeExecution. The worker acknowledges its own work order.
+    // fingerprint's ledger; see confector.core.work_orders.completeExecution. The worker acknowledges its own work order.
     workerRoute(HTTPMethod.POST, "/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         import confector.core.work_orders : InvalidCompletionException, OutcomeNotFoldedException, StaleCompletionException,
             UnknownExecutionException;
@@ -340,9 +339,9 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         catch (InvalidCompletionException e) reject(HTTPStatus.unprocessableEntity, e.msg);
         catch (OutcomeNotFoldedException e)
         {
-            // The execution is finished and final; only the ledger fold or the wake failed. Say
+            // The execution is finished and final; only the ledger fold failed. Say
             // so loudly (500) rather than report success: resending is answered 409, and the fold
-            // is repaired by a sweep that settles ledgers and wakes their waiters (not yet built).
+            // is repaired by a sweep that settles ledgers (not yet built).
             logError("[api] The completion of execution '%s' was recorded but not folded: %s", executionId, e.msg);
             writeError(res, HTTPStatus.internalServerError, e.msg);
         }
@@ -1016,11 +1015,19 @@ unittest
     failingDocuments.beforeNextWrite = null;
     assert(failingStores.executions.get(anotherId).get.status == ExecutionStatus.queued);
 
-    // A completion whose fold fails after the execution finished (a chain waiting on the
-    // fingerprint has no chain state) is a server error that says so; the execution stays finished
-    // and a resent completion is a conflict
-    const unfoldedId = queueExecution(stores, "fp_n1_unfolded");
-    stores.ledgers.subscribe(stores.ledgers.get("fp_n1_unfolded").get, "chain_without_state");
+    // A completion whose fold fails after the execution finished (the execution was never
+    // claimed on a ledger) is a server error that says so; the execution stays finished and a
+    // resent completion is a conflict
+    const unfoldedId = "exe_unclaimed";
+    TaskExecution unclaimed;
+    unclaimed.id = unfoldedId;
+    unclaimed.projectId = "proj_api_1";
+    unclaimed.taskId = "n1";
+    unclaimed.fingerprint = "fp_n1_unfolded";
+    unclaimed.status = ExecutionStatus.queued;
+    unclaimed.definition = node;
+    unclaimed.createdAt = "2026-10-16T10:00:00Z";
+    stores.executions.createIfAbsent(unclaimed);
     assert(post("/executions/" ~ unfoldedId ~ "/complete", completion) == HTTPStatus.internalServerError);
     assert(stores.executions.get(unfoldedId).get.status == ExecutionStatus.succeeded);
     assert(post("/executions/" ~ unfoldedId ~ "/complete", completion) == HTTPStatus.conflict);

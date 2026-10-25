@@ -1,9 +1,8 @@
 module confector.core.execution_dispatcher;
 
 /**
- * The execution dispatcher (design records: beads confector-z7z.2, confector-z7z.4 and
- * confector-z7z.48; AGENTS.md, "Coordinating builds" and "Backend interfaces"): the shell that
- * turns a fingerprint the chain evaluator says needs an execution into a queued execution on the
+ * The execution dispatcher (AGENTS.md, "Coordinating builds" and "Backend interfaces"): the shell
+ * that turns a fingerprint the request evaluator says needs an execution into a queued execution on the
  * dispatch queue, and that makes sure every active execution is recorded and its message sent.
  * It holds no lock and keeps no state between calls: it reads only by id and writes only by
  * single-document compare-and-set (through LedgerStore and ExecutionStore), so any number of
@@ -30,11 +29,11 @@ module confector.core.execution_dispatcher;
  *
  * - **Claimed but never recorded** (a dispatcher crashed after 2): the ledger names an active
  *   execution with no record, and the evaluator reports the task as waiting on it. `repair`
- *   records it under that id from the request the chain awaits it for (AwaitedExecution.requestId
- *   and inputs; the ledger cannot, it has no definition), then sends it. Concurrent repairers and
+ *   records it under that id from the request that awaits it (AwaitedExecution.inputs and the
+ *   request's definition; the ledger cannot, it has no definition), then sends it. Concurrent repairers and
  *   a slow original dispatcher converge on the first record written.
  * - **Recorded but never sent** (a crash after 3, or a send that failed): the execution is queued
- *   with an empty `sentAt`. `repair` (for each execution a chain awaits) and `resendUnsent` (the
+ *   with an empty `sentAt`. `repair` (for each execution a request awaits) and `resendUnsent` (the
  *   sweep's half, over executions found through the lagging active-execution index) send it
  *   again.
  *
@@ -42,12 +41,11 @@ module confector.core.execution_dispatcher;
  * harmless: receiving starts an execution by compare-and-set and drops a duplicate
  * (confector.core.work_orders). An execution that a worker already holds (running) or whose
  * message was stamped sent is never sent again here: a message lost after its send is the
- * dispatch queue's to redeliver, and an expired lease is the lease sweep's (bead
- * confector-z7z.23.5).
+ * dispatch queue's to redeliver, and an expired lease is the lease sweep's.
  */
 
 import confector.core.build_stores : ExecutionStore;
-import confector.core.chain_evaluator : AwaitedExecution, ChainRequest, NeededExecution;
+import confector.core.request_evaluator : AwaitedExecution, DefinedRequest, NeededExecution;
 import confector.core.definition_hash : recordDefinition;
 import confector.core.document_collection : Versioned;
 import confector.core.fingerprint_ledger : ClaimOutcome;
@@ -110,7 +108,7 @@ struct Dispatched
  * input names a repository missing from `repositories` or without an address.
  */
 TaskExecution executionFor(string executionId, string taskId, string fingerprint, in ResolvedInput[] inputs,
-    in ChainRequest request, in RepositoryRecord[string] repositories, string now) @trusted
+    in DefinedRequest request, in RepositoryRecord[string] repositories, string now) @trusted
 {
     const(TaskNode)* task;
     foreach (ref node; request.definition.tasks)
@@ -182,19 +180,16 @@ final class ExecutionDispatcher
     }
 
     /**
-     * Dispatches the execution `needed` asks for, for `request` (the request `needed.requestId`
-     * names, with its definition): builds its record, claims the fingerprint at the
+     * Dispatches the execution `needed` asks for, for `request` (with its definition): builds its record, claims the fingerprint at the
      * `executionSeq` the evaluation saw, and if the claim wins records the execution and sends
      * it. See Dispatched; whatever the outcome, the caller evaluates again before committing.
      *
      * Throws: UndispatchableExecutionException (nothing written) if the execution cannot be
-     * recorded; Exception if `request` is not the request `needed` names; whatever the stores and
-     * the queue throw. A send that fails leaves the execution recorded and unsent, for the next
+     * recorded; whatever the stores and the queue throw. A send that fails leaves the execution recorded and unsent, for the next
      * reconcile or the sweep to send.
      */
-    Dispatched dispatch(in NeededExecution needed, in ChainRequest request)
+    Dispatched dispatch(in NeededExecution needed, in DefinedRequest request)
     {
-        requireRequest(request, needed.requestId, needed.taskId);
         // Built before claiming, so a task that cannot be recorded never holds the fingerprint
         auto execution = executionFor(null, needed.taskId, needed.fingerprint, needed.inputs, request,
             repositoriesOf(needed.taskId, request), m_now());
@@ -213,21 +208,19 @@ final class ExecutionDispatcher
     }
 
     /**
-     * Makes sure the active execution a chain awaits is recorded and sent: if it has no record
+     * Makes sure the active execution a request awaits is recorded and sent: if it has no record
      * (its dispatcher crashed between claiming and recording it), records it under its id from
-     * `request` (the request `awaited.requestId` names, with its definition); then delivers it
-     * (`deliver`).
+     * `request` (with its definition); then delivers it (`deliver`).
      *
      * Throws: UndispatchableExecutionException (nothing written) if it has no record and cannot be
-     * recorded from `request`; Exception if `request` is not the request `awaited` names, or the
-     * stored record is of another fingerprint; whatever the stores and the queue throw.
+     * recorded from `request`; Exception if the stored record is of another fingerprint; whatever
+     * the stores and the queue throw.
      */
-    Delivery repair(in AwaitedExecution awaited, in ChainRequest request)
+    Delivery repair(in AwaitedExecution awaited, in DefinedRequest request)
     {
         auto found = m_stores.executions.get(awaited.executionId);
         if (found.isNull)
         {
-            requireRequest(request, awaited.requestId, awaited.taskId);
             auto execution = executionFor(awaited.executionId, awaited.taskId, awaited.fingerprint, awaited.inputs, request,
                 repositoriesOf(awaited.taskId, request), m_now());
             return deliverRecord(m_stores.executions.createIfAbsent(execution));
@@ -337,7 +330,7 @@ final class ExecutionDispatcher
 
     /// The registered repositories the repository inputs of task `taskId` in `request`'s
     /// definition name, read by id; missing ones are left out (`executionFor` reports them).
-    private RepositoryRecord[string] repositoriesOf(string taskId, in ChainRequest request)
+    private RepositoryRecord[string] repositoriesOf(string taskId, in DefinedRequest request)
     {
         RepositoryRecord[string] repositories;
         foreach (ref task; request.definition.tasks)
@@ -352,21 +345,12 @@ final class ExecutionDispatcher
         }
         return repositories;
     }
-
-    private static void requireRequest(in ChainRequest request, string requestId, string taskId)
-    {
-        if (request.request.id != requestId)
-        {
-            throw new Exception(format("Task '%s' is dispatched for request '%s', but request '%s' was given", taskId, requestId,
-                request.request.id));
-        }
-    }
 }
 
 version (unittest)
 {
-    import confector.core.chain_evaluator : ChainEvaluation;
-    import confector.core.chain_fixtures;
+    import confector.core.request_evaluator : RequestEvaluation;
+    import confector.core.request_fixtures;
     import confector.core.definition_hash : computeDefinitionHash;
     import confector.core.fingerprint_ledger : executionIdFor;
     import confector.core.work_orders : StartKind, startExecution;
@@ -375,11 +359,11 @@ version (unittest)
 
     import std.algorithm.searching : canFind;
 
-    /// A chain's evaluation with the request it was made for.
+    /// A request's evaluation with the request it was made for.
     private struct Requested
     {
-        ChainEvaluation evaluation;
-        ChainRequest request;
+        RequestEvaluation evaluation;
+        DefinedRequest request;
     }
 
     /// Creates chain `chainId` (unless it exists) with request "r_<chainId>" for `targets`, and
@@ -389,13 +373,13 @@ version (unittest)
         if (stores.chains.get(chainId).isNull) createChain(stores, chainId);
         const requestId = "r_" ~ chainId;
         intake(stores, chainId, requestId, targets, "2026-10-20T10:00:00Z");
-        return Requested(evaluateFrom(stores, stores.chainStates.get(chainId).get), chainRequest(stores, requestId));
+        return Requested(evaluateFrom(stores, requestId), definedRequest(stores, requestId));
     }
 
-    /// The one awaited execution of chain `chainId`'s evaluation as stored now.
+    /// The one awaited execution of chain `chainId`'s request "r_<chainId>" as stored now.
     private AwaitedExecution awaitedNow(StateStores stores, string chainId)
     {
-        auto evaluation = evaluateFrom(stores, stores.chainStates.get(chainId).get);
+        auto evaluation = evaluateFrom(stores, "r_" ~ chainId);
         assert(evaluation.awaited.length == 1 && evaluation.needed.length == 0);
         return evaluation.awaited[0];
     }
@@ -435,11 +419,6 @@ unittest
     const stale = dispatcher.dispatch(needed, at.request);
     assert(stale.claim == ClaimOutcome.superseded && stale.executionId.length == 0);
     assert(stores.ledgers.get(needed.fingerprint).get.executionSeq == 1 && messagesIn(queue).length == 0);
-
-    // A dispatch for another request than the one the decision names is refused
-    auto other = at.request;
-    other.request.id = "r_other";
-    assert(throwsA!Exception({ dispatcher.dispatch(needed, other); }));
 }
 
 unittest
@@ -506,8 +485,7 @@ unittest
 unittest
 {
     // Crash after the claim, before the record: the ledger names an execution with no record, and
-    // the chain awaits it. After a restart, repair records it under that id from the chain's own
-    // request and sends it; repairing again sends nothing. The original dispatcher, resuming,
+    // the request awaits it. After a restart, repair records it under that id from the request and sends it; repairing again sends nothing. The original dispatcher, resuming,
     // finds it recorded and sent, and sends no duplicate
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
@@ -519,7 +497,7 @@ unittest
     auto restarted = new StateStores(documents.restart());
     auto dispatcher = dispatcherOf(restarted, queue);
     const awaited = awaitedNow(restarted, "c1");
-    assert(awaited.executionId == claimed.executionId && awaited.requestId == "r_c1");
+    assert(awaited.executionId == claimed.executionId);
     assert(restarted.executions.get(awaited.executionId).isNull);
     assert(dispatcher.repair(awaited, at.request) == Delivery.sent);
     auto recorded = restarted.executions.get(awaited.executionId).get;
@@ -535,14 +513,7 @@ unittest
     assert(dispatcher.deliver(claimed.executionId) == Delivery.alreadySent);
     assert(messagesIn(queue).length == 0);
 
-    // Recording an unrecorded execution for another request than the one it is awaited for is
-    // refused, as is an awaited execution recorded at another fingerprint
-    auto other = at.request;
-    other.request.id = "r_other";
-    auto unrecorded = cast(AwaitedExecution) awaited;
-    unrecorded.executionId = "exe_never_recorded";
-    assert(throwsA!Exception({ dispatcher.repair(unrecorded, other); }));
-    assert(restarted.executions.get("exe_never_recorded").isNull);
+    // An awaited execution recorded at another fingerprint is refused
     auto elsewhere = cast(AwaitedExecution) awaited;
     elsewhere.fingerprint = "fp_other";
     assert(throwsA!Exception({ dispatcher.repair(elsewhere, at.request); }));
@@ -551,7 +522,7 @@ unittest
 unittest
 {
     // Crash after the record, before the send (here: the send fails): the execution is queued and
-    // unsent. The sweep's resend sends it, as does repair for a chain awaiting it; an execution a
+    // unsent. The sweep's resend sends it, as does repair for a request awaiting it; an execution a
     // worker holds or that ended is never sent
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
@@ -571,7 +542,7 @@ unittest
     assert(stores.executions.get(id).get.sentAt == fixedNow() && messagesIn(queue) == [id]);
     assert(sweeper.resendUnsent(10) == 0 && messagesIn(queue).length == 0);
 
-    // Through repair, for a chain awaiting another unsent execution (lint)
+    // Through repair, for a request awaiting another unsent execution (lint)
     auto lint = requested(stores, ["lint"], "c2");
     const lintNeeded = lint.evaluation.needed[0];
     queue.failSends = 1;
@@ -584,9 +555,9 @@ unittest
     auto report = requested(stores, ["report"], "c3"); // compile is active (c1's); nothing needed yet
     assert(report.evaluation.needed.length == 0);
     finish(stores, stores.chains.get("c1").get.value, "compile", ExecutionStatus.succeeded);
-    const testNeeded = evaluateFrom(stores, stores.chainStates.get("c3").get).needed[0];
+    const testNeeded = evaluateFrom(stores, "r_c3").needed[0];
     queue.failSends = 2;
-    assert(throwsA!Exception({ dispatcher.dispatch(testNeeded, chainRequest(stores, "r_c3")); }));
+    assert(throwsA!Exception({ dispatcher.dispatch(testNeeded, definedRequest(stores, "r_c3")); }));
     const testId = stores.ledgers.get(testNeeded.fingerprint).get.activeExecutionId;
     try
     {

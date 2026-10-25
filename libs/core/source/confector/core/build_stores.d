@@ -422,7 +422,7 @@ final class BuildRequestStore
                 request.id, request.chainId, missing));
         }
 
-        // The request records a demand for exactly the tasks it covers, so chain state can be
+        // The request records a demand for exactly the tasks it covers, so request state can be
         // derived from it (validateRequest checked they are sorted and distinct)
         string[] covered;
         foreach (ref task; closure) covered ~= task.id;

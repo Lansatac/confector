@@ -712,15 +712,13 @@ struct TaskExecutionResult
     @optional @asName("duration_ms") ulong durationMs = 0;
 }
 
-// The build model (design records: beads confector-z7z.14, confector-z7z.15 and confector-z7z.2;
-// AGENTS.md, "What a build is"). A request joins or creates a chain; chain state is derived from
-// authoritative inputs (the chain, its requests, the rerun generations, and the fingerprint
-// ledgers and executions for its fingerprints), with a small mutable ChainState document per
-// chain holding its request ids, its last evaluation and a dirty marker (bead confector-z7z.48;
-// ChainState is bead confector-z7z.49.2; each request records its demands, so ChainState can be
-// rebuilt). Each type is stored as its own document. Timestamps are ISO 8601 UTC strings
-// (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because toISOExtString
-// leaves out zero fractional seconds: parse them to compare.
+// The build model (AGENTS.md, "What a build is"). A request joins or creates a chain. Request
+// state is derived from authoritative inputs (the chain's pins, the request and its definition,
+// the rerun generations, and the fingerprint ledgers and executions for its fingerprints), with a
+// small mutable RequestState document per request holding whether it is open, its cached task
+// states and its outcome. Each type is stored as its own document. Timestamps are ISO 8601 UTC
+// strings (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because
+// toISOExtString leaves out zero fractional seconds: parse them to compare.
 
 /**
  * What a build request asks for. See AGENTS.md, "What a build is" and "Re-running a task".
@@ -947,8 +945,7 @@ struct BuildRequest
     @asName("definition_source") DefinitionSource definitionSource;
     /// One entry per task the request covers (its targets and their upstream tasks in its
     /// definition), sorted by task id: the fingerprint and ledger `stopSeq` the task had when the
-    /// request was made (see `TaskDemand`). Chain state is derived from these, so it can be
-    /// rebuilt from the chain's requests (bead confector-z7z.49.2).
+    /// request was made (see `TaskDemand`). Request state is derived from these.
     TaskDemand[] demands;
     /// The identity that made the request: a user, an API token, or the trigger source.
     @asName("requested_by") string requestedBy;
@@ -1123,8 +1120,8 @@ struct FingerprintLedger
     /// The latest execution that failed or was cancelled (a lost execution ends failed); empty
     /// when none has.
     @optional @asName("last_stopped_execution_id") string lastStoppedExecutionId;
-    /// How many executions at this fingerprint have failed or been cancelled. Only grows; chain
-    /// state settles a demand by comparing it with the value seen when the demand was recorded,
+    /// How many executions at this fingerprint have failed or been cancelled. Only grows; a
+    /// request settles a demand by comparing it with the value seen when the demand was recorded,
     /// never by comparing times.
     @optional @asName("stop_seq") ulong stopSeq;
     /// How many executions have ever been claimed at this fingerprint. The nth has the
@@ -1137,12 +1134,12 @@ struct FingerprintLedger
 }
 
 /**
- * A chain task's state, as the chain evaluator derives it (confector.core.chain_evaluator) and
- * ChainState caches it. Only tasks some request on the chain covers have one: a task no request
- * covers is not evaluated (its inputs may not even be pinned). Not an execution status: it is
- * derived from the chain's requests and the fingerprint's ledger.
+ * A request task's state, as the request evaluator derives it (confector.core.request_evaluator)
+ * and RequestState caches it. Only tasks the request covers (its targets and their upstream
+ * tasks) have one. Not an execution status: it is derived from the request and the fingerprint's
+ * ledger.
  */
-enum ChainTaskStatus : string
+enum RequestTaskStatus : string
 {
     /// No valid success of its own (it never ran, or its success's artifacts expired), not
     /// active, not settled, and no task that must run depends on it: every dependent is already
@@ -1158,38 +1155,29 @@ enum ChainTaskStatus : string
     queued = "queued",
     /// Its fingerprint's active execution is held by a worker.
     running = "running",
-    /// Its fingerprint's latest success is usable, whichever chain produced it.
+    /// Its fingerprint's latest success is usable, whichever request produced it.
     succeeded = "succeeded",
-    /// An execution at its fingerprint failed after its latest demand was recorded.
+    /// An execution at its fingerprint failed after the request's demand was recorded.
     failed = "failed",
-    /// An execution at its fingerprint was cancelled after its latest demand was recorded.
+    /// An execution at its fingerprint was cancelled after the request's demand was recorded.
     cancelled = "cancelled",
     /// It must run, but an upstream task failed or was cancelled.
     blocked = "blocked"
 }
 
 /**
- * One chain task's derived state (confector.core.chain_evaluator.evaluateChain), cached in
- * ChainState.
+ * One request task's derived state (confector.core.request_evaluator.evaluateRequest), cached in
+ * RequestState.
  */
-struct ChainTaskState
+struct RequestTaskState
 {
     @asName("task_id") string taskId;
-    /// The fingerprint the task was evaluated at: from the requests' definitions, the chain's pins
-    /// and the current rerun generations.
+    /// The fingerprint the task was evaluated at: from the request's definition, its chain's
+    /// pins and the current rerun generations.
     string fingerprint;
-    ChainTaskStatus status;
-    /// Whether some request on the chain targets the task (rather than only needing it upstream
-    /// of a target).
+    RequestTaskStatus status;
+    /// Whether the request targets the task (rather than only needing it upstream of a target).
     @optional bool target;
-    /// The position (1-based, in ChainState.requestIds) of the request whose demand governs the
-    /// task: of the requests covering it, the one with the highest `stopSeqAtDemand`, the latest
-    /// on ties. Its definition is the one an execution dispatched for the task runs with.
-    @asName("demand_seq") ulong demandSeq;
-    /// The ledger's `stopSeq` at `fingerprint` when that demand was recorded (`TaskDemand.stopSeq`),
-    /// or 0 when the request recorded another fingerprint (a rerun moved the task since). A
-    /// failure or cancellation settles the demand only once the ledger's `stopSeq` is greater.
-    @optional @asName("stop_seq_at_demand") ulong stopSeqAtDemand;
     /// The execution the state comes from: the success used, the active execution, the stop that
     /// settled it, or the expired success of a task not needed. Empty otherwise.
     @optional @asName("execution_id") string executionId;
@@ -1198,27 +1186,40 @@ struct ChainTaskState
 }
 
 /**
- * The chain state (design record: bead confector-z7z.48; AGENTS.md, "What a build is"): one small
- * mutable document per chain, with the chain id as its id (confector.core.chain_state), created with
- * the chain. It names the chain's requests in the order they were added, so demand never depends on
- * a lagging index, caches the last evaluation, and carries the dirty marker signals land on. It is
- * a projection: the chain, its requests (which record their demands), the ledgers and the rerun
- * generations stay authoritative, and a missing or lost ChainState is rebuilt from them.
+ * How a request stands. A request is open until every target is settled.
  */
-struct ChainState
+enum RequestOutcome : string
 {
-    /// The chain, which is also the document's id.
-    @asName("chain_id") string chainId;
+    /// Some target has not settled.
+    open = "open",
+    /// Every target succeeded.
+    succeeded = "succeeded",
+    /// Every target settled and some target failed or was cancelled, or a needed execution could
+    /// not be recorded (`RequestState.error`).
+    failed = "failed",
+    /// Every target settled, none failed, and some is blocked by an upstream task that failed
+    /// or was cancelled.
+    blocked = "blocked"
+}
+
+/**
+ * The request state (AGENTS.md, "What a build is"): one small mutable document per request, with
+ * the request id as its id (confector.core.request_state), written only by compare-and-set. It
+ * caches the last evaluation and the request's outcome. It is a projection: the request, its
+ * chain's pins, the ledgers and the rerun generations stay authoritative.
+ */
+struct RequestState
+{
+    /// The request, which is also the document's id.
+    @asName("request_id") string requestId;
     @asName("project_id") string projectId;
-    /// The chain's requests, in the order they were added. Only appended to.
-    @optional @asName("request_ids") string[] requestIds;
+    /// Whether the request is still open or how it settled. Settled is final.
+    RequestOutcome outcome;
     /// The last evaluation's task states, in topological order; empty until the first evaluation
     /// commits.
-    @optional ChainTaskState[] tasks;
-    /// Something the chain depends on changed since its last evaluation committed: a request was
-    /// added, an execution it waited on ended, or a rerun reached it. Cleared only by a reconcile
-    /// that commits at the version it read.
-    @optional bool dirty;
+    @optional RequestTaskState[] tasks;
+    /// failed because a needed execution could not be recorded: why. Empty otherwise.
+    @optional string error;
 }
 
 /**
@@ -1770,28 +1771,27 @@ unittest
 
 unittest
 {
-    // A chain state round-trips its requests, cached task states and dirty marker
-    ChainState state;
-    state.chainId = "c1";
+    // A request state round-trips its outcome, cached task states and error
+    RequestState state;
+    state.requestId = "r1";
     state.projectId = "game";
-    state.requestIds = ["r1", "r2"];
+    state.outcome = RequestOutcome.failed;
     state.tasks = [
-        ChainTaskState("compile", "fp1", ChainTaskStatus.succeeded, false, 2, 1, "e1"),
-        ChainTaskState("test", "fp2", ChainTaskStatus.blocked, true, 1, 0, null, ["compile"]),
+        RequestTaskState("compile", "fp1", RequestTaskStatus.succeeded, false, "e1"),
+        RequestTaskState("test", "fp2", RequestTaskStatus.blocked, true, null, ["compile"]),
     ];
-    state.dirty = true;
+    state.error = "no address";
     auto json = serializeToJson(state);
-    assert(json["chain_id"].get!string == "c1" && json["request_ids"][1].get!string == "r2" && json["dirty"].get!bool);
-    assert(json["tasks"][0]["status"].get!string == "succeeded" && json["tasks"][0]["demand_seq"].get!long == 2);
-    assert(json["tasks"][0]["stop_seq_at_demand"].get!long == 1 && json["tasks"][0]["execution_id"].get!string == "e1");
+    assert(json["request_id"].get!string == "r1" && json["outcome"].get!string == "failed" && json["error"].get!string == "no address");
+    assert(json["tasks"][0]["status"].get!string == "succeeded" && json["tasks"][0]["execution_id"].get!string == "e1");
     assert(json["tasks"][1]["blocked_by"][0].get!string == "compile" && json["tasks"][1]["target"].get!bool);
     assert(roundTrip(state) == state);
 
-    // A new chain's state has no requests, no evaluation and is clean
-    auto fresh = deserializeJson!ChainState(`{"chain_id": "c2", "project_id": "game"}`);
-    assert(fresh.requestIds.length == 0 && fresh.tasks.length == 0 && !fresh.dirty);
-    auto waiting = deserializeJson!ChainTaskState(`{"task_id": "t", "fingerprint": "f", "status": "waiting_upstream", "demand_seq": 1}`);
-    assert(waiting.status == ChainTaskStatus.waitingUpstream && !waiting.target && waiting.blockedBy.length == 0);
+    // A new request's state is open, with no evaluation
+    auto fresh = deserializeJson!RequestState(`{"request_id": "r2", "project_id": "game", "outcome": "open"}`);
+    assert(fresh.outcome == RequestOutcome.open && fresh.tasks.length == 0 && fresh.error.length == 0);
+    auto waiting = deserializeJson!RequestTaskState(`{"task_id": "t", "fingerprint": "f", "status": "waiting_upstream"}`);
+    assert(waiting.status == RequestTaskStatus.waitingUpstream && !waiting.target && waiting.blockedBy.length == 0);
 }
 
 unittest

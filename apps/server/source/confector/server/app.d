@@ -53,7 +53,7 @@ AuthorizedRoutes createRouter(Backends backends, StateStores stores, string sche
         maxExecutionAttempts, backends.dispatchQueue, stores));
 
     // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
-    // and chain state (beads confector-z7z.23.7 and confector-z7z.49.x)
+    // and request state (beads confector-z7z.23.7 and confector-z7z.49.x)
     router.include(dashboardRouter(authenticator, stores));
     router.get("/projects", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
 
