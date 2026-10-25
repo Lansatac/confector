@@ -192,8 +192,8 @@ Decided October 2026.
   "Branches"), and the default applies only when they say nothing.
 - **Declared, then resolved, then hashed.** Resolution is its own step: it turns the repository
   inputs a request needs into pinned values (ref to revision), each distinct repository and ref
-  once, and records them per task input on the chain, so every task in the chain sees the same
-  revisions. A pin the chain lacks is resolved when first needed and then kept. Pinned values can come
+  once, and records them on the chain per repository and ref, so every task in the chain sees the
+  same revision of a ref. A pin the chain lacks is resolved when first needed and then kept. Pinned values can come
   from querying the repository, from the trigger payload, or from an existing chain. Fingerprints
   are computed only from resolved values.
 - **Each provider defines its own pinned value.** The core treats it as opaque. For git it is the
@@ -241,8 +241,9 @@ Decided October 2026. A "build" used to conflate three things; they are now dist
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
   its payload, optional pins, and the project definition it runs with. Immutable.
-- **Build chain** — the pins of one build: for every repository input its requests have needed,
-  the ref it was built from and that ref's revision. It holds no tasks or edges. Pins only grow
+- **Build chain** — the pins of one build: for every repository and ref its requests have needed,
+  that ref's revision. A chain never holds two revisions of one ref, so a task added later
+  builds from the same revision as the tasks before it. It holds no tasks or edges. Pins only grow
   and never change once set. A *headline ref* groups chains into a history. This is what the UI
   calls a *build*; it has a canonical per-project number (#123) and, separately, user-editable
   labels.
@@ -314,24 +315,29 @@ Decided October 2026. *Principle:* the fewest moving parts that keep the caching
 Correctness rests on reads by id and single-document compare-and-set; liveness rests on a periodic
 sweep, not on subscriptions.
 
-- **Three components, split along what-versus-how.** An *input resolver* turns a request into a
-  chain (resolving inputs, finding or creating the chain). A pure *request evaluator* takes one
-  request, its definition, its chain's pins, the rerun generations and the ledgers of its
-  fingerprints, and returns each task's state plus the fingerprints that need an execution. An
-  *execution dispatcher* claims each needed fingerprint, records the execution with the
-  request's definition, and enqueues it.
+- **Split along what-versus-how.** An *input resolver* turns a request into a chain (resolving
+  inputs, finding or creating the chain). A pure *request evaluator* takes one request, its
+  definition, its chain's pins, the rerun generations and the ledgers of its fingerprints, and
+  returns each task's state plus the fingerprints that need an execution. Each needed
+  fingerprint is claimed by creating its active execution in the ledger; a worker that asks for
+  work is handed one (see "Workers and capacity").
 - **All state is persisted; nothing lives only in memory.** Each fingerprint has a *ledger*
   document, read by id, holding its active execution (at most one), its latest success, and its
   latest stopped execution with a sequence number. At most one active execution per fingerprint
   is enforced with compare-and-set on the ledger, not with locks. *Why:* multiple instances and
   serverless deployment must work, and a restart must lose nothing.
+- **The active execution lives in the ledger.** Claiming it, starting it, extending its lease and
+  expiring it are each one compare-and-set on one document. When it ends, an immutable execution
+  record is written and then folded into the ledger; whoever next reads the ledger completes a
+  fold left half-done. *Why:* every extra document an execution's state is split across adds a
+  crash window and a repair path.
 - **Correctness reads only what the store guarantees fresh.** Reading by id and compare-and-set
   are the only operations treated as current. Index queries are used to find work (open
   requests, history pages); if one lags, work is found a little later, never decided wrongly.
 - **Level-triggered, not event-sourced.** A trigger, a completion or an expired lease only means
-  "something changed"; the handler re-evaluates the open requests it may affect and dispatches
-  whatever is missing. Every step is idempotent, so a crash between saving state and enqueuing
-  work is repaired by the next evaluation.
+  "something changed"; the handler re-evaluates the open requests it may affect and claims
+  whatever is missing. Every step is idempotent, so a crash between two writes is repaired by the
+  next evaluation.
 - **When an execution ends, the open requests of its project are re-evaluated.** Completion,
   failure, lost lease and cancel all finish the execution, fold the result into the ledger, and
   then re-evaluate that project's open requests. If that step is lost, the sweep does it. A
@@ -341,21 +347,38 @@ sweep, not on subscriptions.
   instances.
 - **The control plane owns fingerprints.** Work orders carry an execution id; a worker's
   completion names that id, and the fingerprint comes from the control plane's own record.
-- **The execution owns its lease.** A running execution records when its lease expires and which
-  attempt holds it; the worker's heartbeat extends the lease. The dispatch queue only delivers:
-  a duplicate message loses the compare-and-set that starts the execution and is dropped, and a
-  completion from a superseded attempt is rejected.
+- **The active execution owns its lease.** A running execution records when its lease expires and
+  which attempt holds it; the worker's heartbeat extends the lease, and a heartbeat or completion
+  from a superseded attempt is rejected.
 - **Infrastructure failures retry automatically; task failures do not.** An expired lease counts
   as an attempt, up to an admin-configured limit tracked on the execution. A task that fails is
   retried only when a user asks.
 - **A task that cannot be dispatched fails its request** with the error recorded, rather than
   being retried on every sweep. The user fixes the cause and retries.
 - **The sweep runs on a fixed schedule.** One scheduler entry, always registered: each run expires
-  lost leases, resends executions that were never sent, and re-evaluates every open request. An
+  lost leases and re-evaluates every open request. An
   idle run is one cheap query. Scheduler calls may be duplicated or missed; the sweep is
   idempotent.
 - **The dashboard reads request state** documents. Add a cached summary only if that proves too
   slow.
+
+## Workers and capacity
+
+Decided October 2026.
+
+- **Workers pull.** A worker asks the control plane for work; the control plane chooses a queued
+  execution at that moment and claims it for the worker by compare-and-set. There is no queue
+  service between them. *Why:* choosing at the last moment keeps the build queue reorderable and
+  lets the control plane match a task to the best worker, and a serverless control plane cannot
+  push to workers anyway.
+- **Capacity is separate from assignment.** Whatever makes workers exist — an admin, a compute
+  provider, an external autoscaler — never assigns work. Getting capacity wrong costs money or
+  latency, never correctness: an extra worker finds nothing to do, and work waits for a missing
+  one.
+- **Any compute can host a runner, including functions.**
+- **Deferred:** compute providers and how they scale, how workers authenticate per pool, admin
+  control of workers (disable, drain, terminate), and lower-latency delivery for stateful
+  servers.
 
 ## Branches
 
@@ -445,8 +468,8 @@ handled by trust levels.
 - **Webhooks and scheduler callbacks are verified** — by the provider's signature, or by a secret
   the scheduler sends.
 - **Secrets come from a secret store backend at run time.** Tasks declare secrets by name; the
-  runner fetches the values with its execution token. Values never appear in work orders, queue
-  messages, database records, or logs, and they are not inputs (not fingerprinted).
+  runner fetches the values with its execution token. Values never appear in work orders,
+  database records, or logs, and they are not inputs (not fingerprinted).
 - **Pull requests from forks are untrusted.** Following GitHub's model, untrusted builds wait for
   a member's approval, get no secrets, may reuse trusted cache entries, and store their own
   results in a scope tied to their change request that trusted builds never use. Pull requests
@@ -465,7 +488,7 @@ Decided October 2026.
   never a rebuild. *Why:* the owner prefers separate programs over "bring your own `main.d`" as
   the way to make Confector composable.
 - **How a backend is provided depends on the backend:**
-  - The state store, queue, scheduler, and authenticator are **compiled in** — they are on the
+  - The state store, scheduler, and authenticator are **compiled in** — they are on the
     hot path or security-critical. One binary contains every first-party implementation
     (including an embedded single-node store, so a home build server needs no database server).
   - The artifact store, log store, secret store, and compute are **extension kinds**. Common
@@ -543,7 +566,7 @@ Decided October 2026.
   it came from. So fixing
   a configuration and retrying works the same whether you edit in the UI or commit — and an
   external build of an old, tested commit uses today's release configuration.
-- **An execution runs with the definition of the request that dispatched it.** A request that
+- **An execution runs with the definition of the request that claimed it.** A request that
   finds its fingerprint already running waits for that execution, whatever definition it runs
   with: build configuration is not part of the fingerprint (see "The caching contract").
 - **An invalid definition fails loudly,** with file and line.
@@ -560,15 +583,11 @@ Decided October 2026.
   are for finding things and may lag behind writes. There are no multi-document transactions;
   the next chain evaluation (or the sweep) repairs anything left half-done.
 - **Documents stay under 256 KB.** Larger data belongs in the artifact or log store.
-- **The build queue and the dispatch queue are different things.** The *build queue* is what
-  users see — every queued or waiting task and why — and is computed from the state store. The
-  *dispatch queue* is internal delivery to workers, one per compute pool; it is never the source
-  of truth and never shown, and any lost message is re-sent from the state store.
-- **Dispatch just in time.** Work stays queued in the state store until a pool has idle capacity,
-  so users can reorder the build queue (move to top, priorities) up to the last moment.
-- **Workers never hold database credentials.** They receive work through the control plane, or
-  directly from a queue service (such as SQS) with access scoped to their pool, using a pool
-  credential.
+- **The build queue is computed from the state store:** every queued or waiting task and why.
+  There is no separate dispatch queue.
+- **Dispatch just in time.** A queued execution is assigned only when a worker asks for work, so
+  users can reorder the build queue (move to top, priorities) up to the last moment.
+- **Workers never hold database credentials.** They receive work only through the control plane.
 - **Every backend, including in-memory test fakes, must pass the conformance suite** for its
   interface.
 
@@ -628,8 +647,6 @@ server and fails silently in a function.
 - **Keep startup cheap.** Building the backends from configuration happens on every cold start.
 - **Control-plane extensions should not assume a writable disk or installed language runtimes.**
   In a function, prefer the URL transport; local programs must be self-contained.
-- **Runners never run as functions.** Builds outlast function time limits; runners live in
-  compute pools.
 
 ---
 
@@ -652,6 +669,11 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   folder) should be able to be an input, pinned like a repository. Whether and how
   extensions add input kinds is undecided; until then the kinds are repository, value and task
   output.
+- **Rebinding an input on a chain.** Whether a later request may bind an input the chain has
+  already built to a different ref (adding a pin for that ref), or must be refused as a
+  different build, is undecided.
+- **Terminated workers.** Whether an admin terminating a worker counts as an infrastructure
+  failure (retried automatically) or a task failure (retried only by a user) is undecided.
 
 ---
 
