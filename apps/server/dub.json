@@ -19,9 +19,6 @@
 		"confector:document-store-mongo": {
 			"path": "../.."
 		},
-		"confector:queue-mongo": {
-			"path": "../.."
-		},
 		"confector:scheduler-local": {
 			"path": "../.."
 		},

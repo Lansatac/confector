@@ -34,8 +34,8 @@ void printUsage()
     writeln("  --server-url=<url>       Confector server base URL (default: http://localhost:8080)");
     writeln("  --worker-id=<id>         Unique worker identifier");
     writeln("  --workspace=<dir>        Worker workspace directory (required)");
-    writeln("  --poll-interval=<sec>    Queue poll interval in seconds (default: 2)");
-    writeln("  --visibility-timeout=<s  Visibility timeout in seconds (default: 60)");
+    writeln("  --poll-interval=<sec>    Work poll interval in seconds (default: 2)");
+    writeln("  --lease=<sec>            Seconds the server holds an execution without a heartbeat (default: 60)");
     writeln("  --heartbeat-interval=<s  Heartbeat renewal interval in seconds (default: 15)");
     writeln("  --max-tasks=<count>      Maximum tasks to process before exiting (0 = infinite)");
     writeln("  --verbose                Enable verbose logging to console");
@@ -84,7 +84,7 @@ int handleWorker(string[] args)
     string workerId = environment.get("CONFECTOR_WORKER_ID", "");
     string workspaceDir = "";
     size_t pollInterval = 2;
-    size_t visibilityTimeout = 60;
+    size_t leaseSeconds = 60;
     size_t heartbeatInterval = 15;
     size_t maxTasks = 0;
     bool verbose = false;
@@ -94,8 +94,8 @@ int handleWorker(string[] args)
         "server-url", "Confector server base URL (default: http://localhost:8080)", &serverUrl,
         "worker-id", "Unique worker ID", &workerId,
         "workspace", "Worker workspace directory", &workspaceDir,
-        "poll-interval", "Queue poll interval in seconds", &pollInterval,
-        "visibility-timeout", "Visibility timeout in seconds", &visibilityTimeout,
+        "poll-interval", "Work poll interval in seconds", &pollInterval,
+        "lease", "Seconds the server holds an execution without a heartbeat", &leaseSeconds,
         "heartbeat-interval", "Heartbeat renewal interval in seconds", &heartbeatInterval,
         "max-tasks", "Maximum tasks to process before exiting (0 = infinite)", &maxTasks,
         "verbose", "Enable verbose console logging", &verbose
@@ -132,7 +132,7 @@ int handleWorker(string[] args)
     config.workerId = workerId;
     config.workspaceDir = workspaceDir;
     config.pollIntervalSeconds = pollInterval;
-    config.visibilityTimeoutSeconds = visibilityTimeout;
+    config.leaseSeconds = leaseSeconds;
     config.heartbeatIntervalSeconds = heartbeatInterval;
     config.maxTasksToProcess = maxTasks;
     config.verbose = verbose;

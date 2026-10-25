@@ -236,7 +236,6 @@ unittest
     WorkerTokenClaims claims;
     claims.executionId = "exe_1";
     claims.fingerprint = "fp1";
-    claims.receipt = "receipt_1";
     claims.attempt = 2;
     claims.expiresAt = Clock.currTime.toUnixTime() + 600;
     claims.inputs = [InputArtifact("fp_up", "in.zip")];

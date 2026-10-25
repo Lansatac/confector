@@ -265,7 +265,6 @@ version (unittest)
     import confector.core.request_evaluator : DefinedRequest;
     import confector.core.request_fixtures;
     import confector.core.state_stores : StateStores;
-    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     import std.algorithm.searching : canFind;
@@ -303,7 +302,6 @@ unittest
     // writes nothing when it changes nothing. A commit from an older read conflicts. An
     // evaluation that still needs executions, or is of another request, is refused
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new InMemoryDispatchQueue();
     createChain(stores, "c1");
     intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
 
@@ -314,7 +312,7 @@ unittest
         "An evaluation that needs executions is not committed");
     assert(stores.requestStates.get("r1").get.version_ == unready.version_);
 
-    dispatch(stores, needing.needed[0], "r1", queue);
+    dispatch(stores, needing.needed[0], "r1");
     auto read = stores.requestStates.get("r1").get;
     auto evaluation = evaluateFrom(stores, "r1");
     auto committed = stores.requestStates.commit(read, evaluation);

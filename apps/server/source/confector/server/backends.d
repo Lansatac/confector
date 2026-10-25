@@ -6,21 +6,19 @@ module confector.server.backends;
  * loaded at runtime and nothing is registered globally.
  *
  * Every setting is required: a missing or invalid one stops startup with an error naming it.
- * Each backend has one implementation for now (MongoDB for the document store and the dispatch
- * queue, the local scheduler, the local filesystem artifact store), so the configuration does
- * not name which one to use.
+ * Each backend has one implementation for now (MongoDB for the document store, the local
+ * scheduler, the local filesystem artifact store), so the configuration does not name which one to
+ * use.
  */
 
 import std.format : format;
 
 import kaleidic.mongo_standalone : MongoConnection;
-import confector.api.dispatch_queue : DispatchQueue;
 import confector.api.document_store : DocumentStore;
 import confector.api.model : ArtifactStorage;
 import confector.api.scheduler : Scheduler;
 import confector.backends.artifact.local : LocalArtifactStorage;
 import confector.backends.document_store.mongo : MongoDocumentStore;
-import confector.backends.queue.mongo : MongoDispatchQueue;
 import confector.backends.scheduler.local : LocalScheduler;
 import confector.server.authenticator : Authenticator;
 import confector.server.config : HttpConfig, ServerConfig, requireArtifactStoreConfig, requireDocumentStoreConfig,
@@ -34,8 +32,6 @@ struct Backends
 {
     /// Holds every state store's documents (confector.core.state_stores).
     DocumentStore documentStore;
-    /// Delivers work to workers.
-    DispatchQueue dispatchQueue;
     /// Calls back into the server on a schedule.
     Scheduler scheduler;
     /// Holds artifact bytes.
@@ -92,8 +88,6 @@ unittest
  * Builds the backends `config` describes. Every setting is checked before any backend is built,
  * so a missing one fails startup without touching a database; an invalid one (an unreachable
  * MongoDB, an artifact directory that cannot be created) fails when its backend is built.
- *
- * The dispatch queue lives in the document store's MongoDB, on its own connection.
  */
 Backends buildBackends(in ServerConfig config)
 {
@@ -108,8 +102,6 @@ Backends buildBackends(in ServerConfig config)
     // Before any database is contacted: a server without an authenticator never starts
     backends.authenticator = buildAuthenticator(config);
     backends.documentStore = new MongoDocumentStore(
-        new MongoConnection(config.documentStore.connectionString), config.documentStore.database);
-    backends.dispatchQueue = new MongoDispatchQueue(
         new MongoConnection(config.documentStore.connectionString), config.documentStore.database);
     return backends;
 }

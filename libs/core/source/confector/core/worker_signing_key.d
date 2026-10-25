@@ -168,7 +168,6 @@ unittest
     WorkerTokenClaims claims;
     claims.executionId = "exe_1";
     claims.fingerprint = "fp_1";
-    claims.receipt = "receipt_1";
     claims.attempt = 1;
     claims.expiresAt = 2_000_000;
     const token = mintWorkerToken(first.key, claims);

@@ -3,7 +3,7 @@ module confector.core.request_fixtures;
 /**
  * Test fixtures shared by the unittests of the request components (request_state,
  * execution_dispatcher, request_reconciler): a small project, chains, request intake, finishing
- * executions, and the real dispatcher and reconciler over a test queue. Compiled only for unittests.
+ * executions, and the real dispatcher and reconciler. Compiled only for unittests.
  */
 
 version (unittest):
@@ -17,9 +17,7 @@ import confector.core.fingerprint_ledger : ClaimOutcome;
 import confector.core.input_resolution : GraphResolution;
 import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
 import confector.core.state_stores : StateStores;
-import confector.api.dispatch_queue : DispatchQueue;
 import confector.api.model;
-import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
 import confector.testing.memory_document_store : InterleavingDocumentStore;
 
 import std.format : format;
@@ -146,30 +144,30 @@ RequestEvaluation evaluateFrom(StateStores stores, string requestId)
     return evaluateRequest(chain, entry, generations, summaries);
 }
 
-/// A dispatcher over `stores` sending to `queue` (a fresh test queue if null), on the fixed clock.
-ExecutionDispatcher dispatcherOf(StateStores stores, DispatchQueue queue = null)
+/// A dispatcher over `stores`, on the fixed clock.
+ExecutionDispatcher dispatcherOf(StateStores stores)
 {
-    return new ExecutionDispatcher(stores, queue !is null ? queue : new InMemoryDispatchQueue(), () => fixedNow());
+    return new ExecutionDispatcher(stores, () => fixedNow());
 }
 
-/// A reconciler over `stores` sending to `queue` (a fresh test queue if null).
-RequestReconciler reconcilerOf(StateStores stores, DispatchQueue queue = null)
+/// A reconciler over `stores`.
+RequestReconciler reconcilerOf(StateStores stores)
 {
-    return new RequestReconciler(stores, dispatcherOf(stores, queue));
+    return new RequestReconciler(stores, dispatcherOf(stores));
 }
 
 /// Dispatches the execution `needed` asks for with the real dispatcher; its claim must win.
-Dispatched dispatch(StateStores stores, in NeededExecution needed, string requestId, DispatchQueue queue = null)
+Dispatched dispatch(StateStores stores, in NeededExecution needed, string requestId)
 {
-    auto dispatched = dispatcherOf(stores, queue).dispatch(needed, definedRequest(stores, requestId));
+    auto dispatched = dispatcherOf(stores).dispatch(needed, definedRequest(stores, requestId));
     assert(dispatched.claim == ClaimOutcome.won, "The test dispatch's claim must win");
     return dispatched;
 }
 
 /// Reconciles request `requestId` with the real reconciler and returns its state.
-Versioned!RequestState reconcile(StateStores stores, string requestId, DispatchQueue queue = null)
+Versioned!RequestState reconcile(StateStores stores, string requestId)
 {
-    return reconcilerOf(stores, queue).reconcile(requestId).state;
+    return reconcilerOf(stores).reconcile(requestId).state;
 }
 
 /// Ends the active execution of `taskId`'s current fingerprint in chain `chain` with `status`:
@@ -212,48 +210,4 @@ void beforeWrite(InterleavingDocumentStore store, size_t n, void delegate() acti
         return;
     }
     store.beforeNextWrite = () { beforeWrite(store, n - 1, action); };
-}
-
-/// The execution ids of the messages waiting on the default pool queue of `queue`, received (and
-/// so leased) by this call.
-string[] messagesIn(DispatchQueue queue)
-{
-    import confector.core.work_orders : DispatchMessage, defaultPoolQueue;
-    import core.time : hours;
-    import vibe.data.json : deserializeJson;
-
-    string[] ids;
-    for (;;)
-    {
-        auto leases = queue.receive(defaultPoolQueue, 10, 1.hours);
-        if (leases.length == 0) return ids;
-        foreach (lease; leases) ids ~= deserializeJson!DispatchMessage(lease.message).executionId;
-    }
-}
-
-/// A test dispatch queue whose next `failSends` sends throw, as a queue service that is down would.
-final class FlakyDispatchQueue : DispatchQueue
-{
-    import confector.api.dispatch_queue : Lease;
-    import core.time : Duration;
-
-    InMemoryDispatchQueue inner;
-    size_t failSends;
-
-    this() { inner = new InMemoryDispatchQueue(); }
-
-    override void ensureQueue(string queue) { inner.ensureQueue(queue); }
-    override void send(string queue, Json message, Duration delay = Duration.zero)
-    {
-        if (failSends > 0)
-        {
-            --failSends;
-            throw new Exception("The dispatch queue is unavailable");
-        }
-        inner.send(queue, message, delay);
-    }
-    override Lease[] receive(string queue, size_t maxMessages, Duration visibility) { return inner.receive(queue, maxMessages, visibility); }
-    override void ack(string queue, string receipt) { inner.ack(queue, receipt); }
-    override void extend(string queue, string receipt, Duration visibility) { inner.extend(queue, receipt, visibility); }
-    override void release(string queue, string receipt, Duration delay = Duration.zero) { inner.release(queue, receipt, delay); }
 }

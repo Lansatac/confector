@@ -2,9 +2,8 @@ module confector.testing.memory_artifact_storage;
 
 /**
  * In-memory artifact storage for unit testing only (package confector-testing; never wire it
- * into production code). The in-memory dispatch queue is
- * confector.testing.memory_dispatch_queue and the in-memory document store, over which the state
- * stores (confector.core.state_stores) run in tests, is confector.testing.memory_document_store.
+ * into production code). The in-memory document store, over which the state stores
+ * (confector.core.state_stores) run in tests, is confector.testing.memory_document_store.
  */
 
 import confector.api.model : ArtifactNotFoundException, ArtifactStorage, InvalidArtifactKeyException;

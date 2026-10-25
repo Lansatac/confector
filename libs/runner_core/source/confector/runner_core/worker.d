@@ -1,7 +1,7 @@
 module confector.runner_core.worker;
 
 import confector.api.model;
-import confector.api.dispatch_queue : Lease;
+import confector.core.work_orders : ClaimedWork, LeaseAnswer, maxLeaseDuration;
 import confector.core.worker_pool_credential : requireWorkerPoolCredential, workerPoolCredentialHeader;
 import confector.core.worker_token : workerTokenHeader;
 import confector.runner_core.task_executor;
@@ -18,6 +18,8 @@ import std.uuid : randomUUID;
 import std.format : format;
 import std.stdio : writeln;
 import std.algorithm.searching : canFind;
+import std.typecons : Nullable, nullable;
+import core.atomic : atomicLoad, atomicStore;
 import core.thread : Thread;
 import core.time : Duration, seconds, msecs;
 
@@ -42,12 +44,12 @@ enum CompletionReport
 {
     /// The server recorded it.
     recorded,
-    /// The server rejected it for good: the execution already finished (409), the completion is
-    /// invalid (400, 422), or the execution does not exist (404). Running the work order again
-    /// would be rejected the same way, so its lease is acknowledged.
+    /// The server rejected it for good: the execution already finished or a later attempt holds
+    /// it (409), the completion is invalid (400, 422), or the execution does not exist (404).
+    /// Reporting it again would be rejected the same way.
     rejected,
-    /// It did not reach the server, or the server failed (5xx, or any other status): the lease is
-    /// left unacknowledged so the work order is delivered again.
+    /// It did not reach the server, or the server failed (5xx, or any other status): the work is
+    /// given back so another attempt can run it.
     notRecorded
 }
 
@@ -60,7 +62,8 @@ struct HttpWorkerConfig
     string workerId = "";
     string workspaceDir = "";
     size_t pollIntervalSeconds = 2;
-    size_t visibilityTimeoutSeconds = 60;
+    /// How long the server holds an execution for this worker without a heartbeat.
+    size_t leaseSeconds = 60;
     size_t heartbeatIntervalSeconds = 15;
     size_t maxTasksToProcess = 0; // 0 = continuous loop
     bool verbose = false;
@@ -70,8 +73,27 @@ struct HttpWorkerConfig
 }
 
 /**
+ * Throws, naming the setting, unless the lease is from 1 second to the server's longest lease
+ * and the heartbeat interval is at least 1 second and shorter than the lease: otherwise the
+ * server would expire every execution this worker holds, or refuse its requests.
+ */
+void requireUsableLease(in HttpWorkerConfig config)
+{
+    const longest = maxLeaseDuration.total!"seconds";
+    if (config.leaseSeconds < 1 || config.leaseSeconds > longest)
+    {
+        throw new Exception(format("The lease of %s seconds is outside 1 to %s seconds", config.leaseSeconds, longest));
+    }
+    if (config.heartbeatIntervalSeconds < 1 || config.heartbeatIntervalSeconds >= config.leaseSeconds)
+    {
+        throw new Exception(format("The heartbeat interval of %s seconds must be at least 1 and shorter than the lease of %s seconds",
+            config.heartbeatIntervalSeconds, config.leaseSeconds));
+    }
+}
+
+/**
  * HTTP client for worker-to-server control plane protocol.
- * Handles receiving work orders, lease extensions, log streaming, and completion reporting.
+ * Handles receiving work orders, heartbeats, releasing work, log streaming, and completion reporting.
  */
 class HttpWorkerClient
 {
@@ -217,66 +239,67 @@ class HttpWorkerClient
     }
 
     /**
-     * Receives up to maxMessages work orders, leased for visibilityTimeout seconds. Each lease's
-     * message is a WorkOrder in JSON.
+     * Asks the server for one execution to run, held for `leaseSeconds` until the first heartbeat.
+     * Returns its work order, which carries the execution's worker token, and the attempt the
+     * worker must present from then on; null if nothing is queued.
      */
-    Lease[] receiveWork(size_t maxMessages = 1, size_t visibilityTimeout = 30)
+    Nullable!ClaimedWork receiveWork(size_t leaseSeconds)
     {
         Json req = Json.emptyObject;
-        req["max_messages"] = Json(maxMessages);
-        req["visibility_timeout"] = Json(visibilityTimeout);
+        req["lease_seconds"] = Json(leaseSeconds);
         req["worker_id"] = Json(m_workerId);
 
         Json res = sendJson("/queue/receive", "POST", req, "", m_workerPoolCredential);
-        if (res.type != Json.Type.array)
+        if (res.type != Json.Type.object)
         {
-            throw new Exception(format("Server returned %s from /queue/receive, not an array of leases", res.toString()));
+            throw new Exception(format("Server returned %s from /queue/receive, not a work order", res.toString()));
         }
-        Lease[] leases;
-        foreach (item; res)
-        {
-            leases ~= Lease(item["receipt"].get!string, item["receive_count"].get!uint, item["work_order"]);
-        }
-        return leases;
+        if (res.length == 0) return Nullable!ClaimedWork.init;
+        return ClaimedWork(deserializeJson!WorkOrder(res["work_order"]), res["attempt"].get!ulong).nullable;
     }
 
-    /// Extends the lease `receipt`, which `workerToken` (from the same work order) was issued with.
-    bool extendLease(string receipt, string workerToken, size_t visibilityTimeout = 30)
+    /// Extends the lease of attempt `attempt` of execution `executionId` by `leaseSeconds`, with
+    /// the execution's `workerToken`, and returns the server's answer: continue, cancel or
+    /// superseded. Throws if the server cannot be reached or refuses the request.
+    LeaseAnswer heartbeat(string executionId, ulong attempt, size_t leaseSeconds, string workerToken)
     {
-        if (receipt.length == 0) return false;
+        Json req = Json.emptyObject;
+        req["attempt"] = Json(attempt);
+        req["lease_seconds"] = Json(leaseSeconds);
+        req["worker_id"] = Json(m_workerId);
+        return answerOf(sendJson(format("/executions/%s/heartbeat", executionId), "POST", req, workerToken));
+    }
+
+    /// Gives attempt `attempt` of execution `executionId` back so any worker can claim it again.
+    /// Returns false, logging why, if the server did not take it.
+    bool release(string executionId, ulong attempt, string workerToken)
+    {
         try
         {
             Json req = Json.emptyObject;
-            req["receipt"] = Json(receipt);
-            req["visibility_timeout"] = Json(visibilityTimeout);
+            req["attempt"] = Json(attempt);
             req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/extend", "POST", req, workerToken);
-            return true;
+            const answer = answerOf(sendJson(format("/executions/%s/release", executionId), "POST", req, workerToken));
+            if (answer != LeaseAnswer.released)
+            {
+                logWarn("[HttpWorkerClient] Execution '%s' was not released: the server answered %s", executionId, cast(string) answer);
+            }
+            return answer == LeaseAnswer.released;
         }
         catch (Exception e)
         {
-            logWarn("[HttpWorkerClient] Failed to extend lease for receipt '%s': %s", receipt, e.msg);
+            logError("[HttpWorkerClient] Failed to release execution '%s': %s", executionId, e.msg);
             return false;
         }
     }
 
-    /// Acknowledges the lease `receipt`, which `workerToken` (from the same work order) was issued with.
-    bool ackTask(string receipt, string workerToken)
+    private static LeaseAnswer answerOf(in Json response)
     {
-        if (receipt.length == 0) return false;
-        try
+        if (response.type != Json.Type.object || "answer" !in response)
         {
-            Json req = Json.emptyObject;
-            req["receipt"] = Json(receipt);
-            req["worker_id"] = Json(m_workerId);
-            sendJson("/queue/ack", "POST", req, workerToken);
-            return true;
+            throw new Exception(format("Server answered %s, which holds no answer", response.toString()));
         }
-        catch (Exception e)
-        {
-            logError("[HttpWorkerClient] Failed to acknowledge task receipt '%s': %s", receipt, e.msg);
-            return false;
-        }
+        return deserializeJson!LeaseAnswer(response["answer"]);
     }
 
     /// Appends `lines` to execution `executionId`'s log, with the execution's `workerToken`.
@@ -329,7 +352,7 @@ class HttpWorkerClient
 }
 
 /**
- * Runner loop handling work order receipt, execution via TaskExecutor, lease extensions,
+ * Runner loop handling work order receipt, execution via TaskExecutor, heartbeats,
  * artifact packing/unpacking, and completion reporting over HTTP. Steps run with the
  * `StepRunner` it is given.
  */
@@ -344,10 +367,12 @@ class HttpWorkerDaemon
     private bool m_running = false;
     private size_t m_tasksProcessed = 0;
 
-    /// Throws: Exception if `steps` is null.
+    /// Throws: Exception if `steps` is null or the lease and heartbeat interval cannot work
+    /// (see `requireUsableLease`).
     this(in HttpWorkerConfig config, StepRunner steps, HttpWorkerClient client = null)
     {
         if (steps is null) throw new Exception("A worker needs a step runner");
+        requireUsableLease(config);
         this.m_config = config;
         this.m_steps = steps;
         this.m_client = client !is null ? client : new HttpWorkerClient(config.serverUrl, config.workerId, config.workerPoolCredential);
@@ -376,20 +401,22 @@ class HttpWorkerDaemon
         m_executor = new TaskExecutor(m_storage, m_steps);
     }
 
-    TaskExecutionResult processOneMessage(in Lease lease)
+    /// Runs the work order `work` holds, heartbeating while it runs, and reports its completion
+    /// with the attempt the order was claimed as. Returns the task's result.
+    TaskExecutionResult processOneMessage(in ClaimedWork work)
     {
-        const WorkOrder msg = deserializeJson!WorkOrder(lease.message);
+        const WorkOrder msg = work.workOrder;
         if (msg.executionId.length == 0)
         {
             // Its completion could not name what it completes: refuse it before running anything
-            throw new Exception(format("Work order for task '%s' (receipt '%s') names no execution; it cannot be run or completed",
-                msg.taskNode.id, lease.receipt));
+            throw new Exception(format("Work order for task '%s' names no execution; it cannot be run or completed",
+                msg.taskNode.id));
         }
         if (msg.workerToken.length == 0)
         {
             // Every call to the server needs it: refuse before running anything
-            throw new Exception(format("Work order for execution '%s' (receipt '%s') carries no worker token; it cannot be run",
-                msg.executionId, lease.receipt));
+            throw new Exception(format("Work order for execution '%s' carries no worker token; it cannot be run",
+                msg.executionId));
         }
         const string executionId = msg.executionId;
         const string workerToken = msg.workerToken;
@@ -400,25 +427,37 @@ class HttpWorkerDaemon
             mkdirRecurse(taskWsDir);
         }
 
-        logInfo("[worker] Processing task '%s' for execution '%s' (receipt: %s)", taskId, executionId, lease.receipt);
+        const ulong attempt = work.attempt;
+        logInfo("[worker] Processing task '%s' for execution '%s' (attempt %s)", taskId, executionId, attempt);
 
-        // Heartbeat periodic timer
+        // Heartbeat periodic timer. The server answers whether the worker still holds the
+        // execution; once it says otherwise, the worker has lost it.
         Thread heartbeatThread;
-        bool heartbeatRunning = false;
-        if (lease.receipt.length > 0 && m_config.heartbeatIntervalSeconds > 0)
+        shared bool heartbeatRunning = false;
+        shared bool lostExecution = false;
         {
-            heartbeatRunning = true;
-            string handle = lease.receipt;
+            atomicStore(heartbeatRunning, true);
             size_t intervalSec = m_config.heartbeatIntervalSeconds;
-            size_t visTimeout = m_config.visibilityTimeoutSeconds;
+            size_t leaseSeconds = m_config.leaseSeconds;
             heartbeatThread = new Thread({
-                while (heartbeatRunning)
+                while (atomicLoad(heartbeatRunning))
                 {
                     Thread.sleep(intervalSec.seconds);
-                    if (!heartbeatRunning) break;
-                    if (m_client !is null && handle.length > 0)
+                    if (!atomicLoad(heartbeatRunning)) break;
+                    try
                     {
-                        m_client.extendLease(handle, workerToken, visTimeout);
+                        const answer = m_client.heartbeat(executionId, attempt, leaseSeconds, workerToken);
+                        if (answer != LeaseAnswer.continue_)
+                        {
+                            atomicStore(lostExecution, true);
+                            logWarn("[worker] The server answered %s to the heartbeat of execution '%s' (attempt %s)",
+                                cast(string) answer, executionId, attempt);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        // A missed heartbeat is not a lost execution: the next one may get through
+                        logWarn("[worker] Heartbeat of execution '%s' failed: %s", executionId, e.msg);
                     }
                 }
             });
@@ -427,14 +466,8 @@ class HttpWorkerDaemon
         }
         scope(exit)
         {
-            if (heartbeatRunning)
-            {
-                heartbeatRunning = false;
-                if (heartbeatThread !is null)
-                {
-                    heartbeatThread.join();
-                }
-            }
+            atomicStore(heartbeatRunning, false);
+            heartbeatThread.join();
         }
 
         // The artifact routes accept only this execution's token
@@ -509,19 +542,24 @@ class HttpWorkerDaemon
 
         // Report the execution's completion over HTTP, after its last log lines (flushed above),
         // since the server refuses log lines for a finished execution
-        final switch (m_client.reportCompletion(msg.executionId, result, workerToken))
+        result.attempt = attempt;
+        if (atomicLoad(lostExecution))
+        {
+            logError("[worker] Not reporting task '%s' (execution '%s'): the server no longer holds attempt %s for this worker",
+                taskId, msg.executionId, attempt);
+        }
+        else final switch (m_client.reportCompletion(msg.executionId, result, workerToken))
         {
             case CompletionReport.recorded:
             case CompletionReport.rejected:
-                // A rejection is permanent: delivering the work order again would only run the
-                // task again and be rejected again
-                if (lease.receipt.length > 0) m_client.ackTask(lease.receipt, workerToken);
+                // A rejection is permanent: running the task again would only be rejected again
                 break;
             case CompletionReport.notRecorded:
-                // Not acknowledged: the lease expires and the work order is delivered again,
-                // rather than the work order disappearing with its completion never recorded.
-                logError("[worker] Completion of task '%s' (execution '%s') was not recorded; leaving receipt '%s' unacknowledged so it is delivered again",
-                    taskId, msg.executionId, lease.receipt);
+                // Give the execution back, rather than leave it held until the lease runs out
+                // with its completion never recorded
+                logError("[worker] Completion of task '%s' (execution '%s') was not recorded; giving the execution back",
+                    taskId, msg.executionId);
+                m_client.release(msg.executionId, attempt, workerToken);
                 break;
         }
 
@@ -541,8 +579,8 @@ class HttpWorkerDaemon
         {
             try
             {
-                auto messages = m_client.receiveWork(1, m_config.visibilityTimeoutSeconds);
-                if (messages.length == 0)
+                auto work = m_client.receiveWork(m_config.leaseSeconds);
+                if (work.isNull)
                 {
                     if (m_config.maxTasksToProcess > 0 && m_tasksProcessed >= m_config.maxTasksToProcess)
                     {
@@ -552,14 +590,7 @@ class HttpWorkerDaemon
                     continue;
                 }
 
-                foreach (msg; messages)
-                {
-                    processOneMessage(msg);
-                    if (m_config.maxTasksToProcess > 0 && m_tasksProcessed >= m_config.maxTasksToProcess)
-                    {
-                        break;
-                    }
-                }
+                processOneMessage(work.get);
 
                 if (m_config.maxTasksToProcess > 0 && m_tasksProcessed >= m_config.maxTasksToProcess)
                 {
@@ -581,14 +612,22 @@ version (unittest)
 {
     private enum testWorkerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
 
-    /// The /queue/receive response holding one lease on a work order.
-    private Json testLeases(string receipt, WorkOrder order)
+    /// The /queue/receive response handing out a work order claimed as attempt `attempt`.
+    private Json testWork(ulong attempt, WorkOrder order)
     {
-        Json lease = Json.emptyObject;
-        lease["receipt"] = Json(receipt);
-        lease["receive_count"] = Json(1);
-        lease["work_order"] = serializeToJson(order);
-        return Json([lease]);
+        Json work = Json.emptyObject;
+        work["attempt"] = Json(attempt);
+        work["work_order"] = serializeToJson(order);
+        return work;
+    }
+
+    import vibe.http.server : HTTPServerResponse;
+
+    /// Answers a /queue/receive with nothing queued.
+    private void answerNoWork(HTTPServerResponse res)
+    {
+        res.statusCode = 204;
+        res.writeVoidBody();
     }
 }
 
@@ -598,7 +637,8 @@ version (unittest)
     import confector.runner_core.steps.step : StepContext, StepResult;
 
     /// A step runner for tests: each line of a step's `command` config is one line of its
-    /// output. A step whose command is "fail" fails with exit code 4. Counts the steps it runs; it is
+    /// output. A step whose command is "fail" fails with exit code 4, and one whose command is
+    /// "sleep" takes a few seconds. Counts the steps it runs; it is
     /// passed to the worker explicitly, so the worker's thread sees it.
     private final class ScriptedStepRunner : StepRunner
     {
@@ -611,6 +651,12 @@ version (unittest)
             ++stepsRun;
             StepResult result;
             const command = step.config["command"].get!string;
+            if (command == "sleep")
+            {
+                // Long enough for a heartbeat to go out
+                Thread.sleep(2500.msecs);
+                return result;
+            }
             if (command == "fail")
             {
                 context.log("scripted failure");
@@ -661,8 +707,9 @@ version (unittest)
 
 unittest
 {
-    // The worker protocol against a mock control plane: receive a lease, run the task with the
-    // step runner it was given, stream its logs, report its completion, acknowledge the lease.
+    // The worker protocol against a mock control plane: receive a work order, run the task with
+    // the step runner it was given, stream its logs, heartbeat, report its completion with the
+    // attempt it was given.
     // Handlers only record what they see; the test asserts after the worker is done, on this
     // thread, so a wrong value fails the test.
     import std.file : exists, rmdirRecurse, mkdirRecurse;
@@ -688,11 +735,31 @@ unittest
     unconfigured.serverUrl = "http://127.0.0.1:9099";
     assertThrown!Exception(new HttpWorkerDaemon(unconfigured, new ScriptedStepRunner()));
 
+    // Settings that can never work stop the worker at startup, naming the setting
+    import std.exception : collectException;
+    foreach (timing; [[0, 0], [60, 0], [60, 60], [60, 61], [12 * 3600 + 1, 15]])
+    {
+        const lease = timing[0], heartbeat = timing[1];
+        HttpWorkerConfig unusable;
+        unusable.leaseSeconds = lease;
+        unusable.heartbeatIntervalSeconds = heartbeat;
+        unusable.workerPoolCredential = testWorkerPoolCredential;
+        auto failure = collectException(new HttpWorkerDaemon(unusable, new ScriptedStepRunner()));
+        assert(failure !is null && (failure.msg.canFind("lease") || failure.msg.canFind("heartbeat")),
+            format("lease %s, heartbeat %s was accepted", lease, heartbeat));
+    }
+    HttpWorkerConfig usable;
+    usable.leaseSeconds = 12 * 3600;
+    usable.heartbeatIntervalSeconds = 1;
+    usable.workerPoolCredential = testWorkerPoolCredential;
+    new HttpWorkerDaemon(usable, new ScriptedStepRunner());
+
+    const port = freePort();
     auto router = new URLRouter();
     // A redirect from the server is not followed, so a credential never goes to its target
     router.post("/api/v1/queue/receive-redirect", (HTTPServerRequest req, HTTPServerResponse res) {
         res.statusCode = 302;
-        res.headers["Location"] = "http://127.0.0.1:19188/api/v1/queue/receive";
+        res.headers["Location"] = format("http://127.0.0.1:%d/api/v1/queue/receive", port);
         res.writeVoidBody();
     });
     bool dequeueCalled = false;
@@ -700,7 +767,11 @@ unittest
     string[] completedExecutions;
     TaskExecutionResult[] reported;
     bool[] reportedFingerprint;
-    string[] ackedReceipts;
+    string[] releasedExecutions;
+    string[] heartbeatExecutions;
+    long[] heartbeatAttempts;
+    string heartbeatAnswer = "continue";
+    Json[] receiveRequests;
     int rejectCompletion = 0;
     string[] presentedTokens;
     string[] receivePoolCredentials;
@@ -717,16 +788,20 @@ unittest
     mockOrder.fingerprint = "fp_mock_123";
     mockOrder.taskNode.id = "task_test_1";
     mockOrder.taskNode.steps = [scriptedStep("step", "Mock step execution finished successfully")];
-    Json mockLeases = testLeases("receipt_xyz", mockOrder);
+    Json mockWork = testWork(1, mockOrder);
 
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         dequeueCalled = true;
         receivePoolCredentials ~= req.headers.get(workerPoolCredentialHeader, "");
-        res.writeJsonBody(ackedReceipts.length == 0 ? mockLeases : Json.emptyArray);
+        receiveRequests ~= req.json;
+        if (completedExecutions.length == 0) res.writeJsonBody(mockWork);
+        else answerNoWork(res);
     });
-    router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
         recordToken(req);
-        res.writeJsonBody(["status": "heartbeat_extended"]);
+        heartbeatExecutions ~= req.params["execution_id"];
+        heartbeatAttempts ~= req.json["attempt"].get!long;
+        res.writeJsonBody(["answer": heartbeatAnswer]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         recordToken(req);
@@ -746,20 +821,21 @@ unittest
         }
         res.writeJsonBody(["status": "recorded"]);
     });
-    router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
+    router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
         recordToken(req);
-        ackedReceipts ~= req.json["receipt"].get!string;
-        res.writeJsonBody(["status": "acknowledged"]);
+        assert(req.json["attempt"].get!long == 1);
+        releasedExecutions ~= req.params["execution_id"];
+        res.writeJsonBody(["answer": "released"]);
     });
 
     auto settings = new HTTPServerSettings();
-    settings.port = 19188;
+    settings.port = port;
     settings.bindAddresses = ["127.0.0.1"];
     auto listener = listenHTTP(settings, router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
-    config.serverUrl = "http://127.0.0.1:19188";
+    config.serverUrl = format("http://127.0.0.1:%d", port);
     config.workerId = "test_worker_runner";
     config.workspaceDir = buildPath(testDir, "ws");
     config.maxTasksToProcess = 1;
@@ -770,7 +846,7 @@ unittest
     // A redirect answer is a failed request with its status, and the credential is not sent to
     // the location it names: the receive route the redirect points at is never reached
     const receivesBeforeRedirect = receivePoolCredentials.length;
-    auto probe = new HttpWorkerClient("http://127.0.0.1:19188", "test_worker_1", testWorkerPoolCredential);
+    auto probe = new HttpWorkerClient(config.serverUrl, "test_worker_1", testWorkerPoolCredential);
     int redirectStatus = 0;
     runOffThread({
         try
@@ -794,41 +870,60 @@ unittest
     // Only receiving work presents the pool credential; the execution routes never do
     assert(receivePoolCredentials.length >= 1);
     foreach (presented; receivePoolCredentials) assert(presented == testWorkerPoolCredential, "Receive presented '" ~ presented ~ "'");
-    assert(otherPoolCredentials.length >= 3);
+    assert(otherPoolCredentials.length >= 2);
     foreach (presented; otherPoolCredentials) assert(presented.length == 0, "A non-receive route presented the pool credential");
     assert(steps.stepsRun == 1, "The worker ran the task's step with the step runner it was given");
     assert(completedExecutions == ["exe_mock_1"], "The completion names the work order's execution");
     assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("Reported %s", reported));
     assert(reported[0].taskId == "task_test_1" && reported[0].exitCode == 0 && reported[0].errorMessage.length == 0);
     assert(reportedFingerprint == [false], "The completion carries no fingerprint");
-    assert(ackedReceipts == ["receipt_xyz"]);
+    assert(releasedExecutions.length == 0, "A recorded completion is not given back");
+    assert(receiveRequests[0]["worker_id"].get!string == "test_worker_runner" && receiveRequests[0]["lease_seconds"].get!long == 60,
+        "Receiving names the worker and the lease it asks for");
+    assert(reported[0].attempt == 1, "The completion carries the attempt the work order was claimed as");
     assert(loggedExecutions.length > 0);
     foreach (logged; loggedExecutions) assert(logged == "exe_mock_1", logged);
 
-    // Logs, completion and acknowledgement all present the work order's token
-    assert(presentedTokens.length >= 3);
+    // Logs, completion and heartbeats all present the work order's token
+    assert(presentedTokens.length >= 2);
     foreach (presented; presentedTokens) assert(presented == "token_exe_mock_1", "Presented '" ~ presented ~ "'");
 
     // The workspace is the execution's own directory
     assert(exists(buildPath(config.workspaceDir, "exe_mock_1")));
 
-    // A completion the server failed to record (5xx) leaves the lease unacknowledged, so the work
-    // order is delivered again instead of disappearing. One the server rejected for good (a
-    // duplicate or late completion, 409; an invalid one, 422) is acknowledged: running the work
-    // order again would only be rejected again
-    auto lease = Lease("receipt_xyz", 1, serializeToJson(mockOrder));
-    foreach (status, acked; [500: false, 503: false, 409: true, 422: true])
+    // A completion the server failed to record (5xx) gives the execution back, so another attempt
+    // runs it instead of it staying held. One the server rejected for good (a duplicate or late
+    // completion, 409; an invalid one, 422) is not given back: running the work order again would
+    // only be rejected again
+    auto work = ClaimedWork(mockOrder, 1);
+    foreach (status, givenBack; [500: true, 503: true, 409: false, 422: false])
     {
         rejectCompletion = status;
-        ackedReceipts = null;
+        releasedExecutions = null;
         reported = null;
-        runOffThread({ workerRunner.processOneMessage(lease); });
+        runOffThread({ workerRunner.processOneMessage(work); });
         assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("HTTP %s: reported %s", status, reported));
-        string[] expectedAcks;
-        if (acked) expectedAcks = ["receipt_xyz"];
-        assert(ackedReceipts == expectedAcks, format("HTTP %s: acknowledged %s", status, ackedReceipts));
+        string[] expectedReleases;
+        if (givenBack) expectedReleases = ["exe_mock_1"];
+        assert(releasedExecutions == expectedReleases, format("HTTP %s: released %s", status, releasedExecutions));
     }
     rejectCompletion = 0;
+
+    // A heartbeat the server answers superseded (or cancel) means the worker lost the execution:
+    // its result is not reported, since the server would reject it
+    foreach (answered; ["superseded", "cancel"])
+    {
+        heartbeatAnswer = answered;
+        heartbeatExecutions = null;
+        releasedExecutions = null;
+        reported = null;
+        WorkOrder slow = mockOrder;
+        slow.taskNode.steps = [scriptedStep("Slow", "sleep")];
+        runOffThread({ workerRunner.processOneMessage(ClaimedWork(slow, 1)); });
+        assert(heartbeatExecutions.length > 0 && heartbeatExecutions[0] == "exe_mock_1", answered);
+        assert(reported.length == 0 && releasedExecutions.length == 0, "A lost execution is not reported: " ~ answered);
+    }
+    heartbeatAnswer = "continue";
 
     // A failing step is reported as a failed task, with its exit code and error
     WorkOrder failing = mockOrder;
@@ -836,37 +931,32 @@ unittest
     failing.workerToken = "token_exe_failing";
     failing.taskNode.steps = [scriptedStep("Fail", "fail"), scriptedStep("Never", "never runs")];
     reported = null;
-    ackedReceipts = null;
     steps.stepsRun = 0;
-    auto failingLease = Lease("receipt_failing", 1, serializeToJson(failing));
-    runOffThread({ workerRunner.processOneMessage(failingLease); });
+    runOffThread({ workerRunner.processOneMessage(ClaimedWork(failing, 1)); });
     assert(reported.length == 1 && reported[0].status == ExecutionStatus.failed, format("Reported %s", reported));
     assert(reported[0].exitCode == 4 && reported[0].errorMessage == "The scripted step failed", reported[0].errorMessage);
     assert(steps.stepsRun == 1, "Steps after a failed one do not run");
-    assert(ackedReceipts == ["receipt_failing"]);
 
     // A work order naming no execution is refused before anything runs: its completion could
     // not say what it completes
     reported = null;
-    ackedReceipts = null;
+    releasedExecutions = null;
     WorkOrder anonymous = mockOrder;
     anonymous.executionId = null;
-    auto anonymousLease = Lease("receipt_anon", 1, serializeToJson(anonymous));
     string refusal;
-    try runOffThread({ workerRunner.processOneMessage(anonymousLease); });
+    try runOffThread({ workerRunner.processOneMessage(ClaimedWork(anonymous, 1)); });
     catch (Exception e) refusal = e.msg;
     assert(refusal.canFind("names no execution"), refusal);
-    assert(reported.length == 0 && ackedReceipts.length == 0);
+    assert(reported.length == 0 && releasedExecutions.length == 0);
 
     // So is one without a token: the server would refuse every call it made
     WorkOrder untokened = mockOrder;
     untokened.workerToken = null;
-    auto untokenedLease = Lease("receipt_untokened", 1, serializeToJson(untokened));
     refusal = null;
-    try runOffThread({ workerRunner.processOneMessage(untokenedLease); });
+    try runOffThread({ workerRunner.processOneMessage(ClaimedWork(untokened, 1)); });
     catch (Exception e) refusal = e.msg;
     assert(refusal.canFind("no worker token"), refusal);
-    assert(reported.length == 0 && ackedReceipts.length == 0);
+    assert(reported.length == 0 && releasedExecutions.length == 0);
 }
 
 unittest
@@ -874,7 +964,7 @@ unittest
     // With the runner's built-in steps, a step type that is not built in fails the task and a
     // built-in that is not implemented yet fails it loudly; both are reported, naming the bead.
     // The server does not store log lines yet (bead confector-z7z.31.12) and answers 501: the
-    // worker only warns, and still reports and acknowledges each execution
+    // worker only warns, and still reports each execution
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
@@ -887,7 +977,6 @@ unittest
 
     auto router = new URLRouter();
     TaskExecutionResult[string] reported;
-    string[] ackedReceipts;
     size_t logUploads;
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         ++logUploads;
@@ -898,22 +987,19 @@ unittest
         reported[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json);
         res.writeJsonBody(["status": "recorded"]);
     });
-    router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
-        ackedReceipts ~= req.json["receipt"].get!string;
-        res.writeJsonBody(["status": "acknowledged"]);
-    });
 
     auto settings = new HTTPServerSettings();
-    settings.port = 19190;
+    const port = freePort();
+    settings.port = port;
     settings.bindAddresses = ["127.0.0.1"];
     auto listener = listenHTTP(settings, router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
-    config.serverUrl = "http://127.0.0.1:19190";
+    config.serverUrl = format("http://127.0.0.1:%d", port);
     config.workerId = "test_builtin_worker";
     config.workspaceDir = buildPath(testDir, "ws");
-    config.heartbeatIntervalSeconds = 0;
+    config.heartbeatIntervalSeconds = 1;
     config.workerPoolCredential = testWorkerPoolCredential;
     auto worker = new HttpWorkerDaemon(config, new BuiltinStepRunner());
 
@@ -927,8 +1013,8 @@ unittest
         BuildStep step;
         step.type = type;
         order.taskNode.steps = [step];
-        auto lease = Lease("receipt_" ~ execution, 1, serializeToJson(order));
-        runOffThread({ worker.initialize(); worker.processOneMessage(lease); });
+        auto work = ClaimedWork(order, 1);
+        runOffThread({ worker.initialize(); worker.processOneMessage(work); });
     }
     assert(reported["exe_unknown"].status == ExecutionStatus.failed);
     assert(reported["exe_unknown"].errorMessage.canFind("confector-z7z.35.1"), reported["exe_unknown"].errorMessage);
@@ -937,10 +1023,6 @@ unittest
         assert(reported[execution].status == ExecutionStatus.failed, execution);
         assert(reported[execution].errorMessage.canFind("confector-z7z.35.6"), reported[execution].errorMessage);
     }
-    // Each failure was recorded and its lease acknowledged, so the work order is not delivered
-    // again only to fail the same way
-    import std.algorithm.sorting : sort;
-    assert(ackedReceipts.sort.release == ["receipt_exe_bash", "receipt_exe_powershell", "receipt_exe_unknown"], format("Acknowledged %s", ackedReceipts));
     assert(logUploads > 0, "The worker tried to upload its log lines");
 }
 
@@ -961,7 +1043,6 @@ unittest
     auto router = new URLRouter();
     string[] completedExecutions;
     ExecutionStatus[string] reportedStatus;
-    string[] acknowledgedReceipts;
     string[][string] streamedByExecution;
     bool logAfterCompletion = false;
 
@@ -975,7 +1056,7 @@ unittest
     orderStep1.fingerprint = "fp_step_1";
     orderStep1.taskNode.id = "task_step_1";
     orderStep1.taskNode.steps = [scriptedStep("step1", firstLines.join("\n"))];
-    Json msgStep1 = testLeases("receipt_step_1", orderStep1);
+    Json msgStep1 = testWork(1, orderStep1);
 
     WorkOrder orderStep2;
     orderStep2.executionId = "exe_step_2";
@@ -983,15 +1064,15 @@ unittest
     orderStep2.fingerprint = "fp_step_2";
     orderStep2.taskNode.id = "task_step_2";
     orderStep2.taskNode.steps = [scriptedStep("step2a", "second task line 1"), scriptedStep("step2b", "second task line 2")];
-    Json msgStep2 = testLeases("receipt_step_2", orderStep2);
+    Json msgStep2 = testWork(1, orderStep2);
 
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         if (completedExecutions.length == 0) res.writeJsonBody(msgStep1);
         else if (completedExecutions.length == 1) res.writeJsonBody(msgStep2);
-        else res.writeJsonBody(Json.emptyArray);
+        else answerNoWork(res);
     });
-    router.post("/api/v1/queue/extend", (HTTPServerRequest req, HTTPServerResponse res) {
-        res.writeJsonBody(["status": "heartbeat_extended"]);
+    router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.writeJsonBody(["answer": "continue"]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         const execution = req.params["execution_id"];
@@ -1006,19 +1087,16 @@ unittest
         reportedStatus[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json).status;
         res.writeJsonBody(["status": "recorded"]);
     });
-    router.post("/api/v1/queue/ack", (HTTPServerRequest req, HTTPServerResponse res) {
-        acknowledgedReceipts ~= req.json["receipt"].get!string;
-        res.writeJsonBody(["status": "acknowledged"]);
-    });
 
     auto settings = new HTTPServerSettings();
-    settings.port = 19189;
+    const port = freePort();
+    settings.port = port;
     settings.bindAddresses = ["127.0.0.1"];
     auto listener = listenHTTP(settings, router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
-    config.serverUrl = "http://127.0.0.1:19189";
+    config.serverUrl = format("http://127.0.0.1:%d", port);
     config.workerId = "test_multistep_worker";
     config.workspaceDir = buildPath(testDir, "ws");
     config.maxTasksToProcess = 2;
@@ -1032,7 +1110,6 @@ unittest
     assert(workerRunner.tasksProcessed == 2);
     assert(completedExecutions == ["exe_step_1", "exe_step_2"]);
     assert(reportedStatus == ["exe_step_1": ExecutionStatus.succeeded, "exe_step_2": ExecutionStatus.succeeded], format("Reported %s", reportedStatus));
-    assert(acknowledgedReceipts == ["receipt_step_1", "receipt_step_2"]);
     assert(streamedByExecution.length == 2, format("Logs went to %s", streamedByExecution.keys));
     assert(!logAfterCompletion, "A log batch was sent after the completion");
 
@@ -1152,4 +1229,113 @@ unittest
         }
         assert(proxyUploads == 0, "A refused presign must not fall back to the proxy route");
     }
+}
+
+unittest
+{
+    // A runner runs a task end to end against the in-memory backends: the control plane's routes
+    // are backed by the core's claim, heartbeat, release and completion over the state stores in
+    // an in-memory document store. The runner claims the queued execution, runs its steps,
+    // heartbeats, and its completion finishes the execution and folds it into the ledger. A second
+    // runner finds nothing queued, and a late completion of the finished execution is refused.
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import confector.core.fingerprint_ledger : ClaimOutcome;
+    import confector.core.state_stores : StateStores;
+    import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution, releaseExecution;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+
+    string testDir = "test_http_worker_end_to_end";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const claimed = stores.ledgers.claim("fp_e2e", 0);
+    assert(claimed.outcome == ClaimOutcome.won);
+    TaskExecution queued;
+    queued.id = claimed.executionId;
+    queued.projectId = "game";
+    queued.taskId = "build";
+    queued.fingerprint = "fp_e2e";
+    queued.status = ExecutionStatus.queued;
+    queued.definition.id = "build";
+    queued.definition.steps = [scriptedStep("Build", "building"), scriptedStep("Package", "packaging")];
+    queued.createdAt = "2026-10-16T10:00:00Z";
+    stores.executions.createIfAbsent(queued);
+
+    import core.time : seconds;
+
+    auto router = new URLRouter();
+    router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
+        auto work = claimWork(stores, req.json["worker_id"].get!string, req.json["lease_seconds"].get!long.seconds);
+        if (work.isNull) return answerNoWork(res);
+        work.get.workOrder.workerToken = "token_" ~ work.get.workOrder.executionId;
+        res.writeJsonBody(testWork(work.get.attempt, work.get.workOrder));
+    });
+    router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+        const answer = heartbeatExecution(stores, req.params["execution_id"], req.json["attempt"].get!ulong,
+            req.json["lease_seconds"].get!long.seconds);
+        res.writeJsonBody(["answer": cast(string) answer]);
+    });
+    router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
+        const answer = releaseExecution(stores, req.params["execution_id"], req.json["attempt"].get!ulong);
+        res.writeJsonBody(["answer": cast(string) answer]);
+    });
+    router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.writeJsonBody(["status": "ok"]);
+    });
+    router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            completeExecution(stores, req.params["execution_id"], deserializeJson!TaskExecutionResult(req.json));
+            res.writeJsonBody(["status": "recorded"]);
+        }
+        catch (StaleCompletionException e)
+        {
+            res.statusCode = 409;
+            res.writeJsonBody(["error": e.msg]);
+        }
+    });
+
+    const port = freePort();
+    auto settings = new HTTPServerSettings();
+    settings.port = port;
+    settings.bindAddresses = ["127.0.0.1"];
+    auto listener = listenHTTP(settings, router);
+    scope(exit) listener.stopListening();
+
+    HttpWorkerConfig config;
+    config.serverUrl = format("http://127.0.0.1:%d", port);
+    config.workerId = "runner_one";
+    config.workspaceDir = buildPath(testDir, "ws");
+    config.maxTasksToProcess = 1;
+    config.pollIntervalSeconds = 1;
+    config.heartbeatIntervalSeconds = 1;
+    config.workerPoolCredential = testWorkerPoolCredential;
+
+    auto steps = new ScriptedStepRunner();
+    auto runner = new HttpWorkerDaemon(config, steps);
+    runOffThread({ runner.run(); });
+
+    assert(runner.tasksProcessed == 1 && steps.stepsRun == 2);
+    auto finished = stores.executions.get(claimed.executionId).get;
+    assert(finished.status == ExecutionStatus.succeeded && finished.attempts == 1 && finished.worker == "runner_one");
+    assert(finished.exitCode == 0 && finished.finishedAt.length > 0);
+    auto ledger = stores.ledgers.get("fp_e2e").get;
+    assert(ledger.activeExecutionId.length == 0 && ledger.lastSuccessExecutionId == claimed.executionId, "The outcome was folded");
+
+    // Nothing is queued any more: a second runner finds no work and the finished execution is left alone
+    assert(claimWork(stores, "runner_two", 60.seconds).isNull);
+    bool rejected = false;
+    try
+    {
+        TaskExecutionResult late;
+        late.status = ExecutionStatus.failed;
+        late.attempt = 1;
+        completeExecution(stores, claimed.executionId, late);
+    }
+    catch (StaleCompletionException e) rejected = true;
+    assert(rejected && stores.executions.get(claimed.executionId).get.status == ExecutionStatus.succeeded);
 }

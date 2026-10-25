@@ -683,8 +683,8 @@ Each dub package is a directory with its own `dub.json` and a `source/` folder h
 module path (for example `libs/core/source/confector/core/`).
 
 - `libs/core/` — graph construction, input resolution, fingerprinting, built-in step types.
-- `libs/api/` — data types and backend interfaces (document store, dispatch queue,
-  scheduler, artifact storage).
+- `libs/api/` — data types and backend interfaces (document store, scheduler, artifact
+  storage).
 - `libs/runner_core/` — executes a single task on a worker, including the built-in checkout step.
 - `libs/config/` — configuration types.
 - `libs/testing/` — in-memory fakes and backend conformance suites (test-only).
@@ -692,7 +692,7 @@ module path (for example `libs/core/source/confector/core/`).
 - `apps/server/` — web server, API and dashboard, with its web UI templates
   (`views/`) and static assets (`public/`).
 - `backends/<category>/<name>/` — compiled-in backend libraries by kind (artifact store, document
-  store, queue, scheduler). Build steps are not backends: the
+  store, scheduler). Build steps are not backends: the
   runner's built-in steps live in `libs/runner_core` (`steps/`).
 
 Explore the code for anything more specific; file-level details change too often to list here.

@@ -31,7 +31,7 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
 /// is admitted only with `workerPoolCredential`. Every route is registered with its access, and
 /// user requests are authenticated by `backends.authenticator`.
 AuthorizedRoutes createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, string workerTokenKey,
-    string workerPoolCredential, uint maxExecutionAttempts)
+    string workerPoolCredential)
 {
     auto authenticator = backends.authenticator;
     auto router = new AuthorizedRoutes(authenticator);
@@ -49,8 +49,7 @@ AuthorizedRoutes createRouter(Backends backends, StateStores stores, string sche
 
     // API endpoints and the artifact routes workers use
     router.include(artifactsRouter(authenticator, backends.artifactStore, workerTokenKey, stores));
-    router.include(apiRouter(authenticator, schedulerCallbackSecret, workerTokenKey, workerPoolCredential,
-        maxExecutionAttempts, backends.dispatchQueue, stores));
+    router.include(apiRouter(authenticator, schedulerCallbackSecret, workerTokenKey, workerPoolCredential, stores));
 
     // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
     // and request state (beads confector-z7z.23.7 and confector-z7z.49.x)
@@ -150,7 +149,7 @@ void main()
         logInfo("[auth] Worker tokens are signed with the configured signing key.");
 
     auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret,
-        signingKey.key, serverConfig.workerPool.credential, serverConfig.execution.maxAttempts);
+        signingKey.key, serverConfig.workerPool.credential);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
     {
@@ -168,7 +167,6 @@ unittest
     import confector.api.model : ExecutionStatus, TaskExecution;
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
-    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.core.worker_token : InputArtifact, WorkerTokenClaims, mintWorkerToken, workerTokenHeader;
     import std.datetime.systime : Clock;
@@ -179,7 +177,6 @@ unittest
 
     Backends backends;
     backends.documentStore = new InMemoryDocumentStore();
-    backends.dispatchQueue = new InMemoryDispatchQueue();
     backends.scheduler = new LocalScheduler("test-scheduler-secret", "http://127.0.0.1:8080");
     // The worker routes check their own tokens, so no user identity is needed to reach them
     backends.authenticator = new FixedAuthenticator(Nullable!Identity.init);
@@ -197,7 +194,7 @@ unittest
     execution.attempts = 1;
     testStores.executions.createIfAbsent(execution);
     auto router = createRouter(backends, testStores, "test-scheduler-secret", testSigningKey,
-        "pool-credential-0123456789abcdef0123456789abcdef", 3);
+        "pool-credential-0123456789abcdef0123456789abcdef");
 
     struct Answer { int status; string body; }
 
@@ -206,7 +203,6 @@ unittest
     WorkerTokenClaims claims;
     claims.executionId = "exe_1";
     claims.fingerprint = "fp1";
-    claims.receipt = "receipt_1";
     claims.attempt = 1;
     claims.expiresAt = Clock.currTime.toUnixTime() + 600;
     claims.inputs = [InputArtifact("fp1", "100% done.zip")];
@@ -275,12 +271,10 @@ unittest
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.server.authenticator : FixedAuthenticator, Identity, testIdentity;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
-    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     Backends backends;
     backends.documentStore = new InMemoryDocumentStore();
-    backends.dispatchQueue = new InMemoryDispatchQueue();
     backends.scheduler = new LocalScheduler("test-scheduler-secret", "http://127.0.0.1:8080");
     backends.artifactStore = new InMemoryArtifactStorage();
     auto testStores = new StateStores(backends.documentStore);
@@ -291,7 +285,7 @@ unittest
     AuthorizedRoutes routesAs(Nullable!Identity identity)
     {
         backends.authenticator = new FixedAuthenticator(identity);
-        return createRouter(backends, testStores, "test-scheduler-secret", signingKey, poolCredential, 3);
+        return createRouter(backends, testStores, "test-scheduler-secret", signingKey, poolCredential);
     }
 
     // The route table: every route as "METHOD path access", where access is the role a user needs or
@@ -314,9 +308,8 @@ unittest
         "DELETE /api/v1/artifacts/:fingerprint/:artifactId worker-token",
 
         "POST /api/v1/queue/receive worker-pool-credential",
-        "POST /api/v1/queue/ack worker-token",
-        "POST /api/v1/queue/extend worker-token",
-        "POST /api/v1/queue/release worker-token",
+        "POST /api/v1/executions/:execution_id/heartbeat worker-token",
+        "POST /api/v1/executions/:execution_id/release worker-token",
         "GET /api/v1/executions/:execution_id/logs viewer",
         "POST /api/v1/executions/:execution_id/logs worker-token",
         "POST /api/v1/executions/:execution_id/complete worker-token",

@@ -20,7 +20,6 @@
     "apps/server",
     "apps/runner",
     "backends/artifact/local",
-    "backends/queue/mongo",
     "backends/document_store/mongo",
     "backends/scheduler/local"
   ]

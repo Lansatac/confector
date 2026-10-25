@@ -1408,9 +1408,9 @@ unittest
     TaskExecution readdressed = v3.value;
     readdressed.repositoryAddresses = ["src": "https://example.test/other.git"];
     assert(throwsA!InvalidStateTransitionException({ executions.update(v3, readdressed); }));
-    TaskExecution sent = v3.value;
-    sent.sentAt = "2026-10-15T14:03:30Z";
-    v3 = executions.update(v3, sent);
+    TaskExecution leased = v3.value;
+    leased.leaseExpiresAt = "2026-10-15T14:03:30Z";
+    v3 = executions.update(v3, leased);
 
     TaskExecution succeeded = v3.value;
     succeeded.status = ExecutionStatus.succeeded;

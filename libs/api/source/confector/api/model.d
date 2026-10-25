@@ -706,6 +706,9 @@ struct TaskExecutionResult
     /// How the execution ended: succeeded, failed or cancelled. Required: a completion without
     /// a status is malformed, and one with an active status is rejected.
     @asName("status") ExecutionStatus status;
+    /// The attempt the worker was given with the work order (`TaskExecution.attempts` when it
+    /// claimed the execution). Required: a completion from a superseded attempt is rejected.
+    @asName("attempt") ulong attempt;
     @optional @asName("exit_code") int exitCode = 0;
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
@@ -1016,10 +1019,10 @@ struct BuildChain
  */
 enum ExecutionStatus : string
 {
-    /// Recorded and dispatched; no worker has claimed it yet, or its last worker was lost and
+    /// Recorded; no worker has claimed it yet, or its last worker gave it up or lost its lease and
     /// it waits for another attempt.
     queued = "queued",
-    /// A worker holds it.
+    /// A worker holds it under a lease.
     running = "running",
     succeeded = "succeeded",
     /// The task failed, or infrastructure failures used up its attempts. Never retried
@@ -1044,10 +1047,15 @@ struct TaskExecution
     /// reported by a worker.
     string fingerprint;
     ExecutionStatus status;
-    /// How many times a worker has claimed the execution. Infrastructure failures (a lost
-    /// worker, an expired lease, a queue redelivery) retry within the same execution up to an
-    /// admin-configured limit; a user's retry is a new execution.
+    /// How many times a worker has claimed the execution; the current claim's number is its
+    /// attempt. A worker's heartbeat and completion carry the attempt, and one from an earlier
+    /// attempt is rejected. It fences workers only: a release raises it too, so it is not the
+    /// retry limit (see `expiredLeases`).
     ulong attempts;
+    /// How many leases expired on the execution (a lost worker). Infrastructure failures retry
+    /// within the same execution until this reaches an admin-configured limit; a release does not
+    /// count. A user's retry is a new execution.
+    @optional @asName("expired_leases") ulong expiredLeases;
     /// The full task definition the execution ran with, read from the project when it was
     /// dispatched, and its hash (`computeDefinitionHash`). Not part of the fingerprint.
     TaskNode definition;
@@ -1059,11 +1067,6 @@ struct TaskExecution
     /// Where to fetch each repository input from, keyed by input name: how to fetch, not what,
     /// so never hashed. Read from the repository records at dispatch and fixed then.
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
-    /// When a message for the execution was last sent to the dispatch queue; empty while none has
-    /// been. A queued execution that was never sent (its dispatcher failed or crashed between
-    /// recording and sending it) is sent again by the dispatcher, for a chain awaiting it, or by
-    /// the sweep (confector.core.execution_dispatcher).
-    @optional @asName("sent_at") string sentAt;
     /// Artifacts the execution produced.
     @optional ArtifactMetadata[] artifacts;
     /// When retention deleted the execution's artifacts (ISO 8601 UTC); empty while they exist. A
@@ -1072,10 +1075,9 @@ struct TaskExecution
     @optional @asName("artifacts_expired_at") string artifactsExpiredAt;
     /// The id of the worker that holds or last held it; empty until claimed.
     @optional string worker;
-    /// The id of the dispatch message that started the running attempt (`DispatchMessage.messageId`);
-    /// empty while no worker holds the execution. Only that message coming back means the attempt's
-    /// lease expired; another message for the execution is a duplicate.
-    @optional @asName("started_by_message") string startedByMessage;
+    /// When the running attempt's lease expires unless its worker's heartbeat extends it (ISO 8601
+    /// UTC); empty while no worker holds the execution.
+    @optional @asName("lease_expires_at") string leaseExpiresAt;
     @asName("created_at") string createdAt;
     /// When the current attempt started, and when the execution reached a terminal status.
     @optional @asName("started_at") string startedAt;
@@ -1358,9 +1360,8 @@ struct TaskExecutionPayload
 }
 
 /**
- * A fully resolved, ready-to-execute work order, as a worker receives it. The dispatch queue
- * never carries one: it carries a DispatchMessage naming the execution, and the control plane
- * builds the work order from the execution's record when a worker receives it
+ * A fully resolved, ready-to-execute work order, as a worker receives it. The control plane
+ * builds it from the execution's record when a worker claims the execution
  * (confector.core.work_orders).
  */
 struct WorkOrder

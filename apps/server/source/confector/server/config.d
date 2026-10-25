@@ -21,7 +21,7 @@ struct HttpConfig
 }
 
 /**
- * The MongoDB that holds the document store and the dispatch queue. Both settings are required
+ * The MongoDB that holds the document store. Both settings are required
  * and have no defaults; the server refuses to start without them (see
  * requireDocumentStoreConfig).
  */
@@ -154,7 +154,7 @@ struct ArtifactStoreConfig
  */
 struct ExecutionConfig
 {
-    @Description("How many times a worker may start one execution before it fails with \"lease lost N times\": "
+    @Description("How many times a worker may claim one execution before it fails with \"lease lost N times\": "
         ~ "a worker that dies or loses its lease counts as one attempt, a task that fails is never retried "
         ~ "automatically (optional, default 3, at least 1)")
     uint maxAttempts = defaultMaxAttempts;

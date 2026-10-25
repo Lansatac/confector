@@ -22,8 +22,6 @@ module confector.core.fingerprint_ledger;
  *    (below) at the ledger version that pass reads.
  * 2. `ExecutionStore.createIfAbsent` the queued TaskExecution with that id, carrying the
  *    definition, inputs and repository addresses of the request it is dispatched for.
- * 3. Send its DispatchMessage to the pool's dispatch queue.
- * 4. Stamp `sentAt` on the execution by compare-and-set (receiving it stamps it too).
  *
  * Crash repair, by whoever next reads the ledger (`settle`):
  * - After 1, before 2: the ledger's active execution has no record; `settle` reports it
@@ -31,12 +29,9 @@ module confector.core.fingerprint_ledger;
  *   clears the active execution), so every later reader that needs F sees the same id. The
  *   ledger cannot invent the execution: its definition, inputs and repository addresses come
  *   from a request. So whoever needs F (a reconcile of a chain that wants it, bead
- *   confector-z7z.49.3) repeats steps 2 to 4 with that id, from its own request; concurrent
+ *   confector-z7z.49.3) repeats step 2 with that id, from its own request; concurrent
  *   repairers and the original dispatcher converge on whichever record is written first.
- * - After 2, before 4: the execution is queued with an empty `sentAt`; `settle` reports it
- *   `recorded`, and the dispatcher or the sweep sends it again (beads confector-z7z.49.3 and
- *   confector-z7z.49.5). A duplicate message is harmless: receiving starts an execution by
- *   compare-and-set.
+ *   Once recorded, the queued execution waits for a worker to claim it (confector.core.work_orders).
  *
  * Ending an execution (bead confector-z7z.49.4): the terminal compare-and-set on the
  * TaskExecution stays the fence against duplicate or racing completions; only its winner goes
@@ -303,12 +298,10 @@ enum LedgerActivity
 {
     /// No execution is active (or none was ever claimed).
     idle,
-    /// The active execution is recorded, queued or running. If it is queued with an empty
-    /// `sentAt`, its message may never have been sent.
+    /// The active execution is recorded, queued or running.
     recorded,
     /// The active execution was claimed but never recorded (its dispatcher crashed): record it
-    /// with `ExecutionStore.createIfAbsent` under `executionId`, from the request that needs it,
-    /// and send it.
+    /// with `ExecutionStore.createIfAbsent` under `executionId`, from the request that needs it.
     unrecorded
 }
 
@@ -1068,8 +1061,7 @@ unittest
 
 unittest
 {
-    // settle reports what it finds: no ledger, or an active execution that is recorded (and not
-    // yet sent, which the dispatcher repairs). An active execution recorded at another
+    // settle reports what it finds: no ledger, or an active execution that is recorded. An active execution recorded at another
     // fingerprint means a corrupt store and fails loudly
     auto documents = new InMemoryDocumentStore();
     auto stores = storesOver(documents);
@@ -1079,7 +1071,7 @@ unittest
     const id = dispatch(stores, "fp1", 0);
     auto recorded = stores.ledgers.settle("fp1");
     assert(recorded.activity == LedgerActivity.recorded && recorded.executionId == id);
-    assert(recorded.execution.get.id == id && recorded.execution.get.sentAt.length == 0);
+    assert(recorded.execution.get.id == id);
 
     const misplaced = stores.ledgers.claim("fp2", 0).executionId;
     stores.executions.create(queuedExecution(misplaced, "fp_other"));

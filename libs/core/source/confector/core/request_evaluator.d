@@ -50,11 +50,10 @@ module confector.core.request_evaluator;
  * - **The request is open until every target is settled** (succeeded, failed, cancelled or
  *   blocked); see RequestEvaluation.outcome.
  *
- * Unsent and unrecorded executions are not the evaluator's concern: a task whose fingerprint has
- * an active execution is queued (or running) whether or not that execution was ever sent or
- * recorded; the reconciler hands each awaited execution to the dispatcher, which records an
- * unrecorded one from the request (AwaitedExecution.inputs) and sends an unsent one
- * (confector.core.execution_dispatcher). Infrastructure failures retry within one execution,
+ * Unrecorded executions are not the evaluator's concern: a task whose fingerprint has an active
+ * execution is queued (or running) whether or not that execution was ever recorded; the
+ * reconciler hands each awaited execution to the dispatcher, which records an unrecorded one from
+ * the request (AwaitedExecution.inputs) (confector.core.execution_dispatcher). Infrastructure failures retry within one execution,
  * which stays active meanwhile (TaskExecution.attempts). Stale index copies cannot confuse it: it
  * reads no index.
  */

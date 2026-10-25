@@ -16,8 +16,8 @@ import vibe.data.json : Json, parseJsonString;
  * Format: `<claims>.<mac>`, both base64url without padding. The claims are a JSON object; the mac
  * is HMAC-SHA256 over a version label and the encoded claims, keyed by the server's signing key.
  * Verification checks the mac before it parses the claims. The token allows only what its claims
- * name: the execution's own logs and completion, the lease of the delivery that issued it,
- * uploads under the execution's fingerprint, and downloads of the artifacts its inputs name.
+ * name: the execution's own logs, heartbeats, release and completion, uploads under the
+ * execution's fingerprint, and downloads of the artifacts its inputs name.
  */
 
 /// The request header a worker sends its token in.
@@ -46,9 +46,7 @@ struct WorkerTokenClaims
     string executionId;
     /// The fingerprint the holder may upload artifacts under.
     string fingerprint;
-    /// The lease the token was issued with; the holder may extend, release and acknowledge it.
-    string receipt;
-    /// The execution attempt the token was issued for (`TaskExecution.attempts` when it started).
+    /// The execution attempt the token was issued for (`TaskExecution.attempts` when it was claimed).
     /// A worker from a superseded attempt holds a token for an attempt that is no longer current.
     ulong attempt;
     /// When the token stops being valid, in seconds since the Unix epoch.
@@ -89,26 +87,23 @@ class WorkerTokenScopeException : WorkerAuthException
 }
 
 /**
- * The claims for the token of `order`, delivered under lease `receipt` at `issuedAt` (seconds
- * since the Unix epoch) for execution attempt `attempt`. The token expires when the task's timeout and `workerTokenGrace` have passed. Pure.
+ * The claims for the token of `order`, claimed at `issuedAt` (seconds since the Unix epoch) for
+ * execution attempt `attempt`. The token expires when the task's timeout and `workerTokenGrace`
+ * have passed. Pure.
  *
  * Throws: Exception if the work order lacks an execution, a fingerprint or a resolved
- * task_output input, or `receipt` is empty: a token that allowed too little would only fail
- * later, at the worker.
+ * task_output input: a token that allowed too little would only fail later, at the worker.
  */
-WorkerTokenClaims workerTokenClaimsFor(in WorkOrder order, string receipt, ulong attempt, long issuedAt)
+WorkerTokenClaims workerTokenClaimsFor(in WorkOrder order, ulong attempt, long issuedAt)
 {
     if (order.executionId.length == 0)
         throw new Exception("Cannot issue a worker token for a work order that names no execution");
     if (order.fingerprint.length == 0)
         throw new Exception(format("Cannot issue a worker token for execution '%s': its work order has no fingerprint", order.executionId));
-    if (receipt.length == 0)
-        throw new Exception(format("Cannot issue a worker token for execution '%s' without a lease receipt", order.executionId));
 
     WorkerTokenClaims claims;
     claims.executionId = order.executionId;
     claims.fingerprint = order.fingerprint;
-    claims.receipt = receipt;
     claims.attempt = attempt;
     claims.expiresAt = issuedAt + order.timeoutSeconds + workerTokenGrace.total!"seconds";
 
@@ -146,7 +141,6 @@ string mintWorkerToken(in char[] key, in WorkerTokenClaims claims)
     Json json = Json.emptyObject;
     json["exec"] = Json(claims.executionId);
     json["fp"] = Json(claims.fingerprint);
-    json["rcpt"] = Json(claims.receipt);
     json["att"] = Json(claims.attempt);
     json["exp"] = Json(claims.expiresAt);
     Json inputs = Json.emptyArray;
@@ -193,7 +187,6 @@ WorkerTokenClaims verifyWorkerToken(in char[] key, in char[] token, long now)
         const json = parseJsonString(cast(string) decodeBase64Url(encoded));
         claims.executionId = json["exec"].get!string;
         claims.fingerprint = json["fp"].get!string;
-        claims.receipt = json["rcpt"].get!string;
         claims.attempt = json["att"].get!ulong;
         claims.expiresAt = json["exp"].get!long;
         foreach (entry; json["in"])
@@ -221,13 +214,6 @@ void requireCurrentAttempt(in WorkerTokenClaims claims, ulong currentAttempt)
     if (claims.attempt != currentAttempt)
         throw new WorkerTokenScopeException(format("The worker token is for attempt %d of execution '%s', which is on attempt %d now",
             claims.attempt, claims.executionId, currentAttempt));
-}
-
-/// Throws WorkerTokenScopeException unless the token was issued with lease `receipt`.
-void requireReceipt(in WorkerTokenClaims claims, string receipt)
-{
-    if (claims.receipt != receipt)
-        throw new WorkerTokenScopeException(format("The worker token was issued for another lease than '%s'", receipt));
 }
 
 /// Throws WorkerTokenScopeException unless the token may upload artifacts under `fingerprint`.
@@ -302,11 +288,11 @@ version (unittest)
 
 unittest
 {
-    // The claims name the execution, its fingerprint, the lease, the inputs' artifacts and an
+    // The claims name the execution, its fingerprint, the attempt, the inputs' artifacts and an
     // expiry after the timeout and the grace; a task_output input that names no artifact
     // contributes none
-    const claims = workerTokenClaimsFor(testOrder(), "receipt_1", 1, testNow);
-    assert(claims.executionId == "exe_1" && claims.fingerprint == "fp_1" && claims.receipt == "receipt_1");
+    const claims = workerTokenClaimsFor(testOrder(), 1, testNow);
+    assert(claims.executionId == "exe_1" && claims.fingerprint == "fp_1");
     assert(claims.attempt == 1);
     assert(claims.expiresAt == testNow + 600 + 30 * 60);
     assert(claims.inputs == [InputArtifact("fp_engine", "engine.zip")]);
@@ -315,14 +301,13 @@ unittest
     import std.exception : assertThrown;
     auto noExecution = testOrder();
     noExecution.executionId = "";
-    assertThrown!Exception(workerTokenClaimsFor(noExecution, "receipt_1", 1, testNow));
+    assertThrown!Exception(workerTokenClaimsFor(noExecution, 1, testNow));
     auto noFingerprint = testOrder();
     noFingerprint.fingerprint = "";
-    assertThrown!Exception(workerTokenClaimsFor(noFingerprint, "receipt_1", 1, testNow));
-    assertThrown!Exception(workerTokenClaimsFor(testOrder(), "", 1, testNow));
+    assertThrown!Exception(workerTokenClaimsFor(noFingerprint, 1, testNow));
     auto unresolved = testOrder();
     unresolved.payload.inputs = unresolved.payload.inputs[1 .. $];
-    assertThrown!Exception(workerTokenClaimsFor(unresolved, "receipt_1", 1, testNow));
+    assertThrown!Exception(workerTokenClaimsFor(unresolved, 1, testNow));
 }
 
 unittest
@@ -331,7 +316,7 @@ unittest
     import std.exception : assertThrown, collectException;
 
     // A minted token verifies to the claims it was minted with
-    const claims = workerTokenClaimsFor(testOrder(), "receipt_1", 1, testNow);
+    const claims = workerTokenClaimsFor(testOrder(), 1, testNow);
     const token = mintWorkerToken(testKey, claims);
     assert(verifyWorkerToken(testKey, token, testNow) == claims);
 
@@ -367,11 +352,10 @@ unittest
 {
     import std.exception : collectException;
 
-    const claims = workerTokenClaimsFor(testOrder(), "receipt_1", 1, testNow);
+    const claims = workerTokenClaimsFor(testOrder(), 1, testNow);
 
     // Each scope check passes for what the claims name and refuses anything else with a 403
     requireExecution(claims, "exe_1");
-    requireReceipt(claims, "receipt_1");
     requireCurrentAttempt(claims, 1);
     requireUpload(claims, "fp_1");
     requireInputArtifact(claims, "fp_engine", "engine.zip");
@@ -382,7 +366,6 @@ unittest
         assert(failure !is null && failure.statusCode == 403);
     }
     refused({ requireExecution(claims, "exe_2"); });
-    refused({ requireReceipt(claims, "receipt_2"); });
     refused({ requireCurrentAttempt(claims, 2); });
     refused({ requireCurrentAttempt(claims, 0); });
     refused({ requireUpload(claims, "fp_2"); });

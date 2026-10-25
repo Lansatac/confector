@@ -21,8 +21,7 @@ module confector.core.request_reconciler;
  * 3. If anything is needed, dispatch each (whatever a claim finds) and start the next pass: an
  *    evaluation that still needs executions is never committed.
  * 4. For each execution the request awaits, have the dispatcher record it if it was never
- *    recorded and send it if it was never sent. If one has ended since the evaluation, start the
- *    next pass.
+ *    recorded. If one has ended since the evaluation, start the next pass.
  * 5. Commit the evaluation by compare-and-set at the RequestState version read in step 1, which
  *    settles the request once every target has. If the state changed since
  *    (DocumentConflictException), start the next pass.
@@ -35,15 +34,15 @@ module confector.core.request_reconciler;
  * Other failures leave the state as it was, so the request is reconciled again later and the
  * error stays visible:
  *
- * - A needed execution that cannot be sent does not stop the others: every other needed execution
- *   is dispatched first, then RequestReconcileException names each failure, and nothing is
- *   committed. The same holds for awaited executions that cannot be sent.
+ * - A needed execution that cannot be dispatched does not stop the others: every other needed
+ *   execution is dispatched first, then RequestReconcileException names each failure, and nothing
+ *   is committed. The same holds for awaited executions that cannot be recorded.
  * - A request without a RequestState fails with RequestStateMissingException: create it
  *   (`RequestStateStore.createFor`), then reconcile.
  */
 
 import confector.core.document_collection : Versioned;
-import confector.core.execution_dispatcher : Delivery, ExecutionDispatcher, UndispatchableExecutionException;
+import confector.core.execution_dispatcher : ExecutionDispatcher, UndispatchableExecutionException;
 import confector.core.request_evaluator;
 import confector.core.request_state : RequestStateMissingException;
 import confector.core.state_stores : StateStores;
@@ -53,7 +52,7 @@ import confector.api.model;
 import std.format : format;
 
 /**
- * A reconcile could not finish: some executions could not be dispatched, recorded or sent. Every
+ * A reconcile could not finish: some executions could not be dispatched or recorded. Every
  * other one was handled first; nothing was committed.
  */
 class RequestReconcileException : Exception
@@ -113,7 +112,7 @@ final class RequestReconciler
      * documentation.
      *
      * Throws: RequestStateMissingException if the request has no RequestState;
-     * RequestReconcileException if executions could not be sent; Exception if the request, its
+     * RequestReconcileException if executions could not be dispatched; Exception if the request, its
      * definition or its chain does not exist, or maxPasses passes did not commit; whatever the
      * evaluator and the stores throw.
      */
@@ -137,7 +136,7 @@ final class RequestReconciler
 
             Handled handled;
             if (evaluation.needed.length > 0) dispatchNeeded(evaluation, entry, handled);
-            else deliverAwaited(evaluation, entry, handled);
+            else repairAwaited(evaluation, entry, handled);
 
             if (handled.unrecordable.length == 0)
             {
@@ -153,8 +152,8 @@ final class RequestReconciler
             {
                 if (handled.unrecordable.length > 0)
                 {
-                    // Cache what this pass left behind (claimed and sent executions), and keep
-                    // the send failures in the error beside the unrecordable ones
+                    // Cache what this pass left behind (claimed executions), and keep the
+                    // dispatch failures in the error beside the unrecordable ones
                     auto settled = evaluate(chain.get.value, entry);
                     const error = format("%-(%s
 %)", handled.unrecordable ~ handled.failures);
@@ -172,12 +171,12 @@ final class RequestReconciler
             requestId, maxPasses));
     }
 
-    /// What dispatching and delivering found.
+    /// What dispatching and repairing found.
     private struct Handled
     {
         /// Executions that can never be recorded as the request stands: one line each.
         string[] unrecordable;
-        /// Executions that could not be sent, one line each, and the last cause.
+        /// Executions that could not be dispatched or recorded, one line each, and the last cause.
         string[] failures;
         Exception cause;
         /// Whether an awaited execution has ended since the evaluation.
@@ -202,15 +201,15 @@ final class RequestReconciler
         }
     }
 
-    /// Has the dispatcher record and send each execution `evaluation` awaits; a failure does not
-    /// stop the others.
-    private void deliverAwaited(in RequestEvaluation evaluation, in DefinedRequest entry, ref Handled handled)
+    /// Has the dispatcher record each execution `evaluation` awaits that has no record; a failure
+    /// does not stop the others.
+    private void repairAwaited(in RequestEvaluation evaluation, in DefinedRequest entry, ref Handled handled)
     {
         foreach (ref awaited; evaluation.awaited)
         {
             try
             {
-                if (m_dispatcher.repair(awaited, entry) == Delivery.ended) handled.ended = true;
+                if (m_dispatcher.repair(awaited, entry)) handled.ended = true;
             }
             catch (UndispatchableExecutionException e)
             {
@@ -255,10 +254,9 @@ final class RequestReconciler
 version (unittest)
 {
     import confector.core.request_fixtures;
-    import confector.testing.memory_dispatch_queue : InMemoryDispatchQueue;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
 
-    import std.algorithm.searching : canFind, count;
+    import std.algorithm.searching : canFind;
 
     /// The active execution of task `taskId` of chain `chainId`, as its ledger names it now.
     private string activeOf(StateStores stores, string chainId, string taskId)
@@ -271,6 +269,14 @@ version (unittest)
     {
         return stores.ledgers.get(fingerprintNow(stores, chainId, taskId)).get.value;
     }
+
+    /// The ids of the queued executions, as the active index lists them.
+    private string[] queuedIds(StateStores stores)
+    {
+        string[] ids;
+        foreach (execution; stores.executions.listActive(ExecutionStatus.queued, 100)) ids ~= execution.id;
+        return ids;
+    }
 }
 
 unittest
@@ -279,8 +285,7 @@ unittest
     // (then evaluates again) and commits what it found; a reconcile that finds nothing new writes
     // nothing; a settled request is left alone
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new InMemoryDispatchQueue();
-    auto reconciler = reconcilerOf(stores, queue);
+    auto reconciler = reconcilerOf(stores);
     auto chain = createChain(stores, "c1");
     intake(stores, "c1", "r1", ["report"], "2026-10-20T10:00:00Z");
 
@@ -288,7 +293,7 @@ unittest
     assert(first.committed && first.passes == 2 && first.state.outcome == RequestOutcome.open);
     assert(taskOf(first.state, "compile").status == RequestTaskStatus.queued);
     assert(taskOf(first.state, "test").status == RequestTaskStatus.waitingUpstream);
-    assert(messagesIn(queue) == [activeOf(stores, "c1", "compile")]);
+    assert(queuedIds(stores) == [activeOf(stores, "c1", "compile")]);
 
     auto unchanged = reconciler.reconcile("r1");
     assert(!unchanged.committed && unchanged.passes == 1 && unchanged.state.version_ == first.state.version_,
@@ -300,7 +305,7 @@ unittest
         {
             auto next = reconciler.reconcile("r1");
             assert(next.committed && taskOf(next.state, taskId).status == RequestTaskStatus.queued);
-            assert(messagesIn(queue) == [activeOf(stores, "c1", taskId)]);
+            assert(queuedIds(stores) == [activeOf(stores, "c1", taskId)]);
         }
         finish(stores, chain, taskId, ExecutionStatus.succeeded);
     }
@@ -311,7 +316,7 @@ unittest
 
     auto settled = reconciler.reconcile("r1");
     assert(!settled.committed && settled.passes == 1 && settled.state.version_ == done.state.version_);
-    assert(messagesIn(queue).length == 0);
+    assert(queuedIds(stores).length == 0);
 
     // A request without a state fails loudly; so does a reconciler without its parts
     recordRequest(stores, "c1", "r2", ["lint"], "2026-10-20T10:00:01Z");
@@ -324,22 +329,20 @@ unittest
 {
     // The RequestState compare-and-set loop. A reconcile that loses the commit to another
     // reconcile of the same request reads again and evaluates again; whichever write of the first
-    // reconcile the second overtakes, the request ends with one execution per fingerprint and one
-    // message
-    foreach (overtakenAt; [1, 2, 3, 4])
+    // reconcile the second overtakes, the request ends with one execution per fingerprint
+    foreach (overtakenAt; [1, 2, 3])
     {
         auto documents = new InMemoryDocumentStore();
         auto direct = new StateStores(documents);
-        auto queue = new InMemoryDispatchQueue();
         createChain(direct, "c1");
         intake(direct, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
 
         auto interleaving = new InterleavingDocumentStore(documents);
         Reconciled other;
-        // The first reconciler's writes: 1 claim, 2 record, 3 stamp, 4 commit; the second
-        // reconciles completely just before the chosen one
-        beforeWrite(interleaving, overtakenAt, () { other = reconcilerOf(direct, queue).reconcile("r1"); });
-        auto reconciled = reconcilerOf(new StateStores(interleaving), queue).reconcile("r1");
+        // The first reconciler's writes: 1 claim, 2 record, 3 commit; the second reconciles
+        // completely just before the chosen one
+        beforeWrite(interleaving, overtakenAt, () { other = reconcilerOf(direct).reconcile("r1"); });
+        auto reconciled = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
         assert(interleaving.beforeNextWrite is null);
         assert(other.committed, format("overtaken at write %s: the second reconciler commits", overtakenAt));
         assert(!reconciled.committed, format("overtaken at write %s: the first finds nothing new", overtakenAt));
@@ -348,13 +351,7 @@ unittest
         assert(state.outcome == RequestOutcome.open && taskOf(state, "compile").status == RequestTaskStatus.queued);
         auto compile = ledgerOf(direct, "c1", "compile");
         assert(compile.executionSeq == 1, format("overtaken at write %s", overtakenAt));
-        // Overtaken between its send and its stamp, the first reconciler's message is out but not
-        // yet recorded as sent, so the second sends it again: a duplicate, which receiving drops
-        const messages = overtakenAt == 3 ? 2 : 1;
-        auto sent = messagesIn(queue);
-        assert(sent.length == messages && sent.count(compile.activeExecutionId) == messages,
-            format("overtaken at write %s: messages %s", overtakenAt, sent));
-        assert(direct.executions.get(compile.activeExecutionId).get.sentAt == fixedNow());
+        assert(queuedIds(direct) == [compile.activeExecutionId], format("overtaken at write %s", overtakenAt));
     }
 }
 
@@ -365,18 +362,17 @@ unittest
     // ledger, which is what the stores guarantee fresh
     auto documents = new InMemoryDocumentStore();
     auto direct = new StateStores(documents);
-    auto queue = new InMemoryDispatchQueue();
     auto chain = createChain(direct, "c1");
     intake(direct, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
 
     auto interleaving = new InterleavingDocumentStore(documents);
-    // Writes: 1 claim, 2 record, 3 stamp, 4 commit
-    beforeWrite(interleaving, 4, () { finish(direct, chain, "compile", ExecutionStatus.succeeded); });
-    auto reconciled = reconcilerOf(new StateStores(interleaving), queue).reconcile("r1");
+    // Writes: 1 claim, 2 record, 3 commit
+    beforeWrite(interleaving, 3, () { finish(direct, chain, "compile", ExecutionStatus.succeeded); });
+    auto reconciled = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
     assert(interleaving.beforeNextWrite is null);
     assert(reconciled.committed && taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued);
 
-    auto next = reconcilerOf(direct, queue).reconcile("r1");
+    auto next = reconcilerOf(direct).reconcile("r1");
     assert(taskOf(next.state, "compile").status == RequestTaskStatus.succeeded);
     assert(taskOf(next.state, "test").status == RequestTaskStatus.queued, "The request must not end stuck");
 }
@@ -384,13 +380,12 @@ unittest
 unittest
 {
     // Reconcilers of one request on several threads at once (as several server instances would)
-    // converge: each needed fingerprint is claimed, recorded and sent once
+    // converge: each needed fingerprint is claimed and recorded once
     import core.thread : Thread;
     import core.atomic : atomicOp;
 
     auto documents = new InMemoryDocumentStore();
     auto direct = new StateStores(documents);
-    auto queue = new InMemoryDispatchQueue();
     createChain(direct, "c1");
     intake(direct, "c1", "r1", ["test", "lint"], "2026-10-20T10:00:00Z");
 
@@ -399,7 +394,7 @@ unittest
     foreach (i; 0 .. 4)
     {
         threads ~= new Thread({
-            try reconcilerOf(new StateStores(documents.restart()), queue).reconcile("r1");
+            try reconcilerOf(new StateStores(documents.restart())).reconcile("r1");
             catch (Throwable e)
             {
                 atomicOp!"+="(failures, 1);
@@ -412,60 +407,49 @@ unittest
     assert(failures == 0);
 
     foreach (taskId; ["compile", "lint"]) assert(ledgerOf(direct, "c1", taskId).executionSeq == 1);
-    auto messages = messagesIn(queue);
-    assert(messages.length == 2 && messages.canFind(activeOf(direct, "c1", "compile")) && messages.canFind(activeOf(direct, "c1", "lint")));
+    auto queued = queuedIds(direct);
+    assert(queued.length == 2 && queued.canFind(activeOf(direct, "c1", "compile")) && queued.canFind(activeOf(direct, "c1", "lint")));
 }
 
 unittest
 {
     // A reconcile after a restart needs nothing from the process that crashed, whichever step it
-    // crashed after: the claim, the record or the send
+    // crashed after: the claim or the record
     import confector.core.execution_dispatcher : executionFor;
 
-    foreach (crashedAfter; ["claim", "record", "send"])
+    foreach (crashedAfter; ["claim", "record"])
     {
         auto documents = new InMemoryDocumentStore();
         auto stores = new StateStores(documents);
-        auto queue = new InMemoryDispatchQueue();
         createChain(stores, "c1");
         intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
         const needed = evaluateFrom(stores, "r1").needed[0];
 
         const claimed = stores.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq);
-        if (crashedAfter != "claim")
+        if (crashedAfter == "record")
         {
             stores.executions.createIfAbsent(executionFor(claimed.executionId, needed.taskId, needed.fingerprint, needed.inputs,
                 definedRequest(stores, "r1"), ["game": RepositoryRecord("game", gameAddress)], fixedNow()));
         }
-        if (crashedAfter == "send")
-        {
-            dispatcherOf(stores, queue).deliver(claimed.executionId);
-            assert(messagesIn(queue).length == 1);
-        }
 
         // A new process: new stores over the same database, a new reconciler, nothing else
         auto restarted = new StateStores(documents.restart());
-        auto reconciled = reconcilerOf(restarted, queue).reconcile("r1");
+        auto reconciled = reconcilerOf(restarted).reconcile("r1");
         assert(reconciled.committed && reconciled.passes == 1, crashedAfter);
         assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued, crashedAfter);
         assert(ledgerOf(restarted, "c1", "compile").executionSeq == 1, crashedAfter);
-        auto execution = restarted.executions.get(claimed.executionId).get;
-        assert(execution.status == ExecutionStatus.queued && execution.sentAt == fixedNow(), crashedAfter);
-        string[] expected;
-        if (crashedAfter != "send") expected = [claimed.executionId];
-        assert(messagesIn(queue) == expected, crashedAfter ~ ": sent exactly when it was not");
+        assert(restarted.executions.get(claimed.executionId).get.status == ExecutionStatus.queued, crashedAfter);
+        assert(queuedIds(restarted) == [claimed.executionId], crashedAfter);
     }
 }
 
 unittest
 {
     // Two requests sharing one execution. 1. Request r2 claimed compile and crashed before
-    // recording it. Request r1, needing compile too, records it from its own request and sends
-    // it; r2, reconciled later, finds it recorded and sent, and sends nothing more. Both then
-    // advance on the one execution's outcome
+    // recording it. Request r1, needing compile too, records it from its own request; r2,
+    // reconciled later, finds it recorded. Both then advance on the one execution's outcome
     {
         auto stores = new StateStores(new InMemoryDocumentStore());
-        auto queue = new InMemoryDispatchQueue();
         auto c1 = createChain(stores, "c1");
         createChain(stores, "c2");
         intake(stores, "c2", "r2", ["test"], "2026-10-20T10:00:00Z");
@@ -473,20 +457,19 @@ unittest
         const claimed = stores.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq); // r2's dispatcher crashed
 
         intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:01Z");
-        auto first = reconcilerOf(stores, queue).reconcile("r1");
+        auto first = reconcilerOf(stores).reconcile("r1");
         assert(first.committed && first.passes == 1 && taskOf(first.state, "compile").status == RequestTaskStatus.queued);
-        auto execution = stores.executions.get(claimed.executionId).get;
-        assert(execution.status == ExecutionStatus.queued && execution.sentAt == fixedNow());
-        assert(messagesIn(queue) == [claimed.executionId]);
+        assert(stores.executions.get(claimed.executionId).get.status == ExecutionStatus.queued);
+        assert(queuedIds(stores) == [claimed.executionId]);
 
-        auto second = reconcilerOf(stores, queue).reconcile("r2");
+        auto second = reconcilerOf(stores).reconcile("r2");
         assert(second.committed && taskOf(second.state, "compile").executionId == claimed.executionId);
-        assert(ledgerOf(stores, "c1", "compile").executionSeq == 1 && messagesIn(queue).length == 0);
+        assert(ledgerOf(stores, "c1", "compile").executionSeq == 1 && queuedIds(stores) == [claimed.executionId]);
 
         finish(stores, c1, "compile", ExecutionStatus.succeeded);
         foreach (requestId; ["r1", "r2"])
         {
-            auto advanced = reconcilerOf(stores, queue).reconcile(requestId);
+            auto advanced = reconcilerOf(stores).reconcile(requestId);
             assert(taskOf(advanced.state, "compile").status == RequestTaskStatus.succeeded, requestId);
             assert(taskOf(advanced.state, "test").status == RequestTaskStatus.queued, requestId);
         }
@@ -498,7 +481,6 @@ unittest
     {
         auto documents = new InMemoryDocumentStore();
         auto direct = new StateStores(documents);
-        auto queue = new InMemoryDispatchQueue();
         auto c2 = createChain(direct, "c2");
         createChain(direct, "c1");
         intake(direct, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
@@ -506,52 +488,51 @@ unittest
         auto interleaving = new InterleavingDocumentStore(documents);
         beforeWrite(interleaving, 1, () {
             intake(direct, "c2", "r2", ["compile"], "2026-10-20T10:00:01Z");
-            reconcilerOf(direct, queue).reconcile("r2");
+            reconcilerOf(direct).reconcile("r2");
             finish(direct, c2, "compile", ExecutionStatus.succeeded);
         });
-        auto reconciled = reconcilerOf(new StateStores(interleaving), queue).reconcile("r1");
+        auto reconciled = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
         assert(interleaving.beforeNextWrite is null);
         auto compile = ledgerOf(direct, "c1", "compile");
         assert(compile.executionSeq == 1 && compile.lastSuccessExecutionId.length > 0, "compile was built once");
         assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.succeeded);
         assert(taskOf(reconciled.state, "test").status == RequestTaskStatus.queued);
-        assert(messagesIn(queue).length == 2, "compile (r2's) and test");
+        assert(queuedIds(direct) == [activeOf(direct, "c1", "test")]);
     }
 }
 
 unittest
 {
-    // Executions that cannot be sent do not stop the others: every other one is dispatched, then
-    // the failures are reported together and nothing is committed; the next reconcile sends what
-    // was recorded but not sent
+    // Executions that cannot be dispatched do not stop the others: every other one is dispatched,
+    // then the failures are reported together and nothing is committed; the next reconcile
+    // dispatches what is still needed
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
-    auto queue = new FlakyDispatchQueue();
     createChain(stores, "c1");
     intake(stores, "c1", "r1", ["test", "lint"], "2026-10-20T10:00:00Z");
 
-    queue.failSends = 1;
+    // The first write, compile's claim, fails: the store is unavailable for it
+    auto interleaving = new InterleavingDocumentStore(documents);
+    beforeWrite(interleaving, 1, () { throw new Exception("The store is unavailable"); });
     const before = stores.requestStates.get("r1").get;
     try
     {
-        reconcilerOf(stores, queue).reconcile("r1");
-        assert(false, "A failed send must be reported");
+        reconcilerOf(new StateStores(interleaving)).reconcile("r1");
+        assert(false, "A failed dispatch must be reported");
     }
     catch (RequestReconcileException e)
     {
         assert(e.requestId == "r1" && e.failures.length == 1 && e.msg.canFind("unavailable"));
-        assert(e.next !is null && e.next.msg == "The dispatch queue is unavailable", "The one failure is chained as the cause");
+        assert(e.next !is null && e.next.msg == "The store is unavailable", "The one failure is chained as the cause");
     }
     assert(stores.requestStates.get("r1").get.version_ == before.version_, "Nothing was committed");
-    auto sent = messagesIn(queue);
-    assert(sent.length == 1, "The other needed execution was dispatched");
-    string[] active = [activeOf(stores, "c1", "compile"), activeOf(stores, "c1", "lint")];
-    assert(active[0].length > 0 && active[1].length > 0, "Both were claimed and recorded");
+    assert(stores.ledgers.get(fingerprintNow(stores, "c1", "compile")).isNull, "compile was not claimed");
+    assert(activeOf(stores, "c1", "lint").length > 0, "The other needed execution was dispatched");
 
-    auto reconciled = reconcilerOf(new StateStores(documents.restart()), queue).reconcile("r1");
-    assert(reconciled.committed && reconciled.passes == 1 && reconciled.state.outcome == RequestOutcome.open);
-    auto resent = messagesIn(queue);
-    assert(resent.length == 1 && !sent.canFind(resent[0]) && active.canFind(resent[0]));
+    auto reconciled = reconcilerOf(new StateStores(documents.restart())).reconcile("r1");
+    assert(reconciled.committed && reconciled.state.outcome == RequestOutcome.open);
+    assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued);
+    assert(taskOf(reconciled.state, "lint").status == RequestTaskStatus.queued);
 }
 
 unittest
@@ -560,28 +541,27 @@ unittest
     // request failed, with the error in its RequestState; nothing is claimed for it and it is
     // not retried by later reconciles. A new request, once the repository is fixed, runs
     auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new InMemoryDispatchQueue();
     createChain(stores, "c1");
     intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
 
     RepositoryRecord addressless;
     addressless.name = "game";
     stores.repositories.put(addressless);
-    auto failed = reconcilerOf(stores, queue).reconcile("r1");
+    auto failed = reconcilerOf(stores).reconcile("r1");
     assert(failed.committed && failed.state.outcome == RequestOutcome.failed);
     assert(failed.state.error.canFind("compile") && failed.state.error.canFind("no address"), failed.state.error);
     assert(taskOf(failed.state, "compile").status == RequestTaskStatus.needed);
-    assert(stores.ledgers.get(fingerprintNow(stores, "c1", "compile")).isNull && messagesIn(queue).length == 0, "Nothing was claimed");
+    assert(stores.ledgers.get(fingerprintNow(stores, "c1", "compile")).isNull, "Nothing was claimed");
     assert(stores.requestStates.listOpen("game").length == 0);
 
     addressless.address = gameAddress;
     stores.repositories.put(addressless);
-    auto again = reconcilerOf(stores, queue).reconcile("r1");
+    auto again = reconcilerOf(stores).reconcile("r1");
     assert(!again.committed && again.state.outcome == RequestOutcome.failed, "A failed request is not retried by the next look");
     assert(stores.ledgers.get(fingerprintNow(stores, "c1", "compile")).isNull);
 
     intake(stores, "c1", "r2", ["test"], "2026-10-20T10:00:01Z");
-    auto retry = reconcilerOf(stores, queue).reconcile("r2");
+    auto retry = reconcilerOf(stores).reconcile("r2");
     assert(retry.state.outcome == RequestOutcome.open && retry.state.error.length == 0);
     assert(taskOf(retry.state, "compile").status == RequestTaskStatus.queued);
 
@@ -600,11 +580,11 @@ unittest
 
 unittest
 {
-    // An unrecordable execution and a failed send in one pass: the request fails with both in its
-    // error, and its cached tasks show what the pass did (compile was claimed and recorded, lint
-    // still needs an execution)
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    auto queue = new FlakyDispatchQueue();
+    // An unrecordable execution and a failed dispatch in one pass: the request fails with both
+    // in its error, and its cached tasks show what the pass did (compile, whose claim failed, and
+    // lint, which cannot be recorded, both still need an execution)
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
     auto chain = sampleChain("c1");
     chain.pins[1].repositoryId = "tools";
     RepositoryRecord game;
@@ -619,11 +599,12 @@ unittest
     definition.tasks[3].inputs["src"] = repositoryInput("tools");
     intake(stores, "c1", "r1", ["test", "lint"], "2026-10-20T10:00:00Z", definition);
 
-    queue.failSends = 1;
-    auto failed = reconcilerOf(stores, queue).reconcile("r1");
+    // The first write, compile's claim, fails: the store is unavailable for it
+    auto interleaving = new InterleavingDocumentStore(documents);
+    beforeWrite(interleaving, 1, () { throw new Exception("The store is unavailable"); });
+    auto failed = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
     assert(failed.state.outcome == RequestOutcome.failed);
     assert(failed.state.error.canFind("no address") && failed.state.error.canFind("unavailable"), failed.state.error);
-    assert(taskOf(failed.state, "compile").status == RequestTaskStatus.queued, "The pass claimed and recorded compile");
+    assert(taskOf(failed.state, "compile").status == RequestTaskStatus.needed, "compile was not claimed");
     assert(taskOf(failed.state, "lint").status == RequestTaskStatus.needed);
-    assert(messagesIn(queue).length == 0);
 }
