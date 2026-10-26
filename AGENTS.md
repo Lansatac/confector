@@ -190,11 +190,10 @@ Decided October 2026.
   project. An input may carry a *branch filter* (which refs the task may be built from) and a
   *default ref spec*, but it does not choose the ref: the trigger or request does (see
   "Branches"), and the default applies only when they say nothing.
-- **Declared, then resolved, then hashed.** Resolution is its own step: it turns the repository
-  inputs a request needs into pinned values (ref to revision), each distinct repository and ref
-  once, and records them on the chain per repository and ref, so every task in the chain sees the
-  same revision of a ref. A pin the chain lacks is resolved when first needed and then kept. Pinned values can come
-  from querying the repository, from the trigger payload, or from an existing chain. Fingerprints
+- **Declared, then resolved, then hashed.** Resolution is its own step: it turns repository
+  inputs into pinned values (ref to revision), each distinct repository and ref once. A request
+  records a pin for every repository and ref it binds, taken from the pins supplied with it (the
+  trigger payload or a user), else from its chain, else by querying the repository. Fingerprints
   are computed only from resolved values.
 - **Each provider defines its own pinned value.** The core treats it as opaque. For git it is the
   commit SHA alone — not the URL, branch, or checkout path.
@@ -232,7 +231,7 @@ Decided October 2026.
   can show when a result predates a configuration change.
 - **A build chain fixes only its pinned inputs.** It does not freeze tasks, edges or build
   configuration: each request runs with the project definition as it was when the request was
-  made (see "Pipeline definitions"). Fingerprints are computed from that definition, the chain's
+  made (see "Pipeline definitions"). Fingerprints are computed from that definition, the request's
   pins and the current rerun generations (see "Re-running a task").
 
 ## What a build is
@@ -240,13 +239,15 @@ Decided October 2026.
 Decided October 2026. A "build" used to conflate three things; they are now distinct:
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
-  its payload, optional pins, and the project definition it runs with. Immutable.
-- **Build chain** — the pins of one build: for every repository and ref its requests have needed,
-  that ref's revision. A chain never holds two revisions of one ref, so a task added later
-  builds from the same revision as the tasks before it. It holds no tasks or edges. Pins only grow
-  and never change once set. A *headline ref* groups chains into a history. This is what the UI
-  calls a *build*; it has a canonical per-project number (#123) and, separately, user-editable
-  labels.
+  its payload, the ref each repository input is bound to, the pin of every repository and ref
+  those bindings use, and the project definition it runs with. Immutable, and evaluable from
+  itself.
+- **Build chain** — one build: the requests made for it and an index of their pins (for every
+  repository and ref, its revision). A chain never holds two revisions of one ref, so a task
+  added later builds from the same revision as the tasks before it. It holds no tasks or edges.
+  Pins only grow and never change once set. A *headline ref* groups chains into a history. This
+  is what the UI calls a *build*; it has a canonical per-project number (#123) and, separately,
+  user-editable labels.
 - **Task execution** — one run of one task at one fingerprint ("task run" in the UI).
   Append-only and shared across chains; a cache hit is a chain using an execution another chain
   produced.
@@ -258,16 +259,24 @@ How they fit together:
   (same ref and same revision), the request joins it, adding any pins the chain lacks;
   otherwise a new chain is created. The request runs its targets and their upstream tasks, never
   downstream ones.
+- **A new chain is a snapshot.** Creating a chain binds every repository input of the current
+  definition, not only those the request's tasks use, by the creating request's refs and the
+  inputs' defaults, and pins each of those refs. A build's number means the code as of when it
+  was made. If any of those refs cannot be bound or resolved, the request fails and no chain is
+  created.
 - **Any task in today's definition can be built later for a chain**, against the chain's pins.
   This is how an external build is made from exactly the source that was tested, including with
-  a task added after the chain was created. A pin the chain lacks is resolved when first needed
-  and then kept. A task no longer in the definition is simply not offered; its history stays.
+  a task added after the chain was created. A ref the chain lacks (an input added to the
+  definition later, or bound to another ref) is resolved when first needed and then kept. A
+  task no longer in the definition is simply not offered; its history stays.
+- **Binding an input to another ref adds a pin.** A later request on a chain may bind an input
+  the chain has already built to a different ref; the chain then holds a pin for each ref.
 - **The request is the unit of evaluation.** Each request is evaluated on its own: its graph is
-  its targets and their upstream tasks in its own definition, fingerprinted against its chain's
+  its targets and their upstream tasks in its own definition, fingerprinted against its own
   pins and the current rerun generations. Requests on one chain are never merged; two requests
   that need the same fingerprint share its execution.
-- **Request state is derived from authoritative inputs**: the request, its chain's pins, the
-  ledgers and executions for its fingerprints, and the rerun generations. Each request records
+- **Request state is derived from authoritative inputs**: the request, the ledgers and
+  executions for its fingerprints, and the rerun generations. Each request records
   its demand: for every task it covers, the task's fingerprint and how many executions had
   stopped there when it was made. Evaluation reads the ledgers by id and settles demands from
   those records. A small mutable *request state* document per request holds whether it is still
@@ -316,8 +325,8 @@ Correctness rests on reads by id and single-document compare-and-set; liveness r
 sweep, not on subscriptions.
 
 - **Split along what-versus-how.** An *input resolver* turns a request into a chain (resolving
-  inputs, finding or creating the chain). A pure *request evaluator* takes one request, its
-  definition, its chain's pins, the rerun generations and the ledgers of its fingerprints, and
+  inputs, finding or creating the chain). A pure *request evaluator* takes one request (with its
+  pins), its definition, the rerun generations and the ledgers of its fingerprints, and
   returns each task's state plus the fingerprints that need an execution. Each needed
   fingerprint is claimed by creating its active execution in the ledger; a worker that asks for
   work is handed one (see "Workers and capacity").
@@ -669,9 +678,6 @@ your task depends on one, stop and ask the project owner. When one is decided, u
   folder) should be able to be an input, pinned like a repository. Whether and how
   extensions add input kinds is undecided; until then the kinds are repository, value and task
   output.
-- **Rebinding an input on a chain.** Whether a later request may bind an input the chain has
-  already built to a different ref (adding a pin for that ref), or must be refused as a
-  different build, is undecided.
 - **Terminated workers.** Whether an admin terminating a worker counts as an infrastructure
   failure (retried automatically) or a task failure (retried only by a user) is undecided.
 
