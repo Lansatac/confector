@@ -778,6 +778,7 @@ version (unittest)
     {
         ProjectRecord project;
         project.id = "game";
+        project.name = "Game";
         project.tasks = tasks;
         w.stores.projects.put(project);
     }
@@ -1033,6 +1034,7 @@ unittest
     // A chain of another project does not exist for this one
     ProjectRecord other;
     other.id = "other";
+    other.name = "Other";
     other.tasks = [taskOf("a", null)];
     w.stores.projects.put(other);
     auto otherRequest = build(["a"]);

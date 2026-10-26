@@ -3,13 +3,14 @@ extends layout
 block maincontent
   - import vibe.data.json : serializeToJson;
   - import std.array : replace;
+  - import confector.core.git : redactAddress;
   - struct TaskOpt { string id; string name; }
   - TaskOpt[] availableTasksList;
   - foreach(t; project.tasks) { if (t.id != task.id) availableTasksList ~= TaskOpt(t.id, t.name); }
   - string availableTasksJson = serializeToJson(availableTasksList).toString().replace("<", "\\u003c");
   - struct RepoOpt { string name; string address; }
   - RepoOpt[] availableReposList;
-  - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, r.address); }
+  - foreach(r; repositories) { availableReposList ~= RepoOpt(r.name, redactAddress(r.address)); }
   - string availableReposJson = serializeToJson(availableReposList).toString().replace("<", "\\u003c");
   - string initialStepsJson = serializeToJson(form.stepRows).toString().replace("<", "\\u003c");
   - string stepTypesJson = serializeToJson(stepTypes).toString().replace("<", "\\u003c");

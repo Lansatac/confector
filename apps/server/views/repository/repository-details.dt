@@ -46,6 +46,8 @@ block maincontent
           div.form-group
             label(for="edit-address") Remote Address / URL:
             input.form-control#edit-address(type="text", name="address", value=repoAddress, required)
+            - if (addressWithheld)
+              p.text-muted(style="margin: 6px 0 0 0;") The stored address carries credentials, so it is not shown here. Enter the address again without them; checkout credentials belong in the secret store.
 
           div(style="margin-top: 20px;")
             button.btn.btn-primary(type="submit") Save Changes

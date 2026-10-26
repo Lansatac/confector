@@ -126,6 +126,7 @@ private final class GateEnvironment
 
         ProjectRecord project;
         project.id = "game";
+        project.name = "game";
         project.tasks = [compileTask()];
         stores.projects.put(project);
 

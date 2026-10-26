@@ -134,6 +134,7 @@ version (unittest)
         auto stores = new StateStores(documents);
         ProjectRecord game;
         game.id = "game";
+        game.name = "game";
         stores.projects.put(game);
         return stores;
     }

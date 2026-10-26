@@ -6,6 +6,11 @@ block maincontent
       h1 Create Project
       p Define a new project.
 
+    - if (formError.length > 0)
+      div.alert.alert-danger(style="max-width: 680px; margin-top: 20px;")
+        strong The project was not saved:
+        div #{formError}
+
     div.card(style="max-width: 680px; margin-top: 20px;")
       form(action="/projects/add", method="POST")
         div.form-group

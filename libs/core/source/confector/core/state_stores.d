@@ -80,6 +80,7 @@ unittest
     auto stores = new StateStores(documents);
     ProjectRecord project;
     project.id = "game";
+    project.name = "game";
     stores.projects.put(project);
     assert(stores.counters.next("n") == 1);
     assert(stores.documentStore is documents);

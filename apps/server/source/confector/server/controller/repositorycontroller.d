@@ -8,7 +8,9 @@ import std.string : strip;
 import std.uri : encodeComponent;
 
 import confector.api.model : ProjectRecord, RepositoryRecord, Role, projectUsesRepository, repositoryIds;
-import confector.core.document_collection : tryValue;
+import confector.core.document_collection : tryValue, DocumentCollection;
+import confector.core.git : addressCarriesCredentials, redactAddress;
+import confector.core.project_stores : InvalidRepositoryAddressException, repositoriesCollection;
 import confector.core.state_stores : StateStores;
 import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes;
@@ -52,7 +54,7 @@ AuthorizedRoutes repositoryRouter(Authenticator authenticator, StateStores store
         {
             RepositoryViewModel rvm;
             rvm.name = r.name;
-            rvm.address = r.address;
+            rvm.address = redactAddress(r.address);
             rvm.createdAt = r.createdAt;
 
             ulong count = 0;
@@ -107,7 +109,15 @@ AuthorizedRoutes repositoryRouter(Authenticator authenticator, StateStores store
             record.name = name;
             record.address = address;
             record.createdAt = Clock.currTime.toISOString();
-            stores.repositories.put(record);
+            try
+            {
+                stores.repositories.put(record);
+            }
+            catch (InvalidRepositoryAddressException e)
+            {
+                res.redirect("/repositories/add?error=" ~ encodeComponent(e.msg));
+                return;
+            }
         }
 
         res.redirect("/repositories/details?name=" ~ encodeComponent(name));
@@ -133,7 +143,15 @@ AuthorizedRoutes repositoryRouter(Authenticator authenticator, StateStores store
             if (stores.repositories.get(name).tryValue(record))
             {
                 record.address = address;
-                stores.repositories.put(record);
+                try
+                {
+                    stores.repositories.put(record);
+                }
+                catch (InvalidRepositoryAddressException e)
+                {
+                    res.redirect("/repositories/details?name=" ~ encodeComponent(name) ~ "&error=" ~ encodeComponent(e.msg));
+                    return;
+                }
             }
         }
 
@@ -193,10 +211,14 @@ AuthorizedRoutes repositoryRouter(Authenticator authenticator, StateStores store
         }
 
         string repoName = repo.name;
-        string repoAddress = repo.address;
+        // An address with credentials is not shown at all, not even redacted: the field is left empty
+        // for the address to be entered again, so a saved form never stores a redacted address
+        const addressWithheld = addressCarriesCredentials(repo.address);
+        string repoAddress = addressWithheld ? "" : repo.address;
         string repoCreatedAt = repo.createdAt;
 
-        res.render!("repository/repository-details.dt", repo, repoName, repoAddress, repoCreatedAt, errorMessage, connectedProjects);
+        res.render!("repository/repository-details.dt", repoName, repoAddress, addressWithheld, repoCreatedAt, errorMessage,
+            connectedProjects);
     }
 
     router.get("/repositories/details", Role.viewer, &handleDetails);
@@ -207,6 +229,7 @@ AuthorizedRoutes repositoryRouter(Authenticator authenticator, StateStores store
 unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import vibe.stream.memory : createMemoryOutputStream;
     auto stores = new StateStores(new InMemoryDocumentStore());
 
     RepositoryRecord r1;
@@ -225,4 +248,65 @@ unittest
     router.handleRequest(addReq, addRes);
     assert(addRes.statusCode == HTTPStatus.found);
     assert(stores.repositories.list().length == 1);
+
+    // An address with credentials is refused with the reason, and nothing is stored
+    auto leakReq = createTestHTTPServerRequest(URL("http://localhost/repositories/add"), HTTPMethod.POST);
+    leakReq.form["name"] = "secret-repo";
+    leakReq.form["address"] = "https://token@example.com/secret.git";
+    auto leakRes = createTestHTTPServerResponse();
+    router.handleRequest(leakReq, leakRes);
+    assert(leakRes.statusCode == HTTPStatus.found);
+    assert(leakRes.headers["Location"].canFind("error="), leakRes.headers["Location"]);
+    assert(stores.repositories.list().length == 1);
+
+    // A record written without the store's check still shows without its credentials
+    auto legacy = new DocumentCollection!RepositoryRecord(stores.documentStore, repositoriesCollection, ["listing"],
+        (in RepositoryRecord record) => ["listing": "all"]);
+    RepositoryRecord leaked;
+    leaked.name = "leaked";
+    leaked.address = "https://token@example.com/leaked.git";
+    legacy.put(leaked.name, leaked);
+
+    // Answers a request to a route of this router: its status, its Location and its body
+    struct Answer { int status; string location; string body; }
+    Answer send(HTTPMethod method, string path, string[2][] fields = null)
+    {
+        auto req = createTestHTTPServerRequest(URL("http://localhost" ~ path), method);
+        foreach (field; fields) req.form[field[0]] = field[1];
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
+        router.handleRequest(req, res);
+        res.finalize();
+        return Answer(res.statusCode, res.headers.get("Location", ""), cast(string) sink.data.idup);
+    }
+
+    // The list shows the stored address with its credentials redacted
+    auto listed = send(HTTPMethod.GET, "/repositories/");
+    assert(listed.body.canFind("https://***@example.com/leaked.git"), listed.body);
+    assert(!listed.body.canFind("token@"), listed.body);
+
+    // The details page shows no address for it, so a saved form cannot store a redacted one
+    auto leakedPage = send(HTTPMethod.GET, "/repositories/details?name=leaked");
+    assert(leakedPage.body.canFind("carries credentials") && !leakedPage.body.canFind("example.com"), leakedPage.body);
+    assert(!leakedPage.body.canFind("token@"), leakedPage.body);
+
+    // Editing it with credentials is refused with the reason, and the stored address is kept
+    auto editLeak = send(HTTPMethod.POST, "/repositories/edit",
+        [["name", "leaked"], ["address", "https://token@example.com/new.git"]]);
+    assert(editLeak.status == HTTPStatus.found && editLeak.location.canFind("error="), editLeak.location);
+    assert(stores.repositories.get("leaked").get.value.address == "https://token@example.com/leaked.git");
+
+    // An edit that keeps a login-only address saves it as it is, for both ssh forms
+    foreach (address; ["git@github.com:org/repo.git", "ssh://git@github.com/org/repo.git"])
+    {
+        RepositoryRecord login;
+        login.name = "login";
+        login.address = address;
+        stores.repositories.put(login);
+        auto page = send(HTTPMethod.GET, "/repositories/details?name=login");
+        assert(page.body.canFind(address) && !page.body.canFind("carries credentials"), page.body);
+        auto saved = send(HTTPMethod.POST, "/repositories/edit", [["name", "login"], ["address", address]]);
+        assert(saved.status == HTTPStatus.found && !saved.location.canFind("error="), saved.location);
+        assert(stores.repositories.get("login").get.value.address == address);
+    }
 }

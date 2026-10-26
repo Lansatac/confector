@@ -11,10 +11,12 @@ module confector.core.project_stores;
 
 import confector.core.build_stores : InvalidStateTransitionException;
 import confector.core.document_collection;
+import confector.core.git : addressCarriesCredentials;
 import confector.api.model;
 import confector.api.document_store;
 
 import std.format : format;
+import std.string : strip;
 import std.typecons : Nullable;
 
 /// Projects, by project id; indexed for listing.
@@ -26,6 +28,15 @@ enum CollectionSpec repositoriesCollection = CollectionSpec("repositories", [Ind
 /// Tracked branches, by `trackedBranchId`; indexed by repository.
 enum CollectionSpec trackedBranchesCollection = CollectionSpec("tracked_branches",
     [IndexSpec("by_repository", "repository_id", "ref_key")]);
+
+/// A repository whose address embeds credentials, which must be kept in the secret store instead.
+class InvalidRepositoryAddressException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
 
 /// The partition key value of the listing indexes, which hold every document of a collection.
 private enum string everything = "all";
@@ -54,10 +65,12 @@ final class ProjectStore
     }
 
     /// Writes `project`, creating it or replacing its latest version (last edit wins). Throws if
-    /// it has no id, or DocumentConflictException if another write races this one.
+    /// it has no id or no name that is not blank, or DocumentConflictException if another write
+    /// races this one.
     Versioned!ProjectRecord put(ProjectRecord project)
     {
         if (project.id.length == 0) throw new Exception("A project needs an id");
+        if (project.name.strip.length == 0) throw new Exception(format("Project '%s' needs a name that is not blank", project.id));
         return m_projects.put(project.id, project);
     }
 
@@ -96,10 +109,17 @@ final class RepositoryStore
     }
 
     /// Writes `repository`, creating it or replacing its latest version (last edit wins). Throws
-    /// if it has no name, or DocumentConflictException if another write races this one.
+    /// if it has no name that is not blank, InvalidRepositoryAddressException if its address embeds credentials, or
+    /// DocumentConflictException if another write races this one.
     Versioned!RepositoryRecord put(RepositoryRecord repository)
     {
-        if (repository.name.length == 0) throw new Exception("A repository needs a name");
+        if (repository.name.strip.length == 0) throw new Exception("A repository needs a name that is not blank");
+        if (addressCarriesCredentials(repository.address))
+        {
+            throw new InvalidRepositoryAddressException(format(
+                "Repository '%s': its address embeds credentials; checkout credentials belong in the secret store, not in the address",
+                repository.name));
+        }
         return m_repositories.put(repository.name, repository);
     }
 
@@ -256,6 +276,7 @@ unittest
 
     ProjectRecord tools;
     tools.id = "tools";
+    tools.name = "Tools";
     projects.put(tools);
     auto listed = projects.list();
     assert(listed.length == 2 && listed[0].id == "game" && listed[1].id == "tools");
@@ -265,6 +286,12 @@ unittest
     assert(!projects.remove("tools"));
     assert(projects.list().length == 1);
     assert(throwsA!Exception({ projects.put(ProjectRecord.init); }), "A project needs an id");
+    ProjectRecord nameless;
+    nameless.id = "nameless";
+    assert(throwsA!Exception({ projects.put(nameless); }), "A project needs a name");
+    nameless.name = " 	 ";
+    assert(throwsA!Exception({ projects.put(nameless); }), "A blank name is no name");
+    assert(projects.get("nameless").isNull && projects.list().length == 1, "A refused project is not stored");
 }
 
 unittest
@@ -284,6 +311,29 @@ unittest
     assert(repositories.list() == [repository]);
     assert(repositories.remove("game") && repositories.list().length == 0);
     assert(throwsA!Exception({ repositories.put(RepositoryRecord.init); }));
+    RepositoryRecord blankName;
+    blankName.name = "  ";
+    assert(throwsA!Exception({ repositories.put(blankName); }), "A blank repository name is no name");
+}
+
+unittest
+{
+    // Repositories: an address with credentials is refused, and nothing is stored
+    auto repositories = new RepositoryStore(new InMemoryDocumentStore());
+    RepositoryRecord repository;
+    repository.name = "secret";
+    repository.address = "https://token@example.com/secret.git";
+    assert(throwsA!InvalidRepositoryAddressException({ repositories.put(repository); }));
+    repository.address = "https://user:pass@example.com/secret.git";
+    assert(throwsA!InvalidRepositoryAddressException({ repositories.put(repository); }));
+    assert(repositories.get("secret").isNull && repositories.list().length == 0);
+
+    // A bare ssh or scp user name only selects the login, so it is kept
+    repository.address = "git@github.com:org/secret.git";
+    repositories.put(repository);
+    repository.address = "ssh://git@github.com/org/secret.git";
+    repositories.put(repository);
+    assert(repositories.get("secret").tryValue(repository) && repository.address == "ssh://git@github.com/org/secret.git");
 }
 
 unittest

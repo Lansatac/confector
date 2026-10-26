@@ -1077,11 +1077,20 @@ AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores
     });
 
     router.get("/projects/add", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
-        res.render!("project/add-project.dt");
+        string formError = "";
+        res.render!("project/add-project.dt", formError);
     });
 
     router.post("/projects/add", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
         string projId = "";
+        // A blank name is a form error: nothing is saved and the form is shown again
+        if (req.form.get("name", "Project").strip.length == 0)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            string formError = "The project needs a name that is not blank.";
+            res.render!("project/add-project.dt", formError);
+            return;
+        }
         try
         {
             ProjectRecord proj;
@@ -1155,6 +1164,7 @@ AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores
 
             project.id = projId;
             project.name = req.form.get("name", project.name.length > 0 ? project.name : "Project");
+            if (project.name.strip.length == 0) throw new TaskFormException("The project needs a name that is not blank.");
             project.description = req.form.get("description", project.description);
 
             // Checked with the task editor's rules, against the repositories registered now
@@ -1527,6 +1537,8 @@ unittest
     import vibe.inet.message : InetHeaderMap;
     import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
     import confector.testing.memory_document_store : InterleavingDocumentStore;
+    import confector.core.document_collection : DocumentCollection;
+    import confector.core.project_stores : repositoriesCollection;
 
     auto documents = new InterleavingDocumentStore(new InMemoryDocumentStore());
     auto stores = new StateStores(documents);
@@ -1580,6 +1592,17 @@ unittest
     auto editor = request(HTTPMethod.GET, "/projects/tasks/edit?project_id=proj_dash_1&task_id=test_node_1");
     assert(editor.status == HTTPStatus.ok && editor.body.canFind("echo dashboard test 1"), editor.body);
     assert(!editor.body.canFind("trigger"), "The editor has no triggers tab");
+
+    // A repository address with credentials, written before the store refused them, shows redacted in the editor
+    auto legacyRepositories = new DocumentCollection!RepositoryRecord(documents, repositoriesCollection, ["listing"],
+        (in RepositoryRecord record) => ["listing": "all"]);
+    RepositoryRecord leakedRepository;
+    leakedRepository.name = "leaked";
+    leakedRepository.address = "https://token@example.com/leaked.git";
+    legacyRepositories.put(leakedRepository.name, leakedRepository);
+    auto leakingEditor = request(HTTPMethod.GET, "/projects/tasks/edit?project_id=proj_dash_1&task_id=test_node_1");
+    assert(leakingEditor.body.canFind("https://***@example.com/leaked.git") && !leakingEditor.body.canFind("token@"),
+        leakingEditor.body);
 
     // The form fields the editor submits for `task` when the user changes nothing
     string[2][] editorFields(in TaskNode task)
@@ -1726,6 +1749,15 @@ unittest
     assert(stores.projects.get("proj_dash_1").get.tasks == storedProjectTasks, "Nothing was saved by a rejected graph");
     auto editPage = request(HTTPMethod.GET, "/projects/edit?id=proj_dash_1");
     assert(editPage.status == HTTPStatus.ok && editPage.body.canFind("Edit Project"), editPage.body);
+
+    // A blank project name is a form error on add and on save: nothing is saved
+    auto blankAdd = request(HTTPMethod.POST, "/projects/add", [["id", "proj_blank"], ["name", "   "]]);
+    assert(blankAdd.status == HTTPStatus.badRequest && blankAdd.body.canFind("needs a name that is not blank"), blankAdd.body);
+    assert(stores.projects.get("proj_blank").isNull, "A nameless project is not stored");
+    auto blankSave = request(HTTPMethod.POST, "/projects/save",
+        [["id", "proj_dash_1"], ["name", " "], ["description", ""], ["tasks_json", serializeToJson(storedProjectTasks).toString()]]);
+    assert(blankSave.status == HTTPStatus.badRequest && blankSave.body.canFind("needs a name that is not blank"), blankSave.body);
+    assert(stores.projects.get("proj_dash_1").get.name == "Dashboard Project", "A blank name does not replace the saved one");
 
     // A failed write is a server error that names the failure, and nothing is changed
     documents.beforeNextWrite = () { throw new Exception("store unavailable"); };

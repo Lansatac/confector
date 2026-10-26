@@ -949,6 +949,15 @@ unittest
         return parseJsonString(reply.body[reply.body.indexOf('{') .. $]);
     }
 
+    // A project without a name, or with a blank one, is refused with the reason and stores nothing
+    import std.algorithm.searching : canFind;
+    foreach (nameless; [`{}`, `{"name": "   "}`])
+    {
+        auto refused = postReply(null, "/projects", nameless);
+        assert(refused.status == HTTPStatus.badRequest && refused.body.canFind("needs a name"), refused.body);
+    }
+    assert(stores.projects.list().length == 1);
+
     // Without request intake configured the run route fails loudly instead of doing nothing
     assert(post("/projects/run", `{"project_id": "proj_api_1", "targets": ["n1"]}`) == HTTPStatus.internalServerError);
 
@@ -1337,6 +1346,7 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     ProjectRecord proj;
     proj.id = "proj";
+    proj.name = "proj";
     stores.projects.put(proj);
     BuildRequest ghost;
     ghost.id = "ghost";
@@ -1406,6 +1416,7 @@ unittest
     test.inputs["bin"] = taskOutputInput("compile");
     ProjectRecord project;
     project.id = "game";
+    project.name = "game";
     project.tasks = [compile, test];
     stores.projects.put(project);
 
