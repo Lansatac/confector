@@ -10,8 +10,7 @@ module confector.core.definition_store;
  * The content is canonical: tasks sorted by id, and the id is the SHA-256 of the definition's
  * canonical JSON (RFC 8785 style: sorted keys, no insignificant whitespace;
  * `confector.core.fingerprinter.canonicalPinned`). It covers everything in the definition, inputs
- * and display names included, unlike a task's definition hash
- * (`confector.core.definition_hash.computeDefinitionHash`), which covers only build configuration.
+ * and display names included.
  * A definition is never replaced or removed. (Removing definitions no request references is
  * retention's job.)
  */

@@ -118,7 +118,7 @@ private void reconcileEveryProject(StateStores stores, string now, ref SweepSumm
 version (unittest)
 {
     import confector.api.model : ActiveExecution, ExecutionStatus, RequestOutcome, RequestTaskStatus, TaskExecutionResult;
-    import confector.core.build_stores : buildChainsCollection;
+    import confector.core.build_stores : buildChainsCollection, defaultPageSize;
     import confector.core.fingerprint_ledger : endedExecution;
     import std.datetime.systime : SysTime;
     import confector.api.document_store : DocumentStore;
@@ -127,12 +127,13 @@ version (unittest)
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import core.time : Duration, minutes, seconds;
     import std.algorithm.searching : canFind;
+    import std.format : format;
 
     /// Stores over `documents` with the fixtures' project registered, so that a sweep lists it. The
     /// chains and requests are made by the fixtures.
-    private StateStores projectStores(DocumentStore documents)
+    private StateStores projectStores(DocumentStore documents, size_t pageSize = defaultPageSize)
     {
-        auto stores = new StateStores(documents);
+        auto stores = new StateStores(documents, pageSize);
         ProjectRecord game;
         game.id = "game";
         game.name = "game";
@@ -295,4 +296,85 @@ unittest
     catch (Exception e) refused = e.msg.canFind("at least 1");
     assert(refused);
     assert(activeAt(stores, fingerprint).status == ExecutionStatus.running);
+}
+
+unittest
+{
+    // Five running executions over pages of two: one tick expires every one of them, not only the first page
+    auto stores = projectStores(new InMemoryDocumentStore(), 2);
+    string[] fingerprints;
+    foreach (ulong i; 0 .. 5)
+    {
+        const chain = format("c%s", i);
+        createChainAt(stores, chain, i + 1, format("rev%s", i));
+        intake(stores, chain, format("r%s", i), ["compile"], format("2026-10-20T10:00:0%sZ", i));
+        reconcilerOf(stores).reconcile(format("r%s", i));
+        const fingerprint = fingerprintNow(stores, chain, "compile");
+        assert(!startExecution(stores, fingerprint, format("w%s", i), 1.minutes, fixedNow()).isNull);
+        fingerprints ~= fingerprint;
+    }
+
+    auto summary = sweepCoordination(stores, 3, later(2.minutes));
+    assert(summary.leasesRequeued == 5 && summary.leasesFailed == 0 && summary.errors == 0);
+    foreach (fingerprint; fingerprints)
+    {
+        assert(activeAt(stores, fingerprint).status == ExecutionStatus.queued);
+    }
+}
+
+unittest
+{
+    // Five open requests over pages of two, none reconciled yet: one tick reconciles every one of them
+    auto stores = projectStores(new InMemoryDocumentStore(), 2);
+    createChain(stores, "a");
+    foreach (ulong i; 0 .. 5) intake(stores, "a", format("r%s", i), ["compile"], format("2026-10-20T10:00:0%sZ", i));
+
+    auto summary = sweepCoordination(stores, 3, fixedNow());
+    assert(summary.errors == 0 && summary.requestsReconciled == 5);
+    foreach (ulong i; 0 .. 5)
+    {
+        assert(stores.requests.get(format("r%s", i)).get.value.tasks.length == 1, "Every open request is reconciled");
+    }
+}
+
+unittest
+{
+    // A request whose chain is gone throws on every tick. Over pages of two it is the first open request,
+    // and the requests on the pages after it are still reconciled
+    auto documents = new InMemoryDocumentStore();
+    auto stores = projectStores(documents, 2);
+    createChain(stores, "a");
+    intake(stores, "a", "r0", ["compile"], "2026-10-20T10:00:00Z");
+    documents.remove(buildChainsCollection.name, "a", documents.get(buildChainsCollection.name, "a").get.version_);
+    createChainAt(stores, "b", 2, "rev-b");
+    foreach (ulong i; 1 .. 5) intake(stores, "b", format("r%s", i), ["compile"], format("2026-10-20T10:00:0%sZ", i));
+
+    auto summary = sweepCoordination(stores, 3, fixedNow());
+    assert(summary.errors == 1 && summary.requestsReconciled == 4);
+    assert(stores.requests.get("r0").get.value.tasks.length == 0, "The request that cannot be reconciled stays as it was");
+    foreach (ulong i; 1 .. 5)
+    {
+        assert(stores.requests.get(format("r%s", i)).get.value.tasks.length == 1);
+    }
+}
+
+unittest
+{
+    // An expiry at the attempt limit whose fold fails is counted as an error, and the same tick's reconcile
+    // folds the lost execution and fails its request
+    auto documents = new InMemoryDocumentStore();
+    auto stores = projectStores(documents);
+    const fingerprint = runningRequest(stores);
+    const id = activeAt(stores, fingerprint).id;
+
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto racing = new StateStores(interleaving);
+    // The writes of the expiry: 1 the lost lease counted, 2 the execution's record, 3 its fold
+    beforeWrite(interleaving, 3, () { throw new Exception("The fold is lost"); });
+    auto summary = sweepCoordination(racing, 1, later(2.minutes));
+    assert(summary.errors == 1 && summary.leasesFailed == 0 && summary.requestsReconciled == 1);
+    assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
+    assert(stores.ledgers.get(fingerprint).get.active.isNull);
+    auto state = stores.requests.get("ra").get.value;
+    assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
 }

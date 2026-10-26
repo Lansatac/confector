@@ -8,7 +8,7 @@ module confector.core.state_stores;
  */
 
 import confector.core.api_token_store : ApiTokenStore;
-import confector.core.build_stores : BuildRequestStore, ChainStore, ExecutionStore;
+import confector.core.build_stores : BuildRequestStore, ChainStore, defaultPageSize, ExecutionStore;
 import confector.core.counters : CounterStore;
 import confector.core.definition_store : DefinitionStore;
 import confector.core.fingerprint_ledger : LedgerStore;
@@ -40,8 +40,9 @@ final class StateStores
 
     private DocumentStore m_store;
 
-    /// Builds every store over `store`, declaring their collections.
-    this(DocumentStore store)
+    /// Builds every store over `store`, declaring their collections. `pageSize` is the page size of
+    /// the requests' and the ledgers' queries; the chains' and the executions' keep `defaultPageSize`.
+    this(DocumentStore store, size_t pageSize = defaultPageSize)
     {
         if (store is null)
         {
@@ -50,9 +51,9 @@ final class StateStores
         m_store = store;
         chains = new ChainStore(store);
         definitions = new DefinitionStore(store);
-        requests = new BuildRequestStore(store, chains, definitions);
+        requests = new BuildRequestStore(store, chains, definitions, pageSize);
         executions = new ExecutionStore(store);
-        ledgers = new LedgerStore(store, executions);
+        ledgers = new LedgerStore(store, executions, pageSize);
         rerunGenerations = new RerunGenerationStore(store);
         counters = new CounterStore(store);
         projects = new ProjectStore(store);

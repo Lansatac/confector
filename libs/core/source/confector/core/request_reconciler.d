@@ -49,7 +49,7 @@ module confector.core.request_reconciler;
  *   is committed.
  */
 
-import confector.core.document_collection : Versioned;
+import confector.core.document_collection : Page, Versioned;
 import confector.core.fingerprint_ledger : ClaimOutcome;
 import confector.core.request_evaluator;
 import confector.core.request_state : withEvaluation, withFailure;
@@ -358,37 +358,44 @@ struct ProjectReconciliation
 }
 
 /**
- * Reconciles every open request of `projectId` at the clock `now`, each on its own. A request
- * whose reconcile fails is logged with its error and counted, and the others are still reconciled;
- * a request left open is reconciled again by a later call. Used when an execution of the project
- * ends, and by the coordination sweep.
+ * Reconciles every open request of `projectId` at the clock `now`, each on its own, one page of
+ * open requests at a time (so one page is in memory at once). A request whose reconcile fails is
+ * logged with its error and counted, and the others are still reconciled; a request left open is
+ * reconciled again by a later call. A page that cannot be listed ends the pass, counted as one
+ * error. Used when an execution of the project ends, and by the coordination sweep.
  */
 ProjectReconciliation reconcileOpenRequests(StateStores stores, string projectId, string now)
 {
     ProjectReconciliation result;
-    BuildRequest[] open;
-    try open = stores.requests.listOpen(projectId);
-    catch (Exception e)
-    {
-        logError("[reconcile] Could not list the open requests of project '%s': %s", projectId, e.toString());
-        result.errors += 1;
-        return result;
-    }
     auto reconciler = new RequestReconciler(stores, () => now);
-    foreach (request; open)
+    string cursor;
+    while (true)
     {
-        try
-        {
-            reconciler.reconcile(request.id);
-            result.reconciled += 1;
-        }
+        Page!BuildRequest page;
+        try page = stores.requests.listOpenPage(projectId, cursor);
         catch (Exception e)
         {
-            logError("[reconcile] Could not reconcile request '%s' of project '%s': %s", request.id, projectId, e.toString());
+            logError("[reconcile] Could not list the open requests of project '%s': %s", projectId, e.toString());
             result.errors += 1;
+            return result;
         }
+        foreach (item; page.items)
+        {
+            const id = item.value.id;
+            try
+            {
+                reconciler.reconcile(id);
+                result.reconciled += 1;
+            }
+            catch (Exception e)
+            {
+                logError("[reconcile] Could not reconcile request '%s' of project '%s': %s", id, projectId, e.toString());
+                result.errors += 1;
+            }
+        }
+        if (page.nextCursor.length == 0) return result;
+        cursor = page.nextCursor;
     }
-    return result;
 }
 
 version (unittest)

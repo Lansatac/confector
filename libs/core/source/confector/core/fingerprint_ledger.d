@@ -44,7 +44,7 @@ module confector.core.fingerprint_ledger;
  * for claiming over one.
  */
 
-import confector.core.build_stores : ExecutionStore, InvalidStateTransitionException;
+import confector.core.build_stores : defaultPageSize, ExecutionStore, InvalidStateTransitionException;
 import confector.core.document_collection;
 import confector.api.document_store;
 import confector.api.model;
@@ -289,20 +289,21 @@ final class LedgerStore
     /// many writers can contend on it at once.
     enum maxWriteAttempts = 100;
 
-    /// Ledgers per page of the `active` index.
-    enum pageSize = 100;
-
     private DocumentCollection!FingerprintLedger m_ledgers;
     private ExecutionStore m_executions;
+    /// Ledgers per page of the `active` index.
+    private immutable size_t m_pageSize;
 
     /// Declares `fingerprintLedgersCollection` on `store`; `executions` is where the ledgers'
-    /// finished executions are recorded.
-    this(DocumentStore store, ExecutionStore executions)
+    /// finished executions are recorded. `pageSize` is how many ledgers one page of the `active` index holds.
+    this(DocumentStore store, ExecutionStore executions, size_t pageSize = defaultPageSize)
     {
         if (executions is null) throw new Exception("LedgerStore requires the execution store");
+        if (pageSize == 0) throw new Exception("LedgerStore needs a positive page size");
         m_ledgers = new DocumentCollection!FingerprintLedger(store, fingerprintLedgersCollection,
             ["active_status", "active_due"], &derivedFields);
         m_executions = executions;
+        m_pageSize = pageSize;
     }
 
     private static string[string] derivedFields(in FingerprintLedger ledger)
@@ -522,7 +523,7 @@ final class LedgerStore
         IndexQuery lookup;
         lookup.index = "active";
         lookup.partitionKey = ExecutionStatus.queued;
-        lookup.limit = pageSize;
+        lookup.limit = m_pageSize;
         lookup.cursor = cursor;
         return m_ledgers.query(lookup);
     }
@@ -535,7 +536,7 @@ final class LedgerStore
         lookup.index = "active";
         lookup.partitionKey = ExecutionStatus.running;
         lookup.sortKeyTo = sortableTimestamp(now);
-        lookup.limit = pageSize;
+        lookup.limit = m_pageSize;
         lookup.cursor = cursor;
         return m_ledgers.query(lookup);
     }
@@ -692,6 +693,10 @@ unittest
     assert(executionIdFor("fp2", 1) != executionIdFor("fp1", 1));
     assert(throwsA!Exception({ executionIdFor("", 1); }));
     assert(throwsA!Exception({ executionIdFor("fp1", 0); }));
+    {
+        auto documents = new InMemoryDocumentStore();
+        assert(throwsA!Exception({ new LedgerStore(documents, new ExecutionStore(documents), 0); }));
+    }
 
     // Claims name them: the nth claim at a fingerprint names its nth id, on any store
     auto stores = storesOver(new InMemoryDocumentStore());
@@ -978,9 +983,9 @@ unittest
     assert(fingerprintsOf(stores.ledgers.leaseDuePage("2026-10-18T11:00:00Z", null)) == ["fp_b", "fp_a"]);
 
     // Paging follows the cursor
-    foreach (i; 0 .. LedgerStore.pageSize + 3) dispatch(stores, format("fp_q%04d", i), 0);
+    foreach (i; 0 .. defaultPageSize + 3) dispatch(stores, format("fp_q%04d", i), 0);
     auto page = stores.ledgers.queuedPage(null);
-    assert(page.items.length == LedgerStore.pageSize && page.nextCursor.length > 0);
+    assert(page.items.length == defaultPageSize && page.nextCursor.length > 0);
     assert(stores.ledgers.queuedPage(page.nextCursor).items.length == 4);
 }
 

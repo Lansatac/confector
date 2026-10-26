@@ -49,8 +49,8 @@ enum CollectionSpec taskExecutionsCollection = CollectionSpec("task_executions",
     [IndexSpec("by_fingerprint", "fingerprint", "created_key"),
      IndexSpec("by_task", "project_task", "created_key")]);
 
-/// Page size of the queries that list everything they find.
-private enum size_t pageSize = 100;
+/// Page size of the queries that list everything they find, unless a store is given another.
+enum size_t defaultPageSize = 100;
 
 /// A write that would break the build model's rules: changing an immutable field, rewriting a
 /// chain's history, or changing a terminal execution.
@@ -214,7 +214,7 @@ final class ChainStore
         lookup.index = "by_project";
         lookup.partitionKey = projectId;
         lookup.descending = newestFirst;
-        lookup.limit = pageSize;
+        lookup.limit = defaultPageSize;
         return m_chains.queryAll(lookup, limit);
     }
 
@@ -234,7 +234,7 @@ final class ChainStore
         lookup.index = "by_headline";
         lookup.partitionKey = headlineKey(projectId, headline);
         lookup.descending = newestFirst;
-        lookup.limit = pageSize;
+        lookup.limit = defaultPageSize;
         return m_chains.queryAll(lookup, limit);
     }
 
@@ -332,19 +332,23 @@ final class BuildRequestStore
     private DocumentCollection!BuildRequest m_requests;
     private ChainStore m_chains;
     private DefinitionStore m_definitions;
+    private immutable size_t m_pageSize;
 
     /// Declares `buildRequestsCollection` on `store`; `chains` and `definitions` are where the
-    /// requests' chains and definitions are stored.
-    this(DocumentStore store, ChainStore chains, DefinitionStore definitions)
+    /// requests' chains and definitions are stored. `pageSize` is how many index entries one query
+    /// fetches; a listing follows the cursor through as many queries as it needs.
+    this(DocumentStore store, ChainStore chains, DefinitionStore definitions, size_t pageSize = defaultPageSize)
     {
         if (chains is null || definitions is null)
         {
             throw new Exception("BuildRequestStore requires the chain store and the definition store");
         }
+        if (pageSize == 0) throw new Exception("BuildRequestStore needs a positive page size");
         m_requests = new DocumentCollection!BuildRequest(store, buildRequestsCollection, ["requested_key", "open_project"],
             &derivedFields);
         m_chains = chains;
         m_definitions = definitions;
+        m_pageSize = pageSize;
     }
 
     /// The derived fields of a request: its request time, for ordering, and its project while open.
@@ -504,16 +508,33 @@ final class BuildRequestStore
         return m_requests.replace(current.id, next, read.version_);
     }
 
-    /// Lists the open requests of project `projectId`, oldest first, at most `pageSize` of them.
-    /// Discovery: may lag behind writes, so a request it misses is found by a later look.
-    BuildRequest[] listOpen(string projectId)
+    /// One page of the open requests of project `projectId`, oldest first, from `cursor` (null for the
+    /// first page). `nextCursor` is empty after the last page. Discovery: may lag behind writes, so a
+    /// request it misses is found by a later look.
+    Page!BuildRequest listOpenPage(string projectId, string cursor)
     {
         requireValid(projectId.length > 0, "Open requests are listed for a project");
         IndexQuery lookup;
         lookup.index = "open";
         lookup.partitionKey = projectId;
-        lookup.limit = pageSize;
-        return values(m_requests.queryAll(lookup, pageSize));
+        lookup.limit = m_pageSize;
+        lookup.cursor = cursor;
+        return m_requests.query(lookup);
+    }
+
+    /// Lists every open request of project `projectId`, oldest first, by following `listOpenPage` through
+    /// all its pages. Holds them all in memory: a caller that handles requests one by one uses `listOpenPage`.
+    BuildRequest[] listOpen(string projectId)
+    {
+        BuildRequest[] result;
+        string cursor;
+        while (true)
+        {
+            auto page = listOpenPage(projectId, cursor);
+            foreach (item; page.items) result ~= item.value;
+            if (page.nextCursor.length == 0) return result;
+            cursor = page.nextCursor;
+        }
     }
 
     /// Lists chain `chainId`'s requests, oldest first. Discovery: may lag behind writes, which a
@@ -523,7 +544,7 @@ final class BuildRequestStore
         IndexQuery lookup;
         lookup.index = "by_chain";
         lookup.partitionKey = chainId;
-        lookup.limit = pageSize;
+        lookup.limit = m_pageSize;
         return values(m_requests.queryAll(lookup));
     }
 
@@ -534,7 +555,7 @@ final class BuildRequestStore
         lookup.index = "by_project";
         lookup.partitionKey = projectId;
         lookup.descending = true;
-        lookup.limit = pageSize;
+        lookup.limit = m_pageSize;
         return values(m_requests.queryAll(lookup, limit));
     }
 }
@@ -689,7 +710,7 @@ final class ExecutionStore
         IndexQuery lookup;
         lookup.index = "by_fingerprint";
         lookup.partitionKey = fingerprint;
-        lookup.limit = pageSize;
+        lookup.limit = defaultPageSize;
         return values(m_executions.queryAll(lookup));
     }
 
@@ -701,7 +722,7 @@ final class ExecutionStore
         lookup.index = "by_task";
         lookup.partitionKey = compositeKey(projectId, taskId);
         lookup.descending = true;
-        lookup.limit = pageSize;
+        lookup.limit = defaultPageSize;
         return values(m_executions.queryAll(lookup, limit));
     }
 }
@@ -1506,6 +1527,7 @@ unittest
     assert(requests.create(rerun).intent == BuildIntent.rerun);
 
     assert(throwsA!Exception({ new BuildRequestStore(documents, null, definitions); }));
+    assert(throwsA!Exception({ new BuildRequestStore(documents, chains, definitions, 0); }));
     assert(throwsA!Exception({ new BuildRequestStore(documents, chains, null); }));
 }
 

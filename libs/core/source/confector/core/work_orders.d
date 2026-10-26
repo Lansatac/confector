@@ -1849,3 +1849,22 @@ unittest
     completeExecution(stores, "fp1", id, succeededAt(2), later(3.minutes));
     assert(supersessionNote(seen, stores.ledgers.get("fp1")).length == 0, "An ended execution is not active");
 }
+
+unittest
+{
+    // Five open requests over pages of two, all waiting on one execution: its completion reconciles every one of
+    // them, so none is left open
+    auto stores = new StateStores(new InMemoryDocumentStore(), 2);
+    createChain(stores, "a");
+    foreach (ulong i; 0 .. 5) intake(stores, "a", format("r%s", i), ["compile"], format("2026-10-20T10:00:0%sZ", i));
+    reconcilerOf(stores).reconcile("r0");
+    const fingerprint = fingerprintNow(stores, "a", "compile");
+    assert(!startExecution(stores, fingerprint, "w1", testLease, fixedNow()).isNull);
+    const id = stores.ledgers.get(fingerprint).get.active.get.id;
+
+    TaskExecutionResult result;
+    result.status = ExecutionStatus.succeeded;
+    result.attempt = 1;
+    assert(completeExecution(stores, fingerprint, id, result, fixedNow()).status == ExecutionStatus.succeeded);
+    assert(stores.requests.listOpen("game").length == 0);
+}

@@ -1658,10 +1658,8 @@ unittest
     assert(stored.environment == ["MODE": "release", "FLAGS": "-O2 -g"] && stored.timeoutSeconds == 1234);
 
     // The editor shows the saved task again, and saving it unchanged stores it unchanged: its
-    // environment, its non-default timeout and its definition hash are kept
+    // environment and its non-default timeout are kept
     {
-        import confector.core.definition_hash : computeDefinitionHash;
-
         auto reopened = request(HTTPMethod.GET, "/projects/tasks/edit?project_id=proj_dash_1&task_id=package");
         assert(reopened.status == HTTPStatus.ok && reopened.body.canFind("target_dir"), reopened.body);
         assert(reopened.body.canFind(`value="1234"`) && reopened.body.canFind("FLAGS=-O2 -g&#10;MODE=release"), reopened.body);
@@ -1669,7 +1667,6 @@ unittest
         assert(resaved.status == HTTPStatus.found, format("HTTP %s: %s", resaved.status, resaved.body));
         auto again = storedTask("package");
         assert(again == stored, format("%s\n%s", again, stored));
-        assert(computeDefinitionHash(again) == computeDefinitionHash(stored));
 
         // Tasks stored without going through the editor keep their default timeout too
         auto echoForm = editorFields(storedTask("test_node_1"));

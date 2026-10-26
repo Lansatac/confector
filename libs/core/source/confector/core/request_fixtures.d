@@ -72,6 +72,13 @@ InputBinding[] mainBindings(const TaskGraph graph)
 /// Creates chain `id` and registers repository game if it is not yet.
 BuildChain createChain(StateStores stores, string id)
 {
+    return createChainAt(stores, id, 1, "aaa111");
+}
+
+/// Creates chain `id`, number `number`, whose main of repository game is at revision `revision`: chains
+/// at different revisions have different fingerprints. Registers repository game if it is not yet.
+BuildChain createChainAt(StateStores stores, string id, ulong number, string revision)
+{
     if (stores.repositories.get("game").isNull)
     {
         RepositoryRecord game;
@@ -79,7 +86,10 @@ BuildChain createChain(StateStores stores, string id)
         game.address = gameAddress;
         stores.repositories.put(game);
     }
-    return stores.chains.create(sampleChain(id)).value;
+    auto chain = sampleChain(id);
+    chain.number = number;
+    chain.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json(revision)))];
+    return stores.chains.create(chain).value;
 }
 
 RerunGenerationReader readerOf(StateStores stores)
