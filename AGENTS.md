@@ -264,6 +264,10 @@ How they fit together:
   inputs' defaults, and pins each of those refs. A build's number means the code as of when it
   was made. If any of those refs cannot be bound or resolved, the request fails and no chain is
   created.
+- **A chain remembers how its inputs were bound.** It records the ref each repository input was
+  first bound to, by the snapshot or by a later request. On an existing chain, an input the
+  request names no ref for binds to the chain's ref, and only an input the chain has never bound
+  falls back to the input's default.
 - **Any task in today's definition can be built later for a chain**, against the chain's pins.
   This is how an external build is made from exactly the source that was tested, including with
   a task added after the chain was created. A ref the chain lacks (an input added to the
@@ -410,8 +414,8 @@ Decided October 2026.
   A manual request asks for a ref per repository, prefilled from the defaults; cron and manual
   requests have no event, so their specs are concrete. (The notation is an implementation
   choice; examples here are illustrative.)
-- **Inputs supply defaults, not choices.** What a trigger or request does not specify comes from
-  the input's own default ref spec (a fixed ref or *same name*, never an event spec, because a
+- **Inputs supply defaults, not choices.** What a trigger or request does not specify, and the
+  chain has not already bound, comes from the input's own default ref spec (a fixed ref or *same name*, never an event spec, because a
   default cannot fire a trigger); with neither, loading the definition fails.
 - **Builds carry a headline ref.** A chain records one ref (the event's, or the manual request's
   choice for the primary repository) that groups its history; a project with no repositories has
