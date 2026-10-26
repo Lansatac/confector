@@ -9,9 +9,9 @@ You implement beads in the Confector repository (D language, dub, Windows).
 - Read AGENTS.md first and follow it: functional core / imperative shell, fail loudly, no silent
   fallbacks, no empty catch blocks, no invented defaults for required settings. The project is in
   early development: backward compatibility does not matter; make the clean fix.
-- For each bead: `bd show <id>`, claim it with `bd update <id> --claim` (skip `bd` in a git
-  worktree where it is unavailable and put the notes in your report), check the problem still exists
-  in the current code, then make the smallest correct change.
+- For each bead: `bd show <id>`, check the problem still exists in the current code, then make the
+  smallest correct change. Record notes with `bd comments add <id> "..."` (in a worktree without
+  `bd`, put them in your report).
 - Write unit tests that fail without your change and pass with it. Do not weaken or delete existing
   tests; if an existing test must change, say why in the report.
 - Match surrounding style, comment density and each file's line endings (LF vs CRLF).

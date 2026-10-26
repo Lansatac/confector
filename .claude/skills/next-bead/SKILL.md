@@ -6,139 +6,169 @@ description: Pick the next ready bead (optionally filtered by a label such as m1
 # next-bead
 
 Arguments (optional): a label (`m1`), bead ids, or a theme. With none, use the project's current
-milestone label. You are the orchestrator: you select, brief, verify, commit and close. Sub-agents
-implement and review. Keep your own context small: ask agents for concise reports.
+milestone label. You are the orchestrator: you select, brief, check, commit and close. Sub-agents
+implement and review. Keep your own context small by asking agents for concise reports.
+
+These are guidelines, not a checklist. Each one says why it exists, so use judgment where a case
+doesn't fit. The one firm rule is the model choice in section 2.
 
 ## 1. Select
 
-- `bd ready --label <label>`, then `bd show` the likely candidates. Skip epics and design beads.
-- Prefer, in order: P0/P1; unblocks the most other beads; dependency order; cheap to verify.
-- A bead that needs an owner design decision (the notes or description say so, or the right answer
-  is genuinely ambiguous) is not implemented: surface the question to the user with your
-  recommendation and pick another bead.
+Look at `bd ready --label <label>` and `bd show` the likely candidates, skipping epics and design
+beads. Good picks are high priority, unblock other beads, come next in dependency order and are
+cheap to verify.
+
+A bead that needs an owner design decision is a question, not a task. Ask the user, with your
+recommendation, and pick another bead meanwhile. That applies when the bead says so, or when the
+right answer is genuinely ambiguous.
 
 ### Bundling
 
-Bundle beads into one implementer run when they are **small** and **related** (same files, component
-or design context, or one fixes the other's bug), at most three per bundle. Run them one at a time in
-a single agent, verifying each before the next. Do not bundle large beads, unrelated areas, or
-risky storage, security or concurrency work, which gets its own bundle and review. The point is to
-pay for context loading once.
+Loading context is the expensive part of an agent run, so bundle small, related beads into one run.
+Related means the same files, component or design context, or one fixing the other's bug. Two or
+three is usually the limit. Keep large beads, unrelated areas, and risky storage, security or
+concurrency work in their own runs, so each gets a focused review.
 
-Triage first: some beads are already fixed or moot. The agent must check that the problem still
-exists in current code before changing anything, and say so in the bead notes if not.
+Some beads are already fixed or moot. Ask the implementer to check that the problem still exists
+before changing anything.
 
 ## 2. Choose the models
 
-Default to the cheapest agent that can do the job; the reviewer is always at least one step stronger.
+**Start every bead with `implementer` (haiku), paired with a stronger reviewer.** This is the one
+firm rule. Agents tend to underestimate haiku and reach for opus or sonnet "to be safe". In the
+owner's experience, haiku with a capable reviewer and a fix round has not failed on this project,
+and it costs far less. A bead looking hard is not a reason to start higher.
 
-| Work | Implementer | Reviewer |
-|---|---|---|
-| Well specified, self-contained, tests are the spec, few files (bug fixes, small features, plumbing, config, docs) | `implementer` (haiku) | sonnet |
-| Multi-file but well specified: wiring, audits, interface changes with clear acceptance | `implementer` (haiku) | opus if it touches correctness-critical code, else sonnet |
-| Concurrency, CAS or crash-recovery protocols, security work whose design is already decided | `implementer` (haiku) | opus |
-| Cross-cutting refactors, or anything still needing design judgment the bead and design fields do not settle | `implementer-medium` (sonnet) | opus |
+- `implementer-medium` (sonnet) is for work that still needs design judgment the bead and its
+  design fields don't settle, such as cross-cutting refactors. Start there only in that case.
+- `implementer-strong` (opus) is only for escalation (see "Escalating"), or when the user asks for
+  it explicitly.
 
-**Most beads start on haiku; the reviewer is the backstop.** A haiku implementer with a stronger
-reviewer and one fix round is usually cheaper than a stronger implementer. Use `implementer-medium`
-first only for the last row. Never start a bead with `implementer-strong`, however hard it looks:
-escalate to it only under "Escalating" below. The one exception is an explicit instruction from
-the user to use the strong implementer.
+Pick the reviewer for the risk:
 
-Haiku tends to miss project conventions rather than design: briefs to it should say explicitly to
-reuse existing facilities (crypto, RNG, store patterns, test helpers) before writing new code, and
-that bead ids must not appear in code or comments.
+- **Sonnet** suits most haiku work.
+- **Opus** suits concurrency, compare-and-set, crash recovery, security, and anything
+  correctness-critical or cross-cutting.
 
-Pass `model` on the Agent call to override an agent's default. When an implementer's first attempt
-shows it is out of its depth (it guesses at design, or the reviewer finds structural problems),
-hand the rework to the next model up instead of looping.
+Haiku's misses tend to be project conventions rather than design. Remind it to reuse existing
+facilities (crypto, RNG, store patterns, test helpers), and that bead ids don't belong in code.
 
 ## 3. Brief the implementer
 
-Use `subagent_type: implementer` or `implementer-medium` for the first attempt (`implementer-strong`
-only for an escalation). The prompt must contain: bead ids; the
-files or area; "read AGENTS.md first"; `bd show <id>` and, for design context, the `design` field of
-the relevant closed design beads (`bd show <id> --json`); the acceptance criteria; what is out of
-scope; the verification commands; and the standing rules: no git write commands, do not close or
-create beads, no bead ids or bead details in code, comments, test names, error messages or commit
-messages (beads are local only), record notes with `bd comments add <id> "..."`, report concisely
-(files, design choices, deferred items, exact test results, anything unverified).
+Give the agent what it needs to work without rediscovering it:
 
-### Bead writes by agents
+- the bead ids and the files or area;
+- "read AGENTS.md first", and `bd show <id>`;
+- the `design` field of relevant closed design beads (`bd show <id> --json`);
+- the acceptance criteria and what's out of scope;
+- the packages to test.
 
-`bd` is built for concurrent use and works from a worktree (it finds the main checkout's database), so
-agents may read beads anywhere. Agents (implementers and reviewers) record notes only with
-`bd comments add`: each comment is a new record, so concurrent agents cannot overwrite each other.
-Fields that are replaced whole (`--notes`, `--description`, `--design`, `--acceptance`), status
-changes, `bd close` and `bd create` are the orchestrator's: a read-modify-write of those fields from
-two writers loses an update. When a comment holds lasting context, fold it into the notes or design
-field yourself.
+Include the standing rules:
 
-Run agents in the main tree one at a time. For parallel agents use one git worktree each and only
-parallelize beads that share no files (dub builds collide in one tree). Create them yourself in the
-worktree folder the user has named, or ask where if they have not (`git worktree add -b wt-<name>
-<folder>/<name> HEAD`; keep the path short on Windows), tell the agent to work only inside that
-folder, and remove the worktree and branch after applying the result (`git worktree remove --force`,
-`git branch -D`). The harness's `isolation: "worktree"` does not let you choose the folder. Apply a worktree result to the main tree by `git add -N .` in the worktree, `git diff
---binary` into the scratchpad directory, and `git apply --3way` in the main tree (expect conflicts in
-files another bead also touched, such as the README; resolve them by keeping both sides). Then run the
-tests and build in the main tree before committing.
+- No git write commands; you commit.
+- Don't close or create beads.
+- No bead ids or bead details in code, comments, test names, error messages or commit messages.
+  Beads are local and unsynced, so ids point at nothing for anyone else.
+- Record notes with `bd comments add`.
+- Report concisely: files, design choices, deferred items, exact test results and anything
+  unverified.
+
+### Tests
+
+The implementer owns the test run. It runs the affected packages and `dub build`, and reports
+exact results, including anything that failed, hung or was skipped. Test suites are slow, and
+running them again when nothing has changed tells you nothing new. So the reviewer and you
+normally take that report as the result and spend your effort elsewhere. Run tests yourself when
+you have a reason to, for example:
+
+- the tree changed after the report;
+- the report looks incomplete;
+- a test is the quickest way to settle a question.
+
+### Bead writes
+
+Comments are separate records, so concurrent agents can't overwrite each other's. Fields that are
+replaced whole (notes, description, design, acceptance), status changes, closing and creating are
+yours: two writers doing a read-modify-write lose an update. Fold lasting context from comments
+into the notes or design field yourself.
+
+### Parallel work
+
+dub builds collide in one tree, so run agents in the main tree one at a time. To parallelize, give
+each agent its own git worktree, and only pair beads that share no files.
+
+1. Create the worktree in a folder the user has named, or ask where. Use
+   `git worktree add -b wt-<name> <folder>/<name> HEAD`, and keep the path short on Windows. The
+   harness's `isolation: "worktree"` doesn't let you choose the folder.
+2. Tell the agent to work only inside that folder.
+3. To apply the result, run `git add -N .` in the worktree, write `git diff --binary` to the
+   scratchpad, and `git apply --3way` it in the main tree. Resolve conflicts in shared files such
+   as the README by keeping both sides.
+4. Run the tests there, since the tree changed after the implementer's run.
+5. Remove the worktree and its branch afterward.
 
 ## 4. Review
 
-Always review, with a stronger model than the implementer, via `subagent_type: reviewer`. The
-reviewer defaults to sonnet, which is right for haiku `implementer` work; pass `model: opus` for the
-opus rows of the table. Give it the
-bead id, the design context, and where the changes are (working tree or worktree path). It is
-read-only and reports ranked findings with file:line, a failure scenario and a severity. Ask it
-specifically to check: acceptance criteria; whether tests fail without the change; fail-fast and
-AGENTS.md conventions; leftover or dead code; behavior changes the implementer did not flag;
-stale docs and references; line endings.
+Always have the work reviewed by a stronger model than the one that wrote it, using
+`subagent_type: reviewer`. It defaults to sonnet; pass `model: opus` when section 2 calls for it.
 
-## 5. Fix, verify, commit
+Give it:
 
-- Send the findings to the same implementer with `SendMessage` (resuming is far cheaper than a new
-  agent). Ask for fixes for blockers and should-fix items; defer the rest by filing follow-up beads.
-  One fix round is normal. See "Escalating" below for when to hand off instead of looping.
-- Do not trust reports. Run the tests yourself for every affected package (names are in each
-  `dub.json`: `dub test :core`, `:server`, `:plugin-api`, `:runner-core`, plugin packages) and
-  `dub build`; `dub test :server` overwrites the server exe, so build again afterward. Check
-  `git status` for stray files and `git diff --stat` against `--ignore-cr-at-eol` for line-ending
-  churn (each file keeps its own LF or CRLF).
-- Commit only the files for this work (`git add <paths>`; never `-A`): leave the user's unrelated
-  uncommitted changes alone. If `.git/index.lock` exists, confirm no git process is running before
-  removing it. Message: what and why, which models implemented and reviewed when that
-  is useful, plus the attribution line the system provides. No bead ids or bead details in the
-  message (beads are local only).
-- `bd close <ids> --reason "..."`. Create follow-up beads for deferred findings and real bugs found
-  on the way (with a label and parent), and add notes where a later bead must know something.
+- the bead id and the design context;
+- where the changes are;
+- the implementer's test results.
+
+Points worth asking about:
+
+- acceptance;
+- whether the tests would fail without the change;
+- fail-fast and AGENTS.md conventions;
+- leftover or dead code;
+- unflagged behavior changes;
+- stale docs;
+- line endings.
+
+## 5. Fix and commit
+
+- **Fix round.** Send the findings to the same implementer with `SendMessage`. Resuming is far
+  cheaper than a new agent. Ask for fixes to the blockers and should-fix items, and file follow-up
+  beads for the rest. One fix round is normal.
+- **Final checks.** Check `git status` for stray files. Compare `git diff --stat` with and without
+  `--ignore-cr-at-eol` to catch line-ending churn, since each file keeps its own LF or CRLF.
+- **Commit.** Add only this work's paths, never `-A`, so the user's unrelated changes stay out.
+  The message says what and why, which models implemented and reviewed it, and the attribution
+  line the system provides. No bead ids.
+- **Close.** Run `bd close` with a reason. File follow-ups for deferred findings and bugs found on
+  the way, with a label and parent.
 
 ## Escalating
 
-A cheap model that is struggling costs more than a capable one that is not. Hand the work to the
-next model up (haiku, then sonnet, then opus) instead of continuing when any of these holds:
+A cheap model that is struggling costs more than a capable one that isn't. Hand the work one step
+up (haiku, then sonnet, then opus) rather than looping, when for example:
 
-- The reviewer still reports blockers, or the same should-fix finding, after **one** fix round.
-- The implementer's first report shows it guessed at a design question, left tests failing, weakened
-  or deleted existing tests to get green, or changed behavior beyond the bead.
-- The reviewer finds structural problems (wrong layering, a broken protocol or consistency rule), not
-  just local defects.
-- The implementer ran out of its own context or budget, or reports it could not finish.
+- blockers remain after a fix round;
+- the implementer guessed at a design question, or got tests green by weakening them;
+- the reviewer finds structural problems rather than local defects;
+- the implementer couldn't finish.
 
-Do not run a second fix round with the same model. Do not restart from scratch: start the stronger
-agent on the current working tree (or worktree) with the bead, the reviewer's findings, and the
-implementer's report, and tell it to keep what is sound and rework what is not. Resuming the weaker
-agent with `SendMessage` is only for local, clearly described fixes. If the strongest model also
-needs a second round, stop and report to the user what is unresolved. Mention escalations in the
-final report: they are the evidence for tuning the model table.
+Start the stronger agent on the current tree with the bead, the findings and the previous report,
+and tell it to keep what is sound. If opus also struggles, stop and tell the user what is
+unresolved. Mention escalations in your report: they are the evidence for tuning the model choice.
 
 ## 6. Report
 
-Concisely: the commits, beads closed, findings that mattered, deferred follow-ups (with ids), anything
-unverified, and the token usage per agent from the completion notifications. If the user is
-experimenting with model choices, say how the cheap implementer and the reviewer performed.
+Report concisely:
+
+- the commits and the beads closed;
+- the findings that mattered;
+- the follow-ups filed, with their ids;
+- anything unverified;
+- the token usage per agent.
+
+If the user is experimenting with model choices, say how the implementer and reviewer did.
 
 ## Environment notes
 
-Windows with Git Bash; there is no `/tmp`, use the session scratchpad. dub is the source of truth for
-builds (`reggae -b ninja ..` then `ninja server` from `build/` is an optional faster dev build).
+Windows with Git Bash: there's no `/tmp`, so use the session scratchpad. dub is the source of truth
+for builds. `reggae -b ninja ..` followed by `ninja server` from `build/` is an optional faster dev
+build.

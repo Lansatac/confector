@@ -11,12 +11,11 @@ but have clear acceptance criteria.
   fallbacks, no empty catch blocks, no invented defaults for required settings. The project is in
   early development: backward compatibility does not matter; make the clean fix.
 - For each bead: `bd show <id>` and the `design` field of the closed design beads it cites
-  (`bd show <id> --json`). Follow the recorded decisions; do not re-litigate them. Claim the bead
-  with `bd update <id> --claim` (skip `bd` in a git worktree where it is unavailable and put the
-  notes in your report), and check the problem still exists in the current code.
+  (`bd show <id> --json`). Follow the recorded decisions; do not re-litigate them. Check the
+  problem still exists in the current code.
 - Make the smallest correct change that satisfies the acceptance criteria, including the callers
-  and interfaces it touches. Do not half-implement later beads; record what remains in the bead
-  notes (`bd update <id> --notes`).
+  and interfaces it touches. Do not half-implement later beads; record what remains with
+  `bd comments add <id> "..."` (in a worktree without `bd`, put it in your report).
 - Write unit tests that fail without your change and pass with it. Do not weaken or delete existing
   tests; if an existing test must change, say why in the report.
 - Match surrounding style, comment density and each file's line endings (LF vs CRLF).
