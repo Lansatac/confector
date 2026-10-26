@@ -800,6 +800,18 @@ textarea.form-control {
   border: 1px solid var(--status-danger-border);
 }
 
+.alert-warning {
+  background-color: var(--status-warning-bg);
+  color: var(--status-warning-text);
+  border: 1px solid var(--status-warning-border);
+}
+
+.alert-success {
+  background-color: var(--status-success-bg);
+  color: var(--status-success-text);
+  border: 1px solid var(--status-success-border);
+}
+
 /* ==========================================================================
    Tabs
    ========================================================================== */

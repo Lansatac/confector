@@ -411,7 +411,7 @@ Decided October 2026.
   trigger; *same name* as the event's branch; or a fixed ref such as B1's `main`. A non-fixed
   spec can name a fallback ref, or say to skip the build, for when the name does not exist.
   One event makes one request: other repositories are paired by name, never as a cross product.
-  A manual request asks for a ref per repository, prefilled from the defaults; cron and manual
+  A manual request may name a ref per repository, with the defaults shown as hints; cron and manual
   requests have no event, so their specs are concrete. (The notation is an implementation
   choice; examples here are illustrative.)
 - **Inputs supply defaults, not choices.** What a trigger or request does not specify, and the

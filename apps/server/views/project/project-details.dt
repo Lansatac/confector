@@ -11,9 +11,45 @@ block maincontent
           a.btn.btn-primary(href="/projects/tasks/edit?project_id=#{project.id}") + Add Task
           form(action="/projects/run", method="POST", style="display:inline;")
             input(type="hidden", name="id", value="#{project.id}")
+            input(type="hidden", name="all", value="1")
             button.btn.btn-success(type="submit") Execute All Tasks
           a.btn.btn-secondary(href="/projects/edit?id=#{project.id}") Edit JSON Graph
           a.btn.btn-outline(href="/projects/") Back to Projects
+
+    - if (buildForm.created.length > 0)
+      div.alert.alert-success#build-created(style="margin-top: 20px;") Created build #{buildForm.created}.
+    - if (buildForm.warning.length > 0)
+      div.alert.alert-warning#build-warning(style="margin-top: 20px;") #{buildForm.warning}
+    - if (buildForm.error.length > 0)
+      div.alert.alert-danger#build-error(style="margin-top: 20px; white-space: pre-line;")
+        strong The build was not started:
+        div #{buildForm.error}
+
+    - if (project.tasks.length > 0)
+      div.card#build-form(style="margin-top: 20px;")
+        h3 Build
+        form(action="/projects/run", method="POST")
+          input(type="hidden", name="id", value="#{project.id}")
+          div.form-group
+            label Tasks to build (with their upstream tasks):
+            - import std.algorithm.searching : canFind;
+            - foreach(t; project.tasks)
+              div
+                label
+                  input(type="checkbox", name="target_task_id", value="#{t.id}", checked=buildForm.targets.canFind(t.id))
+                  |  #{t.name.length > 0 ? t.name : t.id}
+          - if (buildForm.refs.length > 0)
+            div.form-group
+              label Ref of each repository (empty: the build's ref, else the default shown):
+              - foreach(row; buildForm.refs)
+                div(style="display: flex; gap: 10px; align-items: center; margin-bottom: 6px;")
+                  code(style="min-width: 140px;") #{row.repository}
+                  input(type="hidden", name="ref_repository", value="#{row.repository}")
+                  input.form-control(type="text", name="ref_name", value="#{row.ref_}", placeholder="#{row.hint}")
+          div.form-group
+            label(for="chain_number") Add to an existing build (number, empty starts a new build):
+            input.form-control#chain_number(type="text", name="chain_number", value="#{buildForm.chainNumber}", placeholder="e.g. 12")
+          button.btn.btn-success(type="submit") Build
 
     div.grid-2col(style="margin-top: 20px;")
       div.card

@@ -9,6 +9,9 @@ import vibe.vibe;
 
 import confector.api.scheduler : Schedule, ScheduleEntry, Scheduler;
 import confector.config;
+import confector.api.input_resolver : RepositoryResolver;
+import confector.core.git_resolver : GitRepositoryResolver;
+import confector.core.intake : RequestIntake;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_signing_key : SigningKeySource, generateWorkerSigningKey;
 import confector.server.backends : Backends, buildBackends;
@@ -42,14 +45,16 @@ void registerCoordinationSweep(Scheduler scheduler)
 }
 
 /// Configures application URL routing over `backends` and `stores`, the state stores kept in
-/// its document store. Worker tokens are signed and checked with `workerTokenKey`; receiving work
-/// is admitted only with `workerPoolCredential`, and an execution's lease expires after
-/// `maxAttempts` lost leases. Every route is registered with its access, and user requests are
+/// its document store. Builds are requested through intake, which resolves refs with `resolver`
+/// (the one place version control is contacted for a request). Worker tokens are signed and
+/// checked with `workerTokenKey`; receiving work is admitted only with `workerPoolCredential`, and
+/// an execution's lease expires after `maxAttempts` lost leases. Every route is registered with its access, and user requests are
 /// authenticated by `backends.authenticator`.
-AuthorizedRoutes createRouter(Backends backends, StateStores stores, string schedulerCallbackSecret, string workerTokenKey,
-    string workerPoolCredential, uint maxAttempts)
+AuthorizedRoutes createRouter(Backends backends, StateStores stores, RepositoryResolver resolver, string schedulerCallbackSecret,
+    string workerTokenKey, string workerPoolCredential, uint maxAttempts)
 {
     auto authenticator = backends.authenticator;
+    auto intake = new RequestIntake(stores, resolver);
     auto router = new AuthorizedRoutes(authenticator);
 
     // Static assets
@@ -65,11 +70,10 @@ AuthorizedRoutes createRouter(Backends backends, StateStores stores, string sche
 
     // API endpoints and the artifact routes workers use
     router.include(artifactsRouter(authenticator, backends.artifactStore, workerTokenKey, stores));
-    router.include(apiRouter(authenticator, schedulerCallbackSecret, workerTokenKey, workerPoolCredential, maxAttempts, stores));
+    router.include(apiRouter(authenticator, schedulerCallbackSecret, workerTokenKey, workerPoolCredential, maxAttempts, stores, intake));
 
-    // Dashboard, projects, tasks and repositories UI. Build views wait for request intake
-    // and request state (beads confector-z7z.23.7 and confector-z7z.49.x)
-    router.include(dashboardRouter(authenticator, stores));
+    // Dashboard, projects, tasks and repositories UI. Build views wait for request state
+    router.include(dashboardRouter(authenticator, stores, intake));
     router.get("/projects", Role.viewer, (HTTPServerRequest req, HTTPServerResponse res) { res.redirect("/projects/"); });
 
     router.include(repositoryRouter(authenticator, stores));
@@ -165,7 +169,8 @@ void main()
         logInfo("[auth] Worker tokens are signed with the configured signing key.");
 
     registerCoordinationSweep(backends.scheduler);
-    auto router = createRouter(backends, stores, serverConfig.scheduler.callbackSecret,
+    // Resolving a ref runs git and waits for it on the event loop
+    auto router = createRouter(backends, stores, new GitRepositoryResolver(), serverConfig.scheduler.callbackSecret,
         signingKey.key, serverConfig.workerPool.credential, serverConfig.execution.maxAttempts);
     auto settings = createServerSettings(serverConfig.http.port);
     if (serverConfig.http.bindAddress.length > 0)
@@ -185,6 +190,7 @@ unittest
     import confector.core.work_orders : defaultMaxAttempts;
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.fake_repository_resolver : FakeRepositoryResolver;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.core.worker_token : InputArtifact, WorkerTokenClaims, mintWorkerToken, workerTokenHeader;
     import std.datetime.systime : Clock;
@@ -211,7 +217,7 @@ unittest
     execution.status = ExecutionStatus.queued;
     execution.attempts = 1;
     testStores.executions.createIfAbsent(execution);
-    auto router = createRouter(backends, testStores, "test-scheduler-secret", testSigningKey,
+    auto router = createRouter(backends, testStores, new FakeRepositoryResolver(), "test-scheduler-secret", testSigningKey,
         "pool-credential-0123456789abcdef0123456789abcdef", defaultMaxAttempts);
 
     struct Answer { int status; string body; }
@@ -290,6 +296,7 @@ unittest
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.server.authenticator : FixedAuthenticator, Identity, testIdentity;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.fake_repository_resolver : FakeRepositoryResolver;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     Backends backends;
@@ -304,7 +311,7 @@ unittest
     AuthorizedRoutes routesAs(Nullable!Identity identity)
     {
         backends.authenticator = new FixedAuthenticator(identity);
-        return createRouter(backends, testStores, "test-scheduler-secret", signingKey, poolCredential, defaultMaxAttempts);
+        return createRouter(backends, testStores, new FakeRepositoryResolver(), "test-scheduler-secret", signingKey, poolCredential, defaultMaxAttempts);
     }
 
     // The route table: every route as "METHOD path access", where access is the role a user needs or

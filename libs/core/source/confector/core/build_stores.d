@@ -140,8 +140,8 @@ final class ChainStore
         requireValid(next.id == was.id && next.projectId == was.projectId && next.number == was.number
             && next.headline == was.headline && next.createdAt == was.createdAt,
             format("Only the labels and history of chain '%s' can change", was.id));
-        requireValid(next.pins == was.pins,
-            format("The pins of chain '%s' change only by adding pins (ChainStore.addPins)", was.id));
+        requireValid(next.pins == was.pins && next.bindings == was.bindings,
+            format("The pins and bindings of chain '%s' change only by adding them (ChainStore.addPins)", was.id));
         requireValid(next.events.length >= was.events.length && next.events[0 .. was.events.length] == was.events,
             format("The history of chain '%s' can only be appended to", was.id));
         validateChain(next);
@@ -149,21 +149,24 @@ final class ChainStore
     }
 
     /**
-     * Adds `pins` to chain `chainId`'s pins in one compare-and-set, re-reading and merging again
-     * when a concurrent write lands first. Pins only grow: a (repository, ref) the chain already
-     * pins alike (same revision, whatever the display info) is left as it is, and when every pin
-     * is already there nothing is written. Returns the chain as stored afterwards.
+     * Adds `pins` to chain `chainId`'s pins, and `bindings` to its bindings, in one compare-and-set,
+     * re-reading and merging again when a concurrent write lands first. Both only grow: a (repository,
+     * ref) the chain already pins alike (same revision, whatever the display info) is left as it
+     * is, and an input the chain has bound already keeps its binding, whatever `bindings` says
+     * about it. When nothing is new nothing is written. Returns the chain as stored afterwards.
      *
      * Throws: PinConflictException if the chain pins one of the refs to another revision (pins
-     * never change; nothing is written, not even the other new pins; decide again);
-     * InvalidPinsException if a pin is incomplete, has an empty value, or `pins` pins one ref
-     * two ways (caller mistakes); InvalidStateTransitionException if the chain's headline is
-     * `default`, which holds no pins; Exception if the chain does not exist or every one of
-     * maxWriteAttempts attempts lost a compare-and-set.
+     * never change; nothing is written, not even the other new pins or the bindings; decide again);
+     * InvalidPinsException if a pin or binding is incomplete, a pin has an empty value, or `pins`
+     * pins one ref two ways or `bindings` binds one input two ways (caller mistakes);
+     * InvalidStateTransitionException if the chain's headline is `default`, which holds no pins;
+     * Exception if the chain does not exist or every one of maxWriteAttempts attempts lost a
+     * compare-and-set.
      */
-    Versioned!BuildChain addPins(string chainId, in RepositoryPin[] pins)
+    Versioned!BuildChain addPins(string chainId, in RepositoryPin[] pins, in InputBinding[] bindings = null)
     {
         requireNonEmpty(chainId, "Adding pins needs a chain id");
+        const added = bindingMap(bindings);
         foreach (attempt; 0 .. maxWriteAttempts)
         {
             auto current = m_chains.get(chainId);
@@ -171,10 +174,18 @@ final class ChainStore
             requireValid(current.get.headline.kind != HeadlineKind.default_ || pins.length == 0,
                 format("Chain '%s' has the headline default (a project with no repositories), so it holds no pins", chainId));
             const merged = mergePins(current.get.pins, pins);
-            if (merged.length == current.get.pins.length) return current.get;
+            auto mergedBindings = current.get.bindings.dup;
+            const bound = bindingMap(current.get.bindings);
+            foreach (key, ref_; added)
+            {
+                if (key !in bound) mergedBindings ~= InputBinding(key.taskId, key.input, ref_);
+            }
+            mergedBindings.sort!((a, b) => inputKeyLess(inputKey(a), inputKey(b)));
+            if (merged.length == current.get.pins.length && mergedBindings.length == current.get.bindings.length) return current.get;
 
             BuildChain next = current.get.value;
             next.pins = cast(RepositoryPin[]) merged;
+            next.bindings = mergedBindings;
             validateChain(next);
             try
             {
@@ -256,6 +267,7 @@ void validateChain(in BuildChain chain)
     requireTimestamp(chain.createdAt, format("The creation time of chain '%s'", chain.id));
     validateHeadline(chain.headline, format("chain '%s'", chain.id));
     validatePins(chain.pins, format("chain '%s'", chain.id));
+    validateBindings(chain.bindings, format("chain '%s'", chain.id));
     requireValid(chain.headline.kind != HeadlineKind.default_ || chain.pins.length == 0,
         format("Chain '%s' has the headline default (a project with no repositories), so it holds no pins", chain.id));
     foreach (label; chain.labels)
@@ -1615,4 +1627,48 @@ unittest
     assert(active.length == 3 && active[0].id == "e2", "A terminal execution leaves the active index");
     assert(executions.listActive(ExecutionStatus.running, 10).length == 0);
     assert(throwsA!InvalidStateTransitionException({ executions.listActive(ExecutionStatus.failed, 10); }));
+}
+
+unittest
+{
+    // A chain's bindings are well formed when created, and change only through addPins
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+
+    auto chains = new ChainStore(new InMemoryDocumentStore());
+    InputBinding bound(string task, string input, string ref_ = "main")
+    {
+        return InputBinding(task, input, RepositoryRef(RefKind.branch, ref_));
+    }
+
+    InputBinding[][string] malformed = [
+        "unsorted": [bound("test", "src"), bound("compile", "src")],
+        "an input twice": [bound("compile", "src"), bound("compile", "src", "release")],
+        "no ref": [bound("compile", "src", "")],
+        "no task": [bound("", "src")],
+    ];
+    foreach (what, bindings; malformed)
+    {
+        auto chain = sampleChain("game", 9);
+        chain.bindings = bindings;
+        assert(throwsA!InvalidPinsException({ chains.create(chain); }), "Bindings with " ~ what ~ " must be refused");
+    }
+    assert(chains.get("game-9").isNull, "Nothing malformed was written");
+
+    auto chain = sampleChain("game", 1);
+    chain.bindings = [bound("compile", "src"), bound("test", "src")];
+    auto created = chains.create(chain);
+    assert(created.bindings == chain.bindings);
+
+    // update changes labels, never bindings
+    BuildChain relabelled = created.value;
+    relabelled.labels = ["release"];
+    assert(chains.update(created, relabelled).labels == ["release"]);
+    auto current = chains.get(created.id).get;
+    BuildChain rebound = current.value;
+    rebound.bindings = [bound("compile", "src", "release"), bound("test", "src")];
+    assert(throwsA!InvalidStateTransitionException({ chains.update(current, rebound); }), "A binding cannot be changed");
+    BuildChain extended = current.value;
+    extended.bindings ~= bound("zzz", "src");
+    assert(throwsA!InvalidStateTransitionException({ chains.update(current, extended); }), "A binding cannot be added by update");
+    assert(chains.get(created.id).get.bindings == chain.bindings);
 }

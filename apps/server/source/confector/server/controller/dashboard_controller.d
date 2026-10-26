@@ -4,14 +4,17 @@ import vibe.vibe;
 import vibe.core.log : logError;
 import confector.core.builtin_steps : builtinStepTypes, checkoutConfigIssues, checkoutStepType;
 import confector.api.model;
+import confector.core.definition_store : currentDefinition;
 import confector.core.document_collection : tryValue;
+import confector.core.intake : IntakeException, IntakeFailure, IntakeRequest, RequestIntake, repositoryDefaults;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;
 import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes;
-import confector.server.controller.api_controller : buildsNotImplemented;
 
-import std.algorithm : canFind;
+import std.algorithm : all, canFind;
+import std.ascii : isDigit;
+import std.conv : to;
 import std.datetime.systime : Clock;
 import std.format : format;
 import std.string : strip;
@@ -31,6 +34,60 @@ struct DashboardProjectViewModel
     ProjectRecord project;
     DashboardTaskViewModel[] tasks;
     ulong totalTasks;
+}
+
+// One repository's ref field in the build form
+struct BuildFormRow
+{
+    string repository;
+    /// What was entered; empty means the build's own ref for the repository, else the default.
+    string ref_;
+    /// The ref the repository's inputs default to, shown as a hint; empty when they have none or disagree.
+    string defaultRef;
+
+    /// The placeholder of the field.
+    string hint() const
+    {
+        return defaultRef.length > 0 ? defaultRef : "default";
+    }
+}
+
+// What the project page's build form shows: its fields, the error of a refused build, and the
+// number ("#12") of the build just created
+struct BuildForm
+{
+    string error;
+    string created;
+    string[] targets;
+    string chainNumber;
+    BuildFormRow[] refs;
+    // Set when the build was recorded but not yet reconciled
+    string warning;
+}
+
+// The build form of `project` before anything is entered: an empty ref field for each repository its
+// tasks use, with the ref its inputs default to as a hint
+BuildForm buildFormFor(in ProjectRecord project)
+{
+    BuildForm form;
+    foreach (entry; repositoryDefaults(currentDefinition(project))) form.refs ~= BuildFormRow(entry.repositoryId, "", entry.defaultRef);
+    return form;
+}
+
+// The tasks no other task of `tasks` depends on: building them all builds every task
+string[] leafTaskIds(in TaskNode[] tasks)
+{
+    bool[string] upstream;
+    foreach (ref task; tasks)
+    {
+        foreach (id; upstreamTaskIds(task)) upstream[id] = true;
+    }
+    string[] leaves;
+    foreach (ref task; tasks)
+    {
+        if (task.id !in upstream) leaves ~= task.id;
+    }
+    return leaves;
 }
 
 /**
@@ -951,7 +1008,7 @@ unittest
  * Creates the routes for the dashboard pages. Viewing a page needs the viewer role; the editor
  * pages and every action that changes a project, task or build need member.
  */
-AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores)
+AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores, RequestIntake intake = null)
 {
     auto router = new AuthorizedRoutes(authenticator);
 
@@ -966,6 +1023,14 @@ AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores
         string[][] stepIssues = taskStepRowIssues(form.stepRows, shownRepositoryInputs(form.inputRows));
         const stepTypes = builtinStepTypes;
         res.render!("project/task-editor.dt", project, task, repositories, form, stepIssues, stepTypes, formError);
+    }
+
+    // Renders the project page with `buildForm`: empty fields, or what was entered when a build was
+    // refused, or the number of the build just created.
+    void renderProjectDetails(HTTPServerResponse res, ProjectRecord project, BuildForm buildForm)
+    {
+        string tasksJson = serializeToJson(project.tasks).toString();
+        res.render!("project/project-details.dt", project, tasksJson, buildForm);
     }
 
     // Renders the project editor with the task graph text as submitted, or as stored. `formError`
@@ -1059,8 +1124,11 @@ AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores
             project.name = "Unknown Project";
         }
 
-        string tasksJson = serializeToJson(project.tasks).toString();
-        res.render!("project/project-details.dt", project, tasksJson);
+        auto buildForm = buildFormFor(project);
+        const created = req.query.get("build", "");
+        if (created.length > 0 && created.all!isDigit) buildForm.created = "#" ~ created;
+        if (req.query.get("warning", "").length > 0) buildForm.warning = "Reconcile is pending; the sweep will retry it.";
+        renderProjectDetails(res, project, buildForm);
     });
 
     router.get("/projects/edit", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
@@ -1298,10 +1366,96 @@ AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores
         res.redirect("/projects/details?id=" ~ projId);
     });
 
-    // Run a project, or a task and its upstream tasks. Not implemented until request intake
-    // (see buildsNotImplemented): the request fails loudly.
+    // Starts a build of the project (`id`) through the same intake as the API: the tasks to build
+    // (`target_task_id`, repeated; or `all` for every task), a ref for each repository
+    // (`ref_repository` and `ref_name`, repeated in step; an empty name means the build's own ref, else the inputs' defaults) and
+    // optionally the number of an existing build (`chain_number`). A refused build shows the project
+    // page again with the message and what was entered; a recorded one redirects to the project page,
+    // which shows the build's number.
     router.post("/projects/run", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
-        throw new HTTPStatusException(HTTPStatus.notImplemented, buildsNotImplemented().msg);
+        const projectId = req.form.get("id", "");
+        ProjectRecord project;
+        if (stores is null || !stores.projects.get(projectId).tryValue(project))
+        {
+            throw new HTTPStatusException(HTTPStatus.notFound, format("Project '%s' does not exist", projectId));
+        }
+        if (intake is null) throw new HTTPStatusException(HTTPStatus.internalServerError, "Request intake is not configured");
+
+        auto form = buildFormFor(project);
+        foreach (target; req.form.getAll("target_task_id")) form.targets ~= target;
+        form.chainNumber = req.form.get("chain_number", "").strip;
+        const repositories = req.form.getAll("ref_repository");
+        const names = req.form.getAll("ref_name");
+        HTTPStatus refused = HTTPStatus.ok;
+        if (repositories.length != names.length)
+        {
+            form.error = "The form has a different number of repository fields and ref fields";
+            refused = HTTPStatus.badRequest;
+        }
+        else if (repositories.length > 0)
+        {
+            // Keep the default hints of the repositories shown, and what was entered for each
+            string[string] hints;
+            foreach (row; form.refs) hints[row.repository] = row.defaultRef;
+            form.refs = null;
+            foreach (i; 0 .. repositories.length) form.refs ~= BuildFormRow(repositories[i], names[i].strip, hints.get(repositories[i], ""));
+        }
+        const buildAll = req.form.get("all", "").length > 0;
+        if (buildAll && form.targets.length > 0)
+        {
+            form.error = "Choose tasks to build, or all of them, not both";
+            refused = HTTPStatus.badRequest;
+        }
+
+        IntakeRequest request;
+        request.projectId = projectId;
+        request.targets = buildAll ? leafTaskIds(project.tasks) : form.targets;
+        foreach (row; form.refs)
+        {
+            if (row.ref_.length > 0) request.refs[row.repository] = row.ref_;
+        }
+        auto caller = authenticator.authenticate(req);
+        request.requestedBy = caller.isNull ? "" : caller.get.subject;
+
+        if (refused == HTTPStatus.ok && form.chainNumber.length > 0)
+        {
+            if (form.chainNumber.all!isDigit && form.chainNumber != "0") request.chainNumber = form.chainNumber.to!ulong;
+            else
+            {
+                form.error = "The build number must be a positive whole number";
+                refused = HTTPStatus.badRequest;
+            }
+        }
+        if (refused == HTTPStatus.ok)
+        {
+            try
+            {
+                const result = intake.intake(request);
+                res.redirect(format("/projects/details?id=%s&build=%s", urlEncode(projectId), result.chainNumber));
+                return;
+            }
+            catch (IntakeException e)
+            {
+                if (e.failure == IntakeFailure.reconcileFailed)
+                {
+                    // Recorded: an error page would invite a duplicate request
+                    logError("[dashboard] %s", e.msg);
+                    res.redirect(format("/projects/details?id=%s&build=%s&warning=1", urlEncode(projectId), e.recorded.chainNumber));
+                    return;
+                }
+                final switch (e.failure)
+                {
+                    case IntakeFailure.notFound: refused = HTTPStatus.notFound; break;
+                    case IntakeFailure.invalid: refused = HTTPStatus.badRequest; break;
+                    case IntakeFailure.refused: refused = HTTPStatus.unprocessableEntity; break;
+                    case IntakeFailure.conflict: refused = HTTPStatus.conflict; break;
+                    case IntakeFailure.reconcileFailed: assert(false, "handled above");
+                }
+                form.error = e.msg;
+            }
+        }
+        res.statusCode = refused;
+        renderProjectDetails(res, project, form);
     });
 
     // Task Details View (Static definition, configuration, steps and dependencies)
@@ -1592,12 +1746,131 @@ unittest
     assert(failedTaskDelete.status == HTTPStatus.internalServerError
         && failedTaskDelete.body.canFind("Failed to delete task: store unavailable"), failedTaskDelete.body);
     assert(stores.projects.get("proj_dash_1").get.tasks == storedProjectTasks, "A task that failed to delete is kept");
+}
 
-    // Running a project fails loudly until request intake lands
-    auto runReq = createTestHTTPServerRequest(URL("http://localhost/projects/run"), HTTPMethod.POST);
-    auto runRes = createTestHTTPServerResponse();
-    bool notImplemented = false;
-    try router.handleRequest(runReq, runRes);
-    catch (HTTPStatusException e) notImplemented = e.status == HTTPStatus.notImplemented && e.msg == buildsNotImplemented().msg;
-    assert(notImplemented);
+unittest
+{
+    // The project page's build form: what it shows, what it starts, and how a refused build is shown
+    import confector.core.definition_store : currentDefinition;
+    import confector.core.intake : RequestIntake;
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    import confector.testing.fake_repository_resolver : FakeRepositoryResolver;
+    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import std.algorithm.searching : canFind;
+    import std.uri : encodeComponent;
+    import vibe.inet.message : InetHeaderMap;
+    import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+    auto documents = new InterleavingDocumentStore(new InMemoryDocumentStore());
+    auto stores = new StateStores(documents);
+    RepositoryRecord game;
+    game.name = "game";
+    game.address = "https://example.test/game.git";
+    stores.repositories.put(game);
+    TaskNode compile;
+    compile.id = "compile";
+    compile.inputs["src"] = repositoryInput("game", RefSpec.fromString("main"));
+    compile.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
+    TaskNode test;
+    test.id = "test";
+    test.inputs["bin"] = taskOutputInput("compile");
+    TaskNode lint;
+    lint.id = "lint";
+    lint.inputs["src"] = repositoryInput("game", RefSpec.fromString("main"));
+    ProjectRecord project;
+    project.id = "game";
+    project.name = "The Game";
+    project.tasks = [compile, test, lint];
+    stores.projects.put(project);
+
+    auto resolver = new FakeRepositoryResolver();
+    resolver.add("game", "main", "aaa111");
+    resolver.add("game", "release", "rel111");
+    auto intake = new RequestIntake(stores, resolver);
+
+    // Runs `action` just before the `n`th write (1 for the next one) through `store`
+    void beforeWrite(InterleavingDocumentStore store, size_t n, void delegate() action)
+    {
+        store.beforeNextWrite = n == 1 ? action : () { beforeWrite(store, n - 1, action); };
+    }
+
+    struct Answer { int status; string body; }
+    Answer askAs(AuthorizedRoutes router, HTTPMethod method, string path, string[2][] form = null)
+    {
+        import std.array : join;
+
+        string[] pairs;
+        foreach (field; form) pairs ~= encodeComponent(field[0]) ~ "=" ~ encodeComponent(field[1]);
+        InetHeaderMap headers;
+        headers["Content-Type"] = "application/x-www-form-urlencoded";
+        auto req = createTestHTTPServerRequest(URL("http://localhost" ~ path), method, headers,
+            createMemoryStream(cast(ubyte[]) pairs.join("&").dup, false));
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
+        router.handleRequest(req, res);
+        res.finalize();
+        return Answer(res.statusCode, cast(string) sink.data.idup);
+    }
+    auto router = dashboardRouter(new FixedAuthenticator(testIdentity(Role.member)), stores, intake);
+    Answer ask(HTTPMethod method, string path, string[2][] form = null) { return askAs(router, method, path, form); }
+
+    // The form lists the tasks and an empty ref field for each repository, with the default as a hint
+    auto page = ask(HTTPMethod.GET, "/projects/details?id=game");
+    assert(page.status == HTTPStatus.ok && page.body.canFind(`action="/projects/run"`) && page.body.canFind(`name="target_task_id" value="lint"`), page.body);
+    assert(page.body.canFind(`name="ref_repository" value="game"`) && page.body.canFind(`name="ref_name" value=""`) && page.body.canFind(`placeholder="main"`), page.body);
+    assert(page.body.canFind(`name="chain_number"`) && !page.body.canFind("build-created") && !page.body.canFind("build-error"));
+
+    // A build starts through intake, and the page redirected to shows its number
+    auto started = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["ref_repository", "game"], ["ref_name", "main"], ["chain_number", ""]]);
+    assert(started.status == HTTPStatus.found && started.body.canFind("/projects/details?id=game&build=1"), started.body);
+    assert(stores.chains.findByNumber("game", 1).get.pins.length == 1);
+    const requests = stores.requests.listForProject("game", 10);
+    assert(requests.length == 1 && requests[0].targets == ["test"] && requests[0].requestedBy == "test-user");
+    assert(ask(HTTPMethod.GET, "/projects/details?id=game&build=1").body.canFind("Created build #1."));
+
+    // Another request on that build, with another ref for the repository; a button that names only a
+    // task still works, and `all` builds every task
+    auto onBuild = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "compile"], ["ref_repository", "game"], ["ref_name", "release"], ["chain_number", "1"]]);
+    assert(onBuild.status == HTTPStatus.found && onBuild.body.canFind("build=1"), onBuild.body);
+    assert(stores.chains.findByNumber("game", 1).get.pins.length == 2, "The other ref is another pin of the same build");
+    assert(ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "lint"]]).body.canFind("build=2"));
+    assert(ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["all", "1"]]).body.canFind("build=3"));
+    auto everything = stores.requests.listForChain(stores.chains.findByNumber("game", 3).get.id);
+    assert(everything.length == 1 && everything[0].targets == ["test", "lint"], "The tasks nothing depends on");
+
+    // A refused build shows the page again with the message and what was entered
+    auto unresolvable = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["target_task_id", "lint"], ["ref_repository", "game"], ["ref_name", "missing"]]);
+    assert(unresolvable.status == HTTPStatus.unprocessableEntity && unresolvable.body.canFind("build-error") && unresolvable.body.canFind("game/missing"), unresolvable.body);
+    assert(unresolvable.body.canFind(`name="ref_name" value="missing"`) && unresolvable.body.canFind(`placeholder="main"`), "What was entered is kept");
+    assert(stores.chains.listForProject("game", 10).length == 3, "A refused build creates no build");
+    auto noTarget = ask(HTTPMethod.POST, "/projects/run", [["id", "game"]]);
+    assert(noTarget.status == HTTPStatus.badRequest && noTarget.body.canFind("no target"), noTarget.body);
+    auto badNumber = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["chain_number", "abc"]]);
+    assert(badNumber.status == HTTPStatus.badRequest && badNumber.body.canFind("positive whole number") && badNumber.body.canFind(`value="abc"`), badNumber.body);
+    auto noSuchBuild = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["chain_number", "99"]]);
+    assert(noSuchBuild.status == HTTPStatus.notFound && noSuchBuild.body.canFind("Build #99"), noSuchBuild.body);
+
+    // Fields that disagree are a 400
+    auto mismatched = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["ref_repository", "game"]]);
+    assert(mismatched.status == HTTPStatus.badRequest && mismatched.body.canFind("different number"), mismatched.body);
+    auto bothWays = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["all", "1"]]);
+    assert(bothWays.status == HTTPStatus.badRequest && bothWays.body.canFind("not both"), bothWays.body);
+
+    // A build recorded but not reconciled redirects with a warning, not an error that invites a repeat
+    const before = stores.requests.listForProject("game", 100).length;
+    beforeWrite(documents, 3, () { throw new Exception("store unavailable"); });
+    auto pending = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["chain_number", "1"]]);
+    assert(pending.status == HTTPStatus.found && pending.body.canFind("build=1&warning=1"), pending.body);
+    assert(stores.requests.listForProject("game", 100).length == before + 1);
+    assert(ask(HTTPMethod.GET, "/projects/details?id=game&build=1&warning=1").body.canFind("build-warning"));
+
+    // An unknown project is a 404, and a viewer may not build
+    bool notFound = false;
+    try ask(HTTPMethod.POST, "/projects/run", [["id", "nope"], ["target_task_id", "test"]]);
+    catch (HTTPStatusException e) notFound = e.status == HTTPStatus.notFound;
+    assert(notFound);
+    auto viewer = dashboardRouter(new FixedAuthenticator(testIdentity(Role.viewer)), stores, intake);
+    assert(askAs(viewer, HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"]]).status == HTTPStatus.forbidden);
+    assert(askAs(viewer, HTTPMethod.GET, "/projects/details?id=game").status == HTTPStatus.ok);
+    assert(stores.chains.listForProject("game", 10).length == 3);
 }

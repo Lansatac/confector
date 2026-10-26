@@ -1030,6 +1030,12 @@ struct BuildChain
     /// requests' pins, read to find the pins of a new request and to check one: evaluation never
     /// reads it.
     @optional RepositoryPin[] pins;
+    /// The ref each repository input was first bound to: every input of the definition when the
+    /// chain was created, plus inputs first bound by later requests. At most one per input, sorted
+    /// by (task, input). Grow-only: the first binding is kept, so binding an input to another ref
+    /// later adds a pin but leaves this unchanged. A request that names no ref for an input binds
+    /// it to the chain's binding.
+    @optional InputBinding[] bindings;
     @asName("created_at") string createdAt;
     /// User-editable labels, separate from the number.
     @optional string[] labels;

@@ -49,6 +49,7 @@ block maincontent
                 a.btn.btn-sm.btn-outline(href="/projects/details?id=#{p.project.id}", title="View DAG graph and details") View DAG
                 form(method="POST", action="/projects/run", style="display: inline-block; margin: 0;")
                   input(type="hidden", name="id", value="#{p.project.id}")
+                  input(type="hidden", name="all", value="1")
                   button.btn.btn-sm.btn-primary(type="submit", title="Execute all tasks in this project") ⚡ Run All
 
             div.accordion-content(id="project-content-#{p.project.id}")

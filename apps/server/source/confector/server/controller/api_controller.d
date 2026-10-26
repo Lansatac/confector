@@ -4,6 +4,7 @@ import vibe.vibe;
 import confector.api.model;
 import confector.core.dag;
 import confector.core.document_collection : tryValue;
+import confector.core.intake : IntakeException, IntakeFailure, IntakeRequest, IntakeResult, RequestIntake;
 import confector.core.not_implemented : NotImplementedException;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, requireCurrentAttempt, requireExecution, requireSigningKey,
@@ -23,13 +24,13 @@ import std.uuid : randomUUID;
 import std.datetime.systime : Clock;
 
 /**
- * Why the routes that start builds fail: starting a build waits for request intake (bead
- * confector-z7z.23.7), the first part of the chain path to accept a request. The routes answer
- * 501 Not Implemented with this exception's message.
+ * Why the scheduler's route that starts builds fails: scheduled builds need trigger rules and
+ * request intake from a schedule, which come after manual requests. The
+ * route answers 501 Not Implemented with this exception's message.
  */
-NotImplementedException buildsNotImplemented()
+NotImplementedException scheduledBuildsNotImplemented()
 {
-    return new NotImplementedException("Starting builds", "confector-z7z.23.7");
+    return new NotImplementedException("Scheduled builds", "confector-z7z.24.4");
 }
 
 /**
@@ -40,6 +41,79 @@ NotImplementedException buildsNotImplemented()
 NotImplementedException logsNotImplemented()
 {
     return new NotImplementedException("Build logs", "confector-z7z.31.12");
+}
+
+/// The answer to a request that was recorded.
+private Json runAnswer(in IntakeResult result)
+{
+    Json answer = Json.emptyObject;
+    answer["request_id"] = Json(result.requestId);
+    answer["chain_id"] = Json(result.chainId);
+    answer["chain_number"] = Json(result.chainNumber);
+    return answer;
+}
+
+/**
+ * Reads the body of a request to start a build (see the route's comment).
+ *
+ * Throws: IntakeException (invalid) if the body is not an object of the documented shape.
+ */
+IntakeRequest parseRunRequest(in Json body)
+{
+    void invalid(string message) { throw new IntakeException(IntakeFailure.invalid, message); }
+
+    if (body.type != Json.Type.object) invalid("The body must be a JSON object");
+    IntakeRequest request;
+    bool hasProject;
+    foreach (string key, value; body)
+    {
+        switch (key)
+        {
+            case "project_id":
+                if (value.type != Json.Type.string) invalid("'project_id' must be a string");
+                request.projectId = value.get!string;
+                hasProject = true;
+                break;
+            case "targets":
+                if (value.type != Json.Type.array) invalid("'targets' must be an array of task ids");
+                foreach (target; value)
+                {
+                    if (target.type != Json.Type.string) invalid("'targets' must be an array of task ids");
+                    request.targets ~= target.get!string;
+                }
+                break;
+            case "intent":
+                if (value.type != Json.Type.string) invalid("'intent' must be \"build\", \"retry\" or \"rerun\"");
+                bool known;
+                foreach (intent; [BuildIntent.build, BuildIntent.retry, BuildIntent.rerun])
+                {
+                    if (cast(string) intent == value.get!string)
+                    {
+                        request.intent = intent;
+                        known = true;
+                    }
+                }
+                if (!known) invalid("'intent' must be \"build\", \"retry\" or \"rerun\"");
+                break;
+            case "chain":
+                if (value.type == Json.Type.string && value.get!string.length > 0) request.chainId = value.get!string;
+                else if (value.type == Json.Type.int_ && value.get!long > 0) request.chainNumber = cast(ulong) value.get!long;
+                else invalid("'chain' must be a chain id or a positive chain number");
+                break;
+            case "refs":
+                if (value.type != Json.Type.object) invalid("'refs' must be an object of ref names by repository id");
+                foreach (string repository, name; value)
+                {
+                    if (name.type != Json.Type.string) invalid("'refs' must be an object of ref names by repository id");
+                    request.refs[repository] = name.get!string;
+                }
+                break;
+            default:
+                invalid(format("Unknown field '%s'", key));
+        }
+    }
+    if (!hasProject) invalid("'project_id' is required");
+    return request;
 }
 
 /**
@@ -53,7 +127,7 @@ NotImplementedException logsNotImplemented()
  * identity.
  */
 AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential,
-    uint maxAttempts, StateStores stores = null)
+    uint maxAttempts, StateStores stores = null, RequestIntake intake = null)
 {
     requireSigningKey(workerTokenKey);
     requireWorkerPoolCredential(workerPoolCredential);
@@ -362,14 +436,71 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         }
     });
 
-    // Starting a build of a project fails loudly until request intake lands (see
-    // buildsNotImplemented). The scheduler calls the second route for cron trigger rules.
+    // Starts a build of a project: records a request on a new chain or an existing one and reconciles
+    // it (see confector.core.intake). The body is a JSON object:
+    //
+    //     {
+    //       "project_id": "<project id>",
+    //       "targets": ["<task id>", ...],
+    //       "intent": "build" | "retry" | "rerun",       optional, default "build"
+    //       "chain": "<chain id>" | <chain number>,      optional; without it a new chain is created
+    //       "refs": {"<repository id>": "<ref name>"}    optional; other repositories use the inputs' defaults
+    //     }
+    //
+    // A retry or a rerun needs a chain, and a rerun exactly one target. Answers 201 with
+    // {"request_id", "chain_id", "chain_number"}. A malformed body is 400, an unknown project or chain
+    // 404, a supplied pin that disagrees with the chain 409, a request that cannot be bound or resolved
+    // (an input without a ref, a ref that does not exist, an unknown target) 422, and a request that
+    // was recorded but could not be reconciled 201 with a "warning" field (the sweep reconciles it).
+    // The scheduler calls the second route for cron trigger rules.
     postRoute("/projects/run", Role.member, (HTTPServerRequest req, HTTPServerResponse res) {
-        writeNotImplemented(res, buildsNotImplemented());
+        if (!requireStores(res)) return;
+        if (intake is null)
+        {
+            writeError(res, HTTPStatus.internalServerError, "This route needs request intake, which is not configured");
+            return;
+        }
+        auto caller = authenticator.authenticate(req);
+        try
+        {
+            Json body;
+            try body = req.json;
+            catch (Exception e) throw new IntakeException(IntakeFailure.invalid, format("The body is not JSON: %s", e.msg), e);
+            IntakeRequest request = parseRunRequest(body);
+            request.requestedBy = caller.isNull ? "" : caller.get.subject;
+            const result = intake.intake(request);
+            res.statusCode = HTTPStatus.created;
+            res.writeJsonBody(runAnswer(result));
+        }
+        catch (IntakeException e)
+        {
+            Json err = Json.emptyObject;
+            err["error"] = Json(e.msg);
+            final switch (e.failure)
+            {
+                case IntakeFailure.notFound: res.statusCode = HTTPStatus.notFound; break;
+                case IntakeFailure.invalid: res.statusCode = HTTPStatus.badRequest; break;
+                case IntakeFailure.refused: res.statusCode = HTTPStatus.unprocessableEntity; break;
+                case IntakeFailure.conflict: res.statusCode = HTTPStatus.conflict; break;
+                case IntakeFailure.reconcileFailed:
+                    // Recorded: answering an error would invite a duplicate request
+                    res.statusCode = HTTPStatus.created;
+                    err = runAnswer(e.recorded);
+                    err["warning"] = Json("reconcile pending; the sweep will retry");
+                    logError("[api] %s", e.msg);
+                    break;
+            }
+            res.writeJsonBody(err);
+        }
+        catch (Exception e)
+        {
+            logError("[api] Could not start a build: %s", e.toString());
+            writeError(res, HTTPStatus.internalServerError, format("Could not start a build: %s", e.msg));
+        }
     });
 
     schedulerRoute("/projects/:id/run", (HTTPServerRequest req, HTTPServerResponse res) {
-        writeNotImplemented(res, buildsNotImplemented());
+        writeNotImplemented(res, scheduledBuildsNotImplemented());
     });
 
     // One tick of the coordination sweep, which the server registers to run every minute (see
@@ -708,8 +839,7 @@ unittest
     router.handleRequest(unauthReq, unauthRes);
     assert(unauthRes.statusCode == HTTPStatus.unauthorized);
 
-    // With the secret the callback reaches its handler, which fails loudly: starting builds waits
-    // for request intake
+    // With the secret the callback reaches its handler, which fails loudly
     auto authReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/proj_api_1/run"), HTTPMethod.POST);
     authReq.headers["X-Confector-Scheduler-Secret"] = "test-scheduler-secret";
     auto authRes = createTestHTTPServerResponse();
@@ -811,20 +941,8 @@ unittest
         return parseJsonString(reply.body[reply.body.indexOf('{') .. $]);
     }
 
-    assert(post("/projects/run", `{"project_id": "proj_api_1"}`) == HTTPStatus.notImplemented);
-    {
-        InetHeaderMap runHeaders;
-        runHeaders["Content-Type"] = "application/json";
-        auto runReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/run"),
-            HTTPMethod.POST, runHeaders, createMemoryStream(cast(ubyte[]) `{"project_id": "proj_api_1"}`.dup, false));
-        auto sink = createMemoryOutputStream();
-        auto runRes = createTestHTTPServerResponse(sink);
-        routerWithStores.handleRequest(runReq, runRes);
-        runRes.finalize();
-        const written = cast(string) sink.data;
-        assert(written.canFind(`"bead":"confector-z7z.23.7"`), written);
-        assert(written.canFind(buildsNotImplemented().msg), written);
-    }
+    // Without request intake configured the run route fails loudly instead of doing nothing
+    assert(post("/projects/run", `{"project_id": "proj_api_1", "targets": ["n1"]}`) == HTTPStatus.internalServerError);
 
     import confector.core.fingerprint_ledger : ClaimOutcome;
     import confector.core.work_orders : claimWork, startExecution;
@@ -1236,4 +1354,133 @@ version (unittest)
         auto written = cast(string) sink.data.idup;
         return SweepAnswer(res.statusCode, written.findSplit("\r\n\r\n")[2]);
     }
+}
+
+unittest
+{
+    // Starting a build through the API: the statuses, the roles, and what is recorded
+    import confector.api.model : ProjectRecord, RepositoryRecord;
+    import confector.core.work_orders : defaultMaxAttempts;
+    import confector.server.authenticator : FixedAuthenticator, Identity, testIdentity;
+    import confector.testing.fake_repository_resolver : FakeRepositoryResolver;
+    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import std.algorithm.searching : canFind;
+    import std.string : indexOf;
+    import std.typecons : Nullable;
+    import vibe.inet.message : InetHeaderMap;
+    import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+    enum workerTokenKey = "0123456789abcdef0123456789abcdef";
+    enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    RepositoryRecord game;
+    game.name = "game";
+    game.address = "https://example.test/game.git";
+    stores.repositories.put(game);
+    TaskNode compile;
+    compile.id = "compile";
+    compile.inputs["src"] = repositoryInput("game", RefSpec.fromString("main"));
+    compile.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
+    TaskNode test;
+    test.id = "test";
+    test.inputs["bin"] = taskOutputInput("compile");
+    ProjectRecord project;
+    project.id = "game";
+    project.tasks = [compile, test];
+    stores.projects.put(project);
+
+    auto resolver = new FakeRepositoryResolver();
+    resolver.add("game", "main", "aaa111");
+    resolver.add("game", "release", "rel111");
+    auto intake = new RequestIntake(stores, resolver);
+
+    // Runs `action` just before the `n`th write (1 for the next one) through `store`
+    void beforeWrite(InterleavingDocumentStore store, size_t n, void delegate() action)
+    {
+        store.beforeNextWrite = n == 1 ? action : () { beforeWrite(store, n - 1, action); };
+    }
+
+    AuthorizedRoutes routerFor(Nullable!Identity identity)
+    {
+        return apiRouter(new FixedAuthenticator(identity), "test-scheduler-secret", workerTokenKey, workerPoolCredential,
+            defaultMaxAttempts, stores, intake);
+    }
+
+    struct Reply { int status; string body; }
+    Reply run(AuthorizedRoutes router, string body)
+    {
+        InetHeaderMap headers;
+        headers["Content-Type"] = "application/json";
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1/projects/run"), HTTPMethod.POST, headers,
+            createMemoryStream(cast(ubyte[]) body.dup, false));
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
+        router.handleRequest(req, res);
+        res.finalize();
+        const written = cast(string) sink.data.idup;
+        return Reply(res.statusCode, written.indexOf('{') < 0 ? "" : written[written.indexOf('{') .. $]);
+    }
+
+    // Roles: a member may start builds; a viewer is refused and nobody is not let in
+    assert(run(routerFor(Nullable!Identity.init), `{"project_id": "game", "targets": ["compile"]}`).status == HTTPStatus.unauthorized);
+    assert(run(routerFor(testIdentity(Role.viewer)), `{"project_id": "game", "targets": ["compile"]}`).status == HTTPStatus.forbidden);
+    assert(stores.chains.listForProject("game", 10).length == 0, "Refused requests record nothing");
+
+    auto member = routerFor(testIdentity(Role.member));
+    auto created = run(member, `{"project_id": "game", "targets": ["test"]}`);
+    assert(created.status == HTTPStatus.created, created.body);
+    auto answer = parseJsonString(created.body);
+    assert(answer["chain_number"].get!long == 1 && answer["chain_id"].get!string.length > 0 && answer["request_id"].get!string.length > 0);
+    auto recorded = stores.requests.get(answer["request_id"].get!string).get.value;
+    assert(recorded.requestedBy == "test-user" && recorded.chainId == answer["chain_id"].get!string && recorded.targets == ["test"]);
+    assert(recorded.intent == BuildIntent.build, "The intent defaults to build");
+
+    // A recorded request whose reconcile failed is still a 201, with a warning, so it is not repeated
+    {
+        auto failing = new InterleavingDocumentStore(new InMemoryDocumentStore());
+        auto failingStores = new StateStores(failing);
+        failingStores.repositories.put(game);
+        failingStores.projects.put(project);
+        auto failingRouter = apiRouter(new FixedAuthenticator(testIdentity(Role.member)), "test-scheduler-secret", workerTokenKey,
+            workerPoolCredential, defaultMaxAttempts, failingStores, new RequestIntake(failingStores, resolver));
+        // The writes of a first build: its definition, number, chain, request and state; then the claim
+        beforeWrite(failing, 6, () { throw new Exception("store unavailable"); });
+        auto pending = run(failingRouter, `{"project_id": "game", "targets": ["compile"]}`);
+        assert(pending.status == HTTPStatus.created, pending.body);
+        auto pendingAnswer = parseJsonString(pending.body);
+        assert(pendingAnswer["warning"].get!string.canFind("reconcile pending") && pendingAnswer["chain_number"].get!long == 1, pending.body);
+        assert(failingStores.requests.listForProject("game", 10).length == 1);
+    }
+
+    // A later request on the chain, by number or by id, with a ref for the repository
+    auto byNumber = run(member, `{"project_id": "game", "targets": ["compile"], "chain": 1, "refs": {"game": "release"}}`);
+    assert(byNumber.status == HTTPStatus.created, byNumber.body);
+    assert(parseJsonString(byNumber.body)["chain_id"] == answer["chain_id"] && parseJsonString(byNumber.body)["chain_number"].get!long == 1);
+    assert(stores.chains.get(answer["chain_id"].get!string).get.pins.length == 2, "Another ref is another pin");
+    const byId = run(member, `{"project_id": "game", "targets": ["compile"], "intent": "retry", "chain": "` ~ answer["chain_id"].get!string ~ `"}`);
+    assert(byId.status == HTTPStatus.created, byId.body);
+    assert(stores.requests.get(parseJsonString(byId.body)["request_id"].get!string).get.intent == BuildIntent.retry);
+    const rerun = run(member, `{"project_id": "game", "targets": ["compile"], "intent": "rerun", "chain": 1}`);
+    assert(rerun.status == HTTPStatus.created, rerun.body);
+
+    // A malformed body is 400, with a message
+    foreach (malformed; [`[]`, `not json`, `{"targets": ["compile"]}`, `{"project_id": "game", "targets": "compile"}`,
+        `{"project_id": "game", "targets": [1]}`, `{"project_id": "game", "targets": []}`, `{"project_id": "game", "targets": ["compile"], "intent": "fly"}`,
+        `{"project_id": "game", "targets": ["compile"], "chain": 0}`, `{"project_id": "game", "targets": ["compile"], "chain": ""}`, `{"project_id": "game", "targets": ["compile"], "chain": true}`,
+        `{"project_id": "game", "targets": ["compile"], "refs": {"game": 1}}`, `{"project_id": "game", "targets": ["compile"], "extra": 1}`,
+        `{"project_id": "game", "targets": ["compile"], "intent": "rerun"}`])
+    {
+        const reply = run(member, malformed);
+        assert(reply.status == HTTPStatus.badRequest && parseJsonString(reply.body)["error"].get!string.length > 0, malformed ~ ": " ~ reply.body);
+    }
+
+    // Unknown project and chain are 404; a request that cannot be bound or resolved is 422
+    assert(run(member, `{"project_id": "nope", "targets": ["compile"]}`).status == HTTPStatus.notFound);
+    assert(run(member, `{"project_id": "game", "targets": ["compile"], "chain": 99}`).status == HTTPStatus.notFound);
+    assert(run(member, `{"project_id": "game", "targets": ["compile"], "chain": "nope"}`).status == HTTPStatus.notFound);
+    const unknownTarget = run(member, `{"project_id": "game", "targets": ["nope"]}`);
+    assert(unknownTarget.status == HTTPStatus.unprocessableEntity && parseJsonString(unknownTarget.body)["error"].get!string.canFind("'nope'"));
+    const unresolvable = run(member, `{"project_id": "game", "targets": ["compile"], "refs": {"game": "missing"}}`);
+    assert(unresolvable.status == HTTPStatus.unprocessableEntity && parseJsonString(unresolvable.body)["error"].get!string.canFind("game/missing"), unresolvable.body);
+    assert(stores.chains.listForProject("game", 10).length == 1, "A refused request created no chain");
 }
