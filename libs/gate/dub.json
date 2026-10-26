@@ -1,0 +1,42 @@
+{
+	"name": "gate",
+	"description": "The Milestone 1 end-to-end gate: builds started through the API and run by workers over HTTP, against the in-memory store and MongoDB. Test-only: its unittest configurations are the only ones that do anything.",
+	"targetType": "library",
+	"targetName": "confector_gate",
+	"targetPath": "../../out/lib",
+	"dependencies": {
+		"confector:api": {
+			"path": "../.."
+		},
+		"confector:core": {
+			"path": "../.."
+		},
+		"confector:server": {
+			"path": "../.."
+		},
+		"confector:testing": {
+			"path": "../.."
+		},
+		"confector:document-store-mongo": {
+			"path": "../.."
+		},
+		"vibe-d": "~>0.10.3"
+	},
+	"subConfigurations": {
+		"confector:server": "library"
+	},
+	"configurations": [
+		{
+			"name": "library"
+		},
+		{
+			"name": "unittest"
+		},
+		{
+			"name": "unittest-mongo",
+			"versions": [
+				"ConfectorGateMongo"
+			]
+		}
+	]
+}

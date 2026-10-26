@@ -17,7 +17,7 @@ import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
 import confector.core.sweep : sweepCoordination;
 import confector.core.work_orders : InvalidLeaseRequestException, LeaseAnswer, UnknownExecutionException, claimWork, completeExecution,
-    finishExecution, heartbeatExecution, leaseOfSeconds, releaseExecution, requireAttemptLimit;
+    finishExecution, heartbeatExecution, leaseOfSeconds, releaseExecution, requireAttemptLimit, utcNow;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -125,14 +125,19 @@ IntakeRequest parseRunRequest(in Json body)
  * out; the routes a worker calls once it holds a work order (heartbeat, release, logs,
  * completion) need that token, signed with `workerTokenKey`. Neither is reached by a user
  * identity.
+ *
+ * The worker and sweep routes read lease and sweep times from `now` (default `utcNow`), so that a
+ * test can move time forward without sleeping. Worker tokens stay on the real clock: they are
+ * issued and checked against it whatever `now` says.
  */
 AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallbackSecret, string workerTokenKey, string workerPoolCredential,
-    uint maxAttempts, StateStores stores = null, RequestIntake intake = null)
+    uint maxAttempts, StateStores stores = null, RequestIntake intake = null, string delegate() now = null)
 {
     requireSigningKey(workerTokenKey);
     requireWorkerPoolCredential(workerPoolCredential);
     requireAttemptLimit(maxAttempts);
     auto router = new AuthorizedRoutes(authenticator);
+    string delegate() clock = now !is null ? now : () => utcNow();
 
     enum string apiPrefix = "/api/v1";
 
@@ -237,7 +242,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
             }
             while (true)
             {
-                auto claimed = claimWork(stores, workerId, lease);
+                auto claimed = claimWork(stores, workerId, lease, clock());
                 if (claimed.isNull)
                 {
                     res.statusCode = HTTPStatus.noContent;
@@ -257,7 +262,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
                     // and hand out the next one.
                     logError("[api] Failing execution '%s': it cannot be given a worker token: %s", work.workOrder.executionId, e.msg);
                     finishExecution(stores, work.workOrder.executionId, ExecutionStatus.failed, 1,
-                        "The execution could not be dispatched: " ~ e.msg, null);
+                        "The execution could not be dispatched: " ~ e.msg, null, clock());
                     continue;
                 }
                 Json answer = Json.emptyObject;
@@ -326,7 +331,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         if (!permitWorker(req, res, { requireCurrentAttempt(claims, attempt); })) return;
         try
         {
-            writeLeaseAnswer(res, heartbeatExecution(stores, executionId, attempt, lease));
+            writeLeaseAnswer(res, heartbeatExecution(stores, executionId, attempt, lease, clock()));
         }
         catch (UnknownExecutionException e) writeError(res, HTTPStatus.notFound, e.msg);
         catch (InvalidLeaseRequestException e) writeError(res, HTTPStatus.badRequest, e.msg);
@@ -409,7 +414,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         try
         {
             if (!requireStores(res)) return;
-            const finished = completeExecution(stores, executionId, result);
+            const finished = completeExecution(stores, executionId, result, clock());
             logInfo("[api] Execution '%s' (task '%s', fingerprint %s) finished %s (exit code %d, %d ms)",
                 executionId, finished.taskId, finished.fingerprint, finished.status, finished.exitCode, result.durationMs);
 
@@ -509,7 +514,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
     // every tick. Ticks are idempotent, so the scheduler's retries are safe.
     schedulerRoute("/sweeps/coordination", (HTTPServerRequest req, HTTPServerResponse res) {
         if (!requireStores(res)) return;
-        auto summary = sweepCoordination(stores, maxAttempts);
+        auto summary = sweepCoordination(stores, maxAttempts, clock());
         if (summary.errors > 0) res.statusCode = HTTPStatus.internalServerError;
         res.writeJsonBody(summary);
     });

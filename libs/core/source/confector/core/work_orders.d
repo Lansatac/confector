@@ -351,7 +351,7 @@ LostLease expireLease(StateStores stores, string executionId, uint maxAttempts, 
             {
                 auto finished = recordOutcome(stores, executionId, ExecutionStatus.failed, 0,
                     format("lease lost %s %s (attempt limit %s)", lost, lost == 1 ? "time" : "times", maxAttempts),
-                    null, now, (in Versioned!TaskExecution latest) => latest.version_ == current.version_);
+                    null, now, (in Versioned!TaskExecution latest) => latest.version_ == current.version_, Nullable!ulong(lost));
                 return LostLease(LostLeaseDisposition.failed, finished);
             }
             catch (StaleCompletionException)
@@ -628,7 +628,8 @@ private void requireTerminal(ExecutionStatus status)
 }
 
 private TaskExecution recordOutcome(StateStores stores, string executionId, ExecutionStatus status, int exitCode,
-    string errorMessage, ArtifactMetadata[] artifacts, string now, bool delegate(in Versioned!TaskExecution) stillApplies = null)
+    string errorMessage, ArtifactMetadata[] artifacts, string now, bool delegate(in Versioned!TaskExecution) stillApplies = null,
+    Nullable!ulong expiredLeases = Nullable!ulong.init)
 {
     foreach (attempt; 0 .. maxWriteAttempts)
     {
@@ -652,6 +653,7 @@ private TaskExecution recordOutcome(StateStores stores, string executionId, Exec
         }
         TaskExecution next = current.get.value;
         next.status = status;
+        if (!expiredLeases.isNull) next.expiredLeases = expiredLeases.get;
         next.exitCode = exitCode;
         next.errorMessage = errorMessage;
         next.artifacts = artifacts;
@@ -1027,6 +1029,21 @@ unittest
     auto last = expireLease(stores, id, 3, later(2.hours));
     assert(last.disposition == LostLeaseDisposition.failed);
     assert(last.execution.errorMessage.canFind("lease lost 3 times"), last.execution.errorMessage);
+}
+
+unittest
+{
+    // The expiry that fails an execution records the leases it counted, as a requeue does: the
+    // stored execution and the answer agree on the count
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = queueExecution(stores);
+    assert(claimWork(stores, "w1", testLease, later(0.minutes)).get.attempt == 1);
+    assert(expireLease(stores, id, 2, later(5.minutes)).disposition == LostLeaseDisposition.requeued);
+    assert(claimWork(stores, "w1", testLease, later(10.minutes)).get.attempt == 2);
+    auto failed = expireLease(stores, id, 2, later(15.minutes));
+    assert(failed.disposition == LostLeaseDisposition.failed);
+    assert(failed.execution.expiredLeases == 2, "The failing expiry counts its lost lease");
+    assert(stores.executions.get(id).get.value.expiredLeases == 2);
 }
 
 unittest

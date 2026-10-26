@@ -2,7 +2,6 @@
 	"name": "server",
 	"targetType": "executable",
 	"targetName": "confector_server",
-	"mainSourceFile": "source/confector/server/app.d",
 	"targetPath": "../../out/server",
 	"workingDirectory": "../../out/server",
 	"copyFiles": [
@@ -30,10 +29,21 @@
 	},
 	"configurations": [
 		{
-			"name": "application"
+			"name": "application",
+			"mainSourceFile": "source/confector/server/app.d"
+		},
+		{
+			"name": "library",
+			"targetType": "library",
+			"targetName": "confector_server",
+			"targetPath": "../../out/lib",
+			"excludedSourceFiles": [
+				"source/confector/server/app.d"
+			]
 		},
 		{
 			"name": "unittest",
+			"mainSourceFile": "source/confector/server/app.d",
 			"dependencies": {
 				"confector:testing": {
 					"path": "../.."

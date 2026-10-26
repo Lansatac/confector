@@ -17,6 +17,7 @@
     "libs/core",
     "libs/runner_core",
     "libs/testing",
+    "libs/gate",
     "apps/server",
     "apps/runner",
     "backends/artifact/local",
