@@ -716,8 +716,8 @@ struct TaskExecutionResult
 }
 
 // The build model (AGENTS.md, "What a build is"). A request joins or creates a chain. Request
-// state is derived from authoritative inputs (the chain's pins, the request and its definition,
-// the rerun generations, and the fingerprint ledgers and executions for its fingerprints), with a
+// state is derived from authoritative inputs (the request's pins and definition, the rerun
+// generations, and the fingerprint ledgers and executions for its fingerprints), with a
 // small mutable RequestState document per request holding whether it is open, its cached task
 // states and its outcome. Each type is stored as its own document. Timestamps are ISO 8601 UTC
 // strings (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because
@@ -784,8 +784,8 @@ struct RepositoryAt
 }
 
 /**
- * A repository ref pinned to a revision: an entry of a chain's pins (`BuildChain.pins`) or of the
- * pins supplied with a request (`BuildRequest.pins`). Two pins of one (repository, ref) agree
+ * A repository ref pinned to a revision: an entry of a chain's pins (`BuildChain.pins`) or of a
+ * request's pins (`BuildRequest.pins`). Two pins of one (repository, ref) agree
  * only when their revisions (the pinned value, as canonical JSON) agree; display info is never
  * compared. Only the revision is ever hashed into a fingerprint, never the ref (AGENTS.md,
  * invariant 1).
@@ -958,11 +958,10 @@ struct BuildRequest
     string[] targets;
     BuildIntent intent;
     BuildTrigger trigger;
-    /// Pins supplied with the request, from the trigger payload or a user ("build against these
-    /// revisions"), at most one per (repository, ref), sorted by repository, ref kind and ref
-    /// name. Resolution takes them as given instead of resolving those refs live, so they choose
-    /// which chain the request joins; the chain holds identical pins before the request is
-    /// recorded. The request is evaluated against the chain's pins, not these.
+    /// The pin of every (repository, ref) the request's bindings use, at most one per (repository,
+    /// ref), sorted by repository, ref kind and ref name. Complete and immutable once recorded: the
+    /// request is evaluated against these pins alone, never against its chain's. Each is also pinned
+    /// on the chain before the request is recorded, with the same revision.
     @optional RepositoryPin[] pins;
     /// The ref each repository input of the request's targets and their upstream tasks is bound
     /// to, at most one per input, sorted by (task, input). Each bound (repository, ref) is pinned
@@ -1027,9 +1026,9 @@ struct BuildChain
     /// how requests find the chain: they join by pin agreement.
     HeadlineRef headline;
     /// The pin of every repository ref the chain's requests have needed: its revision, at most
-    /// one per (repository, ref), sorted by repository, ref kind and ref name. The authoritative
-    /// input to fingerprinting: the tasks of every request's definition on the chain are
-    /// fingerprinted against these, each input at the ref its request bound it to.
+    /// one per (repository, ref), sorted by repository, ref kind and ref name. An index of the
+    /// requests' pins, read to find the pins of a new request and to check one: evaluation never
+    /// reads it.
     @optional RepositoryPin[] pins;
     @asName("created_at") string createdAt;
     /// User-editable labels, separate from the number.
@@ -1069,8 +1068,8 @@ struct TaskExecution
     string id;
     @asName("project_id") string projectId;
     @asName("task_id") string taskId;
-    /// Computed by the control plane from a request's definition and its chain's pins, never
-    /// reported by a worker.
+    /// Computed by the control plane from a request's definition and its pins, never reported by
+    /// a worker.
     string fingerprint;
     ExecutionStatus status;
     /// How many times a worker has claimed the execution; the current claim's number is its
@@ -1182,7 +1181,7 @@ enum RequestTaskStatus : string
 struct RequestTaskState
 {
     @asName("task_id") string taskId;
-    /// The fingerprint the task was evaluated at: from the request's definition, its chain's
+    /// The fingerprint the task was evaluated at: from the request's definition, the request's
     /// pins and the current rerun generations.
     string fingerprint;
     RequestTaskStatus status;
@@ -1216,7 +1215,7 @@ enum RequestOutcome : string
  * The request state (AGENTS.md, "What a build is"): one small mutable document per request, with
  * the request id as its id (confector.core.request_state), written only by compare-and-set. It
  * caches the last evaluation and the request's outcome. It is a projection: the request, its
- * chain's pins, the ledgers and the rerun generations stay authoritative.
+ * pins, the ledgers and the rerun generations stay authoritative.
  */
 struct RequestState
 {
@@ -1379,7 +1378,7 @@ struct WorkOrder
     @optional @asName("execution_id") string executionId;
     /// The task definition to execute: its steps, environment and declared outputs.
     @optional @asName("task_node") TaskNode taskNode;
-    /// The task's fingerprint, computed by the control plane from the build chain's pins. The runner
+    /// The task's fingerprint, computed by the control plane from the request's pins. The runner
     /// stores outputs under it and never computes its own; a work order without one fails.
     @optional @asName("fingerprint") string fingerprint;
     @optional @asName("payload") TaskExecutionPayload payload;

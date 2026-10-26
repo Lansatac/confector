@@ -9,7 +9,7 @@ module confector.core.request_state;
  * settled. A request is open until all its targets are settled; a settled state never changes.
  *
  * It is a projection, never the only record of anything: the request (which records its demands),
- * its chain's pins, the ledgers and the rerun generations are authoritative, and evaluating from
+ * its pins, the ledgers and the rerun generations are authoritative, and evaluating from
  * them recomputes everything it caches.
  *
  * Protocols:

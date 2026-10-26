@@ -10,12 +10,12 @@ version (unittest):
 
 import confector.core.request_evaluator;
 import confector.core.dag : TaskGraph;
-import confector.core.chain_pins : bindingMap, inputKeyLess, pinMap;
+import confector.core.chain_pins : bindingMap, inputKeyLess, pinMap, refsOf, selectPins;
 import confector.core.request_reconciler : RequestReconciler;
 import confector.core.document_collection : Versioned;
 import confector.core.execution_dispatcher : Dispatched, ExecutionDispatcher;
 import confector.core.fingerprint_ledger : ClaimOutcome;
-import confector.core.input_resolution : GraphResolution;
+import confector.core.input_resolution : GraphResolution, requiredPins;
 import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
 import confector.core.state_stores : StateStores;
 import confector.api.model;
@@ -101,8 +101,8 @@ string fingerprintNow(StateStores stores, string chainId, string taskId)
     return closureNow(stores, stores.chains.get(chainId).get.value, [taskId]).fingerprints[taskId];
 }
 
-/// Records request `id` as an intake does: its demands from the settled ledgers, then the
-/// request. Its state is not yet created (`intake` does both).
+/// Records request `id` as an intake does: its pins and demands, from the chain's pins and the
+/// settled ledgers, then the request. Its state is not yet created (`intake` does both).
 BuildRequest recordRequest(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
     ProjectDefinition definition = sampleDefinition())
 {
@@ -119,7 +119,9 @@ BuildRequest recordRequest(StateStores stores, string chainId, string id, string
     request.projectId = chain.projectId;
     request.chainId = chain.id;
     request.targets = targets;
-    request.bindings = mainBindings(closureGraph(definition, targets));
+    const graph = closureGraph(definition, targets);
+    request.bindings = mainBindings(graph);
+    request.pins = selectPins(chain.pins, refsOf(requiredPins(graph, bindingMap(request.bindings))));
     request.intent = BuildIntent.build;
     request.trigger.type = TriggerType.manual;
     request.definitionId = stores.definitions.put(definition);

@@ -17,7 +17,7 @@ module confector.core.build_stores;
  * (InvalidStateTransitionException, or InvalidPinsException for malformed pins).
  */
 
-import confector.core.chain_pins : bindingMap, describeInput, describePin, describeRepositoryAt, inputKeyLess, isEmptyPinned, mergePins, pinMap, samePin, validateBindings, validatePins;
+import confector.core.chain_pins : bindingMap, describeInput, describePin, describeRepositoryAt, inputKeyLess, isEmptyPinned, mergePins, pinMap, refsOf, samePin, validateBindings, validatePins;
 import confector.core.dag : TaskGraph;
 import confector.core.input_resolution : InputResolutionException, requireRepositorySpec, requiredPins;
 import confector.core.counters : CounterStore;
@@ -341,15 +341,17 @@ final class BuildRequestStore
 
     /**
      * Records `request`, after checking it against its chain and its definition, both read by id.
+     * Its pins must be exactly the (repository, ref) pairs its bindings use, each agreeing with
+     * the chain's pin of that ref, and the chain must already hold them all.
      *
      * Throws: DocumentConflictException if a request with its id exists;
      * InvalidStateTransitionException if it is incomplete or malformed (see `validateRequest`),
-     * its chain does not exist or belongs to another project, its chain lacks one of its pins or
-     * pins that ref to another revision, its definition is not stored, a target is not a task of
-     * its definition, its bindings leave a repository input of its targets or their upstream
-     * tasks unbound, binds an input outside them, or its chain lacks the pin of the (repository, ref) one is bound to, or its
-     * demands are not for exactly its targets and their upstream tasks; InvalidPinsException if
-     * its pins or bindings are not a well-formed list.
+     * its chain does not exist or belongs to another project, its definition is not stored, a
+     * target is not a task of its definition, its bindings leave a repository input of its targets
+     * or their upstream tasks unbound or bind an input outside them, its pins do not cover exactly
+     * the refs its bindings use, its chain lacks one of its pins or pins that ref to another
+     * revision, or its demands are not for exactly its targets and their upstream tasks;
+     * InvalidPinsException if its pins or bindings are not a well-formed list.
      */
     Versioned!BuildRequest create(BuildRequest request)
     {
@@ -361,13 +363,6 @@ final class BuildRequestStore
             format("Request '%s' is for project '%s', but chain '%s' belongs to project '%s'", request.id, request.projectId,
                 request.chainId, chain.get.projectId));
         const chainPins = pinMap(chain.get.pins);
-        foreach (ref entry; request.pins)
-        {
-            auto onChain = repositoryAt(entry) in chainPins;
-            requireValid(onChain !is null && samePin(*onChain, entry),
-                format("Request '%s' pins %s, which chain '%s' %s; add the request's pins to the chain first",
-                    request.id, describePin(entry), request.chainId, onChain is null ? "lacks" : "pins to another revision"));
-        }
 
         auto definition = m_definitions.get(request.definitionId);
         requireValid(!definition.isNull,
@@ -380,8 +375,7 @@ final class BuildRequestStore
         }
 
         // Every repository input the targets and their upstream tasks declare must be bound to a
-        // ref, and the chain must pin that ref of the repository the input declares, so the
-        // request can be evaluated against its bindings and its chain's pins alone.
+        // ref, so the request can be evaluated against its bindings and its own pins alone.
         auto graph = new TaskGraph(definition.get.tasks);
         bool[string] needed;
         foreach (target; request.targets)
@@ -419,13 +413,36 @@ final class BuildRequestStore
                 format("Request '%s' binds %s, which is not a repository input of its targets or their upstream tasks",
                     request.id, describeInput(inputKey(binding))));
         }
-        string[] missing;
+        // The request's pins are the pins of exactly the refs its bindings use: each bound ref is
+        // pinned, and no other is
+        const pinned = pinMap(request.pins);
         foreach (key; required.keys.sort!((a, b) => inputKeyLess(a, b)))
         {
-            if (required[key] !in chainPins) missing ~= format("%s (%s)", describeInput(key), describeRepositoryAt(required[key]));
+            requireValid((required[key] in pinned) !is null, format(
+                "Request '%s' binds %s to %s, which its pins do not pin: its pins must be the pins of exactly the refs its bindings use",
+                request.id, describeInput(key), describeRepositoryAt(required[key])));
+        }
+        const boundRefs = refsOf(required);
+        foreach (at; pinned.keys)
+        {
+            requireValid(boundRefs.canFind(at), format(
+                "Request '%s' pins %s, which no binding of its targets or their upstream tasks uses", request.id, describeRepositoryAt(at)));
+        }
+
+        // The chain must hold each of the request's pins, at the same revision
+        string[] missing;
+        string[] otherRevision;
+        foreach (key; required.keys.sort!((a, b) => inputKeyLess(a, b)))
+        {
+            const at = required[key];
+            auto onChain = at in chainPins;
+            if (onChain is null) missing ~= format("%s (%s)", describeInput(key), describeRepositoryAt(at));
+            else if (!samePin(*onChain, *(at in pinned))) otherRevision ~= describePin(*(at in pinned));
         }
         requireValid(missing.length == 0, format("Request '%s' needs pins that chain '%s' lacks: %-(%s, %); add them to the chain first",
             request.id, request.chainId, missing));
+        requireValid(otherRevision.length == 0, format("Request '%s' pins %-(%s, %), which chain '%s' pins to another revision",
+            request.id, otherRevision, request.chainId));
 
         // The request records a demand for exactly the tasks it covers, so request state can be
         // derived from it (validateRequest checked they are sorted and distinct)
@@ -779,6 +796,7 @@ version (unittest)
         request.chainId = chainId;
         request.targets = ["compile"];
         request.bindings = [InputBinding("compile", "src", RepositoryRef(RefKind.branch, "main"))];
+        request.pins = [pinOf("game", "main", "aaa111")];
         request.intent = BuildIntent.build;
         request.trigger.type = TriggerType.manual;
         request.definitionId = definitionId;
@@ -1162,26 +1180,73 @@ unittest
     pinned.pins = [pinOf("game", "main", "aaa111", ["subject": "From the trigger"])];
     assert(requests.create(pinned).pins.length == 1);
     auto unpinnedOnChain = sampleRequest("r5", "game-1", definitionId);
-    unpinnedOnChain.pins = [pinOf("tools", "main", "ttt111")];
-    assert(throwsA!InvalidStateTransitionException({ requests.create(unpinnedOnChain); }), "Add the request's pins to the chain first");
+    unpinnedOnChain.bindings = [InputBinding("compile", "src", RepositoryRef(RefKind.branch, "feature-x"))];
+    unpinnedOnChain.pins = [pinOf("game", "feature-x", "fff333")];
+    try
+    {
+        requests.create(unpinnedOnChain);
+        assert(false, "The chain must hold the request's pins first");
+    }
+    catch (InvalidStateTransitionException e)
+    {
+        assert(e.msg.canFind("lacks") && e.msg.canFind("repository 'game' at branch 'feature-x'"), e.msg);
+    }
     chains.addPins("game-1", unpinnedOnChain.pins);
     assert(requests.create(unpinnedOnChain).id == "r5");
-    // Another revision of a pinned ref disagrees; another ref or repository is one the chain lacks
-    foreach (i, disagreeing; [pinOf("game", "main", "bbb222"), pinOf("game", "develop", "aaa111"),
-        pinOf("game-fork", "main", "aaa111")])
+
+    // Another revision of a pinned ref disagrees with the chain
+    auto disagreeing = sampleRequest("r6", "game-1", definitionId);
+    disagreeing.pins = [pinOf("game", "main", "bbb222")];
+    try
     {
-        auto request6 = sampleRequest(format("r6-%s", i), "game-1", definitionId);
-        request6.pins = [disagreeing];
-        try
-        {
-            requests.create(request6);
-            assert(false, "A request's pin must be identical to its chain's");
-        }
-        catch (InvalidStateTransitionException e)
-        {
-            assert(e.msg.canFind(i == 0 ? "to another revision" : "lacks") && e.msg.canFind("repository '" ~ disagreeing.repositoryId ~ "'"), e.msg);
-        }
+        requests.create(disagreeing);
+        assert(false, "A request's pin must be identical to its chain's");
     }
+    catch (InvalidStateTransitionException e)
+    {
+        assert(e.msg.canFind("to another revision") && e.msg.canFind("repository 'game'"), e.msg);
+    }
+
+    // The pins are exactly the refs the bindings use: a bound ref without a pin, or a pin no
+    // binding uses, is refused, whatever the chain holds
+    auto noPin = sampleRequest("r7", "game-1", definitionId);
+    noPin.pins = null;
+    try
+    {
+        requests.create(noPin);
+        assert(false, "A request must pin every ref its bindings use");
+    }
+    catch (InvalidStateTransitionException e)
+    {
+        assert(e.msg.canFind("task 'compile' input 'src'") && e.msg.canFind("which its pins do not pin"), e.msg);
+    }
+    auto unusedPin = sampleRequest("r8", "game-1", definitionId);
+    unusedPin.pins ~= pinOf("tools", "main", "ttt111");
+    try
+    {
+        requests.create(unusedPin);
+        assert(false, "A request must not pin a ref no binding uses");
+    }
+    catch (InvalidStateTransitionException e)
+    {
+        assert(e.msg.canFind("repository 'tools'") && e.msg.canFind("no binding"), e.msg);
+    }
+    assert(requests.get("r7").isNull && requests.get("r8").isNull, "Nothing was written");
+
+    // A branch and a tag of one name are two refs: a request binding the branch is not served by a
+    // pin of the tag
+    auto tagPinned = sampleRequest("r9", "game-1", definitionId);
+    tagPinned.pins = [RepositoryPin("game", RepositoryRef(RefKind.tag, "main"), InputPin(Json("ttt222")))];
+    try
+    {
+        requests.create(tagPinned);
+        assert(false, "A tag pin must not serve a branch binding");
+    }
+    catch (InvalidStateTransitionException e)
+    {
+        assert(e.msg.canFind("task 'compile' input 'src'") && e.msg.canFind("which its pins do not pin"), e.msg);
+    }
+    assert(requests.get("r9").isNull, "Nothing was written");
 }
 
 unittest
@@ -1234,6 +1299,7 @@ unittest
     // main, which the chain pins already, whichever task asks for it
     release.bindings ~= [InputBinding("sdk", "sdk", RepositoryRef(RefKind.branch, "v2")),
         InputBinding("sdk", "src", RepositoryRef(RefKind.branch, "main"))];
+    release.pins = [pinOf("console-sdk", "v2", "sdk222"), pinOf("game", "main", "aaa111")];
     try
     {
         requests.create(release);
@@ -1257,9 +1323,11 @@ unittest
     auto moved = sampleDefinition();
     moved.tasks[0].inputs["src"] = repositoryInput("game-fork");
     const movedId = definitions.put(moved);
+    auto moving = sampleRequest("r3", "game-1", movedId);
+    moving.pins = [pinOf("game-fork", "main", "aaa111")];
     try
     {
-        requests.create(sampleRequest("r3", "game-1", movedId));
+        requests.create(moving);
         assert(false, "A pin of another repository must not serve the input");
     }
     catch (InvalidStateTransitionException e)
@@ -1309,6 +1377,7 @@ unittest
     requests.create(sampleRequest("r2", "game-1", definitionId));
     auto feature = sampleRequest("r3", "game-1", definitionId);
     feature.bindings = [InputBinding("compile", "src", RepositoryRef(RefKind.branch, "feature-x"))];
+    feature.pins = [pinOf("game", "feature-x", "fff333")];
     try
     {
         requests.create(feature);

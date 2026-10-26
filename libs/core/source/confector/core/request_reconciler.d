@@ -624,6 +624,36 @@ unittest
 
 unittest
 {
+    // The reconciler evaluates a request from its own pins, never its chain's: once the chain's pin
+    // of game at main is another revision, the request still dispatches the execution it needs at
+    // the fingerprint it was recorded with
+    import confector.core.build_stores : buildChainsCollection;
+    import vibe.data.json : Json, serializeToJson;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["compile"], "2026-10-20T10:00:00Z");
+    const needed = evaluateFrom(stores, "r1").needed[0];
+
+    // The chain's document as stored, with its pin changed: the store itself refuses that, so the
+    // document is written directly
+    auto stored = documents.get(buildChainsCollection.name, "c1");
+    Json content = stored.get.content;
+    content["pins"] = serializeToJson([RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222")))]);
+    documents.replace(buildChainsCollection.name, "c1", content, stored.get.version_);
+    assert(stores.chains.get("c1").get.value.pins[0].pin.pinned == Json("bbb222"));
+
+    auto reconciled = reconcilerOf(stores).reconcile("r1");
+    assert(reconciled.state.outcome == RequestOutcome.open);
+    assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued);
+    auto ledger = stores.ledgers.get(needed.fingerprint);
+    assert(!ledger.isNull && ledger.get.value.activeExecutionId.length > 0, "The execution was claimed at the recorded fingerprint");
+    assert(queuedIds(stores) == [ledger.get.value.activeExecutionId]);
+}
+
+unittest
+{
     // An unrecordable execution and a failed dispatch in one pass: the request fails with both
     // in its error, and its cached tasks show what the pass did (compile, whose claim failed, and
     // lint, which cannot be recorded, both still need an execution)

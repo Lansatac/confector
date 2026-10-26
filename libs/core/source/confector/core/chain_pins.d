@@ -1,18 +1,21 @@
 module confector.core.chain_pins;
 
 /**
- * Pure operations on pins (AGENTS.md, "What a build is"): a chain's pins (`BuildChain.pins`) and the pins supplied with a
- * request (`BuildRequest.pins`) are lists of `RepositoryPin`, one per (repository, ref), sorted by
- * repository, ref kind and ref name; input resolution works on maps keyed the same way
+ * Pure operations on pins (AGENTS.md, "What a build is"): a chain's pins (`BuildChain.pins`) and a
+ * request's pins (`BuildRequest.pins`) are lists of `RepositoryPin`, one per (repository, ref),
+ * sorted by repository, ref kind and ref name; input resolution works on maps keyed the same way
  * (`RepositoryPin[RepositoryAt]`). A request binds each repository input to a ref
- * (`BuildRequest.bindings`), per input, and finds that ref's pin on its chain.
+ * (`BuildRequest.bindings`), per input, and its pins are the pins of exactly the (repository, ref)
+ * pairs those bindings use.
  *
- * - `pinMap` turns a list into that map; `pinMap` of a chain's pins is what
+ * - `pinMap` turns a list into that map; `pinMap` of a request's pins is what
  *   `confector.core.input_resolution.graphResolution` takes. `sortPins` turns any list of pins
  *   into a well-formed one.
  * - `mergePins` adds pins to a list: pins only grow, and a pin once set never changes.
  * - `pinsAgree` and `missingPins` are what the input resolver needs to decide whether a request
  *   joins a chain and which pins it adds to it.
+ * - `refsOf` lists the distinct pairs a request's bindings use and `selectPins` takes the pins of
+ *   some of them from a list.
  * - `refsToResolve` and `pinsForRefs` turn the refs a request bound its inputs to into pins,
  *   resolving only the (repository, ref) pairs the chain lacks, each once, so every input bound to
  *   a ref agrees on its revision, including inputs of tasks added to the definition after the
@@ -319,6 +322,38 @@ RepositoryAt[] refsToResolve(const TaskGraph graph, in InputBinding[] bindings, 
     auto result = distinct.keys;
     result.sort!((a, b) => pinKeyLess(a, b));
     return result;
+}
+
+/**
+ * Returns the distinct (repository, ref) pairs that `required` (`requiredPins`) maps repository
+ * inputs to, sorted by key: the pairs a request's pins must cover, each once.
+ */
+RepositoryAt[] refsOf(in RepositoryAt[InputKey] required) @trusted
+{
+    bool[RepositoryAt] distinct;
+    foreach (key, at; required) distinct[at] = true;
+    auto result = distinct.keys;
+    result.sort!((a, b) => pinKeyLess(a, b));
+    return result;
+}
+
+/**
+ * Returns the pins of `pins` for the (repository, ref) pairs `refs`, sorted by key, as copies.
+ *
+ * Throws: InputResolutionException if `pins` has no pin for one of `refs`; InvalidPinsException as
+ * `pinMap` does.
+ */
+RepositoryPin[] selectPins(in RepositoryPin[] pins, in RepositoryAt[] refs) @trusted
+{
+    const byKey = pinMap(pins);
+    RepositoryPin[RepositoryAt] selected;
+    foreach (at; refs)
+    {
+        auto pin = at in byKey;
+        if (pin is null) throw new InputResolutionException(format("%s is not pinned", describeRepositoryAt(at)));
+        selected[at] = copyOf(*pin);
+    }
+    return sortedList(selected);
 }
 
 /**
@@ -664,11 +699,23 @@ unittest
     assert(throwsA!InvalidPinsException({ bindingMap([bound("", "src", "main")]); }));
     assert(throwsA!InvalidPinsException({ bindingMap([bound("a", "src", "")]); }));
     assert(refsToResolve(new TaskGraph([]), null, null).length == 0 && pinsForRefs(null, null).length == 0);
+
+    // The refs a request's bindings use are its pins' refs: each distinct pair once, sorted, and
+    // selectPins takes exactly those pins from a list
+    auto required = requiredPins(graph, bindingMap(bindings));
+    assert(refsOf(required) == [at("engine", "main"), at("game", "main"), at("game", "release")]);
+    assert(refsOf(null).length == 0);
+    auto requestPins = [pinned("game", "release", "ccc333"), pinned("engine", "main", "eee111"),
+        pinned("game", "main", "aaa111"), pinned("tools", "main", "ttt111")];
+    auto selected = selectPins(requestPins, refsOf(required));
+    assert(selected == [pinned("engine", "main", "eee111"), pinned("game", "main", "aaa111"), pinned("game", "release", "ccc333")]);
+    assert(throwsA!InputResolutionException({ selectPins(requestPins[0 .. 1], refsOf(required)); }), "A ref without a pin is refused");
+    assert(selectPins(null, null).length == 0);
 }
 
 unittest
 {
-    // A chain's pins are what its tasks are fingerprinted against: a task added to the definition
+    // A request's pins are what its tasks are fingerprinted against: a task added to the definition
     // after the chain was created, bound to a ref the chain pins, resolves to the chain's revision
     // of it, and no existing fingerprint changes
     import confector.core.dag : TaskGraph;

@@ -14,8 +14,8 @@ module confector.core.input_resolution;
  *   every generation.
  *
  * Repository inputs are bound to refs per request (`InputBinding`, keyed by `InputKey`), and a
- * chain pins each (repository, ref) once (`RepositoryPin`, keyed by `RepositoryAt`;
- * confector.core.chain_pins), so every input bound to a ref sees the chain's one revision of it.
+ * request's pins hold one revision per (repository, ref) (`RepositoryPin`, keyed by `RepositoryAt`;
+ * confector.core.chain_pins), so every input bound to a ref sees the request's one revision of it.
  * The repository of an input is the one its declaration names. Only the revision reaches a
  * fingerprint, never the ref (AGENTS.md, invariant 1), so two inputs at one revision through
  * different refs hash alike. Which ref an input is bound to is the trigger's or request's choice,

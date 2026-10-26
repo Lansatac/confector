@@ -3,7 +3,7 @@ module confector.core.request_evaluator;
 /**
  * The request evaluator (AGENTS.md, "Coordinating builds", "What a build is" and "Re-running a
  * task"): the pure core of build coordination. Given one request, the definition it runs with, its
- * chain's pins, the current rerun generations and a summary of the ledger of each of its
+ * pins, the current rerun generations and a summary of the ledger of each of its
  * fingerprints, it derives the state of every task the request covers, the fingerprints that need
  * an execution, the active executions it waits on and the request's outcome. It performs no I/O
  * and reads no clock. A request is evaluated on its own: its graph is the closure of its targets
@@ -43,7 +43,7 @@ module confector.core.request_evaluator;
  *   whose upstream task failed or was cancelled is blocked. The needed execution carries the
  *   ledger's `executionSeq`, which the dispatcher passes to `LedgerStore.claim` so a decision made
  *   before another execution started and ended never builds the fingerprint twice.
- * - **Reruns are strict.** Fingerprints come from the request's definition, its chain's pins and
+ * - **Reruns are strict.** Fingerprints come from the request's definition, its pins and
  *   the current rerun generations, so after a rerun the rerun task and everything downstream of
  *   it have new fingerprints, earlier successes are not used, and downstream tasks wait for the
  *   new generation to succeed and are blocked if it fails.
@@ -219,7 +219,7 @@ TaskDemand[] requestDemands(in GraphResolution closure, in ulong[string] stopSeq
 string[] requestFingerprints(in BuildChain chain, in DefinedRequest entry, in RerunGenerations generations) @trusted
 {
     const resolution = completeGraphResolution(chain.projectId, closureOf(chain, entry), bindingMap(entry.request.bindings),
-        pinMap(chain.pins), generations);
+        pinMap(entry.request.pins), generations);
     string[] fingerprints;
     foreach (fingerprint; resolution.fingerprints.byValue) fingerprints ~= fingerprint;
     return fingerprints.sort().release;
@@ -235,7 +235,7 @@ string[] requestFingerprints(in BuildChain chain, in DefinedRequest entry, in Re
 RerunGenerations readRequestGenerations(in BuildChain chain, in DefinedRequest entry, scope RerunGenerationReader read) @trusted
 {
     const resolution = readGraphResolution(chain.projectId, closureOf(chain, entry), bindingMap(entry.request.bindings),
-        pinMap(chain.pins), read);
+        pinMap(entry.request.pins), read);
     RerunGenerations generations;
     foreach (taskId, base; resolution.bases) generations[base] = resolution.generations[taskId];
     return generations;
@@ -270,7 +270,7 @@ LedgerSummary readLedgerSummary(LedgerStore ledgers, ExecutionStore executions, 
 /**
  * Derives the state of every task `entry` covers, the fingerprints that need an execution, the
  * active executions it waits on and its outcome (see the module documentation for the rules), from
- * the pins of `chain`, the current rerun `generations` (which must hold every base the request
+ * the pins of the request, the current rerun `generations` (which must hold every base the request
  * covers) and `ledgers`, a summary for every fingerprint it covers (`requestFingerprints`).
  * Summaries of other fingerprints are ignored. Pure: performs no I/O and reads no clock; no
  * timestamp is ever compared.
@@ -280,8 +280,8 @@ LedgerSummary readLedgerSummary(LedgerStore ledgers, ExecutionStore executions, 
  * targets a task its definition lacks, or records demands for other tasks than its targets and
  * their upstream tasks; if a covered fingerprint has no summary, or its summary contradicts itself
  * or the task (see `LedgerSummary`), including an active execution that has already ended (the
- * ledger was not settled). InputResolutionException if a generation is missing or the chain lacks
- * a pin the request needs.
+ * ledger was not settled). InputResolutionException if a generation is missing or the request lacks
+ * a pin it needs.
  */
 RequestEvaluation evaluateRequest(
     in BuildChain chain,
@@ -292,7 +292,7 @@ RequestEvaluation evaluateRequest(
 {
     const request = entry.request;
     auto graph = closureOf(chain, entry);
-    const resolution = completeGraphResolution(chain.projectId, graph, bindingMap(request.bindings), pinMap(chain.pins), generations);
+    const resolution = completeGraphResolution(chain.projectId, graph, bindingMap(request.bindings), pinMap(request.pins), generations);
 
     string[] demanded;
     foreach (ref demand; request.demands) demanded ~= demand.taskId;
@@ -623,8 +623,8 @@ private void requireEvaluable(bool condition, lazy string message) @trusted
 version (unittest)
 {
     import confector.core.fingerprint_ledger : withClaim, withFold;
-    import confector.core.chain_pins : inputKeyLess;
-    import confector.core.input_resolution : InputResolutionException;
+    import confector.core.chain_pins : inputKeyLess, refsOf, selectPins;
+    import confector.core.input_resolution : InputResolutionException, requiredPins;
 
     import vibe.data.json : Json;
 
@@ -725,7 +725,9 @@ version (unittest)
         request.projectId = w.chain.projectId;
         request.chainId = w.chain.id;
         request.targets = targets;
-        request.bindings = mainBindings(closureGraph(definition, targets));
+        const graph = closureGraph(definition, targets);
+        request.bindings = mainBindings(graph);
+        request.pins = selectPins(w.chain.pins, refsOf(requiredPins(graph, bindingMap(request.bindings))));
         request.intent = BuildIntent.build;
         request.trigger.type = TriggerType.manual;
         request.definitionId = definitionId(definition);
@@ -1209,11 +1211,32 @@ unittest
 
     RerunGenerations none;
     assert(throwsA!InputResolutionException({ evaluateRequest(w.chain, w.requests["r1"], none, summaries); }), "A missing generation is never 0");
-    auto unpinned = w.chain;
-    unpinned.pins = null;
-    assert(throwsA!InputResolutionException({ evaluateRequest(unpinned, w.requests["r1"], generations, summaries); }));
+    auto unpinned = DefinedRequest(w.requests["r1"].request, w.requests["r1"].definition);
+    unpinned.request.pins = null;
+    assert(throwsA!InputResolutionException({ evaluateRequest(w.chain, unpinned, generations, summaries); }), "A request without its pins is not evaluated");
     LedgerSummary[string] missing;
     assert(throwsWith!RequestEvaluationException("not summarized", { evaluateRequest(w.chain, w.requests["r1"], generations, missing); }));
+}
+
+unittest
+{
+    // The evaluator reads the request's pins, never its chain's: a chain whose pins change after
+    // the request was recorded gives the request the same fingerprints and the same evaluation
+    auto w = world();
+    request(w, "r1", ["report"]);
+    const entry = w.requests["r1"];
+    auto generations = readRequestGenerations(w.chain, entry, readerOf(w));
+    const summaries = summariesOf(w, entry, generations);
+    const fingerprints = requestFingerprints(w.chain, entry, generations);
+    const evaluated = evaluateRequest(w.chain, entry, generations, summaries);
+
+    auto moved = w.chain;
+    moved.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222")))];
+    assert(readRequestGenerations(moved, entry, readerOf(w)) == generations);
+    assert(requestFingerprints(moved, entry, generations) == fingerprints);
+    assert(evaluateRequest(moved, entry, generations, summaries) == evaluated);
+    moved.pins = null;
+    assert(evaluateRequest(moved, entry, generations, summaries) == evaluated);
 }
 
 unittest
@@ -1267,7 +1290,8 @@ unittest
     string[string] unread;
     RerunGenerations none;
     auto testGraph = closureGraph(sampleDefinition(), ["test"]);
-    auto partial = graphResolution("p", testGraph, bindingMap(mainBindings(testGraph)), pinMap(w.chain.pins), none, unread);
+    auto partial = graphResolution("p", testGraph, bindingMap(mainBindings(testGraph)),
+        pinMap([RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")))]), none, unread);
     assert(throwsWith!RequestEvaluationException("rerun generation", { requestDemands(partial, null); }));
     assert(throwsWith!RequestEvaluationException("'nope'", { closureGraph(sampleDefinition(), ["nope"]); }));
 
