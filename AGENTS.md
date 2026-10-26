@@ -151,8 +151,7 @@ crosses it, who owns it, what can fail) saves a great deal of rework later.
 
 ## Invariants
 
-Every change must preserve these. Some are not yet true of the current code; do not make them
-less true.
+Every change must preserve these.
 
 1. **A task's fingerprint is a deterministic function of its identity (project and task) and its
    resolved declared inputs** — nothing else. Upstream task outputs are inputs, so upstream fingerprints feed in
@@ -209,7 +208,7 @@ less true.
 
 ## What a build is
 
-A "build" used to conflate three things; they are now distinct:
+A build is three distinct things:
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
   its payload, the ref each repository input is bound to, the pin of every repository and ref
@@ -252,9 +251,9 @@ How they fit together:
   its targets and their upstream tasks in its own definition, fingerprinted against its own
   pins and the current rerun generations. Requests on one chain are never merged; two requests
   that need the same fingerprint share its execution.
-- **Request state is derived from authoritative inputs**: the request, the ledgers and
-  executions for its fingerprints, and the rerun generations. A small mutable *request state* document per request holds whether it is still
-  open, its cached task states and its outcome; it can always be rebuilt from those inputs.
+- **Request state is derived from authoritative inputs**: the request, the executions for its
+  fingerprints, and the rerun generations. Whatever is cached about a request can always be
+  rebuilt from those.
 - **What a chain shows is derived for display**: the union of its requests' states (with no
   request open, today's definition over its pins). It is never an input to a decision. An old
   chain's view can change when the definition changes; what actually ran stays in the execution
@@ -271,10 +270,9 @@ How they fit together:
 A rerun means "there was a problem with that build; don't use it anymore." Where cases are ambiguous, choose what is least
 surprising given that meaning.
 
-- **A rerun is an input.** Each task has a *rerun generation*, starting at 0 and keyed by the
-  task's fingerprint without it (its *base*). Rerunning increments the generation, recorded durably
-  and append-only. The fingerprint hashes the base and the generation, so the rerun task and
-  everything downstream of it get new fingerprints through ordinary transitive hashing.
+- **A rerun is an input.** Each rerun advances a *rerun generation*, recorded durably, that feeds
+  the task's fingerprint, so the task and everything downstream of it get new fingerprints through
+  ordinary transitive hashing.
 - **Generations are shared, not per chain.** A rerun updates the chain it was requested in — no
   new chain is created. How far it reaches into other chains that share the task's inputs is an
   open question (see "How far a rerun reaches"); the rerun prompt lists the affected chains.
@@ -291,45 +289,31 @@ surprising given that meaning.
 store guarantees in "Backend interfaces"; liveness rests on a periodic sweep, not on
 subscriptions.
 
-- **Split along what-versus-how.** An *input resolver* turns a request into a chain (resolving
-  inputs, finding or creating the chain). A pure *request evaluator* takes one request (with its
-  pins), its definition, the rerun generations and the ledgers of its fingerprints, and
-  returns each task's state plus the fingerprints that need an execution. Each needed
-  fingerprint is claimed by creating its active execution in the ledger; a worker that asks for
-  work is handed one (see "Workers and capacity").
-- **All state is persisted; nothing lives only in memory.** Each fingerprint has a *ledger*
-  document, read by id, holding its active execution (at most one), its latest success, and its
-  latest stopped execution with a sequence number. At most one active execution per fingerprint
-  is enforced with compare-and-set on the ledger, not with locks. *Why:* multiple instances and
+- **Evaluation is pure; resolution and dispatch are not.** Evaluating a request is a pure
+  function of the request, its definition, the rerun generations and the executions for its
+  fingerprints; it returns each task's state and the work that is missing.
+- **All state is persisted; nothing lives only in memory.** *Why:* multiple instances and
   serverless deployment must work, and a restart must lose nothing.
-- **The active execution lives in the ledger.** Claiming it, starting it, extending its lease and
-  expiring it are each one compare-and-set on one document. When it ends, an immutable execution
-  record is written and then folded into the ledger; whoever next reads the ledger completes a
-  fold left half-done. *Why:* every extra document an execution's state is split across adds a
-  crash window and a repair path.
+- **At most one active execution per fingerprint,** enforced with compare-and-set, not with locks.
+  Keep an execution's state in as few documents as possible: each extra one adds a crash window
+  and a repair path.
 - **Level-triggered, not event-sourced.** A trigger, a completion or an expired lease only means
   "something changed"; the handler re-evaluates the open requests it may affect and claims
   whatever is missing. Every step is idempotent, so a crash between two writes is repaired by the
   next evaluation.
-- **When an execution ends, the open requests of its project are re-evaluated.** Completion,
-  failure, lost lease and cancel all finish the execution, fold the result into the ledger, and
-  then re-evaluate that project's open requests. If that step is lost, the sweep does it.
-- **Ordering uses sequence numbers, not clocks.** Whether a failure settles an earlier request is
-  decided by the ledger's sequence numbers, never by comparing timestamps written by different
-  instances.
-- **The control plane owns fingerprints.** Work orders carry an execution id; a worker's
-  completion names that id, and the fingerprint comes from the control plane, never the worker.
-- **The active execution owns its lease.** A running execution records when its lease expires and
-  which attempt holds it; the worker's heartbeat extends the lease. Heartbeats and completions
-  from a superseded attempt are rejected.
+- **Ordering uses sequence numbers, not clocks.** Never decide by comparing timestamps written by
+  different instances.
+- **The control plane owns fingerprints.** A worker's completion names its execution; the
+  fingerprint comes from the control plane, never the worker.
+- **Running executions hold a lease** that the worker's heartbeat extends. Heartbeats and
+  completions from a superseded attempt are rejected.
 - **Infrastructure failures retry automatically; task failures do not.** An expired lease counts
-  as an attempt, up to an admin-configured limit tracked on the execution. A task that fails is
-  retried only when a user asks.
+  as an attempt, up to an admin-configured limit. A task that fails is retried only when a user
+  asks.
 - **A task that cannot be dispatched fails its request** with the error recorded, rather than
   being retried on every sweep. The user fixes the cause and retries.
-- **The sweep runs on a fixed schedule.** One scheduler entry, always registered: each run expires
-  lost leases and re-evaluates every open request. An
-  idle run is one cheap query. Scheduler calls may be duplicated or missed; the sweep is
+- **A periodic sweep provides liveness.** It expires lost leases and re-evaluates open requests,
+  so any lost step is eventually redone. Scheduler calls may be duplicated or missed; the sweep is
   idempotent.
 
 ## Workers and capacity
@@ -421,17 +405,15 @@ untrusted contributors are handled by trust levels.
 - **Every endpoint is authenticated, and the server fails closed.** It refuses to start without
   an authenticator configured; never add an unauthenticated route or a default credential.
 - **People sign in through someone else's identity provider.** Authentication is a backend: an
-  authenticator turns a request into an identity with roles, or nothing. First an authenticating
-  proxy (such as oauth2-proxy) that sets identity headers plus a shared secret; later, signed
-  proxy headers and a built-in OpenID Connect login. There are no built-in password accounts —
+  authenticator turns a request into an identity with roles, or nothing. There are no built-in
+  password accounts —
   only a bootstrap admin token and API tokens. Group-to-role mapping is configuration, not
   per-provider code.
 - **Roles are global for now:** admin, member, viewer.
 - **Workers hold one token per execution.** It is signed, short-lived, and carried in the work
   order, and it allows only what that execution needs: reporting its own logs and completion,
   uploading its own artifacts, downloading the artifacts its inputs name, and fetching its
-  secrets. The signing key is generated once per installation and kept in the document store
-  unless one is configured; a random per-installation key is not a guessable default.
+  secrets.
 - **Webhooks and scheduler callbacks are verified** — by the provider's signature, or by a secret
   the scheduler sends.
 - **Secrets come from a secret store backend at run time.** Tasks declare secrets by name; the
@@ -455,10 +437,8 @@ untrusted contributors are handled by trust levels.
     hot path or security-critical. One binary contains every first-party implementation
     (including an embedded single-node store, so a home build server needs no database server).
   - The artifact store, log store, secret store, and compute are **extension kinds**. Common
-    implementations are built in using the same protocol — local and S3-compatible artifact
-    storage; build logs in the state store, S3, or CloudWatch; file secrets; local-process
-    compute. Anyone can add others — Azure Blob, Key Vault, a new cloud's machines — in any
-    language, without a rebuild.
+    implementations are built in using the same protocol; anyone can add others — Azure Blob,
+    Key Vault, a new cloud's machines — in any language, without a rebuild.
 - **Nothing is loaded into the process at runtime.** No D shared libraries, no plugin registry.
   Construct a typed set of backends at startup and pass it explicitly. *Why:* runtime library
   loading in D is fragile, a global registry hides state from the core, and an endpoint that
@@ -478,7 +458,7 @@ untrusted contributors are handled by trust levels.
 - **Artifact bytes never pass through an extension.** An artifact-store extension only hands out
   presigned URLs and deletes; runners transfer data directly.
 - **Build logs live in the log store, never line by line in the state store.** Runners write
-  directly where the store allows it, and the UI reads by cursor. Secrets are masked on the
+  directly where the store allows it. Secrets are masked on the
   runner, before log lines leave it.
 - **Installing an extension is running code:** admin-only, pinned by checksum. Running out of
   process isolates crashes, not security.
@@ -499,9 +479,8 @@ untrusted contributors are handled by trust levels.
   forever by default (expiry is configurable) and show "artifacts expired". Building a task in an
   old chain then rebuilds its upstream tasks from the same pinned inputs — the same inputs, not
   necessarily the same bytes. Pin or release a chain to keep exact binaries.
-- **Retention runs as a daily, resumable, idempotent sweep** triggered by the scheduler, deleting
-  through the artifact and log stores. Never rely on storage lifecycle rules: they cannot know
-  what is pinned or still referenced.
+- **Retention is a scheduled sweep** that deletes through the artifact and log stores. Never rely
+  on storage lifecycle rules: they cannot know what is pinned or still referenced.
 
 ## Pipeline definitions
 
@@ -524,9 +503,7 @@ untrusted contributors are handled by trust levels.
   whether you edit in the UI or commit, and an external build of an old, tested commit uses
   today's release configuration.
 - **Each execution records the full definition it ran with** and the revision it came from, so
-  it can be inspected and the UI can show when a result predates a configuration change. A
-  request stores its definition as an immutable document keyed by a hash of its content, and
-  records where it came from.
+  it can be inspected and the UI can show when a result predates a configuration change.
 - **An execution runs with the definition of the request that claimed it.** A request that
   finds its fingerprint already running waits for that execution, whatever definition it runs
   with: build configuration is not part of the fingerprint (see "The caching contract").
@@ -549,11 +526,9 @@ untrusted contributors are handled by trust levels.
 
 ## Build steps
 
-- **A step is a program.** The runner validates the step's configuration against its manifest's
-  schema, runs the program, and sends a JSON request on stdin.
-- **stdout and stderr are the log; structured events go to a file.** Events (progress,
-  annotations) are JSON lines appended to the file named by `CONFECTOR_EVENTS`. *Why:* any script
-  or existing tool is then a valid step without knowing the protocol.
+- **A step is a program with a JSON contract.**
+- **stdout and stderr are the log; structured events go to a file.** *Why:* any script or
+  existing tool is then a valid step without knowing the protocol.
 - **Exit code 0 is success.** A crashing step fails the task; only a lost runner counts as an
   infrastructure failure.
 - **Stopping is graceful, then total.** On cancel or timeout the runner asks the step to stop,
@@ -567,7 +542,7 @@ untrusted contributors are handled by trust levels.
   Confector's credentials are always stripped. Secrets arrive as environment variables or files
   named by the task.
 - **Steps are versioned.** A task names a step and a version range; the exact version that ran is
-  recorded with the execution. Runners fetch step programs from the artifact store by checksum.
+  recorded with the execution.
 - **Bash, PowerShell, and checkout are built in** and follow the same contract.
 
 ## Version control providers
@@ -575,8 +550,8 @@ untrusted contributors are handled by trust levels.
 - **A provider does four things.** On the control plane: list a repository's refs, resolve a ref
   selector to a pinned value, and parse webhooks. On the runner: check out a pinned value.
   Verifying a webhook's signature is part of parsing it and cannot be skipped.
-- **Pinned values are opaque to the core** and hashed in canonical JSON (RFC 8785), so providers
-  cannot disagree on formatting.
+- **Pinned values are opaque to the core** and hashed in one canonical form, so providers cannot
+  disagree on formatting.
 - **Webhooks first, polling as a fallback.** Polling is configured per repository, because it
   costs money even when nothing changes.
 - **Git checkout fetches the exact commit.** If that commit no longer exists (for example after a
@@ -642,10 +617,9 @@ Explore the code for anything more specific; details change too often to list he
   tends to be mistaken later for a decision.
 - **Do not write your own opinions into this file or other design documentation.** Propose changes
   to the project owner instead. This file should state the project's intent, not an agent's.
-- **Change the existing thing, do not add a parallel one.** Adding a new field, function, or module
-  alongside an old one that does nearly the same thing is how the data model got its aliases.
-  The data model (`libs/api/source/confector/api/model.d`) has one canonical form for each
-  concept; do not add another alias. If a representation is wrong, change it and its callers.
+- **Change the existing thing, do not add a parallel one.** The data model has one canonical form
+  for each concept; do not add a new field, function, or module alongside an old one that does
+  nearly the same thing. If a representation is wrong, change it and its callers.
 - **There are no external consumers.** Do not add backward-compatibility shims, re-export
   modules, deprecated fields, or migrations of stored data. Change the code and its callers
   together.
