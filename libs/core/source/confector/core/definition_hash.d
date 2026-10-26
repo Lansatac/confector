@@ -11,11 +11,9 @@ import vibe.data.json : Json;
  * declarations (id and path). Display names, the timeout and inputs do not contribute: names
  * are cosmetic, and inputs are already part of the fingerprint.
  *
- * Each execution result records this hash beside its fingerprint so the UI can show that a
- * result predates a configuration change. It is never part of the fingerprint. The hash is
- * over canonical JSON, so it does not depend on the order of any map or config key; the order
- * of steps and of output declarations does matter. A step without config hashes like one with
- * an empty config object: both mean no settings.
+ * It is never part of the fingerprint. The hash is over canonical JSON, so it does not depend on
+ * the order of any map or config key; the order of steps and of output declarations does matter. A
+ * step without config hashes like one with an empty config object: both mean no settings.
  */
 string computeDefinitionHash(in TaskNode task) @trusted
 {
@@ -42,26 +40,6 @@ string computeDefinitionHash(in TaskNode task) @trusted
     definition["environment"] = stringMap(task.environment);
     definition["outputs"] = outputs;
     return sha256Hex(canonicalPinned(definition));
-}
-
-/**
- * Records on `record` the definition `task` that the execution ran with, and its hash. The
- * record gets its own copy of the steps (configs included), environment, outputs and inputs, so
- * editing `task` afterwards cannot change what was recorded.
- */
-void recordDefinition(ref TaskExecution record, in TaskNode task) @trusted
-{
-    TaskNode copy = cast(TaskNode) task;
-    copy.steps = copy.steps.dup;
-    foreach (ref step; copy.steps)
-    {
-        step.config = step.config.clone;
-    }
-    copy.environment = copy.environment.dup;
-    copy.outputs.artifacts = copy.outputs.artifacts.dup;
-    copy.inputs = copy.inputs.dup;
-    record.definition = copy;
-    record.definitionHash = computeDefinitionHash(task);
 }
 
 private Json stringMap(in string[string] map) @trusted
@@ -178,44 +156,4 @@ unittest
     TaskNode d;
     d.outputs.artifacts = [OutputArtifactDecl("y", "x")];
     assert(computeDefinitionHash(c) != computeDefinitionHash(d));
-}
-
-unittest
-{
-    // A record carries the definition and the hash it was recorded with, and both survive
-    // serialization
-    import vibe.data.json : deserializeJson, serializeToJson;
-
-    TaskNode task;
-    task.id = "build";
-    task.name = "Build";
-    task.inputs["flavor"] = valueInput("internal");
-    task.steps = [step("Compile", "bash", Json(["script": Json("dub build"), "shell": Json("bash")]))];
-    task.environment = ["A": "1"];
-    task.outputs.artifacts = [OutputArtifactDecl("binaries", "out/*")];
-
-    TaskExecution record;
-    recordDefinition(record, task);
-    assert(record.definitionHash == computeDefinitionHash(task));
-    assert(record.definition.steps[0].config["script"].get!string == "dub build");
-
-    // The record does not alias the task's arrays, maps or step configs
-    task.steps[0].config["script"] = "edited";
-    task.steps[0].config["shell"] = "edited";
-    task.environment["A"] = "edited";
-    task.outputs.artifacts[0].path = "edited";
-    assert(record.definition.steps[0].config["script"].get!string == "dub build");
-    assert(record.definition.steps[0].config["shell"].get!string == "bash");
-    assert(record.definition.environment["A"] == "1" && record.definition.outputs.artifacts[0].path == "out/*");
-    assert(computeDefinitionHash(record.definition) == record.definitionHash);
-    task.steps[0].config["script"] = "dub build";
-    task.steps[0].config["shell"] = "bash";
-    task.environment["A"] = "1";
-    task.outputs.artifacts[0].path = "out/*";
-
-    // Survives a serialization round trip, as when stored in and loaded from the state store
-    auto restored = deserializeJson!TaskExecution(serializeToJson(record).toString());
-    assert(restored.definitionHash == record.definitionHash);
-    assert(computeDefinitionHash(restored.definition) == record.definitionHash);
-    assert(restored.definition.name == "Build" && restored.definition.inputs["flavor"].spec.value == "internal");
 }

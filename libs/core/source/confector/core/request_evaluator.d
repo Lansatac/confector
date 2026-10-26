@@ -5,13 +5,13 @@ module confector.core.request_evaluator;
  * task"): the pure core of build coordination. Given one request, the definition it runs with, its
  * pins, the current rerun generations and a summary of the ledger of each of its
  * fingerprints, it derives the state of every task the request covers, the fingerprints that need
- * an execution, the active executions it waits on and the request's outcome. It performs no I/O
+ * an execution and the request's outcome. It performs no I/O
  * and reads no clock. A request is evaluated on its own: its graph is the closure of its targets
  * in its own definition, and other requests only matter through the ledgers they share.
  *
  * The shell (the request reconciler) loads its inputs, all by id: the request and its definition,
  * its chain, the rerun generations (`readRequestGenerations`), and, for every fingerprint
- * (`requestFingerprints`), the ledger settled and the executions it names (`readLedgerSummary`).
+ * (`requestFingerprints`), the ledger settled and its last success and last stop (`readLedgerSummary`).
  *
  * Rules:
  *
@@ -33,7 +33,7 @@ module confector.core.request_evaluator;
  *   latest success, unless retention removed its artifacts (TaskExecution.artifactsExpiredAt),
  *   which makes it a miss, not a cache hit (AGENTS.md, "The caching contract").
  * - **An active execution is attached to**, never duplicated: the ledger holds at most one, and
- *   the request waits on it (RequestEvaluation.awaited), whichever definition it runs with.
+ *   the request waits on it, whichever definition it runs with.
  * - **Failures and cancellations are never cache hits, and are never retried automatically.**
  * - **A task must run** when it is a target, or upstream of a task that must run, and it has no
  *   usable success, no active execution and no stop settling its demand. A covered task that is
@@ -41,7 +41,7 @@ module confector.core.request_evaluator;
  *   hit never forces an upstream task to run.
  * - **A task needs an execution** when it must run and every upstream task has succeeded. A task
  *   whose upstream task failed or was cancelled is blocked. The needed execution carries the
- *   ledger's `executionSeq`, which the dispatcher passes to `LedgerStore.claim` so a decision made
+ *   ledger's `executionSeq`, which the reconciler passes to `LedgerStore.claim` so a decision made
  *   before another execution started and ended never builds the fingerprint twice.
  * - **Reruns are strict.** Fingerprints come from the request's definition, its pins and
  *   the current rerun generations, so after a rerun the rerun task and everything downstream of
@@ -50,12 +50,8 @@ module confector.core.request_evaluator;
  * - **The request is open until every target is settled** (succeeded, failed, cancelled or
  *   blocked); see RequestEvaluation.outcome.
  *
- * Unrecorded executions are not the evaluator's concern: a task whose fingerprint has an active
- * execution is queued (or running) whether or not that execution was ever recorded; the
- * reconciler hands each awaited execution to the dispatcher, which records an unrecorded one from
- * the request (AwaitedExecution.inputs) (confector.core.execution_dispatcher). Infrastructure failures retry within one execution,
- * which stays active meanwhile (TaskExecution.attempts). Stale index copies cannot confuse it: it
- * reads no index.
+ * Infrastructure failures retry within one execution, which stays active meanwhile
+ * (ActiveExecution.attempt). Stale index copies cannot confuse it: it reads no index.
  */
 
 import confector.core.build_stores : ExecutionStore;
@@ -95,15 +91,12 @@ struct DefinedRequest
 /**
  * What the request evaluator needs to know about one fingerprint: its ledger, settled
  * (`LedgerStore.settle`, so a half-finished fold never looks like a running execution), and the
- * executions it names, each read by id (`readLedgerSummary`).
+ * finished executions it names, each read by id (`readLedgerSummary`).
  */
 struct LedgerSummary
 {
     /// The ledger; null if no execution was ever claimed at the fingerprint.
     Nullable!FingerprintLedger ledger;
-    /// The record of `ledger.activeExecutionId`: null when none is active, or when the active
-    /// execution was claimed but its record was never written (the dispatcher repairs that).
-    Nullable!TaskExecution active;
     /// The records of `ledger.lastSuccessExecutionId` and `ledger.lastStoppedExecutionId`; null
     /// exactly when the ledger names none.
     Nullable!TaskExecution lastSuccess;
@@ -111,9 +104,8 @@ struct LedgerSummary
 }
 
 /**
- * A fingerprint that needs an execution. The dispatcher claims it with `LedgerStore.claim(
- * fingerprint, seenExecutionSeq)` and records the execution with `inputs` and the request's
- * definition.
+ * A fingerprint that needs an execution. The reconciler claims it with `LedgerStore.claim(
+ * fingerprint, seenExecutionSeq, ...)`, carrying `inputs` and the request's definition.
  */
 struct NeededExecution
 {
@@ -122,18 +114,6 @@ struct NeededExecution
     /// The ledger's `executionSeq` as the evaluation saw it; 0 when it has no ledger.
     ulong seenExecutionSeq;
     /// The task's resolved inputs, task outputs included, as its work order carries them.
-    ResolvedInput[] inputs;
-}
-
-/**
- * An active execution the request waits on. If it was claimed but never recorded (its dispatcher
- * crashed), the dispatcher records it from `inputs` and the request's definition.
- */
-struct AwaitedExecution
-{
-    string taskId;
-    string fingerprint;
-    string executionId;
     ResolvedInput[] inputs;
 }
 
@@ -147,8 +127,6 @@ struct RequestEvaluation
     RequestTaskState[] tasks;
     /// The fingerprints that need an execution, in topological order of their tasks.
     NeededExecution[] needed;
-    /// The active executions the request waits on, in topological order of their tasks.
-    AwaitedExecution[] awaited;
     /// open until every target is settled; then failed if some target failed or was cancelled,
     /// else blocked if some target is blocked, else succeeded.
     RequestOutcome outcome;
@@ -243,8 +221,8 @@ RerunGenerations readRequestGenerations(in BuildChain chain, in DefinedRequest e
 
 /**
  * Reads what `evaluateRequest` needs to know about `fingerprint`: settles its ledger (completing a
- * half-finished fold) and reads by id the executions it names. Part of the shell, next to the core
- * it feeds.
+ * half-finished fold) and reads by id the finished executions it names. Part of the shell, next to
+ * the core it feeds.
  *
  * Throws: whatever `LedgerStore.settle` and `ExecutionStore.get` throw.
  */
@@ -252,9 +230,8 @@ LedgerSummary readLedgerSummary(LedgerStore ledgers, ExecutionStore executions, 
 {
     auto settled = ledgers.settle(fingerprint);
     LedgerSummary summary;
-    if (settled.ledger.isNull) return summary;
-    summary.ledger = settled.ledger.get.value;
-    if (!settled.execution.isNull) summary.active = nullable(settled.execution.get.value);
+    if (settled.isNull) return summary;
+    summary.ledger = settled.get.value;
 
     Nullable!TaskExecution named(string id)
     {
@@ -268,8 +245,8 @@ LedgerSummary readLedgerSummary(LedgerStore ledgers, ExecutionStore executions, 
 }
 
 /**
- * Derives the state of every task `entry` covers, the fingerprints that need an execution, the
- * active executions it waits on and its outcome (see the module documentation for the rules), from
+ * Derives the state of every task `entry` covers, the fingerprints that need an execution and its
+ * outcome (see the module documentation for the rules), from
  * the pins of the request, the current rerun `generations` (which must hold every base the request
  * covers) and `ledgers`, a summary for every fingerprint it covers (`requestFingerprints`).
  * Summaries of other fingerprints are ignored. Pure: performs no I/O and reads no clock; no
@@ -353,7 +330,6 @@ RequestEvaluation evaluateRequest(
         {
             state.status = fact.running ? RequestTaskStatus.running : RequestTaskStatus.queued;
             state.executionId = fact.activeId;
-            result.awaited ~= AwaitedExecution(taskId, fingerprint, fact.activeId, (cast(ResolvedInput[]) resolution.inputs[taskId]).dup);
         }
         else if (fact.settles(stopSeqAtDemand[taskId]))
         {
@@ -488,7 +464,7 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
     LedgerFacts facts;
     if (summary.ledger.isNull)
     {
-        requireEvaluable(summary.active.isNull && summary.lastSuccess.isNull && summary.lastStopped.isNull, format(
+        requireEvaluable(summary.lastSuccess.isNull && summary.lastStopped.isNull, format(
             "The summary of fingerprint %s (task '%s') names executions but no ledger", fingerprint, taskId));
         return facts;
     }
@@ -502,7 +478,7 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
     facts.executionSeq = ledger.executionSeq;
 
     // Each record named must be the one the ledger names, of this task at this fingerprint
-    void requireRecord(in Nullable!TaskExecution record, string id, string what, bool mayBeMissing)
+    void requireRecord(in Nullable!TaskExecution record, string id, string what)
     {
         if (id.length == 0)
         {
@@ -510,12 +486,8 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
                 fingerprint, taskId, what));
             return;
         }
-        if (record.isNull)
-        {
-            requireEvaluable(mayBeMissing, format("The %s execution '%s' of fingerprint %s (task '%s') was not read", what, id,
-                fingerprint, taskId));
-            return;
-        }
+        requireEvaluable(!record.isNull, format("The %s execution '%s' of fingerprint %s (task '%s') was not read", what, id,
+            fingerprint, taskId));
         const execution = record.get;
         requireEvaluable(execution.id == id && execution.fingerprint == fingerprint && execution.taskId == taskId
             && execution.projectId == projectId, format(
@@ -523,21 +495,13 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
             what, fingerprint, taskId, projectId, execution.id, execution.fingerprint, execution.taskId, execution.projectId, id));
     }
 
-    requireRecord(summary.active, ledger.activeExecutionId, "active", true);
-    requireRecord(summary.lastSuccess, ledger.lastSuccessExecutionId, "last succeeded", false);
-    requireRecord(summary.lastStopped, ledger.lastStoppedExecutionId, "last stopped", false);
+    requireRecord(summary.lastSuccess, ledger.lastSuccessExecutionId, "last succeeded");
+    requireRecord(summary.lastStopped, ledger.lastStoppedExecutionId, "last stopped");
 
-    if (ledger.activeExecutionId.length > 0)
+    if (!ledger.active.isNull)
     {
-        facts.activeId = ledger.activeExecutionId;
-        if (!summary.active.isNull)
-        {
-            const status = summary.active.get.status;
-            requireEvaluable(ExecutionStore.isActive(status), format(
-                "The active execution '%s' of fingerprint %s (task '%s') is %s: settle the ledger before evaluating",
-                facts.activeId, fingerprint, taskId, status));
-            facts.running = status == ExecutionStatus.running;
-        }
+        facts.activeId = ledger.active.get.id;
+        facts.running = ledger.active.get.status == ExecutionStatus.running;
     }
     if (!summary.lastSuccess.isNull)
     {
@@ -622,7 +586,7 @@ private void requireEvaluable(bool condition, lazy string message) @trusted
 
 version (unittest)
 {
-    import confector.core.fingerprint_ledger : withClaim, withFold;
+    import confector.core.fingerprint_ledger : endedExecution, withClaim, withFold, withStart;
     import confector.core.chain_pins : inputKeyLess, refsOf, selectPins;
     import confector.core.input_resolution : InputResolutionException, requiredPins;
 
@@ -669,7 +633,7 @@ version (unittest)
     }
 
     /// What the shell would read: the chain, its requests, rerun generations (bases not listed are
-    /// at 0), ledgers by fingerprint and executions by id. The ledgers move with the pure ledger
+    /// at 0), ledgers by fingerprint and finished executions by id. The ledgers move with the pure ledger
     /// transitions the LedgerStore uses. Requests of one chain share ledgers, as requests do.
     private struct World
     {
@@ -748,26 +712,27 @@ version (unittest)
     private string start(ref World w, string fingerprint, string taskId)
     {
         auto ledger = w.ledgers.get(fingerprint, FingerprintLedger(fingerprint));
-        auto claimed = withClaim(ledger);
+        ActiveExecution proposed;
+        proposed.projectId = w.chain.projectId;
+        proposed.taskId = taskId;
+        proposed.definitionId = "def1";
+        proposed.createdAt = "2026-10-20T10:00:00Z";
+        auto claimed = withClaim(ledger, proposed);
         w.ledgers[fingerprint] = claimed;
-        TaskExecution execution;
-        execution.id = claimed.activeExecutionId;
-        execution.projectId = w.chain.projectId;
-        execution.taskId = taskId;
-        execution.fingerprint = fingerprint;
-        execution.status = ExecutionStatus.queued;
-        execution.createdAt = "2026-10-20T10:00:00Z";
-        w.executions[execution.id] = execution;
-        return execution.id;
+        return claimed.active.get.id;
+    }
+
+    /// Has a worker start the active execution at `fingerprint`.
+    private void begin(ref World w, string fingerprint)
+    {
+        w.ledgers[fingerprint] = withStart(w.ledgers[fingerprint], "w1", "2026-10-20T10:10:00Z", "2026-10-20T10:00:00Z");
     }
 
     /// Ends the active execution at `fingerprint` with `status`, and folds it into its ledger.
     private string end(ref World w, string fingerprint, ExecutionStatus status)
     {
         auto ledger = w.ledgers[fingerprint];
-        auto execution = w.executions[ledger.activeExecutionId];
-        execution.status = status;
-        execution.finishedAt = "2026-10-20T10:05:00Z";
+        auto execution = endedExecution(fingerprint, ledger.active.get, status, "2026-10-20T10:05:00Z");
         w.executions[execution.id] = execution;
         w.ledgers[fingerprint] = withFold(ledger, execution);
         return execution.id;
@@ -792,7 +757,6 @@ version (unittest)
             auto execution = id in w.executions;
             return execution is null ? Nullable!TaskExecution.init : nullable(*execution);
         }
-        summary.active = named(ledger.activeExecutionId);
         summary.lastSuccess = named(ledger.lastSuccessExecutionId);
         summary.lastStopped = named(ledger.lastStoppedExecutionId);
         return summary;
@@ -868,7 +832,7 @@ unittest
     assert(evaluatedTasks(evaluation) == ["compile", "test", "report"], "package and lint are not covered");
     assert(statusOf(evaluation, "compile") == RequestTaskStatus.needed);
     assert(statusOf(evaluation, "test") == RequestTaskStatus.waitingUpstream && statusOf(evaluation, "report") == RequestTaskStatus.waitingUpstream);
-    assert(evaluation.needed.length == 1 && evaluation.awaited.length == 0);
+    assert(evaluation.needed.length == 1);
     const needed = evaluation.needed[0];
     assert(needed.taskId == "compile" && needed.fingerprint == fingerprintOf(w, "compile"));
     assert(needed.seenExecutionSeq == 0);
@@ -880,8 +844,7 @@ unittest
 
 unittest
 {
-    // An active execution is attached to, never duplicated: queued, then running, and awaited;
-    // claimed but not yet recorded (a crashed dispatcher, repaired by the dispatcher) is queued too
+    // An active execution is attached to, never duplicated: queued, then running
     auto w = world();
     request(w, "r1", ["test"]);
     const compileAt = fingerprintOf(w, "compile");
@@ -889,19 +852,13 @@ unittest
 
     auto queued = evaluate(w, "r1");
     assert(statusOf(queued, "compile") == RequestTaskStatus.queued && stateOf(queued, "compile").executionId == id);
-    assert(queued.awaited.length == 1 && queued.needed.length == 0 && queued.outcome == RequestOutcome.open);
-    const awaited = queued.awaited[0];
-    assert(awaited.taskId == "compile" && awaited.fingerprint == compileAt && awaited.executionId == id);
-    assert(awaited.inputs == [ResolvedInput("src", InputKind.repository, Json("aaa111"))],
-        "An unrecorded execution can be recorded from the request");
+    assert(queued.needed.length == 0 && queued.outcome == RequestOutcome.open);
     assert(statusOf(queued, "test") == RequestTaskStatus.waitingUpstream);
 
-    w.executions[id].status = ExecutionStatus.running;
-    assert(statusOf(evaluate(w, "r1"), "compile") == RequestTaskStatus.running);
-
-    w.executions.remove(id);
-    auto unrecorded = evaluate(w, "r1");
-    assert(statusOf(unrecorded, "compile") == RequestTaskStatus.queued && unrecorded.awaited.length == 1 && unrecorded.needed.length == 0);
+    begin(w, compileAt);
+    auto running = evaluate(w, "r1");
+    assert(statusOf(running, "compile") == RequestTaskStatus.running && stateOf(running, "compile").executionId == id);
+    assert(running.needed.length == 0);
 }
 
 unittest
@@ -920,7 +877,7 @@ unittest
     run(w, "report", ExecutionStatus.succeeded);
     auto done = evaluate(w, "r1");
     foreach (taskId; ["compile", "test", "report"]) assert(statusOf(done, taskId) == RequestTaskStatus.succeeded, taskId);
-    assert(done.needed.length == 0 && done.awaited.length == 0);
+    assert(done.needed.length == 0);
     assert(done.outcome == RequestOutcome.succeeded, "Every target succeeded");
 }
 
@@ -977,7 +934,7 @@ unittest
     assert(statusOf(settled, "compile") == RequestTaskStatus.failed && stateOf(settled, "compile").executionId == failure);
     assert(statusOf(settled, "test") == RequestTaskStatus.blocked && stateOf(settled, "test").blockedBy == ["compile"]);
     assert(statusOf(settled, "report") == RequestTaskStatus.blocked && stateOf(settled, "report").blockedBy == ["compile"]);
-    assert(settled.needed.length == 0 && settled.awaited.length == 0, "A failure is never retried automatically");
+    assert(settled.needed.length == 0, "A failure is never retried automatically");
     assert(settled.outcome == RequestOutcome.blocked, "The only target is blocked by the failure");
 
     request(w, "r2", ["compile"]);
@@ -1077,7 +1034,7 @@ unittest
     {
         auto attached = evaluate(w, requestId);
         assert(statusOf(attached, "compile") == RequestTaskStatus.queued && stateOf(attached, "compile").executionId == id, requestId);
-        assert(attached.needed.length == 0 && attached.awaited.length == 1 && attached.awaited[0].executionId == id, requestId);
+        assert(attached.needed.length == 0, requestId);
     }
 
     end(w, first.needed[0].fingerprint, ExecutionStatus.succeeded);
@@ -1241,8 +1198,7 @@ unittest
 
 unittest
 {
-    // Ledger summaries that contradict themselves or the task fail loudly; in particular an
-    // active execution that already ended means the shell did not settle the ledger
+    // Ledger summaries that contradict themselves or the task fail loudly
     auto w = world();
     request(w, "r1", ["compile"]);
     const compileAt = fingerprintOf(w, "compile");
@@ -1261,17 +1217,15 @@ unittest
         return throwsWith!RequestEvaluationException(text, { evaluateRequest(w.chain, entry, generations, [compileAt: summary]); });
     }
 
-    assert(refused("settle the ledger", (ref s) { auto e = s.active.get; e.status = ExecutionStatus.failed; s.active = e; }));
     assert(refused("was not read", (ref s) { s.lastSuccess.nullify(); }));
     assert(refused("was not read", (ref s) { s.lastStopped.nullify(); }));
     assert(refused("is failed", (ref s) { auto e = s.lastSuccess.get; e.status = ExecutionStatus.failed; s.lastSuccess = e; }));
     assert(refused("is succeeded", (ref s) { auto e = s.lastStopped.get; e.status = ExecutionStatus.succeeded; s.lastStopped = e; }));
     assert(refused("not '" ~ succeeded ~ "'", (ref s) { s.lastSuccess = s.lastStopped; }));
-    assert(refused("for task 'lint'", (ref s) { auto e = s.active.get; e.taskId = "lint"; s.active = e; }));
     assert(refused("holds the ledger", (ref s) { auto l = s.ledger.get; l.fingerprint = "other"; s.ledger = l; }));
     assert(refused("counts 0 stops", (ref s) { auto l = s.ledger.get; l.stopSeq = 0; s.ledger = l; }));
     assert(refused("but no ledger", (ref s) { s.ledger.nullify(); }));
-    assert(refused("its ledger names none", (ref s) { auto l = s.ledger.get; l.activeExecutionId = null; s.ledger = l; }));
+    assert(refused("its ledger names none", (ref s) { auto l = s.ledger.get; l.lastSuccessExecutionId = null; s.ledger = l; }));
 }
 
 unittest

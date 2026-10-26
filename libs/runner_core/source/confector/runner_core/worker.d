@@ -1236,7 +1236,7 @@ unittest
     // A runner runs a task end to end against the in-memory backends: the control plane's routes
     // are backed by the core's claim, heartbeat, release and completion over the state stores in
     // an in-memory document store. The runner claims the queued execution, runs its steps,
-    // heartbeats, and its completion finishes the execution and folds it into the ledger. A second
+    // heartbeats, and its completion records the execution and folds it into the ledger. A second
     // runner finds nothing queued, and a late completion of the finished execution is refused.
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
@@ -1252,18 +1252,16 @@ unittest
     scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
 
     auto stores = new StateStores(new InMemoryDocumentStore());
-    const claimed = stores.ledgers.claim("fp_e2e", 0);
-    assert(claimed.outcome == ClaimOutcome.won);
-    TaskExecution queued;
-    queued.id = claimed.executionId;
+    TaskNode build;
+    build.id = "build";
+    build.steps = [scriptedStep("Build", "building"), scriptedStep("Package", "packaging")];
+    ActiveExecution queued;
     queued.projectId = "game";
     queued.taskId = "build";
-    queued.fingerprint = "fp_e2e";
-    queued.status = ExecutionStatus.queued;
-    queued.definition.id = "build";
-    queued.definition.steps = [scriptedStep("Build", "building"), scriptedStep("Package", "packaging")];
+    queued.definitionId = stores.definitions.put(ProjectDefinition([build]));
     queued.createdAt = "2026-10-16T10:00:00Z";
-    stores.executions.createIfAbsent(queued);
+    const claimed = stores.ledgers.claim("fp_e2e", 0, queued);
+    assert(claimed.outcome == ClaimOutcome.won);
 
     import core.time : seconds;
 
@@ -1275,12 +1273,12 @@ unittest
         res.writeJsonBody(testWork(work.get.attempt, work.get.workOrder));
     });
     router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
-        const answer = heartbeatExecution(stores, req.params["execution_id"], req.json["attempt"].get!ulong,
+        const answer = heartbeatExecution(stores, "fp_e2e", req.params["execution_id"], req.json["attempt"].get!ulong,
             req.json["lease_seconds"].get!long.seconds);
         res.writeJsonBody(["answer": cast(string) answer]);
     });
     router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
-        const answer = releaseExecution(stores, req.params["execution_id"], req.json["attempt"].get!ulong);
+        const answer = releaseExecution(stores, "fp_e2e", req.params["execution_id"], req.json["attempt"].get!ulong);
         res.writeJsonBody(["answer": cast(string) answer]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -1289,7 +1287,7 @@ unittest
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            completeExecution(stores, req.params["execution_id"], deserializeJson!TaskExecutionResult(req.json));
+            completeExecution(stores, "fp_e2e", req.params["execution_id"], deserializeJson!TaskExecutionResult(req.json));
             res.writeJsonBody(["status": "recorded"]);
         }
         catch (StaleCompletionException e)
@@ -1324,7 +1322,7 @@ unittest
     assert(finished.status == ExecutionStatus.succeeded && finished.attempts == 1 && finished.worker == "runner_one");
     assert(finished.exitCode == 0 && finished.finishedAt.length > 0);
     auto ledger = stores.ledgers.get("fp_e2e").get;
-    assert(ledger.activeExecutionId.length == 0 && ledger.lastSuccessExecutionId == claimed.executionId, "The outcome was folded");
+    assert(ledger.active.isNull && ledger.lastSuccessExecutionId == claimed.executionId, "The outcome was folded");
 
     // Nothing is queued any more: a second runner finds no work and the finished execution is left alone
     assert(claimWork(stores, "runner_two", 60.seconds).isNull);
@@ -1334,7 +1332,7 @@ unittest
         TaskExecutionResult late;
         late.status = ExecutionStatus.failed;
         late.attempt = 1;
-        completeExecution(stores, claimed.executionId, late);
+        completeExecution(stores, "fp_e2e", claimed.executionId, late);
     }
     catch (StaleCompletionException e) rejected = true;
     assert(rejected && stores.executions.get(claimed.executionId).get.status == ExecutionStatus.succeeded);

@@ -199,7 +199,8 @@ AuthorizedRoutes artifactsRouter(Authenticator authenticator, ArtifactStorage st
 
 unittest
 {
-    import confector.api.model : ExecutionStatus, TaskExecution;
+    import confector.api.model : ActiveExecution;
+    import confector.core.work_orders : releaseExecution, startExecution;
     import confector.backends.artifact.local : LocalArtifactStorage;
     import confector.server.authenticator : FixedAuthenticator, Identity;
     import std.typecons : Nullable;
@@ -208,6 +209,7 @@ unittest
     import std.algorithm.searching : canFind;
     import std.conv : to;
     import std.datetime.systime : Clock;
+    import core.time : minutes;
     import std.file : exists, mkdirRecurse, remove, rmdirRecurse, tempDir, write;
     import std.path : buildPath;
     import std.process : thisProcessID;
@@ -219,22 +221,23 @@ unittest
     enum signingKey = "0123456789abcdef0123456789abcdef";
     auto storage = new LocalArtifactStorage(base);
     auto stores = new StateStores(new InMemoryDocumentStore());
-    TaskExecution execution;
-    execution.id = "exe_1";
+    // Fingerprint "fp1" has an execution on its second attempt: started, released, started again
+    ActiveExecution execution;
     execution.projectId = "proj";
     execution.taskId = "task";
+    execution.definitionId = "def1";
     execution.createdAt = "2026-10-16T10:00:00Z";
-    execution.fingerprint = "fp1";
-    execution.status = ExecutionStatus.queued;
-    execution.attempts = 2;
-    stores.executions.createIfAbsent(execution);
+    const executionId = stores.ledgers.claim("fp1", 0, execution).executionId;
+    startExecution(stores, "fp1", "w1", 1.minutes, "2026-10-16T10:00:00Z");
+    releaseExecution(stores, "fp1", executionId, 1);
+    startExecution(stores, "fp1", "w1", 1.minutes, "2026-10-16T10:00:00Z");
     // The worker routes answer the same with or without a user identity: they never consult it
     auto router = artifactsRouter(new FixedAuthenticator(Nullable!Identity.init), storage, signingKey, stores);
 
     // The token of an execution with fingerprint "fp1", whose one input names artifact
     // "in.zip" of upstream fingerprint "fp_up"
     WorkerTokenClaims claims;
-    claims.executionId = "exe_1";
+    claims.executionId = executionId;
     claims.fingerprint = "fp1";
     claims.attempt = 2;
     claims.expiresAt = Clock.currTime.toUnixTime() + 600;

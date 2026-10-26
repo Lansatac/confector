@@ -1,45 +1,42 @@
 module confector.core.fingerprint_ledger;
 
 /**
- * The fingerprint ledger (design record: bead confector-z7z.48; AGENTS.md, "Coordinating
- * builds"): one FingerprintLedger document per fingerprint, read by id and changed only by
- * compare-and-set, so it works on every DocumentStore backend and in stateless invocations. The
- * collection declares no index: nothing here depends on a query.
+ * The fingerprint ledger (AGENTS.md, "Coordinating builds"): one FingerprintLedger document per
+ * fingerprint, read by id and changed only by compare-and-set, so it works on every DocumentStore
+ * backend and in stateless invocations. The ledger holds everything about the fingerprint that
+ * changes: its active execution (queued or running, at most one), its latest success and its
+ * latest stop.
  *
  * Every operation reads only by id (the ledger and, for `fold`, `settle` and a losing `claim`,
- * the execution it names) and writes only by single-document compare-and-set, retried on a lost
- * compare-and-set where the decision does not depend on what changed. `settle` and a losing
- * `claim` may also complete a fold, a second compare-and-set. Every operation is idempotent, so
- * a crash between any two steps is repaired by repeating them.
+ * the execution record it names) and writes only by single-document compare-and-set, retried on a
+ * lost compare-and-set where the decision does not depend on what changed. Every operation is
+ * idempotent, so a crash between any two steps is repaired by repeating them.
  *
- * Dispatching an execution at fingerprint F (the execution dispatcher, bead confector-z7z.49.3):
+ * The active execution's life, each step one compare-and-set on the ledger (the pure transitions
+ * are the `with...` functions, and `LedgerStore.update` writes them):
  *
- * 1. `claim(F, seen)`, where `seen` is the ledger's `executionSeq` as the caller read it when it
- *    decided F needs an execution (0 if it found no ledger). The claim moves the ledger from "no
- *    active execution" to active = `executionIdFor(F, seen + 1)`. A loser learns the active
- *    execution or that an execution was created and finished since it read; either way it
- *    re-evaluates, and the request waits on the active execution: it is reconciled again when
- *    that execution ends (see below).
- * 2. `ExecutionStore.createIfAbsent` the queued TaskExecution with that id, carrying the
- *    definition, inputs and repository addresses of the request it is dispatched for.
+ * - `claim(F, seen, proposed)` creates it queued, with everything the execution needs (the task,
+ *   its definition, resolved inputs and repository addresses), under the deterministic id
+ *   `executionIdFor(F, seen + 1)`. `seen` is the ledger's `executionSeq` as the caller read it
+ *   when it decided F needs an execution (0 if it found no ledger). A loser learns the active
+ *   execution or that an execution was claimed and finished since it read; either way it
+ *   re-evaluates and waits on the active execution, which reconciles its request again when it
+ *   ends.
+ * - `withStart`: a worker starts it (queued to running, one more attempt, a lease).
+ *   `withLease`: a heartbeat extends the lease. `withRequeue`: a release, or `withLostLease`: an
+ *   expired lease, puts it back to queued.
+ * - It ends by writing the immutable TaskExecution (`ExecutionStore.create`, which only one ender
+ *   can win) and then `fold`, which in one compare-and-set clears the active execution and records
+ *   the outcome as `lastSuccessExecutionId` or `lastStoppedExecutionId` (with `stopSeq`
+ *   incremented).
  *
- * Crash repair, by whoever next reads the ledger (`settle`):
- * - After 1, before 2: the ledger's active execution has no record; `settle` reports it
- *   `unrecorded` with its id. The ledger cannot move on (only a fold of a terminal record
- *   clears the active execution), so every later reader that needs F sees the same id. The
- *   ledger cannot invent the execution: its definition, inputs and repository addresses come
- *   from a request. So whoever needs F (a reconcile of a chain that wants it, bead
- *   confector-z7z.49.3) repeats step 2 with that id, from its own request; concurrent
- *   repairers and the original dispatcher converge on whichever record is written first.
- *   Once recorded, the queued execution waits for a worker to claim it (confector.core.work_orders).
+ * Crash repair, by whoever next reads the ledger (`settle`, or a losing `claim`): if the active
+ * execution already has its record (its ender crashed between the write and the fold), complete
+ * the fold. A crash before the record leaves the execution active, to be ended again.
  *
- * Ending an execution: the terminal compare-and-set on the TaskExecution stays the fence against
- * duplicate or racing completions; only its winner goes on. Then `fold` moves the ledger, in one
- * compare-and-set, from active to idle: the outcome becomes `lastSuccessExecutionId` or
- * `lastStoppedExecutionId` (with `stopSeq` incremented). A crash after the terminal
- * compare-and-set and before the fold leaves a ledger whose active execution is terminal:
- * `settle` completes the fold. The ender then reconciles the open requests of the execution's
- * project (confector.core.work_orders); a reconcile that is lost is repaired by a later one.
+ * The collection's `active` index lists ledgers whose active execution is queued (oldest first)
+ * or running (by lease expiry): discovery for workers asking for work and for the sweep, which
+ * may lag. Both read the ledger by id before acting.
  *
  * Reuse: `lastSuccessExecutionId` only names the latest success. Whether it is usable (its
  * artifacts may have expired) is on the execution record and decided by the caller, which
@@ -56,8 +53,11 @@ import std.conv : to;
 import std.format : format;
 import std.typecons : Nullable, nullable;
 
-/// The state store collection holding fingerprint ledgers, keyed by fingerprint.
-enum CollectionSpec fingerprintLedgersCollection = CollectionSpec("fingerprint_ledgers", null);
+/// The state store collection holding fingerprint ledgers, keyed by fingerprint. Its `active`
+/// index holds the ledgers with an active execution: partitioned by its status, ordered by when it
+/// was claimed (queued) or when its lease expires (running).
+enum CollectionSpec fingerprintLedgersCollection = CollectionSpec("fingerprint_ledgers",
+    [IndexSpec("active", "active_status", "active_due")]);
 
 /**
  * The id of the `seq`th execution claimed at `fingerprint` (seq starts at 1): a hash of both,
@@ -85,17 +85,100 @@ bool claimedOn(in FingerprintLedger ledger, string executionId) @safe
 }
 
 /**
- * `ledger` with its next execution claimed: active, and counted in `executionSeq`.
+ * `ledger` with its next execution claimed: `proposed` (its project, task, definition, inputs,
+ * repository addresses and creation time) becomes the active execution, queued under the next
+ * deterministic id, and counted in `executionSeq`.
  *
  * Throws: InvalidStateTransitionException if an execution is active.
  */
-FingerprintLedger withClaim(in FingerprintLedger ledger) @safe
+FingerprintLedger withClaim(in FingerprintLedger ledger, in ActiveExecution proposed) @trusted
 {
-    requireValid(ledger.activeExecutionId.length == 0, format("Fingerprint %s already has active execution '%s'",
-        ledger.fingerprint, ledger.activeExecutionId));
+    requireValid(ledger.active.isNull, format("Fingerprint %s already has active execution '%s'",
+        ledger.fingerprint, ledger.active.isNull ? "" : ledger.active.get.id));
     auto next = copyOf(ledger);
     next.executionSeq += 1;
-    next.activeExecutionId = executionIdFor(ledger.fingerprint, next.executionSeq);
+    ActiveExecution claimed;
+    claimed.id = executionIdFor(ledger.fingerprint, next.executionSeq);
+    claimed.projectId = proposed.projectId;
+    claimed.taskId = proposed.taskId;
+    claimed.status = ExecutionStatus.queued;
+    claimed.definitionId = proposed.definitionId;
+    claimed.inputs = (cast(ResolvedInput[]) proposed.inputs).dup;
+    claimed.repositoryAddresses = (cast(string[string]) proposed.repositoryAddresses).dup;
+    claimed.createdAt = proposed.createdAt;
+    next.active = claimed;
+    return next;
+}
+
+/**
+ * `ledger` with its queued active execution started by `worker`: running, one more attempt, held
+ * until `leaseExpiresAt`, started at `now`.
+ *
+ * Throws: InvalidStateTransitionException if the active execution is not queued.
+ */
+FingerprintLedger withStart(in FingerprintLedger ledger, string worker, string leaseExpiresAt, string now) @trusted
+{
+    auto active = activeOf(ledger, "start");
+    requireValid(active.status == ExecutionStatus.queued, format("Execution '%s' is %s, so it cannot be started", active.id, active.status));
+    active.status = ExecutionStatus.running;
+    active.attempt += 1;
+    active.worker = worker;
+    active.leaseExpiresAt = leaseExpiresAt;
+    active.startedAt = now;
+    auto next = copyOf(ledger);
+    next.active = active;
+    return next;
+}
+
+/**
+ * `ledger` with the lease of its running active execution extended to `leaseExpiresAt`.
+ *
+ * Throws: InvalidStateTransitionException if the active execution is not running.
+ */
+FingerprintLedger withLease(in FingerprintLedger ledger, string leaseExpiresAt) @trusted
+{
+    auto active = activeOf(ledger, "extend the lease of");
+    requireValid(active.status == ExecutionStatus.running, format("Execution '%s' is %s, so it holds no lease", active.id, active.status));
+    active.leaseExpiresAt = leaseExpiresAt;
+    auto next = copyOf(ledger);
+    next.active = active;
+    return next;
+}
+
+/**
+ * `ledger` with its running active execution given back: queued again, for any worker to start. A
+ * release is not a lost lease (`withLostLease`): it does not count toward the attempt limit.
+ *
+ * Throws: InvalidStateTransitionException if the active execution is not running.
+ */
+FingerprintLedger withRequeue(in FingerprintLedger ledger) @trusted
+{
+    auto active = activeOf(ledger, "release");
+    requireValid(active.status == ExecutionStatus.running, format("Execution '%s' is %s, so it cannot be released", active.id, active.status));
+    active.status = ExecutionStatus.queued;
+    active.worker = null;
+    active.leaseExpiresAt = null;
+    active.startedAt = null;
+    auto next = copyOf(ledger);
+    next.active = active;
+    return next;
+}
+
+/**
+ * `ledger` with a lost lease counted on its running active execution (`expiredLeases`); with
+ * `requeue` the execution is also queued again for another attempt. Without it the execution stays
+ * running, counted, for its ender to fail.
+ *
+ * Throws: InvalidStateTransitionException if the active execution is not running.
+ */
+FingerprintLedger withLostLease(in FingerprintLedger ledger, bool requeue) @trusted
+{
+    auto next = requeue ? withRequeue(ledger) : copyOf(ledger);
+    auto active = activeOf(next, "expire the lease of");
+    requireValid(requeue || active.status == ExecutionStatus.running,
+        format("Execution '%s' is %s, so it holds no lease", active.id, active.status));
+    active.expiredLeases += 1;
+    next.active = active;
     return next;
 }
 
@@ -111,11 +194,11 @@ FingerprintLedger withFold(in FingerprintLedger ledger, in TaskExecution executi
 {
     requireValid(!ExecutionStore.isActive(execution.status),
         format("Execution '%s' is %s; only a finished execution is folded into its ledger", execution.id, execution.status));
-    requireValid(ledger.activeExecutionId.length > 0 && ledger.activeExecutionId == execution.id,
+    requireValid(!ledger.active.isNull && ledger.active.get.id == execution.id,
         format("Execution '%s' is not the active execution ('%s') of fingerprint %s", execution.id,
-            ledger.activeExecutionId, ledger.fingerprint));
+            ledger.active.isNull ? "" : ledger.active.get.id, ledger.fingerprint));
     auto next = copyOf(ledger);
-    next.activeExecutionId = null;
+    next.active.nullify();
     if (execution.status == ExecutionStatus.succeeded)
     {
         next.lastSuccessExecutionId = execution.id;
@@ -128,11 +211,35 @@ FingerprintLedger withFold(in FingerprintLedger ledger, in TaskExecution executi
     return next;
 }
 
+/**
+ * The record of `active`, the execution at `fingerprint`, ended as `status` at `finishedAt`: its
+ * identity, inputs and times, and the attempt and lost leases it ended with. The caller adds the
+ * outcome's exit code, error and artifacts. Pure.
+ */
+TaskExecution endedExecution(string fingerprint, in ActiveExecution active, ExecutionStatus status, string finishedAt) @trusted
+{
+    TaskExecution ended;
+    ended.id = active.id;
+    ended.projectId = active.projectId;
+    ended.taskId = active.taskId;
+    ended.fingerprint = fingerprint;
+    ended.status = status;
+    ended.attempts = active.attempt;
+    ended.expiredLeases = active.expiredLeases;
+    ended.definitionId = active.definitionId;
+    ended.inputs = (cast(ResolvedInput[]) active.inputs).dup;
+    ended.repositoryAddresses = (cast(string[string]) active.repositoryAddresses).dup;
+    ended.worker = active.worker;
+    ended.createdAt = active.createdAt;
+    ended.startedAt = active.startedAt;
+    ended.finishedAt = finishedAt;
+    return ended;
+}
+
 /// What a claim found.
 enum ClaimOutcome
 {
-    /// The claim won: `executionId` is the new active execution, which the claimer records and
-    /// sends.
+    /// The claim won: `executionId` is the new active execution.
     won,
     /// Another execution is active: `executionId`. The caller waits for it to end.
     active,
@@ -169,54 +276,43 @@ struct LedgerFold
     Versioned!FingerprintLedger ledger;
 }
 
-/// The state of a fingerprint's active execution, after `settle` completed any unfinished fold.
-enum LedgerActivity
-{
-    /// No execution is active (or none was ever claimed).
-    idle,
-    /// The active execution is recorded, queued or running.
-    recorded,
-    /// The active execution was claimed but never recorded (its dispatcher crashed): record it
-    /// with `ExecutionStore.createIfAbsent` under `executionId`, from the request that needs it.
-    unrecorded
-}
-
-/// The result of `LedgerStore.settle`.
-struct LedgerSettlement
-{
-    LedgerActivity activity;
-    /// The ledger, settled; null if no execution was ever claimed at the fingerprint.
-    Nullable!(Versioned!FingerprintLedger) ledger;
-    /// recorded and unrecorded: the active execution's id.
-    string executionId;
-    /// recorded: the active execution.
-    Nullable!(Versioned!TaskExecution) execution;
-}
-
 /**
- * Fingerprint ledgers in a DocumentStore, with the executions they name. See the module
+ * Fingerprint ledgers in a DocumentStore, with the execution records they name. See the module
  * documentation for the protocols. Ledgers are never removed.
  */
 final class LedgerStore
 {
     /// How many times an operation re-reads and retries after losing a compare-and-set to a
     /// concurrent write of the same ledger before failing. Every lost attempt means another write
-    /// succeeded, so this is reached only under sustained contention on one fingerprint. Higher
-    /// than work_orders.maxWriteAttempts (10, for one execution, written by its worker and the
-    /// control plane): like a counter or a rerun generation record (100), a ledger is shared by
-    /// every chain that needs the fingerprint, so many chains can contend on it at once.
+    /// succeeded, so this is reached only under sustained contention on one fingerprint. A ledger
+    /// is shared by every chain that needs the fingerprint and by the workers and the sweep, so
+    /// many writers can contend on it at once.
     enum maxWriteAttempts = 100;
+
+    /// Ledgers per page of the `active` index.
+    enum pageSize = 100;
 
     private DocumentCollection!FingerprintLedger m_ledgers;
     private ExecutionStore m_executions;
 
     /// Declares `fingerprintLedgersCollection` on `store`; `executions` is where the ledgers'
-    /// executions are recorded.
+    /// finished executions are recorded.
     this(DocumentStore store, ExecutionStore executions)
     {
         if (executions is null) throw new Exception("LedgerStore requires the execution store");
-        m_ledgers = new DocumentCollection!FingerprintLedger(store, fingerprintLedgersCollection);
+        m_ledgers = new DocumentCollection!FingerprintLedger(store, fingerprintLedgersCollection,
+            ["active_status", "active_due"], &derivedFields);
         m_executions = executions;
+    }
+
+    private static string[string] derivedFields(in FingerprintLedger ledger)
+    {
+        if (ledger.active.isNull) return null;
+        const active = ledger.active.get;
+        return [
+            "active_status": active.status,
+            "active_due": sortableTimestamp(active.status == ExecutionStatus.queued ? active.createdAt : active.leaseExpiresAt),
+        ];
     }
 
     /**
@@ -238,19 +334,20 @@ final class LedgerStore
     }
 
     /**
-     * Claims the next execution at `fingerprint`, creating its ledger on the first claim. Wins
-     * only if no execution is active and the ledger's `executionSeq` is still `seenExecutionSeq`,
-     * the value the caller read when it decided an execution is needed (0 when it found no
-     * ledger), so a decision made before another execution started and finished never builds the
-     * fingerprint twice. Of concurrent claimers exactly one wins; the others see its execution.
-     * A claim that finds an active execution which already ended (its fold never happened)
-     * completes the fold and decides again. See ClaimOutcome.
+     * Claims the next execution at `fingerprint`, creating its ledger on the first claim, with
+     * `proposed` as the active execution (see `withClaim`). Wins only if no execution is active
+     * and the ledger's `executionSeq` is still `seenExecutionSeq`, the value the caller read when
+     * it decided an execution is needed (0 when it found no ledger), so a decision made before
+     * another execution started and finished never builds the fingerprint twice. The claim is one
+     * compare-and-set on the ledger. Of concurrent claimers exactly one wins; the others see its
+     * execution. A claim that finds an active execution which already ended (its fold never
+     * happened) completes the fold and decides again. See ClaimOutcome.
      *
      * Throws: Exception if `fingerprint` is empty or every one of maxWriteAttempts attempts lost
      * a compare-and-set; InvalidStateTransitionException if `seenExecutionSeq` is ahead of the
-     * ledger (the caller did not read it from this ledger).
+     * ledger (the caller did not read it from this ledger) or `proposed` is incomplete.
      */
-    LedgerClaim claim(string fingerprint, ulong seenExecutionSeq)
+    LedgerClaim claim(string fingerprint, ulong seenExecutionSeq, in ActiveExecution proposed)
     {
         requireFingerprint(fingerprint);
         foreach (attempt; 0 .. maxWriteAttempts)
@@ -260,17 +357,21 @@ final class LedgerStore
             requireValid(seenExecutionSeq <= executionSeq, format(
                 "A claim at fingerprint %s saw execution %s, but the ledger has only claimed %s", fingerprint,
                 seenExecutionSeq, executionSeq));
-            if (!current.isNull && current.get.activeExecutionId.length > 0)
+            if (!current.isNull && !current.get.active.isNull)
             {
                 // Only on this losing path: if the active execution ended but was never folded
                 // (its ender crashed), complete the fold and decide again.
-                auto active = m_executions.get(current.get.activeExecutionId);
-                if (!active.isNull && !ExecutionStore.isActive(active.get.status))
+                const activeId = current.get.active.get.id;
+                auto ended = m_executions.get(activeId);
+                if (!ended.isNull)
                 {
-                    foldRecord(active.get.value);
+                    requireValid(ended.get.fingerprint == fingerprint, format(
+                        "The active execution '%s' of fingerprint %s is recorded at fingerprint %s", activeId,
+                        fingerprint, ended.get.fingerprint));
+                    foldRecord(ended.get.value);
                     continue;
                 }
-                return LedgerClaim(ClaimOutcome.active, current.get.activeExecutionId, current.get);
+                return LedgerClaim(ClaimOutcome.active, activeId, current.get);
             }
             if (executionSeq != seenExecutionSeq)
             {
@@ -282,11 +383,15 @@ final class LedgerStore
                 {
                     FingerprintLedger fresh;
                     fresh.fingerprint = fingerprint;
-                    auto created = m_ledgers.create(fingerprint, withClaim(fresh));
-                    return LedgerClaim(ClaimOutcome.won, created.activeExecutionId, created);
+                    auto claimed = withClaim(fresh, proposed);
+                    requireWellFormed(claimed);
+                    auto created = m_ledgers.create(fingerprint, claimed);
+                    return LedgerClaim(ClaimOutcome.won, created.active.get.id, created);
                 }
-                auto replaced = m_ledgers.replace(fingerprint, withClaim(current.get.value), current.get.version_);
-                return LedgerClaim(ClaimOutcome.won, replaced.activeExecutionId, replaced);
+                auto claimed = withClaim(current.get.value, proposed);
+                requireWellFormed(claimed);
+                auto replaced = m_ledgers.replace(fingerprint, claimed, current.get.version_);
+                return LedgerClaim(ClaimOutcome.won, replaced.active.get.id, replaced);
             }
             catch (DocumentConflictException)
             {
@@ -298,10 +403,39 @@ final class LedgerStore
     }
 
     /**
+     * Replaces the ledger `current` with `next`, which may change only its active execution's
+     * attempt, status, worker, lease and lost leases (the `withStart`, `withLease`, `withRequeue`
+     * and `withLostLease` transitions): the claim and the fold have their own operations.
+     *
+     * Throws: DocumentConflictException if the ledger changed since `current` was read;
+     * InvalidStateTransitionException if `next` changes anything else, or is malformed.
+     */
+    Versioned!FingerprintLedger update(in Versioned!FingerprintLedger current, FingerprintLedger next)
+    {
+        const was = current.value;
+        requireValid(!was.active.isNull && !next.active.isNull, format(
+            "Fingerprint %s: only an active execution is updated in place", was.fingerprint));
+        const before = was.active.get;
+        const after = next.active.get;
+        requireValid(next.fingerprint == was.fingerprint && next.lastSuccessExecutionId == was.lastSuccessExecutionId
+            && next.lastStoppedExecutionId == was.lastStoppedExecutionId && next.stopSeq == was.stopSeq
+            && next.executionSeq == was.executionSeq,
+            format("Fingerprint %s: an update cannot change its identity, outcomes or counts", was.fingerprint));
+        requireValid(after.id == before.id && after.projectId == before.projectId && after.taskId == before.taskId
+            && after.definitionId == before.definitionId && after.inputs == before.inputs
+            && cast(string[string]) after.repositoryAddresses == cast(string[string]) before.repositoryAddresses && after.createdAt == before.createdAt,
+            format("Execution '%s' runs with what it was claimed with; it cannot change", before.id));
+        requireValid(after.attempt >= before.attempt && after.expiredLeases >= before.expiredLeases,
+            format("The attempt and lost leases of execution '%s' never go down", before.id));
+        requireWellFormed(next);
+        return m_ledgers.replace(was.fingerprint, next, current.version_);
+    }
+
+    /**
      * Folds the outcome of `execution` into its fingerprint's ledger (see `withFold`). The
      * execution is identified by its id: its stored record is read by id and that record's
-     * outcome is folded, never the status in `execution`, so a caller that lost the terminal
-     * compare-and-set cannot fold the outcome it intended. Idempotent: folding an execution the
+     * outcome is folded, never the status in `execution`, so a caller that lost the race to write
+     * the record cannot fold the outcome it intended. Idempotent: folding an execution the
      * ledger already folded writes nothing.
      *
      * Throws: InvalidStateTransitionException if the stored execution is missing, is not
@@ -331,11 +465,11 @@ final class LedgerStore
             requireValid(!current.isNull, format("Execution '%s' at fingerprint %s has no ledger: it was never claimed",
                 execution.id, execution.fingerprint));
             const ledger = current.get;
-            if (ledger.activeExecutionId != execution.id)
+            if (ledger.active.isNull || ledger.active.get.id != execution.id)
             {
                 requireValid(claimedOn(ledger, execution.id), format(
                     "Execution '%s' was never claimed at fingerprint %s (its ledger has claimed %s executions; active: '%s')",
-                    execution.id, execution.fingerprint, ledger.executionSeq, ledger.activeExecutionId));
+                    execution.id, execution.fingerprint, ledger.executionSeq, ledger.active.isNull ? "" : ledger.active.get.id));
                 return LedgerFold(FoldOutcome.alreadyFolded, current.get);
             }
             try
@@ -353,60 +487,110 @@ final class LedgerStore
     }
 
     /**
-     * Reads the ledger of `fingerprint` and its active execution by id, completing a
-     * half-finished fold first: if the active execution is terminal (its ender crashed between
-     * the terminal compare-and-set and the fold), folds it. Any reader may call it, any number of
-     * times. See LedgerActivity for what the caller must do.
+     * Reads the ledger of `fingerprint`, completing a half-finished fold first: if the active
+     * execution already has its record (its ender crashed between writing it and the fold),
+     * folds it. Any reader may call it, any number of times. Null if no execution was ever
+     * claimed at the fingerprint; otherwise the ledger's `active` is queued or running.
      *
      * Throws: Exception if `fingerprint` is empty or the ledger keeps changing for
      * maxWriteAttempts reads; InvalidStateTransitionException if the active execution's record
      * names another fingerprint.
      */
-    LedgerSettlement settle(string fingerprint)
+    Nullable!(Versioned!FingerprintLedger) settle(string fingerprint)
     {
         requireFingerprint(fingerprint);
         foreach (attempt; 0 .. maxWriteAttempts)
         {
-            LedgerSettlement result;
-            result.ledger = get(fingerprint);
-            if (result.ledger.isNull || result.ledger.get.activeExecutionId.length == 0) return result;
-            result.executionId = result.ledger.get.activeExecutionId;
-            auto execution = m_executions.get(result.executionId);
-            if (execution.isNull)
-            {
-                result.activity = LedgerActivity.unrecorded;
-                return result;
-            }
-            requireValid(execution.get.fingerprint == fingerprint, format(
-                "The active execution '%s' of fingerprint %s is recorded at fingerprint %s", result.executionId,
-                fingerprint, execution.get.fingerprint));
-            if (ExecutionStore.isActive(execution.get.status))
-            {
-                result.activity = LedgerActivity.recorded;
-                result.execution = execution;
-                return result;
-            }
-            foldRecord(execution.get.value);
+            auto ledger = get(fingerprint);
+            if (ledger.isNull || ledger.get.active.isNull) return ledger;
+            const activeId = ledger.get.active.get.id;
+            auto ended = m_executions.get(activeId);
+            if (ended.isNull) return ledger;
+            requireValid(ended.get.fingerprint == fingerprint, format(
+                "The active execution '%s' of fingerprint %s is recorded at fingerprint %s", activeId,
+                fingerprint, ended.get.fingerprint));
+            foldRecord(ended.get.value);
         }
         throw new Exception(format("Could not settle fingerprint %s: it changed on each of %s reads", fingerprint, maxWriteAttempts));
     }
+
+    /// One page of the ledgers whose active execution is queued, oldest claim first, from `cursor`
+    /// (null for the first page). `nextCursor` is empty after the last page. Discovery: it may lag,
+    /// so read each ledger by id before acting on it.
+    Page!FingerprintLedger queuedPage(string cursor)
+    {
+        IndexQuery lookup;
+        lookup.index = "active";
+        lookup.partitionKey = ExecutionStatus.queued;
+        lookup.limit = pageSize;
+        lookup.cursor = cursor;
+        return m_ledgers.query(lookup);
+    }
+
+    /// One page of the ledgers whose running execution's lease expires at or before `now`, the
+    /// earliest first, from `cursor`. Discovery, like `queuedPage`.
+    Page!FingerprintLedger leaseDuePage(string now, string cursor)
+    {
+        IndexQuery lookup;
+        lookup.index = "active";
+        lookup.partitionKey = ExecutionStatus.running;
+        lookup.sortKeyTo = sortableTimestamp(now);
+        lookup.limit = pageSize;
+        lookup.cursor = cursor;
+        return m_ledgers.query(lookup);
+    }
 }
 
-private FingerprintLedger copyOf(in FingerprintLedger ledger) @safe
+/// A mutable copy of `ledger`. The active execution's arrays are shared, which is safe because
+/// ledgers are only ever replaced, never edited in place.
+private FingerprintLedger copyOf(in FingerprintLedger ledger) @trusted
 {
-    FingerprintLedger copy;
-    copy.fingerprint = ledger.fingerprint;
-    copy.activeExecutionId = ledger.activeExecutionId;
-    copy.lastSuccessExecutionId = ledger.lastSuccessExecutionId;
-    copy.lastStoppedExecutionId = ledger.lastStoppedExecutionId;
-    copy.stopSeq = ledger.stopSeq;
-    copy.executionSeq = ledger.executionSeq;
-    return copy;
+    return cast(FingerprintLedger) ledger;
 }
 
-private Versioned!FingerprintLedger copyOf(in Versioned!FingerprintLedger ledger) @safe
+/// A mutable copy of the active execution of `ledger`, for a transition to change.
+private ActiveExecution activeOf(in FingerprintLedger ledger, string action) @trusted
 {
-    return Versioned!FingerprintLedger(copyOf(ledger.value), ledger.version_);
+    requireValid(!ledger.active.isNull, format("Fingerprint %s has no active execution to %s", ledger.fingerprint, action));
+    return cast(ActiveExecution) ledger.active.get;
+}
+
+/// Throws InvalidStateTransitionException unless `ledger` is well formed: its active execution
+/// (if any) is the latest claim, has what it was claimed with, and is queued without a worker or
+/// running with one and a lease.
+private void requireWellFormed(in FingerprintLedger ledger)
+{
+    requireFingerprint(ledger.fingerprint);
+    if (ledger.active.isNull) return;
+    const active = ledger.active.get;
+    requireValid(ledger.executionSeq > 0 && active.id == executionIdFor(ledger.fingerprint, ledger.executionSeq),
+        format("The active execution '%s' of fingerprint %s is not its latest claim", active.id, ledger.fingerprint));
+    requireValid(active.projectId.length > 0 && active.taskId.length > 0 && active.definitionId.length > 0,
+        format("Execution '%s' needs a project id, a task id and a definition id", active.id));
+    requireTimestamp(active.createdAt, format("The creation time of execution '%s'", active.id));
+    final switch (active.status)
+    {
+        case ExecutionStatus.queued:
+            requireValid(active.worker.length == 0 && active.leaseExpiresAt.length == 0 && active.startedAt.length == 0,
+                format("Execution '%s' is queued, so it has no worker, lease or start time", active.id));
+            break;
+        case ExecutionStatus.running:
+            requireValid(active.worker.length > 0 && active.attempt > 0 && active.startedAt.length > 0,
+                format("Execution '%s' is running, so it needs a worker, an attempt and a start time", active.id));
+            requireTimestamp(active.leaseExpiresAt, format("The lease expiry of running execution '%s'", active.id));
+            break;
+        case ExecutionStatus.succeeded:
+        case ExecutionStatus.failed:
+        case ExecutionStatus.cancelled:
+            requireValid(false, format("Execution '%s' is %s, which is not an active status", active.id, active.status));
+            break;
+    }
+}
+
+private void requireTimestamp(string timestamp, lazy string what)
+{
+    try sortableTimestamp(timestamp);
+    catch (Exception e) throw new InvalidStateTransitionException(format("%s is not valid: %s", what, e.msg));
 }
 
 private void requireValid(bool condition, lazy string message) @safe
@@ -422,6 +606,7 @@ private void requireFingerprint(string fingerprint) @safe
 version (unittest)
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import vibe.data.json : Json;
 
     /// The two stores the ledger works with, over one document store.
     private struct Stores
@@ -436,37 +621,41 @@ version (unittest)
         return Stores(executions, new LedgerStore(documents, executions));
     }
 
-    private TaskExecution queuedExecution(string id, string fingerprint, string definitionHash = "def1")
+    /// What a claim of task "compile" carries.
+    private ActiveExecution proposal(string definitionId = "def1", string createdAt = "2026-10-18T10:00:00Z")
     {
-        TaskExecution execution;
-        execution.id = id;
-        execution.projectId = "game";
-        execution.taskId = "compile";
-        execution.fingerprint = fingerprint;
-        execution.status = ExecutionStatus.queued;
-        execution.definition.id = "compile";
-        execution.definitionHash = definitionHash;
-        execution.createdAt = "2026-10-18T10:00:00Z";
-        return execution;
+        ActiveExecution proposed;
+        proposed.projectId = "game";
+        proposed.taskId = "compile";
+        proposed.definitionId = definitionId;
+        proposed.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
+        proposed.repositoryAddresses = ["src": "https://example.test/game.git"];
+        proposed.createdAt = createdAt;
+        return proposed;
     }
 
-    /// Claims `fingerprint` (which must win) and records its execution, as the dispatcher does.
-    private string dispatch(Stores stores, string fingerprint, ulong seen)
+    /// Claims `fingerprint` (which must win) as a dispatch does. Returns the claimed id.
+    private string dispatch(Stores stores, string fingerprint, ulong seen, string createdAt = "2026-10-18T10:00:00Z")
     {
-        auto claimed = stores.ledgers.claim(fingerprint, seen);
+        auto claimed = stores.ledgers.claim(fingerprint, seen, proposal("def1", createdAt));
         assert(claimed.outcome == ClaimOutcome.won, "The dispatch's claim must win");
-        stores.executions.createIfAbsent(queuedExecution(claimed.executionId, fingerprint));
         return claimed.executionId;
     }
 
-    /// The terminal compare-and-set on execution `id`, without the fold.
-    private TaskExecution finish(Stores stores, string id, ExecutionStatus status)
+    /// Writes the record of the active execution at `fingerprint` ended as `status`, without the fold.
+    private TaskExecution finish(Stores stores, string fingerprint, ExecutionStatus status)
     {
-        auto current = stores.executions.get(id).get;
-        TaskExecution next = current.value;
-        next.status = status;
-        next.finishedAt = "2026-10-18T10:05:00Z";
-        return stores.executions.update(current, next).value;
+        auto ledger = stores.ledgers.get(fingerprint).get;
+        auto ended = endedExecution(fingerprint, ledger.active.get, status, "2026-10-18T10:05:00Z");
+        return stores.executions.create(ended).value;
+    }
+
+    /// A finished record under an arbitrary id, which no ledger claimed.
+    private TaskExecution strangerAt(Stores stores, string id, string fingerprint)
+    {
+        ActiveExecution active = proposal();
+        active.id = id;
+        return stores.executions.create(endedExecution(fingerprint, active, ExecutionStatus.succeeded, "2026-10-18T10:05:00Z")).value;
     }
 
     private Versioned!FingerprintLedger ledgerOf(Stores stores, string fingerprint)
@@ -479,6 +668,17 @@ version (unittest)
         try action();
         catch (E) return true;
         return false;
+    }
+
+    /// Counts the writes through `store` into `writes`, from now on.
+    private void countWrites(InterleavingDocumentStore store, ref size_t writes)
+    {
+        size_t* counter = &writes;
+        void arm()
+        {
+            store.beforeNextWrite = () { *counter += 1; arm(); };
+        }
+        arm();
     }
 }
 
@@ -495,43 +695,55 @@ unittest
 
     // Claims name them: the nth claim at a fingerprint names its nth id, on any store
     auto stores = storesOver(new InMemoryDocumentStore());
-    assert(stores.ledgers.claim("fp1", 0).executionId == executionIdFor("fp1", 1));
-    assert(storesOver(new InMemoryDocumentStore()).ledgers.claim("fp1", 0).executionId == executionIdFor("fp1", 1));
+    assert(stores.ledgers.claim("fp1", 0, proposal()).executionId == executionIdFor("fp1", 1));
+    assert(storesOver(new InMemoryDocumentStore()).ledgers.claim("fp1", 0, proposal()).executionId == executionIdFor("fp1", 1));
 }
 
 unittest
 {
-    // A claim creates the ledger, then holds the fingerprint until the execution is folded; a
-    // second claimer sees the active execution. A claim decided on an older ledger is
-    // superseded; a claim never looks at the last success
+    // A claim creates the ledger with the active execution, queued and complete, in one write; a
+    // second claimer sees it. A claim decided on an older ledger is superseded; a claim never
+    // looks at the last success
     auto documents = new InMemoryDocumentStore();
-    auto stores = storesOver(documents);
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto stores = storesOver(interleaving);
     assert(stores.ledgers.get("fp1").isNull);
 
-    auto won = stores.ledgers.claim("fp1", 0);
+    size_t writes;
+    countWrites(interleaving, writes);
+    auto won = stores.ledgers.claim("fp1", 0, proposal());
+    assert(writes == 1, "A claim is one compare-and-set");
     assert(won.outcome == ClaimOutcome.won && won.executionId == executionIdFor("fp1", 1));
-    assert(won.ledger.version_ == 1 && won.ledger.executionSeq == 1 && won.ledger.activeExecutionId == won.executionId);
-    assert(won.ledger.fingerprint == "fp1");
+    assert(won.ledger.version_ == 1 && won.ledger.executionSeq == 1 && won.ledger.fingerprint == "fp1");
+    auto active = won.ledger.active.get;
+    assert(active.id == won.executionId && active.status == ExecutionStatus.queued && active.attempt == 0);
+    assert(active.projectId == "game" && active.taskId == "compile" && active.definitionId == "def1");
+    assert(active.inputs == proposal().inputs && active.repositoryAddresses == proposal().repositoryAddresses);
+    assert(active.createdAt == "2026-10-18T10:00:00Z" && active.worker.length == 0 && active.leaseExpiresAt.length == 0);
 
     foreach (seen; [0UL, 1UL])
     {
-        auto lost = stores.ledgers.claim("fp1", seen);
+        auto lost = stores.ledgers.claim("fp1", seen, proposal());
         assert(lost.outcome == ClaimOutcome.active && lost.executionId == won.executionId);
     }
-    assert(ledgerOf(stores, "fp1").version_ == 1, "A losing claim writes nothing");
-    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.claim("fp1", 5); }), "A claim cannot have seen the future");
-    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.claim("fp9", 1); }));
-    assert(throwsA!Exception({ stores.ledgers.claim("", 0); }));
+    assert(ledgerOf(stores, "fp1").version_ == 1 && writes == 1, "A losing claim writes nothing");
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.claim("fp1", 5, proposal()); }), "A claim cannot have seen the future");
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.claim("fp9", 1, proposal()); }));
+    assert(throwsA!Exception({ stores.ledgers.claim("", 0, proposal()); }));
+    auto incomplete = proposal();
+    incomplete.definitionId = null;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.claim("fp8", 0, incomplete); }), "An incomplete claim is refused");
+    assert(stores.ledgers.get("fp8").isNull);
 
-    stores.executions.createIfAbsent(queuedExecution(won.executionId, "fp1"));
-    stores.ledgers.fold(finish(stores, won.executionId, ExecutionStatus.succeeded));
+    finish(stores, "fp1", ExecutionStatus.succeeded);
+    stores.ledgers.fold(stores.executions.get(won.executionId).get.value);
 
-    auto stale = stores.ledgers.claim("fp1", 0);
+    auto stale = stores.ledgers.claim("fp1", 0, proposal());
     assert(stale.outcome == ClaimOutcome.superseded && stale.executionId.length == 0);
     assert(stale.ledger.lastSuccessExecutionId == won.executionId);
 
     // The caller decided the success is unusable (say its artifacts expired) and claims again
-    auto again = stores.ledgers.claim("fp1", 1);
+    auto again = stores.ledgers.claim("fp1", 1, proposal());
     assert(again.outcome == ClaimOutcome.won && again.executionId == executionIdFor("fp1", 2));
     assert(again.ledger.lastSuccessExecutionId == won.executionId && again.ledger.executionSeq == 2);
 
@@ -550,19 +762,19 @@ unittest
     auto racing = storesOver(interleaving);
 
     LedgerClaim first;
-    interleaving.beforeNextWrite = () { first = direct.ledgers.claim("fp1", 0); };
-    auto second = racing.ledgers.claim("fp1", 0);
+    interleaving.beforeNextWrite = () { first = direct.ledgers.claim("fp1", 0, proposal()); };
+    auto second = racing.ledgers.claim("fp1", 0, proposal());
     assert(first.outcome == ClaimOutcome.won);
     assert(second.outcome == ClaimOutcome.active && second.executionId == first.executionId,
         "The loser sees the winner's execution");
     auto ledger = ledgerOf(direct, "fp1");
-    assert(ledger.version_ == 1 && ledger.executionSeq == 1 && ledger.activeExecutionId == first.executionId);
+    assert(ledger.version_ == 1 && ledger.executionSeq == 1 && ledger.active.get.id == first.executionId);
 
     // And racing to claim an existing, idle ledger: the loser's compare-and-set loses
-    direct.executions.createIfAbsent(queuedExecution(first.executionId, "fp1"));
-    direct.ledgers.fold(finish(direct, first.executionId, ExecutionStatus.failed));
-    interleaving.beforeNextWrite = () { first = direct.ledgers.claim("fp1", 1); };
-    second = racing.ledgers.claim("fp1", 1);
+    finish(direct, "fp1", ExecutionStatus.failed);
+    direct.ledgers.settle("fp1");
+    interleaving.beforeNextWrite = () { first = direct.ledgers.claim("fp1", 1, proposal()); };
+    second = racing.ledgers.claim("fp1", 1, proposal());
     assert(first.outcome == ClaimOutcome.won && first.executionId == executionIdFor("fp1", 2));
     assert(second.outcome == ClaimOutcome.active && second.executionId == first.executionId);
     assert(ledgerOf(direct, "fp1").executionSeq == 2);
@@ -571,23 +783,23 @@ unittest
 unittest
 {
     // A claim that finds an active execution which ended without being folded (its ender
-    // crashed after the terminal compare-and-set) completes the fold and decides again, instead
-    // of reporting an execution that will never end as active
+    // crashed after writing the record) completes the fold and decides again, instead of
+    // reporting an execution that will never end as active
     auto documents = new InMemoryDocumentStore();
     auto before = storesOver(documents);
     const id = dispatch(before, "fp1", 0);
-    finish(before, id, ExecutionStatus.failed); // ... and the process dies
+    finish(before, "fp1", ExecutionStatus.failed); // ... and the process dies
 
     auto after = storesOver(documents.restart());
-    auto retry = after.ledgers.claim("fp1", 1);
+    auto retry = after.ledgers.claim("fp1", 1, proposal());
     assert(retry.outcome == ClaimOutcome.won && retry.executionId == executionIdFor("fp1", 2));
     assert(retry.ledger.lastStoppedExecutionId == id && retry.ledger.stopSeq == 1);
 
     // A claimer that decided before that execution existed is superseded, not active
     auto other = storesOver(new InMemoryDocumentStore());
     const ended = dispatch(other, "fp1", 0);
-    finish(other, ended, ExecutionStatus.succeeded);
-    auto stale = other.ledgers.claim("fp1", 0);
+    finish(other, "fp1", ExecutionStatus.succeeded);
+    auto stale = other.ledgers.claim("fp1", 0, proposal());
     assert(stale.outcome == ClaimOutcome.superseded && stale.ledger.lastSuccessExecutionId == ended);
 }
 
@@ -603,9 +815,9 @@ unittest
     string winner;
     interleaving.beforeNextWrite = () {
         winner = dispatch(direct, "fp1", 0);
-        direct.ledgers.fold(finish(direct, winner, ExecutionStatus.succeeded));
+        direct.ledgers.fold(finish(direct, "fp1", ExecutionStatus.succeeded));
     };
-    auto lost = racing.ledgers.claim("fp1", 0);
+    auto lost = racing.ledgers.claim("fp1", 0, proposal());
     assert(lost.outcome == ClaimOutcome.superseded && lost.executionId.length == 0);
     assert(lost.ledger.lastSuccessExecutionId == winner && lost.ledger.executionSeq == 1);
 }
@@ -622,7 +834,7 @@ unittest
     foreach (t; 0 .. threadCount)
     {
         auto stores = storesOver(documents);
-        threads ~= new Thread(((size_t index, Stores s) => () { claims[index] = s.ledgers.claim("shared", 0); })(t, stores));
+        threads ~= new Thread(((size_t index, Stores s) => () { claims[index] = s.ledgers.claim("shared", 0, proposal()); })(t, stores));
     }
     foreach (thread; threads) thread.start();
     foreach (thread; threads) thread.join();
@@ -640,6 +852,140 @@ unittest
 
 unittest
 {
+    // The transitions of the active execution, each one compare-and-set on the ledger: start,
+    // heartbeat, release, a lost lease with a requeue or counted alone; the claim's own fields
+    // never change, and what a transition cannot do is refused
+    auto documents = new InMemoryDocumentStore();
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto stores = storesOver(interleaving);
+    const id = dispatch(stores, "fp1", 0);
+
+    size_t writes;
+    countWrites(interleaving, writes);
+    auto queued = ledgerOf(stores, "fp1");
+    auto started = stores.ledgers.update(queued, withStart(queued.value, "w1", "2026-10-18T10:01:00Z", "2026-10-18T10:00:00Z"));
+    assert(writes == 1 && started.version_ == 2, "A start is one compare-and-set");
+    auto running = started.active.get;
+    assert(running.status == ExecutionStatus.running && running.attempt == 1 && running.worker == "w1");
+    assert(running.leaseExpiresAt == "2026-10-18T10:01:00Z" && running.startedAt == "2026-10-18T10:00:00Z");
+    assert(running.id == id && running.inputs == proposal().inputs);
+
+    auto extended = stores.ledgers.update(started, withLease(started.value, "2026-10-18T10:05:00Z"));
+    assert(writes == 2 && extended.active.get.leaseExpiresAt == "2026-10-18T10:05:00Z" && extended.active.get.attempt == 1);
+
+    auto released = stores.ledgers.update(extended, withRequeue(extended.value));
+    const back = released.active.get;
+    assert(back.status == ExecutionStatus.queued && back.attempt == 1 && back.expiredLeases == 0, "A release keeps the attempt and counts nothing");
+    assert(back.worker.length == 0 && back.leaseExpiresAt.length == 0 && back.startedAt.length == 0);
+
+    auto second = stores.ledgers.update(released, withStart(released.value, "w2", "2026-10-18T10:06:00Z", "2026-10-18T10:05:00Z"));
+    assert(second.active.get.attempt == 2);
+    auto lostAndQueued = stores.ledgers.update(second, withLostLease(second.value, true));
+    assert(lostAndQueued.active.get.status == ExecutionStatus.queued && lostAndQueued.active.get.expiredLeases == 1);
+    auto third = stores.ledgers.update(lostAndQueued, withStart(lostAndQueued.value, "w3", "2026-10-18T10:08:00Z", "2026-10-18T10:07:00Z"));
+    assert(third.active.get.attempt == 3 && third.active.get.expiredLeases == 1);
+    auto counted = stores.ledgers.update(third, withLostLease(third.value, false));
+    assert(counted.active.get.status == ExecutionStatus.running && counted.active.get.expiredLeases == 2 && counted.active.get.attempt == 3);
+
+    // Transitions that cannot apply
+    assert(throwsA!InvalidStateTransitionException({ withStart(counted.value, "w4", "2026-10-18T10:08:00Z", "2026-10-18T10:07:00Z"); }));
+    assert(throwsA!InvalidStateTransitionException({ withLease(lostAndQueued.value, "2026-10-18T10:09:00Z"); }));
+    assert(throwsA!InvalidStateTransitionException({ withRequeue(released.value); }));
+    assert(throwsA!InvalidStateTransitionException({ withLostLease(released.value, true); }));
+    assert(throwsA!InvalidStateTransitionException({ withClaim(counted.value, proposal()); }), "An active execution cannot be claimed over");
+
+    // update refuses what is not a transition of the active execution
+    FingerprintLedger edited = counted.value;
+    auto changed = edited.active.get;
+    changed.definitionId = "def2";
+    edited.active = changed;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "The claim's definition is fixed");
+    edited = counted.value;
+    changed = edited.active.get;
+    changed.inputs = [ResolvedInput("src", InputKind.repository, Json("bbb222"))];
+    edited.active = changed;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "The claim's inputs are fixed");
+    edited = counted.value;
+    changed = edited.active.get;
+    changed.repositoryAddresses = ["src": "https://example.test/other.git"];
+    edited.active = changed;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "The claim's addresses are fixed");
+    edited = counted.value;
+    changed = edited.active.get;
+    changed.attempt = 1;
+    edited.active = changed;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "The attempt never goes down");
+    edited = counted.value;
+    edited.stopSeq = 5;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "Counts change only by claim and fold");
+    edited = counted.value;
+    edited.active.nullify();
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "Only the fold clears the execution");
+    edited = counted.value;
+    changed = edited.active.get;
+    changed.leaseExpiresAt = null;
+    edited.active = changed;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "A running execution needs a lease");
+    edited = counted.value;
+    changed = edited.active.get;
+    changed.status = ExecutionStatus.queued;
+    edited.active = changed;
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.update(counted, edited); }), "A queued execution has no worker");
+    assert(ledgerOf(stores, "fp1").version_ == counted.version_, "Nothing refused was written");
+
+    // A stale writer loses the compare-and-set
+    assert(throwsA!DocumentConflictException({ stores.ledgers.update(started, withLease(started.value, "2026-10-18T10:30:00Z")); }));
+}
+
+unittest
+{
+    // The active index lists queued executions oldest claim first and running ones by lease
+    // expiry; a ledger with nothing active, or whose execution moved between states, is in the
+    // partition of its current status only
+    auto stores = storesOver(new InMemoryDocumentStore());
+    dispatch(stores, "fp_b", 0, "2026-10-18T10:00:00.5Z");
+    dispatch(stores, "fp_a", 0, "2026-10-18T10:00:01Z");
+    dispatch(stores, "fp_c", 0, "2026-10-18T10:00:00Z");
+    dispatch(stores, "fp_d", 0, "2026-10-18T09:00:00Z");
+
+    string[] fingerprintsOf(Page!FingerprintLedger page)
+    {
+        string[] result;
+        foreach (item; page.items) result ~= item.fingerprint;
+        return result;
+    }
+
+    assert(fingerprintsOf(stores.ledgers.queuedPage(null)) == ["fp_d", "fp_c", "fp_b", "fp_a"], "Oldest claim first, by time not by text");
+    assert(stores.ledgers.queuedPage(null).nextCursor.length == 0);
+
+    void start(string fingerprint, string leaseExpiresAt)
+    {
+        auto current = ledgerOf(stores, fingerprint);
+        stores.ledgers.update(current, withStart(current.value, "w", leaseExpiresAt, "2026-10-18T10:00:00Z"));
+    }
+    start("fp_a", "2026-10-18T10:10:00Z");
+    start("fp_b", "2026-10-18T10:02:00.5Z");
+    start("fp_c", "2026-10-18T10:02:00Z");
+    assert(fingerprintsOf(stores.ledgers.queuedPage(null)) == ["fp_d"]);
+    assert(fingerprintsOf(stores.ledgers.leaseDuePage("2026-10-18T11:00:00Z", null)) == ["fp_c", "fp_b", "fp_a"]);
+    assert(fingerprintsOf(stores.ledgers.leaseDuePage("2026-10-18T10:02:00.25Z", null)) == ["fp_c"], "Only the leases that ran out");
+    assert(fingerprintsOf(stores.ledgers.leaseDuePage("2026-10-18T10:02:00Z", null)) == ["fp_c"], "A lease expiring now has run out");
+    assert(stores.ledgers.leaseDuePage("2026-10-18T10:01:59Z", null).items.length == 0);
+
+    // An ended execution leaves the index
+    finish(stores, "fp_c", ExecutionStatus.succeeded);
+    stores.ledgers.settle("fp_c");
+    assert(fingerprintsOf(stores.ledgers.leaseDuePage("2026-10-18T11:00:00Z", null)) == ["fp_b", "fp_a"]);
+
+    // Paging follows the cursor
+    foreach (i; 0 .. LedgerStore.pageSize + 3) dispatch(stores, format("fp_q%04d", i), 0);
+    auto page = stores.ledgers.queuedPage(null);
+    assert(page.items.length == LedgerStore.pageSize && page.nextCursor.length > 0);
+    assert(stores.ledgers.queuedPage(page.nextCursor).items.length == 4);
+}
+
+unittest
+{
     // Folding: a success becomes the last success without counting as a stop; a failure (also
     // how a lost execution ends) or a cancellation becomes the last stop and increments stopSeq.
     // Earlier outcomes stay until replaced
@@ -648,8 +994,8 @@ unittest
     string run(ExecutionStatus status)
     {
         const id = dispatch(stores, "fp1", seen++);
-        const result = stores.ledgers.fold(finish(stores, id, status));
-        assert(result.outcome == FoldOutcome.folded && result.ledger.activeExecutionId.length == 0);
+        const result = stores.ledgers.fold(finish(stores, "fp1", status));
+        assert(result.outcome == FoldOutcome.folded && result.ledger.active.isNull);
         return id;
     }
 
@@ -681,39 +1027,34 @@ unittest
 
 unittest
 {
-    // A fold that cannot be right fails loudly and writes nothing: an execution still active,
-    // one the ledger never claimed, or one at a fingerprint with no ledger
+    // A fold that cannot be right fails loudly and writes nothing: an execution still active (no
+    // record yet), one the ledger never claimed, or one at a fingerprint with no ledger
     auto stores = storesOver(new InMemoryDocumentStore());
     const id = dispatch(stores, "fp1", 0);
     const version_ = ledgerOf(stores, "fp1").version_;
 
-    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.fold(stores.executions.get(id).get.value); }),
-        "A queued execution is not folded");
+    TaskExecution unrecorded = endedExecution("fp1", ledgerOf(stores, "fp1").active.get, ExecutionStatus.succeeded, "2026-10-18T10:05:00Z");
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.fold(unrecorded); }), "An execution with no record is not folded");
 
-    stores.executions.create(queuedExecution("exe_stranger", "fp1"));
-    auto stranger = finish(stores, "exe_stranger", ExecutionStatus.succeeded);
+    auto stranger = strangerAt(stores, "exe_stranger", "fp1");
     assert(throwsA!InvalidStateTransitionException({ stores.ledgers.fold(stranger); }), "An execution never claimed is rejected");
-
-    stores.executions.create(queuedExecution("exe_unclaimed", "fp_none"));
-    const unclaimed = finish(stores, "exe_unclaimed", ExecutionStatus.succeeded);
+    auto unclaimed = strangerAt(stores, "exe_unclaimed", "fp_none");
     assert(throwsA!InvalidStateTransitionException({ stores.ledgers.fold(unclaimed); }), "An execution with no ledger is rejected");
 
-    auto unrecorded = stranger;
-    unrecorded.id = "exe_unrecorded";
-    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.fold(unrecorded); }), "An unrecorded execution is rejected");
     auto moved = stranger;
     moved.fingerprint = "fp_none";
     assert(throwsA!InvalidStateTransitionException({ stores.ledgers.fold(moved); }), "The fingerprint must match the record");
     assert(ledgerOf(stores, "fp1").version_ == version_ && stores.ledgers.get("fp_none").isNull);
+    assert(ledgerOf(stores, "fp1").active.get.id == id);
 }
 
 unittest
 {
-    // A fold folds the stored record, not the value it is given: a caller that lost the terminal
-    // compare-and-set (it meant to record a success, a cancel won) cannot fold its intended outcome
+    // A fold folds the stored record, not the value it is given: a caller that lost the race to
+    // write the record (it meant to record a success, a cancel won) cannot fold its intended outcome
     auto stores = storesOver(new InMemoryDocumentStore());
     const id = dispatch(stores, "fp1", 0);
-    auto cancelled = finish(stores, id, ExecutionStatus.cancelled);
+    auto cancelled = finish(stores, "fp1", ExecutionStatus.cancelled);
     TaskExecution intended = cancelled;
     intended.status = ExecutionStatus.succeeded;
 
@@ -728,21 +1069,20 @@ unittest
 
 unittest
 {
-    // Crash after an execution's terminal compare-and-set, before its fold: the next reader,
-    // after a restart, completes the fold. Settling again writes nothing
+    // Crash after an execution's record is written, before its fold: the next reader, after a
+    // restart, completes the fold. Settling again writes nothing
     auto documents = new InMemoryDocumentStore();
     auto before = storesOver(documents);
     const id = dispatch(before, "fp1", 0);
-    finish(before, id, ExecutionStatus.succeeded); // ... and the process dies
+    finish(before, "fp1", ExecutionStatus.succeeded); // ... and the process dies
 
     auto after = storesOver(documents.restart());
     auto settled = after.ledgers.settle("fp1");
-    assert(settled.activity == LedgerActivity.idle && settled.executionId.length == 0);
-    auto ledger = settled.ledger.get;
-    assert(ledger.activeExecutionId.length == 0 && ledger.lastSuccessExecutionId == id);
+    auto ledger = settled.get;
+    assert(ledger.active.isNull && ledger.lastSuccessExecutionId == id);
 
     auto again = after.ledgers.settle("fp1");
-    assert(again.activity == LedgerActivity.idle && again.ledger.get.version_ == ledger.version_);
+    assert(again.get.version_ == ledger.version_);
 
     // The ender, resuming, folds again: a no-op
     assert(before.ledgers.fold(before.executions.get(id).get.value).outcome == FoldOutcome.alreadyFolded);
@@ -759,76 +1099,39 @@ unittest
     auto racing = storesOver(interleaving);
 
     const id = dispatch(direct, "fp1", 0);
-    const done = finish(direct, id, ExecutionStatus.cancelled);
+    const done = finish(direct, "fp1", ExecutionStatus.cancelled);
 
     interleaving.beforeNextWrite = () { assert(direct.ledgers.fold(done).outcome == FoldOutcome.folded); };
     auto settled = racing.ledgers.settle("fp1");
-    assert(settled.activity == LedgerActivity.idle);
-    assert(settled.ledger.get.stopSeq == 1 && settled.ledger.get.lastStoppedExecutionId == id);
+    assert(settled.get.active.isNull);
+    assert(settled.get.stopSeq == 1 && settled.get.lastStoppedExecutionId == id);
 }
 
 unittest
 {
-    // settle reports what it finds: no ledger, or an active execution that is recorded. An active execution recorded at another
-    // fingerprint means a corrupt store and fails loudly
-    auto documents = new InMemoryDocumentStore();
-    auto stores = storesOver(documents);
-    auto none = stores.ledgers.settle("fp1");
-    assert(none.activity == LedgerActivity.idle && none.ledger.isNull);
+    // settle reports what it finds: no ledger, or an active execution with no record yet, which
+    // stays active. A record of the active execution at another fingerprint means a corrupt
+    // store and fails loudly
+    auto stores = storesOver(new InMemoryDocumentStore());
+    assert(stores.ledgers.settle("fp1").isNull);
 
     const id = dispatch(stores, "fp1", 0);
-    auto recorded = stores.ledgers.settle("fp1");
-    assert(recorded.activity == LedgerActivity.recorded && recorded.executionId == id);
-    assert(recorded.execution.get.id == id);
+    auto settled = stores.ledgers.settle("fp1").get;
+    assert(settled.active.get.id == id && settled.active.get.status == ExecutionStatus.queued);
+    assert(settled.version_ == 1, "Settling an execution that has not ended writes nothing");
 
-    const misplaced = stores.ledgers.claim("fp2", 0).executionId;
-    stores.executions.create(queuedExecution(misplaced, "fp_other"));
+    const misplaced = stores.ledgers.claim("fp2", 0, proposal()).executionId;
+    strangerAt(stores, misplaced, "fp_other");
     assert(throwsA!InvalidStateTransitionException({ stores.ledgers.settle("fp2"); }));
 }
 
 unittest
 {
-    // Crash between the claim and recording its execution: the ledger keeps the claimed id, so
-    // no second execution can be claimed; the next reader learns the id is unrecorded and
-    // records it from its own request. Recording it again (the original dispatcher resuming)
-    // keeps the first record and writes nothing
-    auto documents = new InMemoryDocumentStore();
-    auto before = storesOver(documents);
-    const claimed = before.ledgers.claim("fp1", 0).executionId; // ... and the process dies
-
-    auto after = storesOver(documents.restart());
-    auto settled = after.ledgers.settle("fp1");
-    assert(settled.activity == LedgerActivity.unrecorded && settled.executionId == claimed && settled.execution.isNull);
-    auto other = after.ledgers.claim("fp1", 1);
-    assert(other.outcome == ClaimOutcome.active && other.executionId == claimed, "Another chain cannot claim a second execution");
-
-    auto repaired = after.executions.createIfAbsent(queuedExecution(settled.executionId, "fp1", "def_repairer"));
-    assert(repaired.version_ == 1 && repaired.definitionHash == "def_repairer");
-    auto now = after.ledgers.settle("fp1");
-    assert(now.activity == LedgerActivity.recorded && now.execution.get.id == claimed);
-
-    auto resumed = before.executions.createIfAbsent(queuedExecution(claimed, "fp1", "def_original"));
-    assert(resumed.version_ == 1 && resumed.definitionHash == "def_repairer", "The first record is kept");
-
-    // An execution under that id for another fingerprint or task is refused loudly
-    assert(throwsA!InvalidStateTransitionException({ after.executions.createIfAbsent(queuedExecution(claimed, "fp_other")); }));
-    auto otherTask = queuedExecution(claimed, "fp1");
-    otherTask.taskId = "link";
-    assert(throwsA!InvalidStateTransitionException({ after.executions.createIfAbsent(otherTask); }));
-}
-
-unittest
-{
-    // Two repairers recording one claimed execution at once: the second's create loses, and it
-    // returns the first's record
-    auto documents = new InMemoryDocumentStore();
-    auto direct = storesOver(documents);
-    auto interleaving = new InterleavingDocumentStore(documents);
-    auto racing = storesOver(interleaving);
-    const claimed = direct.ledgers.claim("fp1", 0).executionId;
-
-    interleaving.beforeNextWrite = () { direct.executions.createIfAbsent(queuedExecution(claimed, "fp1", "def_first")); };
-    auto second = racing.executions.createIfAbsent(queuedExecution(claimed, "fp1", "def_second"));
-    assert(second.version_ == 1 && second.definitionHash == "def_first");
-    assert(direct.executions.get(claimed).get.definitionHash == "def_first");
+    // A claim that finds a record for the active execution at another fingerprint fails loudly
+    // instead of folding it
+    auto stores = storesOver(new InMemoryDocumentStore());
+    const id = dispatch(stores, "fp1", 0);
+    strangerAt(stores, id, "fp_other");
+    assert(throwsA!InvalidStateTransitionException({ stores.ledgers.claim("fp1", 1, proposal()); }));
+    assert(!ledgerOf(stores, "fp1").active.isNull, "Nothing was folded");
 }

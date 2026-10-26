@@ -3,30 +3,40 @@ module confector.core.request_reconciler;
 /**
  * The request reconciler (AGENTS.md, "Coordinating builds"): the imperative shell that brings one
  * request up to date. It reads everything by id, evaluates with the pure request evaluator
- * (confector.core.request_evaluator), has the execution dispatcher
- * (confector.core.execution_dispatcher) dispatch what is needed and repair what the request waits
- * on, and commits the evaluation to the request's RequestState (confector.core.request_state). It
- * keeps no state between calls, so it works the same after a restart, in a short-lived function,
- * and with any number of reconcilers of one request at once. Reconciling is level-triggered: it
- * does not matter what made it run, only what the stores hold now, and every step is idempotent.
+ * (confector.core.request_evaluator), dispatches what is needed, and commits the evaluation to the
+ * request's RequestState (confector.core.request_state). It keeps no state between calls, so it
+ * works the same after a restart, in a short-lived function, and with any number of reconcilers of
+ * one request at once. Reconciling is level-triggered: it does not matter what made it run, only
+ * what the stores hold now, and every step is idempotent.
  *
  * One pass, repeated until a pass commits:
  *
  * 1. Read the RequestState by id. If the request is settled, nothing more can change: stop. The
  *    state is read before anything else, so a concurrent reconcile that commits after this read
- *    changes its version and makes step 5 fail.
+ *    changes its version and makes step 4 fail.
  * 2. Read by id the request, its definition, its chain, the rerun generations, and each
- *    fingerprint's ledger, settled (completing a half-finished fold), with the executions it
- *    names. Evaluate.
+ *    fingerprint's ledger, settled (completing a half-finished fold), with the finished
+ *    executions it names. Evaluate.
  * 3. If anything is needed, dispatch each (whatever a claim finds) and start the next pass: an
  *    evaluation that still needs executions is never committed.
- * 4. For each execution the request awaits, have the dispatcher record it if it was never
- *    recorded. If one has ended since the evaluation, start the next pass.
- * 5. Commit the evaluation by compare-and-set at the RequestState version read in step 1, which
+ * 4. Commit the evaluation by compare-and-set at the RequestState version read in step 1, which
  *    settles the request once every target has. If the state changed since
  *    (DocumentConflictException), start the next pass.
  *
- * A needed execution that cannot be recorded (UndispatchableExecutionException: say, a repository
+ * Dispatching a needed fingerprint F (`dispatch`) is one compare-and-set on F's ledger
+ * (confector.core.fingerprint_ledger):
+ *
+ * 1. Build the execution to claim from the request's definition, the task's resolved inputs and
+ *    the registered repository addresses. A task that cannot be built (its repository is not
+ *    registered or has no address) fails loudly here, before anything is written, so it never
+ *    holds the fingerprint.
+ * 2. `LedgerStore.claim(F, seen, ...)`, with `seen` the ledger's `executionSeq` as the evaluation
+ *    read it (NeededExecution.seenExecutionSeq), so a decision made before another execution
+ *    started and ended never builds F twice. Losing (another execution is active, or one was
+ *    claimed since the evaluation read the ledger) writes nothing: the next evaluation waits on,
+ *    or reuses, what it finds.
+ *
+ * A needed execution that cannot be built (UndispatchableExecutionException: say, a repository
  * input without an address) settles the request failed, with the error in its RequestState,
  * instead of being retried on every look: the user fixes the cause and requests again. Every other
  * needed execution is dispatched first.
@@ -36,24 +46,100 @@ module confector.core.request_reconciler;
  *
  * - A needed execution that cannot be dispatched does not stop the others: every other needed
  *   execution is dispatched first, then RequestReconcileException names each failure, and nothing
- *   is committed. The same holds for awaited executions that cannot be recorded.
+ *   is committed.
  * - A request without a RequestState fails with RequestStateMissingException: create it
  *   (`RequestStateStore.createFor`), then reconcile.
  */
 
 import confector.core.document_collection : Versioned;
-import confector.core.execution_dispatcher : ExecutionDispatcher, UndispatchableExecutionException;
+import confector.core.fingerprint_ledger : ClaimOutcome;
 import confector.core.request_evaluator;
 import confector.core.request_state : RequestStateMissingException;
 import confector.core.state_stores : StateStores;
+import confector.core.work_orders : utcNow;
 import confector.api.document_store : DocumentConflictException;
 import confector.api.model;
 
+import std.algorithm.sorting : sort;
 import std.format : format;
 import vibe.core.log : logError;
 
 /**
- * A reconcile could not finish: some executions could not be dispatched or recorded. Every
+ * An execution cannot be built for a task: the request's definition lacks the task, or a
+ * repository input names a repository that is not registered or has no address to check out
+ * from. Nothing was written.
+ */
+class UndispatchableExecutionException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/// The result of `RequestReconciler.dispatch`.
+struct Dispatched
+{
+    /// What the claim found: won (this call claimed the execution), active (another execution is
+    /// active) or superseded (an execution was claimed since the evaluation read the ledger). On
+    /// every outcome the caller evaluates again.
+    ClaimOutcome claim;
+    /// won and active: the fingerprint's active execution; superseded: empty.
+    string executionId;
+}
+
+/**
+ * The execution to claim for task `taskId` of `request`: the stored definition of the request,
+ * `inputs`, the address of each repository input from `repositories` (keyed by repository id), and
+ * `createdAt` = `now`. Pure.
+ *
+ * Throws: UndispatchableExecutionException if the definition lacks the task, or a repository
+ * input names a repository missing from `repositories` or without an address.
+ */
+ActiveExecution activeExecutionFor(string taskId, in ResolvedInput[] inputs, in DefinedRequest request,
+    in RepositoryRecord[string] repositories, string now) @trusted
+{
+    const(TaskNode)* task;
+    foreach (ref node; request.definition.tasks)
+    {
+        if (node.id == taskId) task = &node;
+    }
+    if (task is null)
+    {
+        throw new UndispatchableExecutionException(format("Task '%s' is not in the definition '%s' of request '%s'", taskId,
+            request.request.definitionId, request.request.id));
+    }
+
+    ActiveExecution active;
+    active.projectId = request.request.projectId;
+    active.taskId = taskId;
+    active.definitionId = request.request.definitionId;
+    active.inputs = (cast(ResolvedInput[]) inputs).dup;
+    foreach (name; task.inputs.keys.sort().release)
+    {
+        const decl = task.inputs[name];
+        if (decl.kind != InputKind.repository) continue;
+        auto repository = decl.spec.repository in repositories;
+        if (repository is null)
+        {
+            throw new UndispatchableExecutionException(format(
+                "Input '%s' of task '%s' (request '%s') names repository '%s', which is not registered", name, taskId,
+                request.request.id, decl.spec.repository));
+        }
+        if (repository.address.length == 0)
+        {
+            throw new UndispatchableExecutionException(format(
+                "Input '%s' of task '%s' (request '%s'): repository '%s' has no address to check out from", name, taskId,
+                request.request.id, decl.spec.repository));
+        }
+        active.repositoryAddresses[name] = repository.address;
+    }
+    active.createdAt = now;
+    return active;
+}
+
+/**
+ * A reconcile could not finish: some executions could not be dispatched. Every
  * other one was handled first; nothing was committed.
  */
 class RequestReconcileException : Exception
@@ -97,15 +183,19 @@ final class RequestReconciler
     enum maxPasses = 100;
 
     private StateStores m_stores;
-    private ExecutionDispatcher m_dispatcher;
+    private string delegate() m_now;
 
-    /// Reconciles requests in `stores`, dispatching through `dispatcher`.
-    this(StateStores stores, ExecutionDispatcher dispatcher)
+    /**
+     * Reconciles requests in `stores`. `now` gives the current time for the executions it claims
+     * (default `utcNow`); tests pass a fixed clock.
+     *
+     * Throws: Exception if `stores` is null.
+     */
+    this(StateStores stores, string delegate() now = null)
     {
         if (stores is null) throw new Exception("The request reconciler requires the state stores");
-        if (dispatcher is null) throw new Exception("The request reconciler requires the execution dispatcher");
         m_stores = stores;
-        m_dispatcher = dispatcher;
+        m_now = now !is null ? now : () => utcNow();
     }
 
     /**
@@ -137,27 +227,26 @@ final class RequestReconciler
 
             Handled handled;
             if (evaluation.needed.length > 0) dispatchNeeded(evaluation, entry, handled);
-            else repairAwaited(evaluation, entry, handled);
 
-            if (handled.unrecordable.length == 0)
+            if (handled.undispatchable.length == 0)
             {
                 if (handled.failures.length > 0)
                 {
                     throw new RequestReconcileException(requestId, handled.failures, handled.failures.length == 1 ? handled.cause : null);
                 }
-                // What was dispatched or has ended is evaluated again before anything is committed
-                if (evaluation.needed.length > 0 || handled.ended) continue;
+                // What was dispatched is evaluated again before anything is committed
+                if (evaluation.needed.length > 0) continue;
             }
 
             try
             {
-                if (handled.unrecordable.length > 0)
+                if (handled.undispatchable.length > 0)
                 {
                     // Cache what this pass left behind (claimed executions), and keep the
-                    // dispatch failures in the error beside the unrecordable ones
+                    // dispatch failures in the error beside the undispatchable ones
                     auto settled = evaluate(chain.get.value, entry);
                     const error = format("%-(%s
-%)", handled.unrecordable ~ handled.failures);
+%)", handled.undispatchable ~ handled.failures);
                     return Reconciled(m_stores.requestStates.fail(read, settled, error), pass, true);
                 }
                 auto committed = m_stores.requestStates.commit(read, evaluation);
@@ -172,16 +261,56 @@ final class RequestReconciler
             requestId, maxPasses));
     }
 
-    /// What dispatching and repairing found.
+    /// What dispatching found.
     private struct Handled
     {
-        /// Executions that can never be recorded as the request stands: one line each.
-        string[] unrecordable;
-        /// Executions that could not be dispatched or recorded, one line each, and the last cause.
+        /// Executions that can never be built as the request stands: one line each.
+        string[] undispatchable;
+        /// Executions that could not be dispatched, one line each, and the last cause.
         string[] failures;
         Exception cause;
-        /// Whether an awaited execution has ended since the evaluation.
-        bool ended;
+    }
+
+    /**
+     * Dispatches the execution `needed` asks for, for `request` (with its definition): builds the
+     * execution to claim, then claims the fingerprint at the `executionSeq` the evaluation saw, in
+     * one compare-and-set. See Dispatched; whatever the outcome, the caller evaluates again before
+     * committing.
+     *
+     * Throws: UndispatchableExecutionException (nothing written) if the execution cannot be
+     * built; whatever the stores throw.
+     */
+    Dispatched dispatch(in NeededExecution needed, in DefinedRequest request)
+    {
+        // Built before claiming, so a task that cannot be built never holds the fingerprint
+        auto proposed = activeExecutionFor(needed.taskId, needed.inputs, request, repositoriesOf(needed.taskId, request), m_now());
+        auto claimed = m_stores.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq, proposed);
+        final switch (claimed.outcome)
+        {
+            case ClaimOutcome.won:
+            case ClaimOutcome.active:
+                return Dispatched(claimed.outcome, claimed.executionId);
+            case ClaimOutcome.superseded:
+                return Dispatched(ClaimOutcome.superseded, null);
+        }
+    }
+
+    /// The registered repositories the repository inputs of task `taskId` in `request`'s
+    /// definition name, read by id; missing ones are left out (`activeExecutionFor` reports them).
+    private RepositoryRecord[string] repositoriesOf(string taskId, in DefinedRequest request)
+    {
+        RepositoryRecord[string] repositories;
+        foreach (ref task; request.definition.tasks)
+        {
+            if (task.id != taskId) continue;
+            foreach (decl; task.inputs.byValue)
+            {
+                if (decl.kind != InputKind.repository || decl.spec.repository in repositories) continue;
+                auto found = m_stores.repositories.get(decl.spec.repository);
+                if (!found.isNull) repositories[decl.spec.repository] = found.get.value;
+            }
+        }
+        return repositories;
     }
 
     /// Dispatches every execution `evaluation` needs; a failure does not stop the others.
@@ -189,38 +318,14 @@ final class RequestReconciler
     {
         foreach (ref needed; evaluation.needed)
         {
-            try m_dispatcher.dispatch(needed, entry);
+            try dispatch(needed, entry);
             catch (UndispatchableExecutionException e)
             {
-                handled.unrecordable ~= format("task '%s' at fingerprint %s: %s", needed.taskId, needed.fingerprint, e.msg);
+                handled.undispatchable ~= format("task '%s' at fingerprint %s: %s", needed.taskId, needed.fingerprint, e.msg);
             }
             catch (Exception e)
             {
                 handled.failures ~= format("task '%s' at fingerprint %s: %s", needed.taskId, needed.fingerprint, e.msg);
-                handled.cause = e;
-            }
-        }
-    }
-
-    /// Has the dispatcher record each execution `evaluation` awaits that has no record; a failure
-    /// does not stop the others.
-    private void repairAwaited(in RequestEvaluation evaluation, in DefinedRequest entry, ref Handled handled)
-    {
-        foreach (ref awaited; evaluation.awaited)
-        {
-            try
-            {
-                if (m_dispatcher.repair(awaited, entry)) handled.ended = true;
-            }
-            catch (UndispatchableExecutionException e)
-            {
-                handled.unrecordable ~= format("task '%s' at fingerprint %s (execution '%s'): %s", awaited.taskId, awaited.fingerprint,
-                    awaited.executionId, e.msg);
-            }
-            catch (Exception e)
-            {
-                handled.failures ~= format("task '%s' at fingerprint %s (execution '%s'): %s", awaited.taskId, awaited.fingerprint,
-                    awaited.executionId, e.msg);
                 handled.cause = e;
             }
         }
@@ -278,7 +383,7 @@ ProjectReconciliation reconcileOpenRequests(StateStores stores, string projectId
         result.errors += 1;
         return result;
     }
-    auto reconciler = new RequestReconciler(stores, new ExecutionDispatcher(stores, () => now));
+    auto reconciler = new RequestReconciler(stores, () => now);
     foreach (state; open)
     {
         try
@@ -298,6 +403,7 @@ ProjectReconciliation reconcileOpenRequests(StateStores stores, string projectId
 version (unittest)
 {
     import confector.core.request_fixtures;
+    import confector.core.fingerprint_ledger : executionIdFor;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
 
     import std.algorithm.searching : canFind;
@@ -305,7 +411,8 @@ version (unittest)
     /// The active execution of task `taskId` of chain `chainId`, as its ledger names it now.
     private string activeOf(StateStores stores, string chainId, string taskId)
     {
-        return stores.ledgers.get(fingerprintNow(stores, chainId, taskId)).get.activeExecutionId;
+        auto ledger = stores.ledgers.get(fingerprintNow(stores, chainId, taskId)).get;
+        return ledger.active.isNull ? "" : ledger.active.get.id;
     }
 
     /// The ledger of task `taskId` of chain `chainId` now.
@@ -314,11 +421,11 @@ version (unittest)
         return stores.ledgers.get(fingerprintNow(stores, chainId, taskId)).get.value;
     }
 
-    /// The ids of the queued executions, as the active index lists them.
+    /// The ids of the queued executions, as the ledgers' active index lists them.
     private string[] queuedIds(StateStores stores)
     {
         string[] ids;
-        foreach (execution; stores.executions.listActive(ExecutionStatus.queued, 100)) ids ~= execution.id;
+        foreach (ledger; stores.ledgers.queuedPage(null).items) ids ~= ledger.active.get.id;
         return ids;
     }
 }
@@ -365,8 +472,7 @@ unittest
     // A request without a state fails loudly; so does a reconciler without its parts
     recordRequest(stores, "c1", "r2", ["lint"], "2026-10-20T10:00:01Z");
     assert(throwsA!RequestStateMissingException({ reconciler.reconcile("r2"); }));
-    assert(throwsA!Exception({ new RequestReconciler(null, dispatcherOf(stores)); }));
-    assert(throwsA!Exception({ new RequestReconciler(stores, null); }));
+    assert(throwsA!Exception({ new RequestReconciler(null); }));
 }
 
 unittest
@@ -374,7 +480,7 @@ unittest
     // The RequestState compare-and-set loop. A reconcile that loses the commit to another
     // reconcile of the same request reads again and evaluates again; whichever write of the first
     // reconcile the second overtakes, the request ends with one execution per fingerprint
-    foreach (overtakenAt; [1, 2, 3])
+    foreach (overtakenAt; [1, 2])
     {
         auto documents = new InMemoryDocumentStore();
         auto direct = new StateStores(documents);
@@ -383,7 +489,7 @@ unittest
 
         auto interleaving = new InterleavingDocumentStore(documents);
         Reconciled other;
-        // The first reconciler's writes: 1 claim, 2 record, 3 commit; the second reconciles
+        // The first reconciler's writes: 1 claim, 2 commit; the second reconciles
         // completely just before the chosen one
         beforeWrite(interleaving, overtakenAt, () { other = reconcilerOf(direct).reconcile("r1"); });
         auto reconciled = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
@@ -395,7 +501,7 @@ unittest
         assert(state.outcome == RequestOutcome.open && taskOf(state, "compile").status == RequestTaskStatus.queued);
         auto compile = ledgerOf(direct, "c1", "compile");
         assert(compile.executionSeq == 1, format("overtaken at write %s", overtakenAt));
-        assert(queuedIds(direct) == [compile.activeExecutionId], format("overtaken at write %s", overtakenAt));
+        assert(queuedIds(direct) == [compile.active.get.id], format("overtaken at write %s", overtakenAt));
     }
 }
 
@@ -410,8 +516,8 @@ unittest
     intake(direct, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
 
     auto interleaving = new InterleavingDocumentStore(documents);
-    // Writes: 1 claim, 2 record, 3 commit
-    beforeWrite(interleaving, 3, () { finish(direct, chain, "compile", ExecutionStatus.succeeded); });
+    // Writes: 1 claim, 2 commit
+    beforeWrite(interleaving, 2, () { finish(direct, chain, "compile", ExecutionStatus.succeeded); });
     auto reconciled = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
     assert(interleaving.beforeNextWrite is null);
     assert(reconciled.committed && taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued);
@@ -424,7 +530,7 @@ unittest
 unittest
 {
     // Reconcilers of one request on several threads at once (as several server instances would)
-    // converge: each needed fingerprint is claimed and recorded once
+    // converge: each needed fingerprint is claimed once
     import core.thread : Thread;
     import core.atomic : atomicOp;
 
@@ -457,53 +563,42 @@ unittest
 
 unittest
 {
-    // A reconcile after a restart needs nothing from the process that crashed, whichever step it
-    // crashed after: the claim or the record
-    import confector.core.execution_dispatcher : executionFor;
+    // A reconcile after a restart needs nothing from the process that crashed after its claim: the
+    // claim carries everything the execution needs, so the new process finds the execution queued
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    const needed = evaluateFrom(stores, "r1").needed[0];
+    const dispatched = reconcilerOf(stores).dispatch(needed, definedRequest(stores, "r1")); // and crashed
+    assert(dispatched.claim == ClaimOutcome.won);
 
-    foreach (crashedAfter; ["claim", "record"])
-    {
-        auto documents = new InMemoryDocumentStore();
-        auto stores = new StateStores(documents);
-        createChain(stores, "c1");
-        intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
-        const needed = evaluateFrom(stores, "r1").needed[0];
-
-        const claimed = stores.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq);
-        if (crashedAfter == "record")
-        {
-            stores.executions.createIfAbsent(executionFor(claimed.executionId, needed.taskId, needed.fingerprint, needed.inputs,
-                definedRequest(stores, "r1"), ["game": RepositoryRecord("game", gameAddress)], fixedNow()));
-        }
-
-        // A new process: new stores over the same database, a new reconciler, nothing else
-        auto restarted = new StateStores(documents.restart());
-        auto reconciled = reconcilerOf(restarted).reconcile("r1");
-        assert(reconciled.committed && reconciled.passes == 1, crashedAfter);
-        assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued, crashedAfter);
-        assert(ledgerOf(restarted, "c1", "compile").executionSeq == 1, crashedAfter);
-        assert(restarted.executions.get(claimed.executionId).get.status == ExecutionStatus.queued, crashedAfter);
-        assert(queuedIds(restarted) == [claimed.executionId], crashedAfter);
-    }
+    // A new process: new stores over the same database, a new reconciler, nothing else
+    auto restarted = new StateStores(documents.restart());
+    auto reconciled = reconcilerOf(restarted).reconcile("r1");
+    assert(reconciled.committed && reconciled.passes == 1);
+    assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued);
+    assert(ledgerOf(restarted, "c1", "compile").executionSeq == 1);
+    assert(restarted.ledgers.get(needed.fingerprint).get.active.get.status == ExecutionStatus.queued);
+    assert(queuedIds(restarted) == [dispatched.executionId]);
 }
 
 unittest
 {
     // Two requests sharing one execution. 1. Request r2 claimed compile and crashed before
-    // recording it. Request r1, needing compile too, records it from its own request; r2,
-    // reconciled later, finds it recorded. Both then advance on the one execution's outcome
+    // committing. Request r1, needing compile too, finds it claimed; r2, reconciled later, finds
+    // it too. Both then advance on the one execution's outcome
     {
         auto stores = new StateStores(new InMemoryDocumentStore());
         auto c1 = createChain(stores, "c1");
         createChain(stores, "c2");
         intake(stores, "c2", "r2", ["test"], "2026-10-20T10:00:00Z");
         const needed = evaluateFrom(stores, "r2").needed[0];
-        const claimed = stores.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq); // r2's dispatcher crashed
+        const claimed = reconcilerOf(stores).dispatch(needed, definedRequest(stores, "r2")); // r2's reconciler crashed
 
         intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:01Z");
         auto first = reconcilerOf(stores).reconcile("r1");
         assert(first.committed && first.passes == 1 && taskOf(first.state, "compile").status == RequestTaskStatus.queued);
-        assert(stores.executions.get(claimed.executionId).get.status == ExecutionStatus.queued);
         assert(queuedIds(stores) == [claimed.executionId]);
 
         auto second = reconcilerOf(stores).reconcile("r2");
@@ -581,7 +676,7 @@ unittest
 
 unittest
 {
-    // A needed execution that cannot be recorded (its repository has no address) settles the
+    // A needed execution that cannot be built (its repository has no address) settles the
     // request failed, with the error in its RequestState; nothing is claimed for it and it is
     // not retried by later reconciles. A new request, once the repository is fixed, runs
     auto stores = new StateStores(new InMemoryDocumentStore());
@@ -609,17 +704,15 @@ unittest
     assert(retry.state.outcome == RequestOutcome.open && retry.state.error.length == 0);
     assert(taskOf(retry.state, "compile").status == RequestTaskStatus.queued);
 
-    // An unregistered repository fails an awaited execution the same way: it was claimed by a
-    // dispatcher that crashed before recording it, and cannot be recorded from this request
+    // An unregistered repository fails the request the same way
     auto other = new StateStores(new InMemoryDocumentStore());
     createChain(other, "c1");
     intake(other, "c1", "r1", ["compile"], "2026-10-20T10:00:00Z");
-    const needed = evaluateFrom(other, "r1").needed[0];
-    const claimed = other.ledgers.claim(needed.fingerprint, needed.seenExecutionSeq);
     other.repositories.remove("game");
-    auto unrecorded = reconcilerOf(other).reconcile("r1");
-    assert(unrecorded.state.outcome == RequestOutcome.failed);
-    assert(unrecorded.state.error.canFind(claimed.executionId) && unrecorded.state.error.canFind("not registered"), unrecorded.state.error);
+    auto unregistered = reconcilerOf(other).reconcile("r1");
+    assert(unregistered.state.outcome == RequestOutcome.failed);
+    assert(unregistered.state.error.canFind("compile") && unregistered.state.error.canFind("not registered"), unregistered.state.error);
+    assert(other.ledgers.get(fingerprintNow(other, "c1", "compile")).isNull, "Nothing was claimed");
 }
 
 unittest
@@ -648,15 +741,15 @@ unittest
     assert(reconciled.state.outcome == RequestOutcome.open);
     assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.queued);
     auto ledger = stores.ledgers.get(needed.fingerprint);
-    assert(!ledger.isNull && ledger.get.value.activeExecutionId.length > 0, "The execution was claimed at the recorded fingerprint");
-    assert(queuedIds(stores) == [ledger.get.value.activeExecutionId]);
+    assert(!ledger.isNull && !ledger.get.value.active.isNull, "The execution was claimed at the recorded fingerprint");
+    assert(queuedIds(stores) == [ledger.get.value.active.get.id]);
 }
 
 unittest
 {
-    // An unrecordable execution and a failed dispatch in one pass: the request fails with both
+    // An undispatchable execution and a failed dispatch in one pass: the request fails with both
     // in its error, and its cached tasks show what the pass did (compile, whose claim failed, and
-    // lint, which cannot be recorded, both still need an execution)
+    // lint, which cannot be built, both still need an execution)
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
     auto chain = sampleChain("c1");
@@ -681,4 +774,111 @@ unittest
     assert(failed.state.error.canFind("no address") && failed.state.error.canFind("unavailable"), failed.state.error);
     assert(taskOf(failed.state, "compile").status == RequestTaskStatus.needed, "compile was not claimed");
     assert(taskOf(failed.state, "lint").status == RequestTaskStatus.needed);
+}
+
+unittest
+{
+    // A needed fingerprint is claimed at the executionSeq the evaluation saw, in one write, as a
+    // queued execution with the request's definition, inputs and repository addresses
+    auto documents = new InMemoryDocumentStore();
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto stores = new StateStores(interleaving);
+    auto reconciler = reconcilerOf(stores);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    auto entry = definedRequest(stores, "r1");
+    auto evaluation = evaluateFrom(stores, "r1");
+    assert(evaluation.needed.length == 1);
+    const needed = evaluation.needed[0];
+    assert(needed.taskId == "compile" && needed.seenExecutionSeq == 0);
+
+    size_t writes;
+    void countWrites()
+    {
+        interleaving.beforeNextWrite = () { writes += 1; countWrites(); };
+    }
+    countWrites();
+    const dispatched = reconciler.dispatch(needed, entry);
+    assert(writes == 1, "A dispatch is one compare-and-set");
+    assert(dispatched.claim == ClaimOutcome.won);
+    assert(dispatched.executionId == executionIdFor(needed.fingerprint, 1));
+    auto claimed = stores.ledgers.get(needed.fingerprint).get;
+    auto active = claimed.active.get;
+    assert(active.id == dispatched.executionId && active.status == ExecutionStatus.queued);
+    assert(active.projectId == "game" && active.taskId == "compile" && active.inputs == needed.inputs);
+    assert(active.definitionId == entry.request.definitionId && stores.definitions.get(active.definitionId).get.tasks.length == 4);
+    assert(active.repositoryAddresses == ["src": gameAddress]);
+    assert(active.createdAt == fixedNow() && active.attempt == 0 && active.worker.length == 0);
+
+    // The same decision again finds the execution active: nothing more is written
+    const again = reconciler.dispatch(needed, entry);
+    assert(again.claim == ClaimOutcome.active && again.executionId == dispatched.executionId && writes == 1);
+
+    // It ends; a decision made before it started is superseded (it would build compile twice)
+    finish(stores, stores.chains.get("c1").get.value, "compile", ExecutionStatus.failed);
+    const stale = reconciler.dispatch(needed, entry);
+    assert(stale.claim == ClaimOutcome.superseded && stale.executionId.length == 0);
+    assert(stores.ledgers.get(needed.fingerprint).get.executionSeq == 1);
+}
+
+unittest
+{
+    // A task that cannot be claimed fails loudly before anything is written, so it never holds
+    // its fingerprint: a repository without an address, one that is not registered, a task the
+    // request's definition lacks
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto reconciler = reconcilerOf(stores);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    auto entry = definedRequest(stores, "r1");
+    const needed = evaluateFrom(stores, "r1").needed[0];
+
+    RepositoryRecord addressless;
+    addressless.name = "game";
+    stores.repositories.put(addressless);
+    try
+    {
+        reconciler.dispatch(needed, entry);
+        assert(false, "A repository without an address must fail the dispatch");
+    }
+    catch (UndispatchableExecutionException e)
+    {
+        assert(e.msg.canFind("'game'") && e.msg.canFind("no address"));
+    }
+    stores.repositories.remove("game");
+    try
+    {
+        reconciler.dispatch(needed, entry);
+        assert(false, "An unregistered repository must fail the dispatch");
+    }
+    catch (UndispatchableExecutionException e)
+    {
+        assert(e.msg.canFind("'game'") && e.msg.canFind("not registered"));
+    }
+    auto missingTask = cast(NeededExecution) needed;
+    missingTask.taskId = "deploy";
+    assert(throwsA!UndispatchableExecutionException({ reconciler.dispatch(missingTask, entry); }));
+    assert(stores.ledgers.get(needed.fingerprint).isNull, "Nothing was claimed");
+}
+
+unittest
+{
+    // Two reconcilers dispatching one fingerprint at once: exactly one claims; the other finds the
+    // winner's execution active and writes nothing more
+    auto documents = new InMemoryDocumentStore();
+    auto direct = new StateStores(documents);
+    createChain(direct, "c1");
+    intake(direct, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    auto entry = definedRequest(direct, "r1");
+    const needed = evaluateFrom(direct, "r1").needed[0];
+
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto racing = new StateStores(interleaving);
+    Dispatched first;
+    interleaving.beforeNextWrite = () { first = reconcilerOf(direct).dispatch(needed, entry); };
+    const second = reconcilerOf(racing).dispatch(needed, entry);
+    assert(first.claim == ClaimOutcome.won);
+    assert(second.claim == ClaimOutcome.active && second.executionId == first.executionId);
+    assert(direct.ledgers.get(needed.fingerprint).get.executionSeq == 1);
+    assert(queuedIds(direct) == [first.executionId]);
 }

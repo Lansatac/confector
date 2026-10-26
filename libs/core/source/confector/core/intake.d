@@ -49,7 +49,6 @@ import confector.core.chain_pins;
 import confector.core.dag : TaskGraph;
 import confector.core.document_collection : Versioned;
 import confector.core.definition_store : InvalidDefinitionException, currentDefinition;
-import confector.core.execution_dispatcher : ExecutionDispatcher;
 import confector.core.input_resolution : InputResolutionException, requireRepositorySpec, requiredPins;
 import confector.core.project_stores : RepositoryStore;
 import confector.core.request_evaluator : closureGraph, requestDemands;
@@ -478,7 +477,7 @@ final class RequestIntake
         m_resolver = resolver;
         m_now = now !is null ? now : () => utcNow();
         m_newId = newId !is null ? newId : (string prefix) => prefix ~ "_" ~ randomUUID().toString();
-        m_reconciler = new RequestReconciler(stores, new ExecutionDispatcher(stores, m_now));
+        m_reconciler = new RequestReconciler(stores, m_now);
     }
 
     /**
@@ -610,7 +609,7 @@ final class RequestIntake
         foreach (fingerprint; resolution.fingerprints.byValue)
         {
             auto settled = m_stores.ledgers.settle(fingerprint);
-            stopSeqs[fingerprint] = settled.ledger.isNull ? 0 : settled.ledger.get.stopSeq;
+            stopSeqs[fingerprint] = settled.isNull ? 0 : settled.get.stopSeq;
         }
 
         BuildRequest recorded;
@@ -843,7 +842,7 @@ unittest
     auto state = w.stores.requestStates.get(result.requestId).get.value;
     assert(state.outcome == RequestOutcome.open && state.tasks.length == 2, "The request was reconciled");
     const compile = w.stores.ledgers.get(demandOf(request, "compile").fingerprint);
-    assert(!compile.isNull && compile.get.activeExecutionId.length > 0, "An execution is claimed for the needed fingerprint");
+    assert(!compile.isNull && !compile.get.active.isNull, "An execution is claimed for the needed fingerprint");
     assert(w.stores.ledgers.get(demandOf(request, "test").fingerprint).isNull, "Downstream waits for compile");
 }
 

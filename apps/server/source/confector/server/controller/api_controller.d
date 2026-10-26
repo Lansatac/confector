@@ -257,11 +257,11 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
                 }
                 catch (Exception e)
                 {
-                    // This execution's record cannot be run (say, an input without a resolved
+                    // This execution cannot be run (say, an input without a resolved
                     // value), and would fail every receive that meets it. Fail it, recording why,
                     // and hand out the next one.
                     logError("[api] Failing execution '%s': it cannot be given a worker token: %s", work.workOrder.executionId, e.msg);
-                    finishExecution(stores, work.workOrder.executionId, ExecutionStatus.failed, 1,
+                    finishExecution(stores, work.workOrder.fingerprint, work.workOrder.executionId, ExecutionStatus.failed, 1,
                         "The execution could not be dispatched: " ~ e.msg, null, clock());
                     continue;
                 }
@@ -331,7 +331,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         if (!permitWorker(req, res, { requireCurrentAttempt(claims, attempt); })) return;
         try
         {
-            writeLeaseAnswer(res, heartbeatExecution(stores, executionId, attempt, lease, clock()));
+            writeLeaseAnswer(res, heartbeatExecution(stores, claims.fingerprint, executionId, attempt, lease, clock()));
         }
         catch (UnknownExecutionException e) writeError(res, HTTPStatus.notFound, e.msg);
         catch (InvalidLeaseRequestException e) writeError(res, HTTPStatus.badRequest, e.msg);
@@ -355,7 +355,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         if (!permitWorker(req, res, { requireCurrentAttempt(claims, attempt); })) return;
         try
         {
-            writeLeaseAnswer(res, releaseExecution(stores, executionId, attempt));
+            writeLeaseAnswer(res, releaseExecution(stores, claims.fingerprint, executionId, attempt));
         }
         catch (UnknownExecutionException e) writeError(res, HTTPStatus.notFound, e.msg);
         catch (Exception e)
@@ -382,9 +382,9 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         writeNotImplemented(res, logsNotImplemented());
     });
 
-    // A worker's completion of an execution. It names the execution only: the fingerprint and
-    // task come from the execution record (design record: bead confector-z7z.2), and anything
-    // that does not match it is rejected. A completion finishes the execution, folds it into its
+    // A worker's completion of an execution. It names the execution only: the fingerprint comes
+    // from the worker's token and the task from the ledger's active execution, and anything that
+    // does not match them is rejected. A completion records the execution, folds it into its
     // fingerprint's ledger; see confector.core.work_orders.completeExecution. A completion from a
     // superseded attempt is rejected.
     workerRoute(HTTPMethod.POST, "/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -414,7 +414,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         try
         {
             if (!requireStores(res)) return;
-            const finished = completeExecution(stores, executionId, result, clock());
+            const finished = completeExecution(stores, claims.fingerprint, executionId, result, clock());
             logInfo("[api] Execution '%s' (task '%s', fingerprint %s) finished %s (exit code %d, %d ms)",
                 executionId, finished.taskId, finished.fingerprint, finished.status, finished.exitCode, result.durationMs);
 
@@ -879,6 +879,10 @@ unittest
 
     import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, verifyWorkerToken, workerTokenHeader;
     import confector.core.worker_pool_credential : workerPoolCredentialHeader;
+    import confector.core.work_orders : currentAttempt;
+
+    // The fingerprint of each execution the test queued, by execution id
+    string[string] fingerprintOf;
 
     // The token of the execution a /executions/<id>/... path names, which every execution route
     // below presents unless a test says otherwise
@@ -890,9 +894,9 @@ unittest
         if (!path.startsWith("/executions/")) return null;
         WorkerTokenClaims claims;
         claims.executionId = path.split("/")[2];
-        claims.fingerprint = "fp_n1";
-        auto recorded = (of is null ? stores : of).executions.get(claims.executionId);
-        claims.attempt = recorded.isNull ? 0 : recorded.get.value.attempts;
+        claims.fingerprint = fingerprintOf.get(claims.executionId, "fp_n1");
+        auto attempt = currentAttempt(of is null ? stores : of, claims.fingerprint, claims.executionId);
+        claims.attempt = attempt.isNull ? 0 : attempt.get;
         claims.expiresAt = Clock.currTime.toUnixTime() + 600;
         return mintWorkerToken(workerTokenKey, claims);
     }
@@ -949,28 +953,32 @@ unittest
     // Without request intake configured the run route fails loudly instead of doing nothing
     assert(post("/projects/run", `{"project_id": "proj_api_1", "targets": ["n1"]}`) == HTTPStatus.internalServerError);
 
+    import confector.api.model : ActiveExecution;
     import confector.core.fingerprint_ledger : ClaimOutcome;
     import confector.core.work_orders : claimWork, startExecution;
     import core.time : hours;
 
-    // Dispatches as the dispatcher does: claims the fingerprint's ledger and records the queued
-    // execution under the claimed id
+    // Claims the fingerprint's ledger for task "n1" of a stored definition of `definition` (and
+    // `others`, the tasks it depends on), as a dispatch does: the execution is queued under the
+    // claimed id
     string queueExecution(StateStores into, string fingerprint, TaskNode definition = node,
-        string createdAt = "2026-10-16T10:00:00Z")
+        string createdAt = "2026-10-16T10:00:00Z", TaskNode[] others = null)
     {
-        const claimed = into.ledgers.claim(fingerprint, 0);
+        ActiveExecution proposed;
+        proposed.projectId = "proj_api_1";
+        proposed.taskId = "n1";
+        proposed.definitionId = into.definitions.put(ProjectDefinition([definition] ~ others));
+        proposed.createdAt = createdAt;
+        const claimed = into.ledgers.claim(fingerprint, 0, proposed);
         assert(claimed.outcome == ClaimOutcome.won);
-        const id = claimed.executionId;
-        TaskExecution execution;
-        execution.id = id;
-        execution.projectId = "proj_api_1";
-        execution.taskId = "n1";
-        execution.fingerprint = fingerprint;
-        execution.status = ExecutionStatus.queued;
-        execution.definition = definition;
-        execution.createdAt = createdAt;
-        into.executions.createIfAbsent(execution);
-        return id;
+        fingerprintOf[claimed.executionId] = fingerprint;
+        return claimed.executionId;
+    }
+
+    // The active execution at `fingerprint`
+    ActiveExecution activeAt(StateStores of, string fingerprint)
+    {
+        return of.ledgers.get(fingerprint).get.active.get;
     }
 
     // Receiving needs the worker pool credential, checked before anything else: without it, or
@@ -1002,7 +1010,7 @@ unittest
         const sameLength = receiveWithCredential(workerPoolCredential[0 .. $ - 1] ~ "X");
         assert(sameLength.status == HTTPStatus.unauthorized && sameLength.body.canFind("Invalid " ~ workerPoolCredentialHeader),
             sameLength.body);
-        assert(stores.executions.get(pending).get.status == ExecutionStatus.queued, "A refused receive hands out nothing");
+        assert(activeAt(stores, "fp_pool").status == ExecutionStatus.queued, "A refused receive hands out nothing");
 
         // A receive names its worker and its lease; a malformed one claims nothing
         assert(receiveWithCredential(workerPoolCredential, `{"lease_seconds": 30}`).status == HTTPStatus.badRequest);
@@ -1014,7 +1022,7 @@ unittest
         {
             assert(receiveWithCredential(workerPoolCredential, malformed).status == HTTPStatus.badRequest, malformed);
         }
-        assert(stores.executions.get(pending).get.status == ExecutionStatus.queued);
+        assert(activeAt(stores, "fp_pool").status == ExecutionStatus.queued);
 
         // With the credential, the same receive claims the queued execution and answers with its
         // attempt and work order
@@ -1022,8 +1030,8 @@ unittest
         assert(accepted.status == HTTPStatus.ok, accepted.body);
         const handed = bodyOf(accepted);
         assert(handed["attempt"].get!long == 1 && handed["work_order"]["execution_id"].get!string == pending, accepted.body);
-        const claimedRecord = stores.executions.get(pending).get;
-        assert(claimedRecord.status == ExecutionStatus.running && claimedRecord.worker == "w-pool" && claimedRecord.attempts == 1);
+        const claimedExecution = activeAt(stores, "fp_pool");
+        assert(claimedExecution.status == ExecutionStatus.running && claimedExecution.worker == "w-pool" && claimedExecution.attempt == 1);
         assert(receiveWithCredential(workerPoolCredential).status == HTTPStatus.noContent, "Two workers cannot claim one execution");
     }
 
@@ -1058,7 +1066,7 @@ unittest
             assert(postWith(issued, route.replace(tokenExecutionId, executionId), body) == HTTPStatus.forbidden,
                 route ~ " with another execution's token");
         }
-        assert(stores.executions.get(tokenExecutionId).get.status == ExecutionStatus.running, "A refused request changes nothing");
+        assert(activeAt(stores, "fp_token").status == ExecutionStatus.running, "A refused request changes nothing");
 
         // A token for a superseded attempt may not complete or log, even though it is genuine and
         // unexpired
@@ -1069,7 +1077,7 @@ unittest
         {
             assert(postWith(supersededToken, "/executions/" ~ tokenExecutionId ~ route, `{}`) == HTTPStatus.forbidden, route);
         }
-        assert(stores.executions.get(tokenExecutionId).get.status == ExecutionStatus.running);
+        assert(activeAt(stores, "fp_token").status == ExecutionStatus.running);
 
         // The execution routes accept the execution's own token only
         auto expired = cast() issuedClaims;
@@ -1085,7 +1093,7 @@ unittest
             assert(postWith(issued, "/executions/" ~ executionId ~ route, `{}`) == HTTPStatus.forbidden, path ~ " with another execution's token");
         }
         assert(postWith(issued, "/executions/" ~ tokenExecutionId ~ "/logs", `{"lines": []}`) == HTTPStatus.notImplemented);
-        assert(stores.executions.get(executionId).get.status == ExecutionStatus.running,
+        assert(activeAt(stores, "fp_n1").status == ExecutionStatus.running && stores.executions.get(executionId).isNull,
             "A refused completion records nothing");
     }
 
@@ -1108,11 +1116,11 @@ unittest
         }
 
         assert(answerOf(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 3600}`) == "continue");
-        assert(stores.executions.get(leasedId).get.leaseExpiresAt.length > 0);
+        assert(activeAt(stores, "fp_lease").leaseExpiresAt.length > 0);
         // The body's attempt must be the token's, as for completion and logs
         assert(postWith(firstToken, heartbeat, `{"attempt": 2, "lease_seconds": 30}`) == HTTPStatus.forbidden);
         assert(postWith(firstToken, release, `{"attempt": 2}`) == HTTPStatus.forbidden);
-        assert(stores.executions.get(leasedId).get.status == ExecutionStatus.running);
+        assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(postWith(firstToken, heartbeat, `{"lease_seconds": 30}`) == HTTPStatus.badRequest, "A heartbeat carries the attempt");
         assert(postWith(firstToken, heartbeat, `{"attempt": 1}`) == HTTPStatus.badRequest, "A heartbeat carries the lease");
         assert(postWith(firstToken, release, `{}`) == HTTPStatus.badRequest, "A release carries the attempt");
@@ -1122,25 +1130,25 @@ unittest
         assert(postWith(firstToken, heartbeat, `{"attempt": "one", "lease_seconds": 30}`) == HTTPStatus.badRequest);
 
         assert(answerOf(firstToken, release, `{"attempt": 1}`) == "released");
-        assert(stores.executions.get(leasedId).get.status == ExecutionStatus.queued);
+        assert(activeAt(stores, "fp_lease").status == ExecutionStatus.queued);
         assert(answerOf(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 30}`) == "superseded");
 
         const second = bodyOf(postReply(null, "/queue/receive", `{"worker_id": "w-two", "lease_seconds": 30}`));
         assert(second["work_order"]["execution_id"].get!string == leasedId && second["attempt"].get!long == 2);
         const secondToken = second["work_order"]["worker_token"].get!string;
-        assert(stores.executions.get(leasedId).get.worker == "w-two");
+        assert(activeAt(stores, "fp_lease").worker == "w-two");
 
         // The first attempt can neither heartbeat, release nor complete, whether it names its own
         // attempt or the current one; the second completes
         assert(postWith(firstToken, heartbeat, `{"attempt": 2, "lease_seconds": 30}`) == HTTPStatus.forbidden,
             "A token for attempt 1 cannot heartbeat attempt 2");
         assert(postWith(firstToken, release, `{"attempt": 2}`) == HTTPStatus.forbidden, "A token for attempt 1 cannot release attempt 2");
-        assert(stores.executions.get(leasedId).get.status == ExecutionStatus.running);
+        assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(answerOf(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 30}`) == "superseded");
         const completeLeased = "/executions/" ~ leasedId ~ "/complete";
         assert(postWith(firstToken, completeLeased, `{"status": "succeeded", "attempt": 1}`) == HTTPStatus.forbidden);
         assert(postWith(secondToken, completeLeased, `{"status": "succeeded", "attempt": 1}`) == HTTPStatus.conflict);
-        assert(stores.executions.get(leasedId).get.status == ExecutionStatus.running);
+        assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(postWith(secondToken, completeLeased, `{"status": "succeeded", "attempt": 2}`) == HTTPStatus.ok);
         assert(answerOf(secondToken, release, `{"attempt": 2}`) == "superseded", "A finished execution is not released");
 
@@ -1160,7 +1168,9 @@ unittest
     {
         TaskNode needy = node;
         needy.inputs["up"] = taskOutputInput("up-task", "a.zip");
-        const brokenId = queueExecution(stores, "fp_broken", needy, "2026-10-16T10:00:01Z");
+        TaskNode upstream;
+        upstream.id = "up-task";
+        const brokenId = queueExecution(stores, "fp_broken", needy, "2026-10-16T10:00:01Z", [upstream]);
         const healthyId = queueExecution(stores, "fp_healthy", node, "2026-10-16T10:00:02Z");
         const batch = postReply(null, "/queue/receive", `{"worker_id": "w-batch", "lease_seconds": 30}`);
         assert(batch.status == HTTPStatus.ok && bodyOf(batch)["work_order"]["execution_id"].get!string == healthyId, batch.body);
@@ -1201,7 +1211,7 @@ unittest
     assert(post("/executions/" ~ executionId ~ "/complete", `{"status": `) == HTTPStatus.badRequest, "Malformed JSON");
     assert(post("/executions/" ~ executionId ~ "/complete", `{"task_id": "n1", "status": "succeeded", "attempt": 2}`) == HTTPStatus.conflict,
         "A completion from another attempt is rejected");
-    assert(stores.executions.get(executionId).get.status == ExecutionStatus.running);
+    assert(activeAt(stores, "fp_n1").status == ExecutionStatus.running && stores.executions.get(executionId).isNull);
 
     // The completion finishes the execution under its own fingerprint
     assert(post("/executions/" ~ executionId ~ "/complete", completion) == HTTPStatus.ok);
@@ -1229,25 +1239,34 @@ unittest
     failingRouter.handleRequest(failingReq, failingRes);
     assert(failingRes.statusCode == HTTPStatus.internalServerError);
     failingDocuments.beforeNextWrite = null;
-    assert(failingStores.executions.get(anotherId).get.status == ExecutionStatus.running);
+    assert(activeAt(failingStores, "fp_n1_again").status == ExecutionStatus.running);
+    assert(failingStores.executions.get(anotherId).isNull, "The failed completion recorded nothing");
 
-    // A completion whose fold fails after the execution finished (the execution was never
-    // claimed on a ledger) is a server error that says so; the execution stays finished and a
-    // resent completion is a conflict
-    const unfoldedId = "exe_unclaimed";
-    TaskExecution unclaimed;
-    unclaimed.id = unfoldedId;
-    unclaimed.projectId = "proj_api_1";
-    unclaimed.taskId = "n1";
-    unclaimed.fingerprint = "fp_n1_unfolded";
-    unclaimed.status = ExecutionStatus.queued;
-    unclaimed.definition = node;
-    unclaimed.createdAt = "2026-10-16T10:00:00Z";
-    stores.executions.createIfAbsent(unclaimed);
-    assert(!startExecution(stores.executions, unfoldedId, "w-unfolded", 1.hours, "2026-10-16T10:00:00Z").isNull);
-    assert(post("/executions/" ~ unfoldedId ~ "/complete", completion) == HTTPStatus.internalServerError);
-    assert(stores.executions.get(unfoldedId).get.status == ExecutionStatus.succeeded);
-    assert(post("/executions/" ~ unfoldedId ~ "/complete", completion) == HTTPStatus.conflict);
+    // A completion whose fold fails after the execution finished is a server error that says so;
+    // the execution stays finished and a resent completion is a conflict
+    auto unfoldedDocuments = new InterleavingDocumentStore(new InMemoryDocumentStore());
+    auto unfoldedStores = new StateStores(unfoldedDocuments);
+    const unfoldedId = queueExecution(unfoldedStores, "fp_n1_unfolded");
+    assert(!claimWork(unfoldedStores, "w-unfolded", 1.hours).isNull);
+    auto unfoldedRouter = apiRouter(admin, "test-scheduler-secret", workerTokenKey, workerPoolCredential, defaultMaxAttempts, unfoldedStores);
+    int completeUnfolded()
+    {
+        InetHeaderMap unfoldedHeaders;
+        unfoldedHeaders["Content-Type"] = "application/json";
+        unfoldedHeaders[workerTokenHeader] = tokenForPath("/executions/" ~ unfoldedId ~ "/complete", unfoldedStores);
+        auto unfoldedReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ unfoldedId ~ "/complete"),
+            HTTPMethod.POST, unfoldedHeaders, createMemoryStream(cast(ubyte[]) completion.dup, false));
+        auto unfoldedRes = createTestHTTPServerResponse();
+        unfoldedRouter.handleRequest(unfoldedReq, unfoldedRes);
+        return unfoldedRes.statusCode;
+    }
+    // The completion's writes: 1 the execution's record, 2 the fold, which is lost
+    unfoldedDocuments.beforeNextWrite = () { unfoldedDocuments.beforeNextWrite = () { throw new Exception("The fold's write is lost"); }; };
+    assert(completeUnfolded() == HTTPStatus.internalServerError);
+    assert(unfoldedStores.executions.get(unfoldedId).get.status == ExecutionStatus.succeeded);
+    assert(!unfoldedStores.ledgers.get("fp_n1_unfolded").get.active.isNull, "The fold did not happen");
+    assert(completeUnfolded() == HTTPStatus.conflict);
+    assert(unfoldedStores.ledgers.get("fp_n1_unfolded").get.active.isNull, "The resent completion completed the fold");
 
     // Without the state stores the execution routes fail loudly rather than drop the report
     InetHeaderMap headers;
@@ -1268,7 +1287,7 @@ unittest
     // The coordination sweep is a scheduler route: it runs one tick, on the server's clock, only
     // with the scheduler secret. A tick expires a lease that ran out long ago, and the summary of
     // what it did answers the call
-    import confector.api.model : ExecutionStatus, TaskExecution;
+    import confector.api.model : ActiveExecution, ExecutionStatus;
     import confector.api.scheduler : schedulerSecretHeader;
     import confector.core.work_orders : defaultMaxAttempts, startExecution;
     import confector.server.authenticator : FixedAuthenticator, testIdentity;
@@ -1284,27 +1303,25 @@ unittest
     auto router = apiRouter(new FixedAuthenticator(testIdentity(Role.admin)), "test-scheduler-secret",
         workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
 
-    TaskExecution execution;
-    execution.id = "exe_sweep";
+    ActiveExecution execution;
     execution.projectId = "proj";
     execution.taskId = "compile";
-    execution.fingerprint = "fp_sweep";
-    execution.status = ExecutionStatus.queued;
+    execution.definitionId = "def_sweep";
     execution.createdAt = "2000-01-01T00:00:00Z";
-    stores.executions.create(execution);
-    assert(!startExecution(stores.executions, "exe_sweep", "w1", 1.minutes, "2000-01-01T00:00:00Z").isNull);
+    stores.ledgers.claim("fp_sweep", 0, execution);
+    assert(!startExecution(stores, "fp_sweep", "w1", 1.minutes, "2000-01-01T00:00:00Z").isNull);
 
     // Without the secret, or with another one, the tick does not run
     assert(sweepTick(router, "").status == HTTPStatus.unauthorized);
     assert(sweepTick(router, "wrong-secret").status == HTTPStatus.unauthorized);
-    assert(stores.executions.get("exe_sweep").get.status == ExecutionStatus.running, "A refused tick changes nothing");
+    assert(stores.ledgers.get("fp_sweep").get.active.get.status == ExecutionStatus.running, "A refused tick changes nothing");
 
     // With the secret it runs: the expired lease is requeued and the summary says so
     auto answered = sweepTick(router, "test-scheduler-secret");
     assert(answered.status == HTTPStatus.ok, answered.body);
     assert(parseJsonString(answered.body)["leasesRequeued"].get!long == 1, answered.body);
     assert(parseJsonString(answered.body)["errors"].get!long == 0, answered.body);
-    assert(stores.executions.get("exe_sweep").get.status == ExecutionStatus.queued);
+    assert(stores.ledgers.get("fp_sweep").get.active.get.status == ExecutionStatus.queued);
 }
 
 unittest

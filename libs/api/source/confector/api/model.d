@@ -3,6 +3,7 @@ module confector.api.model;
 import vibe.data.serialization : asName = name, optional;
 
 import std.format : format;
+import std.typecons : Nullable;
 
 /**
  * What made a build request (`BuildTrigger.type`).
@@ -706,8 +707,8 @@ struct TaskExecutionResult
     /// How the execution ended: succeeded, failed or cancelled. Required: a completion without
     /// a status is malformed, and one with an active status is rejected.
     @asName("status") ExecutionStatus status;
-    /// The attempt the worker was given with the work order (`TaskExecution.attempts` when it
-    /// claimed the execution). Required: a completion from a superseded attempt is rejected.
+    /// The attempt the worker was given with the work order (`ActiveExecution.attempt` when it
+    /// started the execution). Required: a completion from a superseded attempt is rejected.
     @asName("attempt") ulong attempt;
     @optional @asName("exit_code") int exitCode = 0;
     @optional @asName("error_message") string errorMessage;
@@ -1064,39 +1065,33 @@ enum ExecutionStatus : string
 }
 
 /**
- * One run of one task at one fingerprint ("task run" in the UI; bead confector-z7z.14).
- * Append-only and shared across chains: records are never overwritten by another execution,
- * and a cache hit is a chain using an execution another chain produced. A terminal execution
- * does not change again.
+ * One finished run of one task at one fingerprint ("task run" in the UI). Written once, when the
+ * execution ends, and never changed after: it is terminal (succeeded, failed or cancelled). Shared
+ * across chains: a cache hit is a chain using an execution another chain produced. While an
+ * execution is queued or running it is the fingerprint ledger's `ActiveExecution`; the ledger names
+ * the finished record as its last success or last stop.
  */
 struct TaskExecution
 {
+    /// The id the ledger gave the execution when it was claimed (`executionIdFor`).
     string id;
     @asName("project_id") string projectId;
     @asName("task_id") string taskId;
     /// Computed by the control plane from a request's definition and its pins, never reported by
     /// a worker.
     string fingerprint;
+    /// How the execution ended: succeeded, failed or cancelled.
     ExecutionStatus status;
-    /// How many times a worker has claimed the execution; the current claim's number is its
-    /// attempt. A worker's heartbeat and completion carry the attempt, and one from an earlier
-    /// attempt is rejected. It fences workers only: a release raises it too, so it is not the
-    /// retry limit (see `expiredLeases`).
+    /// The attempt that ended it: how many times a worker had claimed the execution by then.
     ulong attempts;
-    /// How many leases expired on the execution (a lost worker). Infrastructure failures retry
-    /// within the same execution until this reaches an admin-configured limit; a release does not
-    /// count. A user's retry is a new execution.
+    /// How many leases expired on the execution (a lost worker) before it ended.
     @optional @asName("expired_leases") ulong expiredLeases;
-    /// The full task definition the execution ran with, read from the project when it was
-    /// dispatched, and its hash (`computeDefinitionHash`). Not part of the fingerprint.
-    TaskNode definition;
-    @asName("definition_hash") string definitionHash;
-    /// The task's resolved inputs, sorted by name, as the chain that dispatched the execution
-    /// pins them (every chain at one fingerprint pins the same values). Fixed at dispatch; the
-    /// work order a worker receives is built from them.
+    /// The stored definition the execution ran with (`BuildRequest.definitionId`); `taskId` names
+    /// the task in it.
+    @asName("definition_id") string definitionId;
+    /// The task's resolved inputs, sorted by name, as the execution ran with them.
     @optional ResolvedInput[] inputs;
-    /// Where to fetch each repository input from, keyed by input name: how to fetch, not what,
-    /// so never hashed. Read from the repository records at dispatch and fixed then.
+    /// Where each repository input was fetched from, keyed by input name.
     @optional @asName("repository_addresses") string[string] repositoryAddresses;
     /// Artifacts the execution produced.
     @optional ArtifactMetadata[] artifacts;
@@ -1104,15 +1099,13 @@ struct TaskExecution
     /// succeeded execution with this set is a cache miss, not a cache hit (AGENTS.md, "The caching
     /// contract"). Only a succeeded execution has artifacts to expire.
     @optional @asName("artifacts_expired_at") string artifactsExpiredAt;
-    /// The id of the worker that holds or last held it; empty until claimed.
+    /// The id of the worker that held it last; empty if no worker ever did.
     @optional string worker;
-    /// When the running attempt's lease expires unless its worker's heartbeat extends it (ISO 8601
-    /// UTC); empty while no worker holds the execution.
-    @optional @asName("lease_expires_at") string leaseExpiresAt;
+    /// When the execution was claimed (queued), when its last attempt started and when it ended
+    /// (ISO 8601 UTC).
     @asName("created_at") string createdAt;
-    /// When the current attempt started, and when the execution reached a terminal status.
     @optional @asName("started_at") string startedAt;
-    @optional @asName("finished_at") string finishedAt;
+    @asName("finished_at") string finishedAt;
     /// The exit code of the task's steps; meaningful only when `status` is succeeded or failed
     /// and the task ran to completion. An infrastructure failure or cancellation has no exit
     /// code: read `status` and `errorMessage`.
@@ -1121,18 +1114,60 @@ struct TaskExecution
 }
 
 /**
- * The fingerprint ledger (design record: bead confector-z7z.48; AGENTS.md, "Coordinating
- * builds"): one document per fingerprint, with the fingerprint as its id, read by id and changed
- * only by compare-and-set (confector.core.fingerprint_ledger). It is the linearization point for
- * one fingerprint: at most one active execution, and the latest success and stop.
+ * The execution a fingerprint's ledger holds queued or running: at most one per fingerprint. It
+ * is created by the ledger's claim, changed only by compare-and-set on the ledger (a worker
+ * starting it, its heartbeat, a release, an expired lease), and removed when it ends, when its
+ * outcome is written as a `TaskExecution` and folded into the ledger.
+ */
+struct ActiveExecution
+{
+    /// Deterministic: `executionIdFor(fingerprint, executionSeq)` of the claim that created it.
+    string id;
+    @asName("project_id") string projectId;
+    @asName("task_id") string taskId;
+    /// queued (waiting for a worker) or running (held by `worker` under a lease).
+    ExecutionStatus status;
+    /// How many times a worker has started the execution; the current start's number is its
+    /// attempt. A worker's heartbeat, release and completion carry the attempt, and one from
+    /// another attempt is rejected. It fences workers only: a release raises it too, so it is not
+    /// the retry limit (see `expiredLeases`).
+    ulong attempt;
+    /// The worker holding it and when its lease expires unless a heartbeat extends it (ISO 8601
+    /// UTC); both empty unless running.
+    @optional string worker;
+    @optional @asName("lease_expires_at") string leaseExpiresAt;
+    /// How many leases expired on the execution (a lost worker). Infrastructure failures retry
+    /// within the same execution until this reaches an admin-configured limit; a release does not
+    /// count. A user's retry is a new execution.
+    @optional @asName("expired_leases") ulong expiredLeases;
+    /// The stored definition (`BuildRequest.definitionId`) of the request that claimed it, and the
+    /// task in it. The execution runs with that definition's task as it was then.
+    @asName("definition_id") string definitionId;
+    /// The task's resolved inputs, sorted by name, as the claiming request pins them (every chain
+    /// at one fingerprint pins the same values). Fixed at the claim; the work order is built from
+    /// them.
+    @optional ResolvedInput[] inputs;
+    /// Where to fetch each repository input from, keyed by input name: how to fetch, not what, so
+    /// never hashed. Read from the repository records at the claim and fixed then.
+    @optional @asName("repository_addresses") string[string] repositoryAddresses;
+    @asName("created_at") string createdAt;
+    /// When the current attempt started; empty while queued.
+    @optional @asName("started_at") string startedAt;
+}
+
+/**
+ * The fingerprint ledger (AGENTS.md, "Coordinating builds"): one document per fingerprint, with
+ * the fingerprint as its id, read by id and changed only by compare-and-set
+ * (confector.core.fingerprint_ledger). It is the linearization point for one fingerprint: the
+ * active execution (at most one), and the latest success and stop.
  */
 struct FingerprintLedger
 {
     /// The fingerprint, which is also the document's id.
     string fingerprint;
-    /// The execution queued or running at this fingerprint; empty when none is. Set by a claim,
+    /// The execution queued or running at this fingerprint; null when none is. Set by a claim,
     /// cleared only by the fold of that execution's terminal outcome.
-    @optional @asName("active_execution_id") string activeExecutionId;
+    @optional Nullable!ActiveExecution active;
     /// The latest execution that succeeded; empty when none has. Whether it is still usable (its
     /// artifacts may have expired) is on the execution record.
     @optional @asName("last_success_execution_id") string lastSuccessExecutionId;
@@ -1709,25 +1744,24 @@ unittest
 
     auto execution = deserializeJson!TaskExecution(`{
         "id": "e1", "project_id": "game", "task_id": "compile", "fingerprint": "fp1",
-        "status": "queued", "attempts": 0, "definition": {"id": "compile"},
-        "definition_hash": "def1", "created_at": "2026-10-15T14:02:02Z"
+        "status": "failed", "attempts": 1, "definition_id": "def1",
+        "created_at": "2026-10-15T14:02:02Z", "finished_at": "2026-10-15T14:09:00Z"
     }`);
-    assert(execution.status == ExecutionStatus.queued && execution.attempts == 0);
-    assert(execution.definition.id == "compile" && execution.definition.steps.length == 0);
-    assert(execution.artifacts.length == 0 && execution.worker.length == 0);
-    assert(execution.startedAt.length == 0 && execution.finishedAt.length == 0);
+    assert(execution.status == ExecutionStatus.failed && execution.attempts == 1 && execution.definitionId == "def1");
+    assert(execution.artifacts.length == 0 && execution.worker.length == 0 && execution.inputs.length == 0);
+    assert(execution.startedAt.length == 0 && execution.finishedAt == "2026-10-15T14:09:00Z");
     assert(execution.exitCode == 0 && execution.errorMessage.length == 0);
 
     // A required field left out fails loudly rather than defaulting
     bool threw = false;
-    try deserializeJson!TaskExecution(`{"id": "e1", "project_id": "game", "task_id": "compile", "status": "queued"}`);
+    try deserializeJson!TaskExecution(`{"id": "e1", "project_id": "game", "task_id": "compile", "status": "failed"}`);
     catch (Exception) threw = true;
     assert(threw, "A missing fingerprint must not deserialize");
 }
 
 unittest
 {
-    // A task execution round-trips its definition, artifacts and timestamps
+    // A task execution round-trips its inputs, artifacts and timestamps
     TaskExecution execution;
     execution.id = "e1";
     execution.projectId = "game";
@@ -1735,12 +1769,9 @@ unittest
     execution.fingerprint = "fp1";
     execution.status = ExecutionStatus.succeeded;
     execution.attempts = 2;
-    execution.definition.id = "compile";
-    execution.definition.inputs["src"] = repositoryInput("game", RefSpec.fromString("main"));
-    execution.definition.steps = [BuildStep("Checkout", "checkout", Json(["input": Json("src")])),
-        BuildStep("Compile", "bash", Json(["script": Json("make")]))];
-    execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
-    execution.definitionHash = "def1";
+    execution.definitionId = "def1";
+    execution.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
+    execution.repositoryAddresses = ["src": "https://example.test/game.git"];
     ArtifactMetadata artifact;
     artifact.artifactId = "game.zip";
     artifact.taskFingerprint = "fp1";
@@ -1756,8 +1787,8 @@ unittest
     auto json = serializeToJson(execution);
     assert(json["status"].get!string == "succeeded");
     assert(json["attempts"].get!long == 2);
-    assert(json["definition_hash"].get!string == "def1");
-    assert(json["definition"]["steps"][1]["config"]["script"].get!string == "make");
+    assert(json["definition_id"].get!string == "def1");
+    assert(json["inputs"][0]["pinned"].get!string == "aaa111");
     assert(roundTrip(execution) == execution);
 
     // Retention keeps the record and marks when the artifacts went
@@ -1766,23 +1797,50 @@ unittest
     assert(serializeToJson(expired)["artifacts_expired_at"].get!string == "2026-10-16T09:00:00Z");
     assert(roundTrip(expired) == expired);
 
-    // A failed execution keeps its exit code and error; a queued one has no worker or times yet
+    // A failed execution keeps its exit code and error
     TaskExecution failed = execution;
     failed.status = ExecutionStatus.failed;
     failed.artifacts = null;
     failed.exitCode = 2;
     failed.errorMessage = "make: *** [all] Error 2";
     assert(roundTrip(failed) == failed);
+}
 
-    TaskExecution queued;
-    queued.id = "e2";
-    queued.projectId = "game";
-    queued.taskId = "compile";
-    queued.fingerprint = "fp2";
-    queued.status = ExecutionStatus.queued;
-    queued.definition.id = "compile";
-    queued.definitionHash = "def1";
-    queued.createdAt = "2026-10-15T14:02:02Z";
+unittest
+{
+    // A ledger round-trips its active execution, queued or running, and reads without one
+    FingerprintLedger idle;
+    idle.fingerprint = "fp1";
+    idle.lastSuccessExecutionId = "e1";
+    idle.executionSeq = 1;
+    assert(idle.active.isNull);
+    assert(roundTrip(idle) == idle);
+    assert(deserializeJson!FingerprintLedger(`{"fingerprint": "fp1"}`).active.isNull);
+
+    ActiveExecution active;
+    active.id = "e2";
+    active.projectId = "game";
+    active.taskId = "compile";
+    active.status = ExecutionStatus.queued;
+    active.definitionId = "def1";
+    active.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
+    active.repositoryAddresses = ["src": "https://example.test/game.git"];
+    active.createdAt = "2026-10-15T14:02:02Z";
+    FingerprintLedger queued = idle;
+    queued.executionSeq = 2;
+    queued.active = active;
+    auto json = serializeToJson(queued);
+    assert(json["active"]["status"].get!string == "queued" && json["active"]["definition_id"].get!string == "def1");
+    assert(roundTrip(queued) == queued);
+
+    ActiveExecution running = active;
+    running.status = ExecutionStatus.running;
+    running.attempt = 2;
+    running.expiredLeases = 1;
+    running.worker = "worker-1";
+    running.leaseExpiresAt = "2026-10-15T14:04:02Z";
+    running.startedAt = "2026-10-15T14:03:02Z";
+    queued.active = running;
     assert(roundTrip(queued) == queued);
 }
 

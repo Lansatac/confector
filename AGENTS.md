@@ -359,10 +359,13 @@ sweep, not on subscriptions.
   decided by the ledger's sequence numbers, never by comparing timestamps written by different
   instances.
 - **The control plane owns fingerprints.** Work orders carry an execution id; a worker's
-  completion names that id, and the fingerprint comes from the control plane's own record.
+  completion names that id, and the fingerprint comes from the control plane, never the worker.
 - **The active execution owns its lease.** A running execution records when its lease expires and
-  which attempt holds it; the worker's heartbeat extends the lease, and a heartbeat or completion
-  from a superseded attempt is rejected.
+  which attempt holds it; the worker's heartbeat extends the lease. A heartbeat from a superseded
+  attempt is rejected, and so is a completion whose attempt was superseded before it was checked.
+  A completion checked just before its attempt was superseded stands: it is a genuine run of the
+  same task at the same inputs. The newer attempt is told it was superseded, and a warning is
+  logged.
 - **Infrastructure failures retry automatically; task failures do not.** An expired lease counts
   as an attempt, up to an admin-configured limit tracked on the execution. A task that fails is
   retried only when a user asks.

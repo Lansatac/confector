@@ -186,8 +186,9 @@ void main()
 
 unittest
 {
-    import confector.api.model : ExecutionStatus, TaskExecution;
-    import confector.core.work_orders : defaultMaxAttempts;
+    import confector.api.model : ActiveExecution;
+    import confector.core.work_orders : defaultMaxAttempts, startExecution;
+    import core.time : minutes;
     import confector.backends.scheduler.local : LocalScheduler;
     import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
     import confector.testing.fake_repository_resolver : FakeRepositoryResolver;
@@ -208,15 +209,14 @@ unittest
     backends.artifactStore = artifacts;
     enum testSigningKey = "0123456789abcdef0123456789abcdef";
     auto testStores = new StateStores(backends.documentStore);
-    TaskExecution execution;
-    execution.id = "exe_1";
+    // Fingerprint "fp1" has an execution on its first attempt
+    ActiveExecution execution;
     execution.projectId = "proj";
     execution.taskId = "task";
+    execution.definitionId = "def1";
     execution.createdAt = "2026-10-16T10:00:00Z";
-    execution.fingerprint = "fp1";
-    execution.status = ExecutionStatus.queued;
-    execution.attempts = 1;
-    testStores.executions.createIfAbsent(execution);
+    const executionId = testStores.ledgers.claim("fp1", 0, execution).executionId;
+    startExecution(testStores, "fp1", "w1", 1.minutes, "2026-10-16T10:00:00Z");
     auto router = createRouter(backends, testStores, new FakeRepositoryResolver(), "test-scheduler-secret", testSigningKey,
         "pool-credential-0123456789abcdef0123456789abcdef", defaultMaxAttempts);
 
@@ -225,7 +225,7 @@ unittest
     // The worker token of an execution that uploads under "fp1" and downloads "fp1"'s artifact
     // "100% done.zip" as an input
     WorkerTokenClaims claims;
-    claims.executionId = "exe_1";
+    claims.executionId = executionId;
     claims.fingerprint = "fp1";
     claims.attempt = 1;
     claims.expiresAt = Clock.currTime.toUnixTime() + 600;

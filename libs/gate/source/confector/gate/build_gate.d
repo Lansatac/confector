@@ -81,6 +81,16 @@ private struct Reply
     Json body;
 }
 
+/// What a scenario reads of an execution, whether it is still active or has ended.
+private struct ExecutionView
+{
+    ExecutionStatus status;
+    ulong attempts;
+    string worker;
+    ulong expiredLeases;
+    string errorMessage;
+}
+
 /// An execution a worker holds: the attempt and token its requests present, and the work order.
 private struct Held
 {
@@ -218,17 +228,28 @@ private final class GateEnvironment
         return stores.requestStates.get(requestId).get.value.outcome;
     }
 
-    TaskExecution[] executionsOf(string fingerprint)
+    /// How many executions were ever claimed at `fingerprint`.
+    ulong executionCountAt(string fingerprint)
     {
-        return stores.executions.listForFingerprint(fingerprint);
+        auto ledger = stores.ledgers.get(fingerprint);
+        return ledger.isNull ? 0 : ledger.get.executionSeq;
     }
 
-    /// The execution recorded at `fingerprint`, which must be the only one.
-    TaskExecution onlyExecutionAt(string fingerprint)
+    /// The execution at `fingerprint`, which must be the only one: as the ledger holds it while it
+    /// is queued or running, as its record says once it has ended.
+    ExecutionView onlyExecutionAt(string fingerprint)
     {
-        auto executions = executionsOf(fingerprint);
-        assert(executions.length == 1, format("Expected one execution at '%s', found %s", fingerprint, executions.length));
-        return executions[0];
+        assert(executionCountAt(fingerprint) == 1, format("Expected one execution at '%s', found %s", fingerprint,
+            executionCountAt(fingerprint)));
+        const ledger = stores.ledgers.get(fingerprint).get.value;
+        if (!ledger.active.isNull)
+        {
+            const active = ledger.active.get;
+            return ExecutionView(active.status, active.attempt, active.worker, active.expiredLeases, null);
+        }
+        auto ended = stores.executions.get(ledger.lastSuccessExecutionId.length > 0
+            ? ledger.lastSuccessExecutionId : ledger.lastStoppedExecutionId).get;
+        return ExecutionView(ended.status, ended.attempts, ended.worker, ended.expiredLeases, ended.errorMessage);
     }
 
     /// The pinned revision of the work order's input `name`.
@@ -293,7 +314,7 @@ private void newCommitGetsNewFingerprint(FreshStore fresh)
     assert(GateEnvironment.revisionOf(runSecond.get, "src") == "c2", "The new commit's execution builds the new revision");
     env.complete(runSecond.get, ExecutionStatus.succeeded);
     assert(env.outcomeOf(secondRequest) == RequestOutcome.succeeded);
-    assert(env.executionsOf(firstFingerprint).length == 1 && env.executionsOf(secondFingerprint).length == 1,
+    assert(env.executionCountAt(firstFingerprint) == 1 && env.executionCountAt(secondFingerprint) == 1,
         "Each commit has exactly one execution");
 }
 
@@ -311,7 +332,7 @@ private void sameCommitIsCacheHit(FreshStore fresh)
     const request = requestIdOf(env.build(`{"project_id": "game", "targets": ["compile"]}`));
     assert(env.fingerprintOf(request, "compile") == fingerprint, "The same commit has the same fingerprint");
     assert(env.outcomeOf(request) == RequestOutcome.succeeded, "The same commit is answered from the cache, without a worker");
-    assert(env.executionsOf(fingerprint).length == 1, "The same commit makes no new execution");
+    assert(env.executionCountAt(fingerprint) == 1, "The same commit makes no new execution");
     assert(env.receive("worker-b", 60).isNull, "Nothing is queued for a worker");
 }
 
@@ -354,7 +375,7 @@ private void requestsNeedingOneFingerprintShareOneExecution(FreshStore fresh)
     auto claimed = env.receive("worker-a", 60);
     assert(!claimed.isNull && claimed.get.fingerprint == fingerprint, "The shared execution is handed out");
     assert(env.receive("worker-b", 60).isNull, "The second request made no second execution to hand out");
-    assert(env.executionsOf(fingerprint).length == 1, "One execution exists for the fingerprint");
+    assert(env.executionCountAt(fingerprint) == 1, "One execution exists for the fingerprint");
 
     env.complete(claimed.get, ExecutionStatus.succeeded);
     assert(env.outcomeOf(first) == RequestOutcome.succeeded, "The first request succeeds with the shared execution");

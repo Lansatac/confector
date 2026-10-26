@@ -3,6 +3,7 @@ module confector.server.worker_auth;
 import vibe.vibe;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_pool_credential : matchesWorkerPoolCredential, workerPoolCredentialHeader;
+import confector.core.work_orders : currentAttempt;
 import confector.core.worker_token : WorkerAuthException, WorkerTokenClaims, WorkerTokenScopeException, requireCurrentAttempt,
     verifyWorkerToken, workerTokenHeader;
 import std.datetime.systime : Clock;
@@ -71,14 +72,14 @@ bool permitWorker(HTTPServerRequest req, HTTPServerResponse res, void delegate()
  */
 void requireCurrentExecutionAttempt(StateStores stores, in WorkerTokenClaims claims, bool missingIsRefused)
 {
-    auto execution = stores.executions.get(claims.executionId);
-    if (execution.isNull)
+    auto attempt = currentAttempt(stores, claims.fingerprint, claims.executionId);
+    if (attempt.isNull)
     {
         if (missingIsRefused)
             throw new WorkerTokenScopeException(format("Execution '%s' does not exist", claims.executionId));
         return;
     }
-    requireCurrentAttempt(claims, execution.get.value.attempts);
+    requireCurrentAttempt(claims, attempt.get);
 }
 
 private void refuseWorker(HTTPServerRequest req, HTTPServerResponse res, WorkerAuthException e)

@@ -2,8 +2,8 @@ module confector.core.request_fixtures;
 
 /**
  * Test fixtures shared by the unittests of the request components (request_state,
- * execution_dispatcher, request_reconciler): a small project, chains, request intake, finishing
- * executions, and the real dispatcher and reconciler. Compiled only for unittests.
+ * request_reconciler): a small project, chains, request intake, finishing executions, and the real
+ * reconciler. Compiled only for unittests.
  */
 
 version (unittest):
@@ -11,10 +11,9 @@ version (unittest):
 import confector.core.request_evaluator;
 import confector.core.dag : TaskGraph;
 import confector.core.chain_pins : bindingMap, inputKeyLess, pinMap, refsOf, selectPins;
-import confector.core.request_reconciler : RequestReconciler;
+import confector.core.request_reconciler : Dispatched, RequestReconciler;
 import confector.core.document_collection : Versioned;
-import confector.core.execution_dispatcher : Dispatched, ExecutionDispatcher;
-import confector.core.fingerprint_ledger : ClaimOutcome;
+import confector.core.fingerprint_ledger : ClaimOutcome, endedExecution;
 import confector.core.input_resolution : GraphResolution, requiredPins;
 import confector.core.rerun_generations : RerunGenerationReader, readGraphResolution;
 import confector.core.state_stores : StateStores;
@@ -28,7 +27,7 @@ import vibe.data.json : Json;
 /// The address the fixtures register for repository "game".
 enum string gameAddress = "https://example.test/game.git";
 
-/// The clock the fixtures' dispatchers use.
+/// The clock the fixtures' reconcilers use.
 string fixedNow() { return "2026-10-20T10:00:00Z"; }
 
 /// compile -> test -> report, and lint; compile and lint build repository game.
@@ -112,7 +111,7 @@ BuildRequest recordRequest(StateStores stores, string chainId, string id, string
     foreach (fingerprint; closure.fingerprints.byValue)
     {
         auto settled = stores.ledgers.settle(fingerprint);
-        stopSeqs[fingerprint] = settled.ledger.isNull ? 0 : settled.ledger.get.stopSeq;
+        stopSeqs[fingerprint] = settled.isNull ? 0 : settled.get.stopSeq;
     }
     BuildRequest request;
     request.id = id;
@@ -162,22 +161,16 @@ RequestEvaluation evaluateFrom(StateStores stores, string requestId)
     return evaluateRequest(chain, entry, generations, summaries);
 }
 
-/// A dispatcher over `stores`, on the fixed clock.
-ExecutionDispatcher dispatcherOf(StateStores stores)
-{
-    return new ExecutionDispatcher(stores, () => fixedNow());
-}
-
-/// A reconciler over `stores`.
+/// A reconciler over `stores`, on the fixed clock.
 RequestReconciler reconcilerOf(StateStores stores)
 {
-    return new RequestReconciler(stores, dispatcherOf(stores));
+    return new RequestReconciler(stores, () => fixedNow());
 }
 
-/// Dispatches the execution `needed` asks for with the real dispatcher; its claim must win.
+/// Dispatches the execution `needed` asks for with the real reconciler; its claim must win.
 Dispatched dispatch(StateStores stores, in NeededExecution needed, string requestId)
 {
-    auto dispatched = dispatcherOf(stores).dispatch(needed, definedRequest(stores, requestId));
+    auto dispatched = reconcilerOf(stores).dispatch(needed, definedRequest(stores, requestId));
     assert(dispatched.claim == ClaimOutcome.won, "The test dispatch's claim must win");
     return dispatched;
 }
@@ -189,16 +182,13 @@ Versioned!RequestState reconcile(StateStores stores, string requestId)
 }
 
 /// Ends the active execution of `taskId`'s current fingerprint in chain `chain` with `status`:
-/// the terminal compare-and-set and the fold.
+/// writes its record and folds it.
 void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionStatus status)
 {
     const fingerprint = closureNow(stores, chain, [taskId]).fingerprints[taskId];
     auto ledger = stores.ledgers.get(fingerprint).get;
-    auto current = stores.executions.get(ledger.activeExecutionId).get;
-    TaskExecution ended = current.value;
-    ended.status = status;
-    ended.finishedAt = "2026-10-20T11:00:00Z";
-    stores.executions.update(current, ended);
+    auto ended = endedExecution(fingerprint, ledger.active.get, status, "2026-10-20T11:00:00Z");
+    stores.executions.create(ended);
     stores.ledgers.fold(ended);
 }
 

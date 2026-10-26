@@ -21,7 +21,7 @@ module confector.core.request_state;
  * - **Reconciling** (confector.core.request_reconciler) reads the state, evaluates, dispatches
  *   what is needed and `commit`s the evaluation at the version read. A reconcile that loses the
  *   compare-and-set (another reconcile committed) reads again and evaluates again. A needed
- *   execution that cannot be recorded settles the request failed (`fail`), with the error kept.
+ *   execution that cannot be built settles the request failed (`fail`), with the error kept.
  * - **Finding work**: `listOpen` reads the index of open requests by project. It is discovery and
  *   may lag; a request it misses is found by a later look.
  */
@@ -75,7 +75,7 @@ RequestState withEvaluation(in RequestState state, in RequestEvaluation evaluati
 }
 
 /**
- * `state` settled failed because a needed execution could not be recorded: `error` says why.
+ * `state` settled failed because a needed execution could not be built: `error` says why.
  * `evaluation`'s tasks are cached as they were when the failure was found. Pure.
  *
  * Throws: InvalidStateTransitionException if `state` is settled already, `evaluation` is of

@@ -42,12 +42,11 @@ enum CollectionSpec buildChainsCollection = CollectionSpec("build_chains",
 enum CollectionSpec buildRequestsCollection = CollectionSpec("build_requests",
     [IndexSpec("by_chain", "chain_id", "requested_key"), IndexSpec("by_project", "project_id", "requested_key")]);
 
-/// Task executions, by execution id; indexed by fingerprint, by project and task, and (active
-/// executions only) by status, each in creation order.
+/// Finished task executions, by execution id; indexed by fingerprint and by project and task, each
+/// in creation order.
 enum CollectionSpec taskExecutionsCollection = CollectionSpec("task_executions",
     [IndexSpec("by_fingerprint", "fingerprint", "created_key"),
-     IndexSpec("by_task", "project_task", "created_key"),
-     IndexSpec("active", "active_status", "created_key")]);
+     IndexSpec("by_task", "project_task", "created_key")]);
 
 /// Page size of the queries that list everything they find.
 private enum size_t pageSize = 100;
@@ -546,10 +545,9 @@ void validateRequest(in BuildRequest request)
 }
 
 /**
- * Task executions. Append-only and shared across chains: an execution is created queued, moves
- * between queued and running while workers claim and lose it, and once terminal never changes
- * again. Its identity (project, task, fingerprint, creation time) and the definition it was
- * dispatched with never change.
+ * Finished task executions. Append-only and shared across chains: a record is written once, when
+ * its execution ends, and never changes again. Executions that are queued or running live in
+ * their fingerprint's ledger (confector.core.fingerprint_ledger), not here.
  */
 final class ExecutionStore
 {
@@ -559,17 +557,15 @@ final class ExecutionStore
     this(DocumentStore store)
     {
         m_executions = new DocumentCollection!TaskExecution(store, taskExecutionsCollection,
-            ["created_key", "project_task", "active_status"], &derivedFields);
+            ["created_key", "project_task"], &derivedFields);
     }
 
     private static string[string] derivedFields(in TaskExecution execution)
     {
-        string[string] fields = [
+        return [
             "created_key": sortableTimestamp(execution.createdAt),
             "project_task": compositeKey(execution.projectId, execution.taskId),
         ];
-        if (isActive(execution.status)) fields["active_status"] = execution.status;
-        return fields;
     }
 
     /// Whether an execution with `status` is active (queued or running).
@@ -585,89 +581,23 @@ final class ExecutionStore
     }
 
     /**
-     * Records a new execution, which must be queued: an execution is created when it is
-     * dispatched.
+     * Records a finished execution. This is the only write: there is no way to change a record
+     * afterwards.
      *
-     * Throws: DocumentConflictException if an execution with its id exists;
-     * InvalidStateTransitionException if it has no id, project, task or fingerprint, or is not
-     * queued; Exception if `createdAt` is not an ISO 8601 timestamp.
+     * Throws: DocumentConflictException if an execution with its id exists (it was recorded
+     * already, by whoever ended it first); InvalidStateTransitionException if it has no id,
+     * project, task, fingerprint or definition, is not terminal, or records no finish time;
+     * Exception if `createdAt` or `finishedAt` is not an ISO 8601 timestamp.
      */
     Versioned!TaskExecution create(TaskExecution execution)
     {
         requireValid(execution.id.length > 0 && execution.projectId.length > 0 && execution.taskId.length > 0
-            && execution.fingerprint.length > 0,
-            format("Execution '%s' needs an id, a project id, a task id and a fingerprint", execution.id));
-        requireValid(execution.status == ExecutionStatus.queued,
-            format("Execution '%s' must be created queued, not %s", execution.id, execution.status));
+            && execution.fingerprint.length > 0 && execution.definitionId.length > 0,
+            format("Execution '%s' needs an id, a project id, a task id, a fingerprint and a definition id", execution.id));
+        requireValid(!isActive(execution.status),
+            format("Execution '%s' is %s; only a finished execution is recorded", execution.id, execution.status));
+        requireTimestamp(execution.finishedAt, format("The finish time of execution '%s'", execution.id));
         return m_executions.create(execution.id, execution);
-    }
-
-    /**
-     * Records `execution` as `create` does, unless an execution with its id exists already; then
-     * returns the stored one, whatever its status, and writes nothing. For executions with
-     * deterministic ids (confector.core.fingerprint_ledger.executionIdFor): the dispatcher that
-     * won a claim, and anyone repairing a claim whose dispatcher crashed before recording it,
-     * create the same execution, and whichever writes first is kept. The stored execution may
-     * carry another request's definition: an execution runs with the definition of whoever
-     * recorded it (AGENTS.md, "Pipeline definitions").
-     *
-     * Callers must check the returned record's status: a slow dispatcher or repairer can get back
-     * an execution that already ran and finished, which must not be sent again or treated as
-     * newly queued.
-     *
-     * Throws: as `create`; InvalidStateTransitionException if the stored execution has another
-     * project, task or fingerprint, which a deterministic id rules out unless the store is
-     * corrupt.
-     */
-    Versioned!TaskExecution createIfAbsent(TaskExecution execution)
-    {
-        foreach (attempt; 0 .. 2)
-        {
-            auto existing = m_executions.get(execution.id);
-            if (!existing.isNull)
-            {
-                const was = existing.get.value;
-                requireValid(was.projectId == execution.projectId && was.taskId == execution.taskId
-                    && was.fingerprint == execution.fingerprint,
-                    format("Execution '%s' exists for project '%s', task '%s' at fingerprint %s, not for project '%s', task '%s' at fingerprint %s",
-                        execution.id, was.projectId, was.taskId, was.fingerprint, execution.projectId, execution.taskId,
-                        execution.fingerprint));
-                return existing.get;
-            }
-            try
-            {
-                return create(execution);
-            }
-            catch (DocumentConflictException)
-            {
-                // Created concurrently: read it and check it is the same execution.
-            }
-        }
-        throw new Exception(format("Execution '%s' was reported to exist and then not found", execution.id));
-    }
-
-    /**
-     * Replaces the execution `current` with `next`.
-     *
-     * Throws: DocumentConflictException if the execution changed since `current` was read;
-     * InvalidStateTransitionException if `current` is terminal or `next` changes its identity,
-     * or the definition (and its hash), inputs or repository addresses it was dispatched with, or
-     * `next` is terminal without recording when it finished.
-     */
-    Versioned!TaskExecution update(in Versioned!TaskExecution current, TaskExecution next)
-    {
-        const was = current.value;
-        requireValid(isActive(was.status),
-            format("Execution '%s' is %s, and a terminal execution never changes", was.id, was.status));
-        requireValid(next.id == was.id && next.projectId == was.projectId && next.taskId == was.taskId
-            && next.fingerprint == was.fingerprint && next.createdAt == was.createdAt,
-            format("The identity of execution '%s' cannot change", was.id));
-        requireValid(next.definitionHash == was.definitionHash && next.definition == cast(TaskNode) was.definition
-            && next.inputs == was.inputs && next.repositoryAddresses == cast(string[string]) was.repositoryAddresses,
-            format("Execution '%s' runs with the definition and inputs it was dispatched with; they cannot change", was.id));
-        requireValid(isActive(next.status) || next.finishedAt.length > 0,
-            format("Execution '%s' is %s, and must record when it finished", was.id, next.status));
-        return m_executions.replace(was.id, next, current.version_);
     }
 
     /// Lists every execution recorded at `fingerprint`, oldest first. Discovery: may lag behind
@@ -691,31 +621,6 @@ final class ExecutionStore
         lookup.descending = true;
         lookup.limit = pageSize;
         return values(m_executions.queryAll(lookup, limit));
-    }
-
-    /// Lists active executions with `status` (queued or running), oldest first, at most `limit`
-    /// of them. Discovery.
-    TaskExecution[] listActive(ExecutionStatus status, size_t limit)
-    {
-        requireValid(isActive(status), format("%s is not an active execution status", status));
-        IndexQuery lookup;
-        lookup.index = "active";
-        lookup.partitionKey = status;
-        lookup.limit = pageSize;
-        return values(m_executions.queryAll(lookup, limit));
-    }
-
-    /// One page of the active executions with `status` (queued or running), oldest first, from
-    /// `cursor` (null for the first page). `nextCursor` is empty after the last page. Discovery.
-    Page!TaskExecution listActivePage(ExecutionStatus status, string cursor)
-    {
-        requireValid(isActive(status), format("%s is not an active execution status", status));
-        IndexQuery lookup;
-        lookup.index = "active";
-        lookup.partitionKey = status;
-        lookup.limit = pageSize;
-        lookup.cursor = cursor;
-        return m_executions.query(lookup);
     }
 }
 
@@ -782,10 +687,11 @@ version (unittest)
         execution.projectId = "game";
         execution.taskId = taskId;
         execution.fingerprint = fingerprint;
-        execution.status = ExecutionStatus.queued;
-        execution.definition.id = taskId;
-        execution.definitionHash = "def1";
+        execution.status = ExecutionStatus.succeeded;
+        execution.attempts = 1;
+        execution.definitionId = "def1";
         execution.createdAt = createdAt;
+        execution.finishedAt = "2026-10-15T14:09:00Z";
         return execution;
     }
 
@@ -1523,97 +1429,49 @@ unittest
 
 unittest
 {
-    // Executions: created queued, active until terminal, then never changed again
+    // An execution is recorded once, finished, and never changes: the store offers no update, a
+    // second record under the id is refused, and an unfinished or incomplete one is refused
     auto executions = new ExecutionStore(new InMemoryDocumentStore());
-    auto queued = executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z"));
-    assert(queued.version_ == 1);
+    auto recorded = executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z"));
+    assert(recorded.version_ == 1 && executions.get("e1").get.value == recorded.value);
+    assert(!__traits(hasMember, ExecutionStore, "update"), "No code path updates a recorded execution");
 
-    TaskExecution running = queued.value;
-    running.status = ExecutionStatus.running;
-    running.attempts = 1;
-    running.worker = "w1";
-    running.startedAt = "2026-10-15T14:03:00Z";
-    auto v2 = executions.update(queued, running);
-    assert(v2.status == ExecutionStatus.running && v2.attempts == 1);
+    auto other = sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z");
+    other.status = ExecutionStatus.failed;
+    assert(throwsA!DocumentConflictException({ executions.create(other); }), "A second record of the execution is refused");
+    assert(executions.get("e1").get.value == recorded.value && executions.get("e1").get.version_ == 1);
 
-    // A stale writer (another worker's lost update) loses the compare-and-set
-    TaskExecution stale = queued.value;
-    stale.status = ExecutionStatus.cancelled;
-    stale.finishedAt = "2026-10-15T14:03:00Z";
-    assert(throwsA!DocumentConflictException({ executions.update(queued, stale); }));
-
-    // A lost worker puts it back in the queue; the identity cannot change
-    TaskExecution requeued = v2.value;
-    requeued.status = ExecutionStatus.queued;
-    auto v3 = executions.update(v2, requeued);
-    TaskExecution moved = v3.value;
-    moved.fingerprint = "fp2";
-    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, moved); }));
-    TaskExecution redefined = v3.value;
-    redefined.definitionHash = "def2";
-    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, redefined); }), "The definition hash is fixed at dispatch");
-    TaskExecution restepped = v3.value;
-    restepped.definition.steps = [BuildStep("Compile", "bash", Json(["script": Json("make release")]))];
-    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, restepped); }), "The definition is fixed at dispatch");
-    TaskExecution repinned = v3.value;
-    repinned.inputs = [ResolvedInput("src", InputKind.repository, Json("bbb222"))];
-    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, repinned); }), "The inputs are fixed at dispatch");
-    TaskExecution readdressed = v3.value;
-    readdressed.repositoryAddresses = ["src": "https://example.test/other.git"];
-    assert(throwsA!InvalidStateTransitionException({ executions.update(v3, readdressed); }));
-    TaskExecution leased = v3.value;
-    leased.leaseExpiresAt = "2026-10-15T14:03:30Z";
-    v3 = executions.update(v3, leased);
-
-    TaskExecution succeeded = v3.value;
-    succeeded.status = ExecutionStatus.succeeded;
-    succeeded.finishedAt = "2026-10-15T14:09:00Z";
-    auto v4 = executions.update(v3, succeeded);
-    TaskExecution reopened = v4.value;
-    reopened.status = ExecutionStatus.running;
-    assert(throwsA!InvalidStateTransitionException({ executions.update(v4, reopened); }), "A terminal execution never changes");
-    assert(executions.get("e1").get.value == succeeded);
-
-    // Only queued executions are created
-    auto premature = sampleExecution("e2", "fp1", "2026-10-15T14:02:00Z");
-    premature.status = ExecutionStatus.succeeded;
-    assert(throwsA!InvalidStateTransitionException({ executions.create(premature); }));
+    foreach (status; [ExecutionStatus.queued, ExecutionStatus.running])
+    {
+        auto unfinished = sampleExecution("e2", "fp1", "2026-10-15T14:02:00Z");
+        unfinished.status = status;
+        assert(throwsA!InvalidStateTransitionException({ executions.create(unfinished); }), "Only a finished execution is recorded");
+    }
     assert(throwsA!InvalidStateTransitionException({ executions.create(sampleExecution("e2", "", "2026-10-15T14:02:00Z")); }));
-    assert(throwsA!DocumentConflictException({ executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z")); }));
-}
+    auto undefined = sampleExecution("e2", "fp1", "2026-10-15T14:02:00Z");
+    undefined.definitionId = null;
+    assert(throwsA!InvalidStateTransitionException({ executions.create(undefined); }));
+    auto unfinishedAt = sampleExecution("e2", "fp1", "2026-10-15T14:02:00Z");
+    unfinishedAt.finishedAt = null;
+    assert(throwsA!InvalidStateTransitionException({ executions.create(unfinishedAt); }), "A finish time is required");
+    assert(executions.get("e2").isNull);
 
-unittest
-{
-    // A terminal execution records when it finished: one that finishes without a time is refused
-    auto executions = new ExecutionStore(new InMemoryDocumentStore());
-    auto queued = executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z"));
     foreach (status; [ExecutionStatus.failed, ExecutionStatus.cancelled, ExecutionStatus.succeeded])
     {
-        TaskExecution unfinished = queued.value;
-        unfinished.status = status;
-        assert(throwsA!InvalidStateTransitionException({ executions.update(queued, unfinished); }),
-            "A terminal execution without finished_at is refused");
+        auto ended = sampleExecution("e_" ~ cast(string) status, "fp1", "2026-10-15T14:02:00Z");
+        ended.status = status;
+        assert(executions.create(ended).status == status);
     }
-
-    TaskExecution cancelled = queued.value;
-    cancelled.status = ExecutionStatus.cancelled;
-    cancelled.finishedAt = "2026-10-15T14:04:00Z";
-    assert(executions.update(queued, cancelled).value.finishedAt == "2026-10-15T14:04:00Z");
 }
 
 unittest
 {
-    // Executions: listed by fingerprint, by task and while active
+    // Executions: listed by fingerprint and by task
     auto executions = new ExecutionStore(new InMemoryDocumentStore());
-    auto first = executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z"));
+    executions.create(sampleExecution("e1", "fp1", "2026-10-15T14:02:00Z"));
     executions.create(sampleExecution("e2", "fp1", "2026-10-15T14:02:00.25Z"));
     executions.create(sampleExecution("e3", "fp2", "2026-10-15T15:00:00Z"));
     executions.create(sampleExecution("e4", "fp9", "2026-10-15T16:00:00Z", "lint"));
-
-    TaskExecution failed = first.value;
-    failed.status = ExecutionStatus.failed;
-    failed.finishedAt = "2026-10-15T14:05:00Z";
-    executions.update(first, failed);
 
     auto atFp1 = executions.listForFingerprint("fp1");
     assert(atFp1.length == 2 && atFp1[0].id == "e1" && atFp1[1].id == "e2");
@@ -1622,11 +1480,6 @@ unittest
     auto history = executions.listForTask("game", "compile", 2);
     assert(history.length == 2 && history[0].id == "e3" && history[1].id == "e2");
     assert(executions.listForTask("game", "lint", 10).length == 1);
-
-    auto active = executions.listActive(ExecutionStatus.queued, 10);
-    assert(active.length == 3 && active[0].id == "e2", "A terminal execution leaves the active index");
-    assert(executions.listActive(ExecutionStatus.running, 10).length == 0);
-    assert(throwsA!InvalidStateTransitionException({ executions.listActive(ExecutionStatus.failed, 10); }));
 }
 
 unittest

@@ -3,35 +3,44 @@ module confector.core.work_orders;
 /**
  * The control plane's side of running work (AGENTS.md, "Workers and capacity"): a worker asks for
  * work and is handed a queued execution it holds under a lease, extends the lease while it runs,
- * and reports the outcome. There is no queue service: the execution record is the queue entry.
+ * and reports the outcome. There is no queue service: the execution is the active execution of its
+ * fingerprint's ledger (confector.core.fingerprint_ledger), and every step of its life is one
+ * compare-and-set on that ledger.
  *
- * `claimWork` finds queued executions through the active-execution index (discovery, which may
- * lag: work found late is only delayed) and claims one by compare-and-set on the execution
- * (queued to running, one more attempt, a lease expiry, the worker). Of two workers claiming the
+ * `claimWork` finds ledgers with a queued execution through the ledger's `active` index
+ * (discovery, which may lag: work found late is only delayed) and starts one by compare-and-set
+ * (queued to running, one more attempt, a lease expiry, the worker). Of two workers starting the
  * same execution exactly one wins; the other moves on. The work order is built from the
- * execution's record.
+ * execution's claim and the task of its stored definition.
  *
- * `TaskExecution.attempts` counts claims, and the current claim's number is its attempt. A worker's
- * heartbeat, release and completion carry the attempt it was given; one from an earlier attempt
- * (the lease expired and the execution was claimed again, or released) is answered
+ * `ActiveExecution.attempt` counts starts, and the current start's number is its attempt. A
+ * worker's heartbeat, release and completion carry the attempt it was given; one from an earlier
+ * attempt (the lease expired and the execution was started again, or released) is answered
  * `LeaseAnswer.superseded` or rejected, so a worker that lost its lease cannot extend it or report.
  *
  * A lease that runs out (`expireLease`, which a sweep calls) is an infrastructure failure, counted
- * in `TaskExecution.expiredLeases` (a release is not counted): within the limit the execution
- * goes back to queued; with the limit reached it fails with the reason "lease lost N times" (a failed execution is never a cache hit, and only a user retries
- * it) through the same terminal path as a completion.
+ * in `ActiveExecution.expiredLeases` (a release is not counted): within the limit the execution
+ * goes back to queued; with the limit reached it fails with the reason "lease lost N times" (a
+ * failed execution is never a cache hit, and only a user retries it) through the same end as a
+ * completion.
  *
- * A completion finishes its execution by compare-and-set, then folds the outcome into the
- * fingerprint's ledger. Every way an execution ends goes through `recordOutcome`, so failed and
- * cancelled executions are folded the same way. The terminal compare-and-set and the fold are
- * separate writes: a crash between them leaves a finished execution that nothing has folded yet,
- * which `LedgerStore.settle` completes on the next read of the ledger. Then the open requests of the
- * execution's project are reconciled; a reconcile that fails is logged and left to a later one.
+ * Every way an execution ends goes through `endExecution`: it writes the immutable TaskExecution
+ * (only one ender can: the others are rejected as stale), then folds the outcome into the
+ * fingerprint's ledger. The write and the fold are separate steps: a crash between them leaves a
+ * finished execution that nothing has folded yet, which `LedgerStore.settle` completes on the next
+ * read of the ledger. Then the open requests of the execution's project are reconciled; a
+ * reconcile that fails is logged and left to a later one.
+ *
+ * An outcome is decided from the ledger as read, and the record write is not conditional on the
+ * ledger, so a completion whose attempt was superseded between its check and its write stands: the
+ * worker did finish the execution, and the newer attempt is told it is superseded at its next
+ * heartbeat. A completion that arrives after the supersession is visible is rejected.
  */
 
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
 import confector.api.model;
+import confector.core.fingerprint_ledger : claimedOn, endedExecution, withLease, withLostLease, withRequeue, withStart;
 import confector.core.request_reconciler : reconcileOpenRequests;
 import confector.core.state_stores : StateStores;
 import confector.api.document_store : DocumentConflictException;
@@ -41,9 +50,10 @@ import std.datetime.systime : Clock, SysTime;
 import std.datetime.timezone : UTC;
 import std.format : format;
 import std.typecons : Nullable, nullable;
+import vibe.core.log : logError, logWarn;
 
 /// How many times a write that loses a compare-and-set to a concurrent writer of the same
-/// execution re-reads and retries. Every lost attempt means another write succeeded, so this is
+/// ledger re-reads and retries. Every lost attempt means another write succeeded, so this is
 /// reached only under sustained contention on one document.
 enum maxWriteAttempts = 10;
 
@@ -87,7 +97,7 @@ string utcNow()
 struct ClaimedWork
 {
     WorkOrder workOrder;
-    /// The execution's attempt number this claim started (`TaskExecution.attempts`).
+    /// The execution's attempt number this claim started (`ActiveExecution.attempt`).
     ulong attempt;
 }
 
@@ -104,28 +114,32 @@ class InvalidLeaseRequestException : Exception
 }
 
 /**
- * The work order for `execution`: its definition (whose steps, environment and declared outputs
- * the runner uses), fingerprint, resolved inputs and repository addresses. Pure.
+ * The work order for `active`, the execution at `fingerprint`, running `task` (the task of its
+ * stored definition): the task (whose steps, environment and declared outputs the runner uses),
+ * fingerprint, resolved inputs and repository addresses. Pure.
  */
-WorkOrder workOrderFor(in TaskExecution execution) @trusted
+WorkOrder workOrderFor(string fingerprint, in ActiveExecution active, in TaskNode task) @trusted
 {
     WorkOrder order;
-    order.executionId = execution.id;
-    order.taskNode = cast(TaskNode) execution.definition;
-    order.fingerprint = execution.fingerprint;
-    order.payload.inputs = (cast(ResolvedInput[]) execution.inputs).dup;
-    foreach (name, address; execution.repositoryAddresses) order.payload.repositoryAddresses[name] = address;
-    order.timeoutSeconds = execution.definition.timeoutSeconds;
-    order.createdAt = execution.createdAt;
+    order.executionId = active.id;
+    order.taskNode = cast(TaskNode) task;
+    order.fingerprint = fingerprint;
+    order.payload.inputs = (cast(ResolvedInput[]) active.inputs).dup;
+    foreach (name, address; active.repositoryAddresses) order.payload.repositoryAddresses[name] = address;
+    order.timeoutSeconds = task.timeoutSeconds;
+    order.createdAt = active.createdAt;
     return order;
 }
 
 /**
  * Claims the oldest queued execution for worker `workerId`, holding it under a lease of `lease`
  * from `now` (default `utcNow`), and returns its work order and attempt; null if no queued
- * execution could be claimed. Executions are found through the active-execution index and each
- * is claimed by compare-and-set (`startExecution`), so concurrent workers never claim one
- * execution twice: a worker that loses moves on to the next.
+ * execution could be claimed. Ledgers with a queued execution are found through the ledger index
+ * and each execution is started by compare-and-set (`startExecution`), so concurrent workers never
+ * claim one execution twice: a worker that loses moves on to the next.
+ *
+ * An execution whose stored definition or task is missing is failed, saying so, and the next one
+ * is claimed.
  *
  * Throws: InvalidLeaseRequestException if `workerId` is empty or `lease` is not valid; whatever
  * the stores throw.
@@ -141,53 +155,103 @@ Nullable!ClaimedWork claimWork(StateStores stores, string workerId, Duration lea
     string cursor;
     while (true)
     {
-        auto page = stores.executions.listActivePage(ExecutionStatus.queued, cursor);
+        auto page = stores.ledgers.queuedPage(cursor);
         foreach (ref candidate; page.items)
         {
-            auto started = startExecution(stores.executions, candidate.id, workerId, lease, now);
-            if (!started.isNull) return ClaimedWork(workOrderFor(started.get), started.get.attempts).nullable;
+            if (candidate.active.isNull || candidate.active.get.status != ExecutionStatus.queued) continue;
+            // An execution that cannot be run is failed with the real cause before any worker
+            // holds it, so it never loops on lost leases
+            try
+            {
+                definedTask(stores, candidate.active.get);
+            }
+            catch (UnrunnableExecutionException e)
+            {
+                logError("[work] Failing execution '%s': %s", candidate.active.get.id, e.msg);
+                try
+                {
+                    finishExecution(stores, candidate.fingerprint, candidate.active.get.id, ExecutionStatus.failed, 1,
+                        "The execution could not be dispatched: " ~ e.msg, null, now);
+                }
+                catch (StaleCompletionException)
+                {
+                    // It ended or moved on since the index listed it: nothing left to fail
+                    logWarn("[work] Execution '%s' ended before it could be failed", candidate.active.get.id);
+                }
+                continue;
+            }
+            auto started = startExecution(stores, candidate.fingerprint, workerId, lease, now);
+            if (started.isNull) continue;
+            const task = definedTask(stores, started.get);
+            return ClaimedWork(workOrderFor(candidate.fingerprint, started.get, task), started.get.attempt).nullable;
         }
         if (page.nextCursor.length == 0) return Nullable!ClaimedWork.init;
         cursor = page.nextCursor;
     }
 }
 
+/// An execution's stored definition, or its task in it, does not exist: it can never be run.
+class UnrunnableExecutionException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/// The task `active` runs, read from its stored definition.
+///
+/// Throws: UnrunnableExecutionException if the definition or the task is missing.
+private TaskNode definedTask(StateStores stores, in ActiveExecution active)
+{
+    auto definition = stores.definitions.get(active.definitionId);
+    if (definition.isNull)
+    {
+        throw new UnrunnableExecutionException(format("Execution '%s' runs with definition '%s', which does not exist", active.id, active.definitionId));
+    }
+    foreach (ref task; definition.get.tasks)
+    {
+        if (task.id == active.taskId) return task;
+    }
+    throw new UnrunnableExecutionException(format("Execution '%s' runs task '%s', which definition '%s' does not have", active.id, active.taskId, active.definitionId));
+}
+
 /**
- * Claims execution `executionId` for worker `workerId` by compare-and-set: a queued execution
- * becomes running with one more attempt, held by the worker until `now` plus `lease`. Returns the
- * running execution, or null (writing nothing) if it is not queued: it was claimed by another
- * worker, or it has ended.
+ * Starts the active execution of `fingerprint` for worker `workerId` by compare-and-set: a queued
+ * execution becomes running with one more attempt, held by the worker until `now` plus `lease`.
+ * Returns the running execution, or null (writing nothing) if the fingerprint's active execution is
+ * not queued: it was started by another worker, or it has ended (or has its record, and is folded
+ * instead).
  *
- * Throws: UnknownExecutionException if the execution does not exist.
+ * Throws: UnknownExecutionException if the fingerprint has no ledger.
  */
-Nullable!TaskExecution startExecution(ExecutionStore executions, string executionId, string workerId, Duration lease, string now)
+Nullable!ActiveExecution startExecution(StateStores stores, string fingerprint, string workerId, Duration lease, string now)
 {
     foreach (_; 0 .. maxWriteAttempts)
     {
-        auto current = executions.get(executionId);
+        auto current = stores.ledgers.get(fingerprint);
         if (current.isNull)
         {
-            throw new UnknownExecutionException(format("Cannot claim execution '%s', which does not exist", executionId));
+            throw new UnknownExecutionException(format("Cannot start an execution at fingerprint %s, which has no ledger", fingerprint));
         }
-        if (current.get.status != ExecutionStatus.queued) return Nullable!TaskExecution.init;
-
-        TaskExecution next = current.get.value;
-        next.status = ExecutionStatus.running;
-        next.attempts += 1;
-        next.worker = workerId;
-        next.startedAt = now;
-        next.leaseExpiresAt = leaseExpiry(now, lease);
+        if (current.get.active.isNull || current.get.active.get.status != ExecutionStatus.queued) return Nullable!ActiveExecution.init;
+        // An execution that already ended but was not folded is not started: fold it instead
+        if (!stores.executions.get(current.get.active.get.id).isNull)
+        {
+            stores.ledgers.settle(fingerprint);
+            return Nullable!ActiveExecution.init;
+        }
         try
         {
-            return executions.update(current.get, next).value.nullable;
+            return stores.ledgers.update(current.get, withStart(current.get.value, workerId, leaseExpiry(now, lease), now)).active;
         }
         catch (DocumentConflictException)
         {
             continue;
         }
     }
-    throw new Exception(format("Could not claim execution '%s': it lost %s compare-and-sets in a row",
-        executionId, maxWriteAttempts));
+    throw new Exception(format("Could not start the execution at fingerprint %s: it lost %s compare-and-sets in a row",
+        fingerprint, maxWriteAttempts));
 }
 
 /// What a worker is told about the execution it holds, by a heartbeat or a release.
@@ -195,37 +259,35 @@ enum LeaseAnswer : string
 {
     /// The attempt still holds the execution: keep running. A heartbeat extended its lease.
     continue_ = "continue",
-    /// A release was accepted: the execution is queued again, for any worker to claim.
+    /// A release was accepted: the execution is queued again, for any worker to start.
     released = "released",
     /// The execution was cancelled: stop the work.
     cancel = "cancel",
     /// The attempt no longer holds the execution (its lease expired and the execution was queued
-    /// or claimed again, or it finished): stop the work and report nothing.
+    /// or started again, or it finished): stop the work and report nothing.
     superseded = "superseded"
 }
 
 /**
- * Extends the lease of attempt `attempt` of execution `executionId` to `now` (default `utcNow`)
- * plus `lease`, by compare-and-set, and answers what the worker is to do. Writes nothing unless
- * the answer is `continue_`.
+ * Extends the lease of attempt `attempt` of execution `executionId` at `fingerprint` to `now`
+ * (default `utcNow`) plus `lease`, by compare-and-set on the ledger, and answers what the worker is
+ * to do. Writes nothing unless the answer is `continue_`.
  *
- * Throws: UnknownExecutionException if the execution does not exist; InvalidLeaseRequestException
- * if `lease` is not valid.
+ * Throws: UnknownExecutionException if the fingerprint has no ledger or never claimed the
+ * execution; InvalidLeaseRequestException if `lease` is not valid.
  */
-LeaseAnswer heartbeatExecution(StateStores stores, string executionId, ulong attempt, Duration lease, string now = null)
+LeaseAnswer heartbeatExecution(StateStores stores, string fingerprint, string executionId, ulong attempt, Duration lease, string now = null)
 {
     requireLeaseDuration(lease);
     if (now.length == 0) now = utcNow();
     foreach (_; 0 .. maxWriteAttempts)
     {
-        auto current = readExecution(stores, executionId, "A heartbeat");
-        const answer = holderAnswer(current.value, attempt);
+        auto current = readLedger(stores, fingerprint, executionId, "A heartbeat");
+        const answer = holderAnswer(stores, current.value, executionId, attempt, "A heartbeat");
         if (answer != LeaseAnswer.continue_) return answer;
-        TaskExecution next = current.value;
-        next.leaseExpiresAt = leaseExpiry(now, lease);
         try
         {
-            stores.executions.update(current, next);
+            stores.ledgers.update(current, withLease(current.value, leaseExpiry(now, lease)));
             return LeaseAnswer.continue_;
         }
         catch (DocumentConflictException)
@@ -238,23 +300,24 @@ LeaseAnswer heartbeatExecution(StateStores stores, string executionId, ulong att
 }
 
 /**
- * Gives up attempt `attempt` of execution `executionId`: if that attempt still holds it, the
- * execution goes back to queued at once, for any worker to claim, and the answer is `released`.
- * A release is not a lost lease: it does not count toward the attempt limit. Writes nothing for
- * any other answer.
+ * Gives up attempt `attempt` of execution `executionId` at `fingerprint`: if that attempt still
+ * holds it, the execution goes back to queued at once, for any worker to start, and the answer is
+ * `released`. A release is not a lost lease: it does not count toward the attempt limit. Writes
+ * nothing for any other answer.
  *
- * Throws: UnknownExecutionException if the execution does not exist.
+ * Throws: UnknownExecutionException if the fingerprint has no ledger or never claimed the
+ * execution.
  */
-LeaseAnswer releaseExecution(StateStores stores, string executionId, ulong attempt)
+LeaseAnswer releaseExecution(StateStores stores, string fingerprint, string executionId, ulong attempt)
 {
     foreach (_; 0 .. maxWriteAttempts)
     {
-        auto current = readExecution(stores, executionId, "A release");
-        const answer = holderAnswer(current.value, attempt);
+        auto current = readLedger(stores, fingerprint, executionId, "A release");
+        const answer = holderAnswer(stores, current.value, executionId, attempt, "A release");
         if (answer != LeaseAnswer.continue_) return answer;
         try
         {
-            stores.executions.update(current, requeued(current.value));
+            stores.ledgers.update(current, withRequeue(current.value));
             return LeaseAnswer.released;
         }
         catch (DocumentConflictException)
@@ -266,43 +329,61 @@ LeaseAnswer releaseExecution(StateStores stores, string executionId, ulong attem
         executionId, maxWriteAttempts));
 }
 
-private Versioned!TaskExecution readExecution(StateStores stores, string executionId, string what)
+/// The ledger of `fingerprint`, which a worker's request (`what`) about `executionId` names.
+private Versioned!FingerprintLedger readLedger(StateStores stores, string fingerprint, string executionId, string what)
 {
-    auto found = stores.executions.get(executionId);
+    auto found = stores.ledgers.get(fingerprint);
     if (found.isNull)
     {
-        throw new UnknownExecutionException(format("%s names execution '%s', which does not exist", what, executionId));
+        throw new UnknownExecutionException(format("%s names execution '%s' at fingerprint %s, which has no ledger", what, executionId, fingerprint));
     }
     return found.get;
 }
 
-/// What `execution` says to the worker holding attempt `attempt`: continue only if that attempt
-/// still holds it.
-private LeaseAnswer holderAnswer(in TaskExecution execution, ulong attempt) pure nothrow @safe
+/// What the ledger says to the worker holding attempt `attempt` of execution `executionId`:
+/// continue only if that attempt still holds the active execution. An execution the ledger no
+/// longer holds has ended: cancelled tells the worker to stop, any other end supersedes it.
+///
+/// Throws: UnknownExecutionException if the ledger never claimed the execution.
+private LeaseAnswer holderAnswer(StateStores stores, in FingerprintLedger ledger, string executionId, ulong attempt, string what)
 {
-    if (execution.status == ExecutionStatus.cancelled) return LeaseAnswer.cancel;
-    if (execution.status != ExecutionStatus.running || execution.attempts != attempt) return LeaseAnswer.superseded;
-    return LeaseAnswer.continue_;
+    if (!ledger.active.isNull && ledger.active.get.id == executionId)
+    {
+        const active = ledger.active.get;
+        return active.status == ExecutionStatus.running && active.attempt == attempt ? LeaseAnswer.continue_ : LeaseAnswer.superseded;
+    }
+    if (!claimedOn(ledger, executionId))
+    {
+        throw new UnknownExecutionException(format("%s names execution '%s', which fingerprint %s never claimed", what, executionId, ledger.fingerprint));
+    }
+    auto ended = stores.executions.get(executionId);
+    return !ended.isNull && ended.get.status == ExecutionStatus.cancelled ? LeaseAnswer.cancel : LeaseAnswer.superseded;
 }
 
-private TaskExecution requeued(in TaskExecution execution) @trusted
+/**
+ * The attempt execution `executionId` at `fingerprint` is on: the active execution's current
+ * attempt, or the attempt a finished execution ended with. Null if the fingerprint never claimed
+ * the execution (or its record is missing).
+ */
+Nullable!ulong currentAttempt(StateStores stores, string fingerprint, string executionId)
 {
-    TaskExecution next = cast(TaskExecution) execution;
-    next.status = ExecutionStatus.queued;
-    next.worker = null;
-    next.startedAt = null;
-    next.leaseExpiresAt = null;
-    return next;
+    auto ledger = stores.ledgers.get(fingerprint);
+    if (ledger.isNull) return Nullable!ulong.init;
+    if (!ledger.get.active.isNull && ledger.get.active.get.id == executionId) return nullable(ledger.get.active.get.attempt);
+    if (!claimedOn(ledger.get.value, executionId)) return Nullable!ulong.init;
+    auto ended = stores.executions.get(executionId);
+    return ended.isNull ? Nullable!ulong.init : nullable(ended.get.attempts);
 }
 
 /// What `expireLease` did.
 enum LostLeaseDisposition
 {
-    /// The execution is queued again, for a worker to claim.
+    /// The execution is queued again, for a worker to start.
     requeued,
     /// The attempts were used up: the execution failed and was folded into its ledger.
     failed,
-    /// Nothing was written: the execution is not running, or its lease has not expired.
+    /// Nothing was written: the fingerprint has no running execution, or its lease has not
+    /// expired.
     nothingToDo
 }
 
@@ -310,68 +391,76 @@ enum LostLeaseDisposition
 struct LostLease
 {
     LostLeaseDisposition disposition;
-    /// The execution as it is now.
-    TaskExecution execution;
+    /// requeued and failed: how many leases the execution has lost, this one included.
+    ulong expiredLeases;
+    /// failed: the finished execution.
+    Nullable!TaskExecution ended;
 }
 
 /**
- * Expires the lease of execution `executionId` if it is running and its lease ran out by `now`
+ * Expires the lease of the execution running at `fingerprint` if its lease ran out by `now`
  * (default `utcNow`): the worker holding it is presumed lost, and the loss is counted in
- * `expiredLeases`. Within the limit the execution goes back to queued, to be claimed as the next
- * attempt; when the count reaches `maxAttempts` it fails with the reason "lease lost N times", by the same terminal compare-and-set and
- * fold as a completion (`recordOutcome`). A task that failed is never retried this way: this
- * handles only attempts that never reported. This is the entry point for a sweep that finds
+ * `expiredLeases` by one compare-and-set on the ledger. Within the limit the same write puts the
+ * execution back to queued, to be started as the next attempt; when the count reaches
+ * `maxAttempts` the execution is ended failed with the reason "lease lost N times", by the same
+ * write and fold as a completion (`endExecution`). A task that failed is never retried this way:
+ * this handles only attempts that never reported. This is the entry point for a sweep that finds
  * expired leases.
  *
- * Throws: UnknownExecutionException if the execution does not exist; OutcomeNotFoldedException
+ * Throws: UnknownExecutionException if the fingerprint has no ledger; OutcomeNotFoldedException
  * if it failed but the fold did not complete; Exception if `maxAttempts` is 0 or a running
  * execution has no lease expiry.
  */
-LostLease expireLease(StateStores stores, string executionId, uint maxAttempts, string now = null)
+LostLease expireLease(StateStores stores, string fingerprint, uint maxAttempts, string now = null)
 {
     requireAttemptLimit(maxAttempts);
     if (now.length == 0) now = utcNow();
     foreach (_; 0 .. maxWriteAttempts)
     {
-        auto current = readExecution(stores, executionId, "A lease expiry");
-        TaskExecution seen = current.value;
-        if (seen.status != ExecutionStatus.running) return LostLease(LostLeaseDisposition.nothingToDo, seen);
+        // Settled first: an execution that already ended is folded, not counted as lost
+        auto current = stores.ledgers.settle(fingerprint);
+        if (current.isNull)
+        {
+            throw new UnknownExecutionException(format("A lease expiry names fingerprint %s, which has no ledger", fingerprint));
+        }
+        if (current.get.active.isNull || current.get.active.get.status != ExecutionStatus.running)
+        {
+            return LostLease(LostLeaseDisposition.nothingToDo);
+        }
+        const seen = current.get.active.get;
         if (seen.leaseExpiresAt.length == 0)
         {
-            throw new Exception(format("Execution '%s' is running but has no lease expiry", executionId));
+            throw new Exception(format("Execution '%s' is running but has no lease expiry", seen.id));
         }
         if (SysTime.fromISOExtString(seen.leaseExpiresAt) > SysTime.fromISOExtString(now))
         {
-            return LostLease(LostLeaseDisposition.nothingToDo, seen);
+            return LostLease(LostLeaseDisposition.nothingToDo);
         }
         const lost = seen.expiredLeases + 1;
-        if (lost >= maxAttempts)
-        {
-            try
-            {
-                auto finished = recordOutcome(stores, executionId, ExecutionStatus.failed, 0,
-                    format("lease lost %s %s (attempt limit %s)", lost, lost == 1 ? "time" : "times", maxAttempts),
-                    null, now, (in Versioned!TaskExecution latest) => latest.version_ == current.version_, Nullable!ulong(lost));
-                return LostLease(LostLeaseDisposition.failed, finished);
-            }
-            catch (StaleCompletionException)
-            {
-                continue; // It finished or moved on meanwhile: decide again from what is there now
-            }
-        }
+        const fail = lost >= maxAttempts;
+        Versioned!FingerprintLedger counted;
         try
         {
-            auto next = requeued(seen);
-            next.expiredLeases = lost;
-            return LostLease(LostLeaseDisposition.requeued, stores.executions.update(current, next).value);
+            counted = stores.ledgers.update(current.get, withLostLease(current.get.value, !fail));
         }
         catch (DocumentConflictException)
         {
-            continue;
+            continue; // The execution moved on meanwhile: decide again from what is there now
+        }
+        if (!fail) return LostLease(LostLeaseDisposition.requeued, lost);
+        try
+        {
+            auto finished = endExecution(stores, fingerprint, counted.active.get, ExecutionStatus.failed, 0,
+                format("lease lost %s %s (attempt limit %s)", lost, lost == 1 ? "time" : "times", maxAttempts), null, now);
+            return LostLease(LostLeaseDisposition.failed, lost, nullable(finished));
+        }
+        catch (StaleCompletionException)
+        {
+            return LostLease(LostLeaseDisposition.nothingToDo); // A completion ended it first
         }
     }
-    throw new Exception(format("Could not expire the lease of execution '%s': it lost %s compare-and-sets in a row",
-        executionId, maxWriteAttempts));
+    throw new Exception(format("Could not expire the lease of the execution at fingerprint %s: it lost %s compare-and-sets in a row",
+        fingerprint, maxWriteAttempts));
 }
 
 /// `now` plus `lease`, as the build model records times.
@@ -420,7 +509,7 @@ class StaleCompletionException : Exception
 
 /**
  * A completion came from an attempt that no longer holds its execution: the lease expired and the
- * execution was queued or claimed again, or it was released. Its report is rejected and nothing
+ * execution was queued or started again, or it was released. Its report is rejected and nothing
  * is recorded.
  */
 class SupersededAttemptException : StaleCompletionException
@@ -474,31 +563,33 @@ class InvalidCompletionException : Exception
 }
 
 /**
- * Reads execution `executionId`, which a worker reports the outcome of, and checks it is still
- * active. The execution record is the only source of the completion's fingerprint and task: a
- * worker never names them.
+ * Reads the execution `executionId` at `fingerprint`, which a worker reports the outcome of, and
+ * checks it is still active. The ledger's active execution is the only source of the completion's
+ * task and definition: a worker never names them.
  *
  * Throws: StaleCompletionException if it is not active; UnknownExecutionException if
- * `executionId` is empty or names no execution.
+ * `executionId` is empty or the fingerprint never claimed it.
  */
-TaskExecution requireActiveExecution(StateStores stores, string executionId)
+ActiveExecution requireActiveExecution(StateStores stores, string fingerprint, string executionId)
 {
     if (executionId.length == 0)
     {
         throw new UnknownExecutionException("A completion must name the execution it completes");
     }
-    auto found = stores.executions.get(executionId);
+    auto found = stores.ledgers.get(fingerprint);
     if (found.isNull)
     {
         throw new UnknownExecutionException(format("A completion names execution '%s', which does not exist", executionId));
     }
-    if (!ExecutionStore.isActive(found.get.status))
+    if (!found.get.active.isNull && found.get.active.get.id == executionId) return found.get.active.get;
+    if (!claimedOn(found.get.value, executionId))
     {
-        throw new StaleCompletionException(format(
-            "Execution '%s' at fingerprint %s already finished %s; its completion is rejected",
-            executionId, found.get.fingerprint, found.get.status));
+        throw new UnknownExecutionException(format("A completion names execution '%s', which does not exist", executionId));
     }
-    return found.get.value;
+    auto ended = stores.executions.get(executionId);
+    throw new StaleCompletionException(format(
+        "Execution '%s' at fingerprint %s already finished%s; its completion is rejected",
+        executionId, fingerprint, ended.isNull ? "" : " " ~ cast(string) ended.get.status));
 }
 
 /**
@@ -513,56 +604,59 @@ class ForeignArtifactException : InvalidCompletionException
 }
 
 /**
- * The artifacts a worker reported for `execution`, each stamped with the execution's fingerprint
- * and id. An artifact may leave its fingerprint and execution id empty; one naming another
- * fingerprint or another execution is rejected, so a completion cannot place artifacts under a
- * cache key the control plane did not compute or attribute them to another execution. Pure.
+ * The artifacts a worker reported for execution `executionId` at `fingerprint`, each stamped with
+ * the fingerprint and execution id. An artifact may leave its fingerprint and execution id empty;
+ * one naming another fingerprint or another execution is rejected, so a completion cannot place
+ * artifacts under a cache key the control plane did not compute or attribute them to another
+ * execution. Pure.
  *
  * Throws: ForeignArtifactException if an artifact names a fingerprint or execution other than the
  * execution's.
  */
-ArtifactMetadata[] executionArtifacts(in TaskExecution execution, ArtifactMetadata[] reported)
+ArtifactMetadata[] executionArtifacts(string fingerprint, string executionId, ArtifactMetadata[] reported)
 {
     ArtifactMetadata[] own;
     foreach (artifact; reported)
     {
-        if (artifact.taskFingerprint.length > 0 && artifact.taskFingerprint != execution.fingerprint)
+        if (artifact.taskFingerprint.length > 0 && artifact.taskFingerprint != fingerprint)
         {
             throw new ForeignArtifactException(format(
                 "Execution '%s' (fingerprint %s) reported artifact '%s' under fingerprint %s; its completion is rejected",
-                execution.id, execution.fingerprint, artifact.artifactId, artifact.taskFingerprint));
+                executionId, fingerprint, artifact.artifactId, artifact.taskFingerprint));
         }
-        if (artifact.executionId.length > 0 && artifact.executionId != execution.id)
+        if (artifact.executionId.length > 0 && artifact.executionId != executionId)
         {
             throw new ForeignArtifactException(format(
                 "Execution '%s' reported artifact '%s' as produced by execution '%s'; its completion is rejected",
-                execution.id, artifact.artifactId, artifact.executionId));
+                executionId, artifact.artifactId, artifact.executionId));
         }
         ArtifactMetadata stamped = artifact;
-        stamped.taskFingerprint = execution.fingerprint;
-        stamped.executionId = execution.id;
+        stamped.taskFingerprint = fingerprint;
+        stamped.executionId = executionId;
         own ~= stamped;
     }
     return own;
 }
 
 /**
- * Records the outcome a worker reported for execution `executionId` (`status`, which must be
- * terminal, with its exit code, error and artifacts, see `executionArtifacts`) by
- * compare-and-set, folds it into the fingerprint's ledger, and returns the finished execution. A terminal execution never changes:
- * a completion that loses the compare-and-set to another one is rejected, not merged.
+ * Records the outcome a worker reported for execution `executionId` at `fingerprint` (`status`,
+ * which must be terminal, with its exit code, error and artifacts, see `executionArtifacts`) as the
+ * immutable execution record, folds it into the fingerprint's ledger, and returns the finished
+ * execution. A terminal execution never changes: a completion that loses to another one is
+ * rejected, not merged.
  *
  * Throws: StaleCompletionException if the execution is not active (see
  * `requireActiveExecution`), including when a concurrent completion finishes it first; ForeignArtifactException if an artifact names another fingerprint;
  * UnknownExecutionException if `executionId` names no execution; Exception if `status` is not
  * terminal; OutcomeNotFoldedException if the execution finished but the fold failed.
  */
-TaskExecution finishExecution(StateStores stores, string executionId, ExecutionStatus status, int exitCode,
+TaskExecution finishExecution(StateStores stores, string fingerprint, string executionId, ExecutionStatus status, int exitCode,
     string errorMessage, ArtifactMetadata[] artifacts, string now = null)
 {
     requireTerminal(status);
-    auto own = executionArtifacts(requireActiveExecution(stores, executionId), artifacts);
-    return recordOutcome(stores, executionId, status, exitCode, errorMessage, own, now.length > 0 ? now : utcNow());
+    const active = requireActiveExecution(stores, fingerprint, executionId);
+    auto own = executionArtifacts(fingerprint, executionId, artifacts);
+    return endExecution(stores, fingerprint, active, status, exitCode, errorMessage, own, now.length > 0 ? now : utcNow());
 }
 
 /**
@@ -582,41 +676,39 @@ ExecutionStatus reportedExecutionStatus(ExecutionStatus status) pure @safe
 }
 
 /**
- * Records the completion a worker reported for execution `executionId` (see `finishExecution`)
- * and returns the finished execution. The execution record is the only source of the
- * fingerprint and task: a `result` naming a different task is rejected. Only the attempt that
+ * Records the completion a worker reported for execution `executionId` at `fingerprint` (see
+ * `finishExecution`) and returns the finished execution. The ledger's active execution is the
+ * only source of the task: a `result` naming a different task is rejected. Only the attempt that
  * holds the execution (`result.attempt`) may complete it.
  *
- * A completion finishes the execution, folds it into the fingerprint's ledger and reconciles the
- * open requests of its project; nothing is cached anywhere else.
+ * A completion writes the execution record, folds it into the fingerprint's ledger and reconciles
+ * the open requests of its project; nothing is cached anywhere else.
  * Log lines are not part of a completion: the worker streams them to the execution's log as it
  * runs.
  *
  * Throws: as `finishExecution`, SupersededAttemptException if the execution is not running
- * attempt `result.attempt` (including when that changes while the outcome is recorded), and
- * InvalidCompletionException if `result.status` is not a status a worker can report or
- * `result.taskId` names another task; except for OutcomeNotFoldedException (the outcome is
- * recorded), nothing is recorded.
+ * attempt `result.attempt`, and InvalidCompletionException if `result.status` is not a status a
+ * worker can report or `result.taskId` names another task; except for OutcomeNotFoldedException
+ * (the outcome is recorded), nothing is recorded.
  */
-TaskExecution completeExecution(StateStores stores, string executionId, in TaskExecutionResult result, string now = null)
+TaskExecution completeExecution(StateStores stores, string fingerprint, string executionId, in TaskExecutionResult result, string now = null)
 {
     const status = reportedExecutionStatus(result.status);
-    const execution = requireActiveExecution(stores, executionId);
-    if (result.taskId.length > 0 && result.taskId != execution.taskId)
+    const active = requireActiveExecution(stores, fingerprint, executionId);
+    if (result.taskId.length > 0 && result.taskId != active.taskId)
     {
         throw new InvalidCompletionException(format("A completion of execution '%s' (task '%s') names task '%s'; it is rejected",
-            executionId, execution.taskId, result.taskId));
+            executionId, active.taskId, result.taskId));
     }
-    if (holderAnswer(execution, result.attempt) != LeaseAnswer.continue_)
+    if (active.status != ExecutionStatus.running || active.attempt != result.attempt)
     {
         throw new SupersededAttemptException(format(
             "Execution '%s' is %s at attempt %s; a completion from attempt %s is rejected",
-            executionId, execution.status, execution.attempts, result.attempt));
+            executionId, active.status, active.attempt, result.attempt));
     }
-    auto own = executionArtifacts(execution, (cast(ArtifactMetadata[]) result.producedArtifacts).dup);
-    return recordOutcome(stores, executionId, status, result.exitCode, result.errorMessage, own,
-        now.length > 0 ? now : utcNow(),
-        (in Versioned!TaskExecution latest) => holderAnswer(latest.value, result.attempt) == LeaseAnswer.continue_);
+    auto own = executionArtifacts(fingerprint, executionId, (cast(ArtifactMetadata[]) result.producedArtifacts).dup);
+    return endExecution(stores, fingerprint, active, status, result.exitCode, result.errorMessage, own,
+        now.length > 0 ? now : utcNow());
 }
 
 private void requireTerminal(ExecutionStatus status)
@@ -627,74 +719,68 @@ private void requireTerminal(ExecutionStatus status)
     }
 }
 
-private TaskExecution recordOutcome(StateStores stores, string executionId, ExecutionStatus status, int exitCode,
-    string errorMessage, ArtifactMetadata[] artifacts, string now, bool delegate(in Versioned!TaskExecution) stillApplies = null,
-    Nullable!ulong expiredLeases = Nullable!ulong.init)
+/**
+ * What to log when an outcome decided for `seen` (the active execution as the ender read it) is
+ * recorded after the ledger's execution moved on: a lost lease requeued it or a newer attempt
+ * started it. Empty when it did not. The outcome stands, since the worker did finish the execution.
+ */
+string supersessionNote(in ActiveExecution seen, in Nullable!(Versioned!FingerprintLedger) ledger)
 {
-    foreach (attempt; 0 .. maxWriteAttempts)
-    {
-        auto current = stores.executions.get(executionId);
-        if (current.isNull)
-        {
-            throw new Exception(format("Execution '%s' disappeared while its completion was recorded", executionId));
-        }
-        if (!ExecutionStore.isActive(current.get.status))
-        {
-            throw new StaleCompletionException(format(
-                "Execution '%s' finished %s while this completion (%s) was recorded; its completion is rejected",
-                executionId, current.get.status, status));
-        }
-        // An outcome decided from an earlier read (an expired lease, an attempt's completion) must
-        // not land on an execution that has moved on since
-        if (stillApplies !is null && !stillApplies(current.get))
-        {
-            throw new StaleCompletionException(format(
-                "Execution '%s' changed while this outcome (%s) was recorded; the outcome is rejected", executionId, status));
-        }
-        TaskExecution next = current.get.value;
-        next.status = status;
-        if (!expiredLeases.isNull) next.expiredLeases = expiredLeases.get;
-        next.exitCode = exitCode;
-        next.errorMessage = errorMessage;
-        next.artifacts = artifacts;
-        next.finishedAt = now;
-        TaskExecution finished;
-        try
-        {
-            finished = stores.executions.update(current.get, next).value;
-        }
-        catch (DocumentConflictException)
-        {
-            continue;
-        }
-        // Only the winner of the terminal compare-and-set gets here. The execution is final: a
-        // failure from here on cannot undo it, so it is reported as such, not as a failed
-        // completion.
-        try
-        {
-            stores.ledgers.fold(finished);
-        }
-        catch (Exception e)
-        {
-            throw new OutcomeNotFoldedException(executionId, format(
-                "Execution '%s' (fingerprint %s) finished %s, but folding it into its ledger failed: %s; "
-                ~ "the outcome is recorded, so a resent completion is rejected as stale; the next read of the ledger settles it",
-                executionId, finished.fingerprint, finished.status, e.msg), e);
-        }
-        reconcileOpenRequests(stores, finished.projectId, now);
-        return finished;
-    }
-    throw new Exception(format("Could not record the outcome of execution '%s': it lost %s compare-and-sets in a row",
-        executionId, maxWriteAttempts));
+    if (ledger.isNull || ledger.get.active.isNull || ledger.get.active.get.id != seen.id) return null;
+    const now = ledger.get.active.get;
+    if (now.attempt == seen.attempt && now.status == seen.status) return null;
+    return format("The outcome of execution '%s' from attempt %s stands over the ledger's attempt %s (%s)",
+        seen.id, seen.attempt, now.attempt, now.status);
 }
 
-
+/// Ends `active`, the execution at `fingerprint`: writes its immutable record, folds the record
+/// into the ledger and reconciles the project's open requests. Throws StaleCompletionException if
+/// another ender wrote the record first, after completing that ender's fold.
+private TaskExecution endExecution(StateStores stores, string fingerprint, in ActiveExecution active, ExecutionStatus status,
+    int exitCode, string errorMessage, ArtifactMetadata[] artifacts, string now)
+{
+    auto ended = endedExecution(fingerprint, active, status, now);
+    ended.exitCode = exitCode;
+    ended.errorMessage = errorMessage;
+    ended.artifacts = artifacts;
+    try
+    {
+        stores.executions.create(ended);
+    }
+    catch (DocumentConflictException)
+    {
+        stores.ledgers.settle(fingerprint);
+        auto winner = stores.executions.get(active.id);
+        if (winner.isNull) throw new Exception(format("Execution '%s' was reported to exist and then not found", active.id));
+        throw new StaleCompletionException(format(
+            "Execution '%s' finished %s while this completion (%s) was recorded; its completion is rejected",
+            active.id, winner.get.status, status));
+    }
+    // Only the winner of the record write gets here. The execution is final: a failure from here
+    // on cannot undo it, so it is reported as such, not as a failed completion.
+    const note = supersessionNote(active, stores.ledgers.get(fingerprint));
+    if (note.length > 0) logWarn("[work] %s", note);
+    try
+    {
+        stores.ledgers.fold(ended);
+    }
+    catch (Exception e)
+    {
+        throw new OutcomeNotFoldedException(ended.id, format(
+            "Execution '%s' (fingerprint %s) finished %s, but folding it into its ledger failed: %s; "
+            ~ "the outcome is recorded, so a resent completion is rejected as stale; the next read of the ledger settles it",
+            ended.id, fingerprint, ended.status, e.msg), e);
+    }
+    reconcileOpenRequests(stores, ended.projectId, now);
+    return ended;
+}
 
 version (unittest)
 {
     import confector.core.request_fixtures : beforeWrite, createChain, fingerprintNow, intake, reconcilerOf, taskOf;
-    import confector.core.fingerprint_ledger : ClaimOutcome, FoldOutcome;
+    import confector.core.fingerprint_ledger : ClaimOutcome, FoldOutcome, executionIdFor;
     import confector.api.document_store : IndexQuery, QueryPage;
+    import confector.core.build_stores : InvalidStateTransitionException;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import core.time : minutes;
     import std.algorithm.searching : canFind;
@@ -711,46 +797,56 @@ version (unittest)
         return (SysTime.fromISOExtString(fixedNow()) + by).toISOExtString();
     }
 
-    /// A queued execution `id` of task "compile" at `fingerprint`, with a full definition.
-    private TaskExecution sampleExecution(string id, string fingerprint = "fp1", string createdAt = "2026-10-16T10:00:00Z")
+    /// A project definition whose task "compile" has a full build configuration.
+    private ProjectDefinition sampleProject()
     {
-        TaskExecution execution;
-        execution.id = id;
-        execution.projectId = "p";
-        execution.taskId = "compile";
-        execution.fingerprint = fingerprint;
-        execution.status = ExecutionStatus.queued;
-        execution.definition.id = "compile";
-        execution.definition.inputs["src"] = repositoryInput("game");
-        execution.definition.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
-        execution.definition.environment = ["MODE": "release"];
-        execution.definition.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
-        execution.definition.timeoutSeconds = 1200;
-        execution.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
-        execution.repositoryAddresses = ["src": "https://example.test/game.git"];
-        execution.createdAt = createdAt;
-        return execution;
+        TaskNode compile;
+        compile.id = "compile";
+        compile.inputs["src"] = repositoryInput("game");
+        compile.steps = [BuildStep("Compile", "bash", Json(["script": Json("make")]))];
+        compile.environment = ["MODE": "release"];
+        compile.outputs.artifacts = [OutputArtifactDecl("game.zip", "out/game.zip")];
+        compile.timeoutSeconds = 1200;
+        return ProjectDefinition([compile]);
     }
 
-    /// Dispatches an execution at `fingerprint` as the dispatcher does: claims the fingerprint's
-    /// ledger (the claim must win, so any earlier execution there must have been folded) and
-    /// records `sampleExecution` under the claimed deterministic id, queued. Returns the id.
+    /// What a claim of "compile" carries, with the stored definition's id.
+    private ActiveExecution sampleClaim(StateStores stores, string createdAt = "2026-10-16T10:00:00Z")
+    {
+        ActiveExecution proposed;
+        proposed.projectId = "p";
+        proposed.taskId = "compile";
+        proposed.definitionId = stores.definitions.put(sampleProject());
+        proposed.inputs = [ResolvedInput("src", InputKind.repository, Json("aaa111"), ["ref": "main"])];
+        proposed.repositoryAddresses = ["src": "https://example.test/game.git"];
+        proposed.createdAt = createdAt;
+        return proposed;
+    }
+
+    /// Claims an execution of "compile" at `fingerprint` as a dispatch does (the claim must win, so
+    /// any earlier execution there must have been folded). Returns the claimed id.
     private string queueExecution(StateStores stores, string fingerprint = "fp1", string createdAt = "2026-10-16T10:00:00Z")
     {
         auto ledger = stores.ledgers.get(fingerprint);
-        auto claimed = stores.ledgers.claim(fingerprint, ledger.isNull ? 0 : ledger.get.executionSeq);
+        auto claimed = stores.ledgers.claim(fingerprint, ledger.isNull ? 0 : ledger.get.executionSeq, sampleClaim(stores, createdAt));
         assert(claimed.outcome == ClaimOutcome.won, "The test dispatch's claim must win");
-        const id = claimed.executionId;
-        stores.executions.createIfAbsent(sampleExecution(id, fingerprint, createdAt));
-        return id;
+        return claimed.executionId;
     }
 
-    /// As `queueExecution`, then claimed by worker `workerId` (attempt 1) at `fixedNow`.
+    /// As `queueExecution`, then started by worker `workerId` (attempt 1) at `fixedNow`.
     private string runningExecution(StateStores stores, string workerId = "w1", string fingerprint = "fp1")
     {
         const id = queueExecution(stores, fingerprint);
-        assert(!startExecution(stores.executions, id, workerId, testLease, fixedNow()).isNull);
+        assert(!startExecution(stores, fingerprint, workerId, testLease, fixedNow()).isNull);
         return id;
+    }
+
+    /// The active execution of `fingerprint`, which must have one.
+    private ActiveExecution activeAt(StateStores stores, string fingerprint = "fp1")
+    {
+        auto ledger = stores.ledgers.get(fingerprint).get;
+        assert(!ledger.active.isNull, "The fingerprint has no active execution");
+        return ledger.active.get;
     }
 
     /// A successful completion of attempt `attempt`.
@@ -761,13 +857,20 @@ version (unittest)
         result.attempt = attempt;
         return result;
     }
+
+    private bool throwsInvalidLease(scope void delegate() action)
+    {
+        try action();
+        catch (InvalidLeaseRequestException) return true;
+        return false;
+    }
 }
 
 unittest
 {
     // A worker claims a queued execution: it gets the full work order, built from the execution's
-    // record, and the attempt; the execution is running under the worker's lease, and nothing is
-    // left to claim
+    // claim and its stored definition, and the attempt; the execution is running under the
+    // worker's lease, and nothing is left to claim
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = queueExecution(stores);
 
@@ -778,15 +881,15 @@ unittest
     assert(order.taskNode.steps[0].config["script"].get!string == "make" && order.timeoutSeconds == 1200);
     assert(order.taskNode.environment == ["MODE": "release"]);
     assert(order.taskNode.outputs.artifacts == [OutputArtifactDecl("game.zip", "out/game.zip")]);
-    assert(order.payload.inputs == sampleExecution(id).inputs);
+    assert(order.payload.inputs == sampleClaim(stores).inputs);
     assert(order.payload.repositoryAddresses == ["src": "https://example.test/game.git"]);
-    auto running = stores.executions.get(id).get;
-    assert(running.status == ExecutionStatus.running && running.attempts == 1 && running.worker == "w1");
+    auto running = activeAt(stores);
+    assert(running.status == ExecutionStatus.running && running.attempt == 1 && running.worker == "w1");
     assert(running.startedAt == fixedNow() && running.leaseExpiresAt == later(testLease));
 
     assert(claimWork(stores, "w2", testLease, fixedNow()).isNull, "A held execution is not claimed again");
-    auto held = stores.executions.get(id).get;
-    assert(held.attempts == 1 && held.worker == "w1");
+    auto held = activeAt(stores);
+    assert(held.attempt == 1 && held.worker == "w1");
 
     // Oldest first
     const newer = queueExecution(stores, "fp2", "2026-10-16T10:00:05Z");
@@ -805,13 +908,6 @@ unittest
 version (unittest)
 {
     import core.time : msecs;
-
-    private bool throwsInvalidLease(scope void delegate() action)
-    {
-        try action();
-        catch (InvalidLeaseRequestException) return true;
-        return false;
-    }
 }
 
 unittest
@@ -831,15 +927,29 @@ unittest
     assert(interleaving.beforeNextWrite is null);
     assert(!first.isNull && first.get.workOrder.executionId == only && first.get.attempt == 1);
     assert(second.isNull, "Two workers cannot claim one execution");
-    auto held = stores.executions.get(only).get;
-    assert(held.status == ExecutionStatus.running && held.attempts == 1 && held.worker == "w1");
+    auto held = activeAt(stores);
+    assert(held.status == ExecutionStatus.running && held.attempt == 1 && held.worker == "w1");
 
     const other = queueExecution(stores, "fp2", "2026-10-16T10:00:05Z");
     const next = queueExecution(stores, "fp3", "2026-10-16T10:00:06Z");
     interleaving.beforeNextWrite = () { first = claimWork(stores, "w1", testLease, fixedNow()); };
     second = claimWork(racing, "w2", testLease, fixedNow());
     assert(first.get.workOrder.executionId == other && second.get.workOrder.executionId == next);
-    assert(stores.executions.get(other).get.worker == "w1" && stores.executions.get(next).get.worker == "w2");
+    assert(activeAt(stores, "fp2").worker == "w1" && activeAt(stores, "fp3").worker == "w2");
+}
+
+unittest
+{
+    // A queued execution whose record was already written (its ender crashed before the fold) is
+    // not handed to a worker: claiming folds it and moves on
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    const id = queueExecution(stores);
+    stores.executions.create(endedExecution("fp1", activeAt(stores), ExecutionStatus.cancelled, fixedNow()));
+
+    assert(claimWork(new StateStores(documents.restart()), "w1", testLease, fixedNow()).isNull);
+    auto ledger = stores.ledgers.get("fp1").get;
+    assert(ledger.active.isNull && ledger.lastStoppedExecutionId == id);
 }
 
 unittest
@@ -850,30 +960,34 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = runningExecution(stores);
 
-    assert(heartbeatExecution(stores, id, 1, testLease, later(30.seconds)) == LeaseAnswer.continue_);
-    assert(stores.executions.get(id).get.leaseExpiresAt == later(30.seconds + testLease));
+    assert(heartbeatExecution(stores, "fp1", id, 1, testLease, later(30.seconds)) == LeaseAnswer.continue_);
+    assert(activeAt(stores).leaseExpiresAt == later(30.seconds + testLease));
 
-    const lease = stores.executions.get(id).get.leaseExpiresAt;
-    assert(heartbeatExecution(stores, id, 2, testLease, later(40.seconds)) == LeaseAnswer.superseded);
-    assert(heartbeatExecution(stores, id, 0, testLease, later(40.seconds)) == LeaseAnswer.superseded);
-    assert(stores.executions.get(id).get.leaseExpiresAt == lease, "A superseded heartbeat extends nothing");
+    const lease = activeAt(stores).leaseExpiresAt;
+    assert(heartbeatExecution(stores, "fp1", id, 2, testLease, later(40.seconds)) == LeaseAnswer.superseded);
+    assert(heartbeatExecution(stores, "fp1", id, 0, testLease, later(40.seconds)) == LeaseAnswer.superseded);
+    assert(activeAt(stores).leaseExpiresAt == lease, "A superseded heartbeat extends nothing");
 
-    assert(releaseExecution(stores, id, 1) == LeaseAnswer.released);
-    assert(heartbeatExecution(stores, id, 1, testLease) == LeaseAnswer.superseded, "A queued execution is held by no attempt");
+    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.released);
+    assert(heartbeatExecution(stores, "fp1", id, 1, testLease) == LeaseAnswer.superseded, "A queued execution is held by no attempt");
 
     const cancelledId = runningExecution(stores, "w1", "fp2");
-    finishExecution(stores, cancelledId, ExecutionStatus.cancelled, 0, "stopped", null, fixedNow());
-    assert(heartbeatExecution(stores, cancelledId, 1, testLease) == LeaseAnswer.cancel);
+    finishExecution(stores, "fp2", cancelledId, ExecutionStatus.cancelled, 0, "stopped", null, fixedNow());
+    assert(heartbeatExecution(stores, "fp2", cancelledId, 1, testLease) == LeaseAnswer.cancel);
 
     const finishedId = runningExecution(stores, "w1", "fp3");
-    finishExecution(stores, finishedId, ExecutionStatus.succeeded, 0, null, null, fixedNow());
-    assert(heartbeatExecution(stores, finishedId, 1, testLease) == LeaseAnswer.superseded);
+    finishExecution(stores, "fp3", finishedId, ExecutionStatus.succeeded, 0, null, null, fixedNow());
+    assert(heartbeatExecution(stores, "fp3", finishedId, 1, testLease) == LeaseAnswer.superseded);
 
     bool unknown = false;
-    try heartbeatExecution(stores, "exe_missing", 1, testLease);
+    try heartbeatExecution(stores, "fp1", "exe_missing", 1, testLease);
     catch (UnknownExecutionException e) unknown = e.msg.canFind("'exe_missing'");
     assert(unknown);
-    assert(throwsInvalidLease({ heartbeatExecution(stores, id, 1, Duration.zero); }));
+    unknown = false;
+    try heartbeatExecution(stores, "fp_nowhere", id, 1, testLease);
+    catch (UnknownExecutionException e) unknown = e.msg.canFind("no ledger");
+    assert(unknown);
+    assert(throwsInvalidLease({ heartbeatExecution(stores, "fp1", id, 1, Duration.zero); }));
 }
 
 unittest
@@ -884,33 +998,54 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = runningExecution(stores);
 
-    assert(releaseExecution(stores, id, 2) == LeaseAnswer.superseded, "Only the holding attempt releases");
-    assert(stores.executions.get(id).get.status == ExecutionStatus.running);
-    assert(releaseExecution(stores, id, 1) == LeaseAnswer.released);
-    auto released = stores.executions.get(id).get;
-    assert(released.status == ExecutionStatus.queued && released.attempts == 1);
+    assert(releaseExecution(stores, "fp1", id, 2) == LeaseAnswer.superseded, "Only the holding attempt releases");
+    assert(activeAt(stores).status == ExecutionStatus.running);
+    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.released);
+    auto released = activeAt(stores);
+    assert(released.status == ExecutionStatus.queued && released.attempt == 1);
     assert(released.worker.length == 0 && released.startedAt.length == 0 && released.leaseExpiresAt.length == 0);
-    assert(releaseExecution(stores, id, 1) == LeaseAnswer.superseded, "A released attempt does not release again");
+    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.superseded, "A released attempt does not release again");
 
     auto again = claimWork(stores, "w2", testLease, fixedNow());
     assert(!again.isNull && again.get.workOrder.executionId == id && again.get.attempt == 2);
 
-    assert(heartbeatExecution(stores, id, 1, testLease) == LeaseAnswer.superseded);
-    assert(releaseExecution(stores, id, 1) == LeaseAnswer.superseded);
+    assert(heartbeatExecution(stores, "fp1", id, 1, testLease) == LeaseAnswer.superseded);
+    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.superseded);
     bool rejected = false;
-    try completeExecution(stores, id, succeededAt(1), fixedNow());
+    try completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
     catch (SupersededAttemptException e) rejected = e.msg.canFind(id) && e.msg.canFind("attempt 1");
     assert(rejected);
-    auto held = stores.executions.get(id).get;
-    assert(held.status == ExecutionStatus.running && held.attempts == 2 && held.worker == "w2");
+    auto held = activeAt(stores);
+    assert(held.status == ExecutionStatus.running && held.attempt == 2 && held.worker == "w2");
 
-    assert(completeExecution(stores, id, succeededAt(2), fixedNow()).status == ExecutionStatus.succeeded);
-    assert(releaseExecution(stores, id, 2) == LeaseAnswer.superseded, "A finished execution is not released");
+    assert(completeExecution(stores, "fp1", id, succeededAt(2), fixedNow()).status == ExecutionStatus.succeeded);
+    assert(releaseExecution(stores, "fp1", id, 2) == LeaseAnswer.superseded, "A finished execution is not released");
 
     bool unknown = false;
-    try releaseExecution(stores, "exe_missing", 1);
+    try releaseExecution(stores, "fp1", "exe_missing", 1);
     catch (UnknownExecutionException e) unknown = e.msg.canFind("'exe_missing'");
     assert(unknown);
+}
+
+unittest
+{
+    // Start, heartbeat, release and a lost lease are each one compare-and-set on the ledger
+    auto documents = new InMemoryDocumentStore();
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto stores = new StateStores(interleaving);
+    const id = queueExecution(stores);
+
+    size_t writes;
+    void countWrites()
+    {
+        interleaving.beforeNextWrite = () { writes += 1; countWrites(); };
+    }
+    countWrites();
+    assert(!startExecution(stores, "fp1", "w1", testLease, fixedNow()).isNull && writes == 1);
+    assert(heartbeatExecution(stores, "fp1", id, 1, testLease, later(10.seconds)) == LeaseAnswer.continue_ && writes == 2);
+    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.released && writes == 3);
+    assert(!startExecution(stores, "fp1", "w1", testLease, fixedNow()).isNull && writes == 4);
+    assert(expireLease(stores, "fp1", 3, later(5.minutes)).disposition == LostLeaseDisposition.requeued && writes == 5);
 }
 
 unittest
@@ -920,29 +1055,31 @@ unittest
     // worker holds (queued) is rejected too. The attempt that holds it completes it
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = runningExecution(stores);
-    assert(expireLease(stores, id, 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
+    assert(expireLease(stores, "fp1", 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
 
     bool queuedRejected = false;
-    try completeExecution(stores, id, succeededAt(1), fixedNow());
+    try completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
     catch (SupersededAttemptException e) queuedRejected = e.msg.canFind("queued");
-    assert(queuedRejected && stores.executions.get(id).get.status == ExecutionStatus.queued);
+    assert(queuedRejected && activeAt(stores).status == ExecutionStatus.queued);
 
     assert(claimWork(stores, "w2", testLease, later(2.minutes)).get.attempt == 2);
     bool oldRejected = false;
-    try completeExecution(stores, id, succeededAt(1), fixedNow());
+    try completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
     catch (StaleCompletionException e) oldRejected = cast(SupersededAttemptException) e !is null;
     assert(oldRejected);
-    assert(heartbeatExecution(stores, id, 1, testLease) == LeaseAnswer.superseded);
-    assert(stores.executions.get(id).get.status == ExecutionStatus.running);
+    assert(heartbeatExecution(stores, "fp1", id, 1, testLease) == LeaseAnswer.superseded);
+    assert(activeAt(stores).status == ExecutionStatus.running);
+    assert(stores.executions.get(id).isNull, "A rejected completion records nothing");
 
-    assert(completeExecution(stores, id, succeededAt(2), fixedNow()).worker == "w2");
+    assert(completeExecution(stores, "fp1", id, succeededAt(2), fixedNow()).worker == "w2");
 }
 
 unittest
 {
-    // A completion that loses a race with an expiry and a new claim: it read the execution running
-    // attempt 1, then the lease expired and attempt 2 claimed it before the completion was written.
-    // It is rejected and attempt 2's execution is untouched
+    // A completion whose attempt is superseded between its check and its write: it read the
+    // execution running attempt 1, then the lease expired and attempt 2 started before the
+    // completion was written. The worker did finish the execution, so the outcome is recorded once
+    // and folded; attempt 2 is told it is superseded and cannot report
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
     const id = runningExecution(stores);
@@ -950,57 +1087,63 @@ unittest
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
     interleaving.beforeNextWrite = () {
-        assert(expireLease(stores, id, 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
+        assert(expireLease(stores, "fp1", 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
         assert(claimWork(stores, "w2", testLease, later(2.minutes)).get.attempt == 2);
     };
+    auto done = completeExecution(racing, "fp1", id, succeededAt(1), fixedNow());
+    assert(done.status == ExecutionStatus.succeeded && done.attempts == 1 && done.worker == "w1");
+    auto ledger = stores.ledgers.get("fp1").get;
+    assert(ledger.active.isNull && ledger.lastSuccessExecutionId == id && ledger.stopSeq == 0);
+    assert(heartbeatExecution(stores, "fp1", id, 2, testLease) == LeaseAnswer.superseded);
     bool rejected = false;
-    try completeExecution(racing, id, succeededAt(1), fixedNow());
+    try completeExecution(stores, "fp1", id, succeededAt(2), fixedNow());
     catch (StaleCompletionException e) rejected = true;
-    assert(rejected);
-    auto held = stores.executions.get(id).get;
-    assert(held.status == ExecutionStatus.running && held.attempts == 2 && held.worker == "w2");
+    assert(rejected, "Attempt 2 cannot report once the outcome is recorded");
+    assert(stores.executions.get(id).get.value == done && stores.executions.get(id).get.version_ == 1);
 }
 
 unittest
 {
     // A worker lost on every attempt: each expired lease requeues the execution until the
     // attempts are used up. Then the execution fails with "lease lost N times" through the
-    // terminal path of a completion: it is folded into the ledger, and the request sees the task
-    // failed, not retried
+    // end of a completion: it is folded into the ledger, and the request sees the task failed,
+    // not retried
     auto stores = new StateStores(new InMemoryDocumentStore());
     const fingerprint = requestsSharingFingerprint(stores);
-    const id = stores.ledgers.get(fingerprint).get.activeExecutionId;
+    const id = activeAt(stores, fingerprint).id;
 
     assert(claimWork(stores, "w1", testLease, fixedNow()).get.attempt == 1);
-    assert(expireLease(stores, id, 3, later(testLease - 1.seconds)).disposition == LostLeaseDisposition.nothingToDo,
+    assert(expireLease(stores, fingerprint, 3, later(testLease - 1.seconds)).disposition == LostLeaseDisposition.nothingToDo,
         "The lease has not run out");
-    assert(stores.executions.get(id).get.status == ExecutionStatus.running);
+    assert(activeAt(stores, fingerprint).status == ExecutionStatus.running);
 
     foreach (lostSoFar; 1 .. 3)
     {
         const at = later(lostSoFar * 10.minutes);
-        auto lost = expireLease(stores, id, 3, at);
-        assert(lost.disposition == LostLeaseDisposition.requeued && lost.execution.status == ExecutionStatus.queued);
-        auto requeued = stores.executions.get(id).get;
-        assert(requeued.attempts == lostSoFar && requeued.worker.length == 0 && requeued.leaseExpiresAt.length == 0);
-        assert(stores.ledgers.get(fingerprint).get.activeExecutionId == id, "Still the active execution");
+        auto lost = expireLease(stores, fingerprint, 3, at);
+        assert(lost.disposition == LostLeaseDisposition.requeued && lost.expiredLeases == lostSoFar);
+        auto requeued = activeAt(stores, fingerprint);
+        assert(requeued.status == ExecutionStatus.queued && requeued.id == id);
+        assert(requeued.attempt == lostSoFar && requeued.worker.length == 0 && requeued.leaseExpiresAt.length == 0);
+        assert(stores.executions.get(id).isNull, "A lost lease within the limit ends nothing");
 
         auto retried = claimWork(stores, "w2", testLease, at);
         assert(!retried.isNull && retried.get.attempt == lostSoFar + 1);
-        assert(stores.executions.get(id).get.status == ExecutionStatus.running);
+        assert(activeAt(stores, fingerprint).status == ExecutionStatus.running);
     }
 
     // The third attempt is lost too
-    auto last = expireLease(stores, id, 3, later(1.hours));
-    assert(last.disposition == LostLeaseDisposition.failed);
+    auto last = expireLease(stores, fingerprint, 3, later(1.hours));
+    assert(last.disposition == LostLeaseDisposition.failed && last.expiredLeases == 3);
     auto failed = stores.executions.get(id).get;
     assert(failed.status == ExecutionStatus.failed && failed.attempts == 3 && failed.finishedAt == later(1.hours));
     assert(failed.errorMessage.canFind("lease lost 3 times"), failed.errorMessage);
+    assert(last.ended.get == failed.value);
     assert(claimWork(stores, "w3", testLease, later(1.hours)).isNull, "A failed execution is not claimed again");
-    assert(expireLease(stores, id, 3, later(2.hours)).disposition == LostLeaseDisposition.nothingToDo);
+    assert(expireLease(stores, fingerprint, 3, later(2.hours)).disposition == LostLeaseDisposition.nothingToDo);
 
     auto ledger = stores.ledgers.get(fingerprint).get;
-    assert(ledger.activeExecutionId.length == 0 && ledger.lastStoppedExecutionId == id);
+    assert(ledger.active.isNull && ledger.lastStoppedExecutionId == id);
     auto settled = reconcilerOf(stores).reconcile("rb");
     assert(taskOf(settled.state, "compile").status == RequestTaskStatus.failed && settled.state.outcome == RequestOutcome.failed);
 }
@@ -1014,21 +1157,21 @@ unittest
     foreach (round; 1 .. 6)
     {
         assert(claimWork(stores, "w1", testLease, fixedNow()).get.attempt == round);
-        assert(releaseExecution(stores, id, round) == LeaseAnswer.released);
+        assert(releaseExecution(stores, "fp1", id, round) == LeaseAnswer.released);
     }
-    assert(stores.executions.get(id).get.expiredLeases == 0 && stores.executions.get(id).get.attempts == 5);
+    assert(activeAt(stores).expiredLeases == 0 && activeAt(stores).attempt == 5);
 
     foreach (lost; 1 .. 3)
     {
         assert(claimWork(stores, "w1", testLease, later(lost * 10.minutes)).get.attempt == 5 + lost);
-        auto expired = expireLease(stores, id, 3, later(lost * 10.minutes + 5.minutes));
-        assert(expired.disposition == LostLeaseDisposition.requeued && expired.execution.expiredLeases == lost);
-        assert(releaseExecution(stores, id, 5 + lost) == LeaseAnswer.superseded);
+        auto expired = expireLease(stores, "fp1", 3, later(lost * 10.minutes + 5.minutes));
+        assert(expired.disposition == LostLeaseDisposition.requeued && expired.expiredLeases == lost);
+        assert(releaseExecution(stores, "fp1", id, 5 + lost) == LeaseAnswer.superseded);
     }
     assert(claimWork(stores, "w1", testLease, later(1.hours)).get.attempt == 8);
-    auto last = expireLease(stores, id, 3, later(2.hours));
+    auto last = expireLease(stores, "fp1", 3, later(2.hours));
     assert(last.disposition == LostLeaseDisposition.failed);
-    assert(last.execution.errorMessage.canFind("lease lost 3 times"), last.execution.errorMessage);
+    assert(last.ended.get.errorMessage.canFind("lease lost 3 times"), last.ended.get.errorMessage);
 }
 
 unittest
@@ -1038,12 +1181,12 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = queueExecution(stores);
     assert(claimWork(stores, "w1", testLease, later(0.minutes)).get.attempt == 1);
-    assert(expireLease(stores, id, 2, later(5.minutes)).disposition == LostLeaseDisposition.requeued);
+    assert(expireLease(stores, "fp1", 2, later(5.minutes)).disposition == LostLeaseDisposition.requeued);
     assert(claimWork(stores, "w1", testLease, later(10.minutes)).get.attempt == 2);
-    auto failed = expireLease(stores, id, 2, later(15.minutes));
+    auto failed = expireLease(stores, "fp1", 2, later(15.minutes));
     assert(failed.disposition == LostLeaseDisposition.failed);
-    assert(failed.execution.expiredLeases == 2, "The failing expiry counts its lost lease");
-    assert(stores.executions.get(id).get.value.expiredLeases == 2);
+    assert(failed.expiredLeases == 2, "The failing expiry counts its lost lease");
+    assert(failed.ended.get.expiredLeases == 2 && stores.executions.get(id).get.value.expiredLeases == 2);
 }
 
 unittest
@@ -1051,36 +1194,41 @@ unittest
     // What an expiry leaves alone: a task that reported failure is never retried by it, an
     // execution that is queued or whose lease runs on is not touched, and a running execution
     // without a lease expiry is a corrupt record that fails loudly
-    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
     const id = runningExecution(stores);
-    finishExecution(stores, id, ExecutionStatus.failed, 2, "make failed", null, fixedNow());
+    finishExecution(stores, "fp1", id, ExecutionStatus.failed, 2, "make failed", null, fixedNow());
 
-    auto late = expireLease(stores, id, 3, later(1.hours));
+    auto late = expireLease(stores, "fp1", 3, later(1.hours));
     assert(late.disposition == LostLeaseDisposition.nothingToDo);
     auto kept = stores.executions.get(id).get;
     assert(kept.status == ExecutionStatus.failed && kept.attempts == 1 && kept.errorMessage == "make failed" && kept.exitCode == 2);
 
-    const queuedId = queueExecution(stores, "fp2");
-    assert(expireLease(stores, queuedId, 3, later(1.hours)).disposition == LostLeaseDisposition.nothingToDo);
-    assert(stores.executions.get(queuedId).get.attempts == 0, "A queued execution is not counted as lost");
+    queueExecution(stores, "fp2");
+    assert(expireLease(stores, "fp2", 3, later(1.hours)).disposition == LostLeaseDisposition.nothingToDo);
+    assert(activeAt(stores, "fp2").expiredLeases == 0, "A queued execution is not counted as lost");
 
-    const leaseless = queueExecution(stores, "fp3");
-    auto current = stores.executions.get(leaseless).get;
-    TaskExecution broken = current.value;
-    broken.status = ExecutionStatus.running;
-    stores.executions.update(current, broken);
+    runningExecution(stores, "w1", "fp3");
+    assert(expireLease(stores, "fp3", 3, later(testLease - 1.seconds)).disposition == LostLeaseDisposition.nothingToDo);
+    assert(activeAt(stores, "fp3").expiredLeases == 0, "A lease that runs on is not counted");
+
+    runningExecution(stores, "w1", "fp4");
+    auto stored = documents.get("fingerprint_ledgers", "fp4").get;
+    Json content = stored.content;
+    content["active"]["lease_expires_at"] = Json("");
+    documents.replace("fingerprint_ledgers", "fp4", content, stored.version_);
     bool corrupt = false;
-    try expireLease(stores, leaseless, 3, later(1.hours));
+    try expireLease(stores, "fp4", 3, later(1.hours));
     catch (Exception e) corrupt = e.msg.canFind("no lease expiry");
     assert(corrupt);
 
     bool unknown = false;
-    try expireLease(stores, "exe_missing", 3);
-    catch (UnknownExecutionException e) unknown = e.msg.canFind("'exe_missing'");
+    try expireLease(stores, "fp_nowhere", 3);
+    catch (UnknownExecutionException e) unknown = e.msg.canFind("fp_nowhere");
     assert(unknown);
 
     bool noLimit = false;
-    try expireLease(stores, id, 0);
+    try expireLease(stores, "fp1", 0);
     catch (Exception e) noLimit = e.msg.canFind("at least 1");
     assert(noLimit);
 }
@@ -1095,10 +1243,26 @@ unittest
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
-    interleaving.beforeNextWrite = () { completeExecution(stores, id, succeededAt(1), fixedNow()); };
-    auto result = expireLease(racing, id, 1, later(1.hours));
+    interleaving.beforeNextWrite = () { completeExecution(stores, "fp1", id, succeededAt(1), fixedNow()); };
+    auto result = expireLease(racing, "fp1", 1, later(1.hours));
     assert(result.disposition == LostLeaseDisposition.nothingToDo);
     assert(stores.executions.get(id).get.status == ExecutionStatus.succeeded);
+    assert(stores.ledgers.get("fp1").get.lastSuccessExecutionId == id);
+
+    // The same when the completion lands after the expiry counted its lost lease, before it ends
+    // the execution: the completion's record is written first, and the expiry yields to it
+    auto otherDocuments = new InMemoryDocumentStore();
+    auto other = new StateStores(otherDocuments);
+    const otherId = runningExecution(other);
+    auto otherInterleaving = new InterleavingDocumentStore(otherDocuments);
+    auto otherRacing = new StateStores(otherInterleaving);
+    // The expiry's writes: 1 counts the lost lease, 2 writes the record
+    beforeWrite(otherInterleaving, 2, () { completeExecution(other, "fp1", otherId, succeededAt(1), fixedNow()); });
+    auto yielded = expireLease(otherRacing, "fp1", 1, later(1.hours));
+    assert(otherInterleaving.beforeNextWrite is null);
+    assert(yielded.disposition == LostLeaseDisposition.nothingToDo);
+    assert(other.executions.get(otherId).get.status == ExecutionStatus.succeeded);
+    assert(other.ledgers.get("fp1").get.active.isNull && other.ledgers.get("fp1").get.lastSuccessExecutionId == otherId);
 }
 
 unittest
@@ -1110,18 +1274,19 @@ unittest
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
     const id = runningExecution(stores);
-    assert(expireLease(stores, id, 5, later(10.minutes)).disposition == LostLeaseDisposition.requeued);
+    assert(expireLease(stores, "fp1", 5, later(10.minutes)).disposition == LostLeaseDisposition.requeued);
     assert(claimWork(stores, "w2", testLease, later(10.minutes)).get.attempt == 2);
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
     interleaving.beforeNextWrite = () {
-        assert(expireLease(stores, id, 5, later(20.minutes)).disposition == LostLeaseDisposition.requeued);
+        assert(expireLease(stores, "fp1", 5, later(20.minutes)).disposition == LostLeaseDisposition.requeued);
         assert(claimWork(stores, "w3", testLease, later(20.minutes)).get.attempt == 3);
     };
-    auto result = expireLease(racing, id, 2, later(1.hours));
+    auto result = expireLease(racing, "fp1", 2, later(1.hours));
     assert(result.disposition == LostLeaseDisposition.failed);
-    assert(result.execution.errorMessage.canFind("lease lost 3 times"), result.execution.errorMessage);
+    assert(result.ended.get.errorMessage.canFind("lease lost 3 times"), result.ended.get.errorMessage);
+    assert(result.ended.get.attempts == 3 && result.ended.get.worker == "w3" && result.ended.get.id == id);
 }
 
 unittest
@@ -1129,12 +1294,12 @@ unittest
     // A failed or cancelled outcome records when it finished even when the caller gives no time
     auto stores = new StateStores(new InMemoryDocumentStore());
     const cancelledId = queueExecution(stores);
-    finishExecution(stores, cancelledId, ExecutionStatus.cancelled, 0, "stopped", null);
+    finishExecution(stores, "fp1", cancelledId, ExecutionStatus.cancelled, 0, "stopped", null);
     auto cancelled = stores.executions.get(cancelledId).get;
     assert(cancelled.status == ExecutionStatus.cancelled && cancelled.finishedAt.length > 0);
 
     const failedId = queueExecution(stores);
-    finishExecution(stores, failedId, ExecutionStatus.failed, 1, "boom", null);
+    finishExecution(stores, "fp1", failedId, ExecutionStatus.failed, 1, "boom", null);
     auto failed = stores.executions.get(failedId).get;
     assert(failed.status == ExecutionStatus.failed && failed.finishedAt.length > 0);
 }
@@ -1146,42 +1311,47 @@ unittest
     // execution at the same fingerprint is untouched
     auto stores = new StateStores(new InMemoryDocumentStore());
     const first = queueExecution(stores);
-    finishExecution(stores, first, ExecutionStatus.failed, 1, "worker lost", null, fixedNow());
+    finishExecution(stores, "fp1", first, ExecutionStatus.failed, 1, "worker lost", null, fixedNow());
     const second = queueExecution(stores);
 
     bool stale = false;
-    try finishExecution(stores, first, ExecutionStatus.succeeded, 0, null, null);
+    try finishExecution(stores, "fp1", first, ExecutionStatus.succeeded, 0, null, null);
     catch (StaleCompletionException e) stale = e.msg.canFind(first) && e.msg.canFind("failed");
     assert(stale);
     auto kept = stores.executions.get(first).get;
     assert(kept.status == ExecutionStatus.failed && kept.errorMessage == "worker lost");
-    assert(stores.executions.get(second).get.status == ExecutionStatus.queued, "The newer execution is untouched");
+    assert(activeAt(stores).id == second && activeAt(stores).status == ExecutionStatus.queued, "The newer execution is untouched");
 
-    finishExecution(stores, second, ExecutionStatus.succeeded, 0, null, null, fixedNow());
+    finishExecution(stores, "fp1", second, ExecutionStatus.succeeded, 0, null, null, fixedNow());
     assert(stores.executions.get(second).get.status == ExecutionStatus.succeeded);
 }
 
 unittest
 {
-    // Bug confector-1oj: a completion is identified only by its execution id. One naming no
-    // execution, or an execution that does not exist, is rejected loudly and records nothing
+    // A completion is identified only by its execution id. One naming no execution, or an
+    // execution that does not exist, is rejected loudly and records nothing
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = queueExecution(stores);
 
     bool unnamed = false;
-    try finishExecution(stores, "", ExecutionStatus.succeeded, 0, null, null);
+    try finishExecution(stores, "fp1", "", ExecutionStatus.succeeded, 0, null, null);
     catch (StaleCompletionException e) assert(false, "Not stale: unnamed");
     catch (UnknownExecutionException e) unnamed = e.msg.canFind("must name the execution");
     assert(unnamed);
 
     bool unknown = false;
-    try finishExecution(stores, "exe_unknown", ExecutionStatus.succeeded, 0, null, null);
+    try finishExecution(stores, "fp1", "exe_unknown", ExecutionStatus.succeeded, 0, null, null);
     catch (StaleCompletionException e) assert(false, "Not stale: unknown");
     catch (UnknownExecutionException e) unknown = e.msg.canFind("'exe_unknown'") && e.msg.canFind("does not exist");
     assert(unknown);
 
-    assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
-    assert(stores.executions.get("exe_unknown").isNull);
+    bool noLedger = false;
+    try finishExecution(stores, "fp_nowhere", id, ExecutionStatus.succeeded, 0, null, null);
+    catch (UnknownExecutionException e) noLedger = e.msg.canFind(id);
+    assert(noLedger);
+
+    assert(activeAt(stores).id == id && activeAt(stores).status == ExecutionStatus.queued, "Nothing was recorded");
+    assert(stores.executions.get("exe_unknown").isNull && stores.executions.get(id).isNull);
 }
 
 unittest
@@ -1191,16 +1361,17 @@ unittest
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = queueExecution(stores);
     auto produced = [ArtifactMetadata("game.zip")];
-    finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, produced, fixedNow());
+    finishExecution(stores, "fp1", id, ExecutionStatus.succeeded, 0, null, produced, fixedNow());
 
     foreach (status; [ExecutionStatus.succeeded, ExecutionStatus.failed])
     {
         bool rejected = false;
-        try finishExecution(stores, id, status, 7, "late", null, "2026-10-16T11:00:00Z");
+        try finishExecution(stores, "fp1", id, status, 7, "late", null, "2026-10-16T11:00:00Z");
         catch (StaleCompletionException e) rejected = e.msg.canFind(id);
         assert(rejected);
     }
     auto kept = stores.executions.get(id).get;
+    assert(kept.version_ == 1, "A finished execution is written once");
     assert(kept.status == ExecutionStatus.succeeded && kept.exitCode == 0 && kept.errorMessage.length == 0);
     assert(kept.artifacts.length == 1 && kept.artifacts[0].artifactId == "game.zip" && kept.finishedAt == fixedNow());
 }
@@ -1208,21 +1379,22 @@ unittest
 unittest
 {
     // Two completions of one execution racing (a worker reporting twice, or two control-plane
-    // instances): both pass the check, exactly one records its outcome by compare-and-set, and
-    // the other is rejected loudly instead of overwriting it
+    // instances): both pass the check, exactly one writes its outcome, and the other is
+    // rejected loudly instead of overwriting it
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
     const id = queueExecution(stores);
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
-    interleaving.beforeNextWrite = () { finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, null, fixedNow()); };
+    interleaving.beforeNextWrite = () { finishExecution(stores, "fp1", id, ExecutionStatus.succeeded, 0, null, null, fixedNow()); };
     bool rejected = false;
-    try finishExecution(racing, id, ExecutionStatus.failed, 1, "duplicate", null, fixedNow());
+    try finishExecution(racing, "fp1", id, ExecutionStatus.failed, 1, "duplicate", null, fixedNow());
     catch (StaleCompletionException e) rejected = e.msg.canFind("finished succeeded");
-    assert(rejected, "The loser re-reads, finds it finished, and is rejected");
+    assert(rejected, "The loser finds the execution recorded, and is rejected");
     auto kept = stores.executions.get(id).get;
-    assert(kept.status == ExecutionStatus.succeeded && kept.errorMessage.length == 0);
+    assert(kept.status == ExecutionStatus.succeeded && kept.errorMessage.length == 0 && kept.version_ == 1);
+    assert(stores.ledgers.get("fp1").get.lastSuccessExecutionId == id && stores.ledgers.get("fp1").get.stopSeq == 0);
 }
 
 unittest
@@ -1237,20 +1409,20 @@ unittest
     foreign.artifactId = "game.zip";
     foreign.taskFingerprint = "fp_somebody_else";
     bool rejected = false;
-    try finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, [foreign]);
+    try finishExecution(stores, "fp1", id, ExecutionStatus.succeeded, 0, null, [foreign]);
     catch (ForeignArtifactException e) rejected = e.msg.canFind("fp_somebody_else") && e.msg.canFind(id);
     assert(rejected);
-    assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
+    assert(stores.executions.get(id).isNull && activeAt(stores).status == ExecutionStatus.queued, "Nothing was recorded");
 
     // Nor attribute them to another execution
     ArtifactMetadata misattributed;
     misattributed.artifactId = "game.zip";
     misattributed.executionId = "exe_somebody_else";
     bool rejectedExecution = false;
-    try finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, [misattributed]);
+    try finishExecution(stores, "fp1", id, ExecutionStatus.succeeded, 0, null, [misattributed]);
     catch (ForeignArtifactException e) rejectedExecution = e.msg.canFind("exe_somebody_else") && e.msg.canFind(id);
     assert(rejectedExecution);
-    assert(stores.executions.get(id).get.status == ExecutionStatus.queued, "Nothing was recorded");
+    assert(stores.executions.get(id).isNull && activeAt(stores).status == ExecutionStatus.queued, "Nothing was recorded");
 
     ArtifactMetadata unnamed;
     unnamed.artifactId = "game.zip";
@@ -1258,7 +1430,7 @@ unittest
     own.artifactId = "tools.zip";
     own.taskFingerprint = "fp1";
     own.executionId = id;
-    const done = finishExecution(stores, id, ExecutionStatus.succeeded, 0, null, [unnamed, own]);
+    const done = finishExecution(stores, "fp1", id, ExecutionStatus.succeeded, 0, null, [unnamed, own]);
     assert(done.artifacts.length == 2 && done.artifacts[0].taskFingerprint == "fp1" && done.artifacts[1].taskFingerprint == "fp1");
     assert(done.artifacts[0].executionId == id && done.artifacts[1].executionId == id);
 }
@@ -1278,7 +1450,7 @@ unittest
 
     bool rejectedWith(TaskExecutionResult result, string text)
     {
-        try completeExecution(stores, id, result);
+        try completeExecution(stores, "fp1", id, result);
         catch (InvalidCompletionException e) return e.msg.canFind(text);
         return false;
     }
@@ -1295,9 +1467,9 @@ unittest
     otherTask.attempt = 1;
     otherTask.status = ExecutionStatus.succeeded;
     assert(rejectedWith(otherTask, "names task 'link'"));
-    assert(stores.executions.get(id).get.status == ExecutionStatus.running, "Nothing was recorded");
+    assert(activeAt(stores).status == ExecutionStatus.running && stores.executions.get(id).isNull, "Nothing was recorded");
 
-    // A completion is recorded on the execution named in the route; its outcome, exit code,
+    // A completion is recorded for the execution named in the route; its outcome, exit code,
     // error and artifacts (stamped with the execution's fingerprint) are kept. Nothing else is
     // written: no cache entry; the open requests of its project are reconciled after the fold
     TaskExecutionResult failed;
@@ -1307,22 +1479,24 @@ unittest
     failed.exitCode = 2;
     failed.errorMessage = "make: *** [all] Error 2";
     failed.producedArtifacts = [ArtifactMetadata("partial.log")];
-    const done = completeExecution(stores, id, failed, fixedNow());
+    const done = completeExecution(stores, "fp1", id, failed, fixedNow());
     assert(done.id == id && done.status == ExecutionStatus.failed && done.exitCode == 2);
     assert(done.errorMessage == "make: *** [all] Error 2" && done.finishedAt == fixedNow());
     assert(done.artifacts.length == 1 && done.artifacts[0].taskFingerprint == "fp1");
+    assert(done.worker == "w1" && done.startedAt == fixedNow() && done.createdAt == "2026-10-16T10:00:00Z");
+    assert(done.definitionId.length > 0 && done.inputs == sampleClaim(stores).inputs);
     assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
 
     // A task id is optional; a duplicate is rejected as stale, an unknown execution as unknown
     bool unknownExecution = false;
-    try completeExecution(stores, "exe_nope", failed);
+    try completeExecution(stores, "fp1", "exe_nope", failed);
     catch (UnknownExecutionException e) unknownExecution = e.msg.canFind("exe_nope");
     assert(unknownExecution);
     TaskExecutionResult again;
     again.status = ExecutionStatus.succeeded;
     again.attempt = 1;
     bool stale = false;
-    try completeExecution(stores, id, again);
+    try completeExecution(stores, "fp1", id, again);
     catch (StaleCompletionException e) stale = e.msg.canFind(id);
     assert(stale && stores.executions.get(id).get.status == ExecutionStatus.failed);
 }
@@ -1330,7 +1504,7 @@ unittest
 unittest
 {
     // Two completions of one execution race through completeExecution: the second passes its
-    // checks, then loses the compare-and-set to the first and is rejected without overwriting it
+    // checks, then loses to the first and is rejected without overwriting it
     auto documents = new InMemoryDocumentStore();
     auto stores = new StateStores(documents);
     const id = runningExecution(stores);
@@ -1344,12 +1518,51 @@ unittest
 
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
-    interleaving.beforeNextWrite = () { completeExecution(stores, id, succeeded, fixedNow()); };
+    interleaving.beforeNextWrite = () { completeExecution(stores, "fp1", id, succeeded, fixedNow()); };
     bool rejected = false;
-    try completeExecution(racing, id, cancelled, fixedNow());
+    try completeExecution(racing, "fp1", id, cancelled, fixedNow());
     catch (StaleCompletionException e) rejected = e.msg.canFind("finished succeeded");
     assert(rejected);
     assert(stores.executions.get(id).get.status == ExecutionStatus.succeeded);
+}
+
+unittest
+{
+    // The attempt an execution is on, for the routes that check a worker's token: the active
+    // execution's, then the finished one's, and none for an execution the fingerprint never had
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = queueExecution(stores);
+    assert(currentAttempt(stores, "fp1", id).get == 0);
+    startExecution(stores, "fp1", "w1", testLease, fixedNow());
+    assert(currentAttempt(stores, "fp1", id).get == 1);
+    completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
+    assert(currentAttempt(stores, "fp1", id).get == 1);
+    assert(currentAttempt(stores, "fp1", "exe_missing").isNull && currentAttempt(stores, "fp_nowhere", id).isNull);
+}
+
+unittest
+{
+    // A finished execution is never written again: the record stays at version 1, unchanged, through
+    // everything that can still reach its fingerprint (heartbeats, releases, expiries, completions,
+    // and a newer execution's whole life)
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = runningExecution(stores);
+    auto done = completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
+    auto stored = stores.executions.get(id).get;
+    assert(stored.version_ == 1 && stored.value == done);
+
+    heartbeatExecution(stores, "fp1", id, 1, testLease);
+    releaseExecution(stores, "fp1", id, 1);
+    expireLease(stores, "fp1", 3, later(1.hours));
+    bool lateRejected = false;
+    try completeExecution(stores, "fp1", id, succeededAt(1));
+    catch (StaleCompletionException e) lateRejected = true;
+    assert(lateRejected);
+    const next = queueExecution(stores);
+    startExecution(stores, "fp1", "w2", testLease, fixedNow());
+    completeExecution(stores, "fp1", next, succeededAt(1), later(2.minutes));
+    assert(stores.executions.get(id).get.version_ == 1 && stores.executions.get(id).get.value == done);
+    assert(stores.executions.get(next).get.version_ == 1);
 }
 
 version (unittest)
@@ -1380,17 +1593,17 @@ unittest
     {
         auto stores = new StateStores(new InMemoryDocumentStore());
         const fingerprint = requestsSharingFingerprint(stores);
-        const id = stores.ledgers.get(fingerprint).get.activeExecutionId;
+        const id = activeAt(stores, fingerprint).id;
 
-        assert(!startExecution(stores.executions, id, "w1", testLease, fixedNow()).isNull);
+        assert(!startExecution(stores, fingerprint, "w1", testLease, fixedNow()).isNull);
         TaskExecutionResult result;
         result.status = status;
         result.attempt = 1;
         result.errorMessage = status == ExecutionStatus.succeeded ? null : "stopped";
-        completeExecution(stores, id, result, fixedNow());
+        completeExecution(stores, fingerprint, id, result, fixedNow());
 
         auto ledger = stores.ledgers.get(fingerprint).get;
-        assert(ledger.activeExecutionId.length == 0, "The outcome was folded");
+        assert(ledger.active.isNull, "The outcome was folded");
         assert(ledger.lastSuccessExecutionId == (status == ExecutionStatus.succeeded ? id : ""));
         assert(ledger.lastStoppedExecutionId == (status == ExecutionStatus.succeeded ? "" : id));
 
@@ -1406,25 +1619,22 @@ unittest
 
 unittest
 {
-    // A coordinator restart between the terminal compare-and-set and the fold: the execution is
-    // finished but unfolded. After the restart, reconciling settles the ledger (completing the
-    // fold) and sees the outcome
+    // A coordinator restart between the write of the execution's record and the fold: the
+    // execution is finished but unfolded. After the restart, reconciling settles the ledger
+    // (completing the fold) and sees the outcome
     auto documents = new InMemoryDocumentStore();
     auto before = new StateStores(documents);
     const fingerprint = requestsSharingFingerprint(before);
-    const id = before.ledgers.get(fingerprint).get.activeExecutionId;
-    auto current = before.executions.get(id).get;
-    TaskExecution ended = current.value;
-    ended.status = ExecutionStatus.succeeded;
-    ended.finishedAt = fixedNow();
-    before.executions.update(current, ended); // ... and the process dies before the fold
+    const id = activeAt(before, fingerprint).id;
+    before.executions.create(endedExecution(fingerprint, activeAt(before, fingerprint), ExecutionStatus.succeeded, fixedNow()));
+    // ... and the process dies before the fold
 
     auto after = new StateStores(documents.restart());
-    assert(after.ledgers.get(fingerprint).get.activeExecutionId == id, "Nothing was folded");
+    assert(after.ledgers.get(fingerprint).get.active.get.id == id, "Nothing was folded");
 
     auto reconciled = reconcilerOf(after).reconcile("rb");
     assert(taskOf(reconciled.state, "compile").status == RequestTaskStatus.succeeded && reconciled.state.outcome == RequestOutcome.succeeded);
-    assert(after.ledgers.get(fingerprint).get.activeExecutionId.length == 0 && after.ledgers.get(fingerprint).get.lastSuccessExecutionId == id);
+    assert(after.ledgers.get(fingerprint).get.active.isNull && after.ledgers.get(fingerprint).get.lastSuccessExecutionId == id);
 
     // Folding again is idempotent
     assert(after.ledgers.fold(after.executions.get(id).get.value).outcome == FoldOutcome.alreadyFolded);
@@ -1432,27 +1642,35 @@ unittest
 
 unittest
 {
-    // The fold failing after the terminal compare-and-set: here the execution was never claimed on
-    // a ledger. The completion answers OutcomeNotFoldedException (the cause chained), the
-    // execution stays finished and a resent completion is stale
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    stores.executions.createIfAbsent(sampleExecution("exe_unclaimed"));
-    assert(!startExecution(stores.executions, "exe_unclaimed", "w1", testLease, fixedNow()).isNull);
+    // The fold failing after the execution's record is written: the completion answers
+    // OutcomeNotFoldedException (the cause chained), the execution stays finished and a resent
+    // completion is stale; the next read of the ledger completes the fold
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    const id = runningExecution(stores);
 
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto racing = new StateStores(interleaving);
+    // The completion's writes: 1 the record, 2 the fold
+    beforeWrite(interleaving, 2, () { throw new Exception("The fold's write is lost"); });
     TaskExecutionResult result = succeededAt(1);
     bool unfolded = false;
-    try completeExecution(stores, "exe_unclaimed", result, fixedNow());
+    try completeExecution(racing, "fp1", id, result, fixedNow());
     catch (OutcomeNotFoldedException e)
     {
-        unfolded = e.executionId == "exe_unclaimed" && e.next !is null && e.msg.canFind("exe_unclaimed") && e.msg.canFind("is rejected as stale");
+        unfolded = e.executionId == id && e.next !is null && e.next.msg == "The fold's write is lost"
+            && e.msg.canFind(id) && e.msg.canFind("is rejected as stale");
     }
     assert(unfolded);
-    assert(stores.executions.get("exe_unclaimed").get.status == ExecutionStatus.succeeded);
+    assert(stores.executions.get(id).get.status == ExecutionStatus.succeeded);
+    assert(activeAt(stores).id == id, "The ledger was not folded");
 
     bool stale = false;
-    try completeExecution(stores, "exe_unclaimed", result, fixedNow());
+    try completeExecution(stores, "fp1", id, result, fixedNow());
     catch (StaleCompletionException) stale = true;
     assert(stale);
+    assert(stores.ledgers.get("fp1").get.active.isNull && stores.ledgers.get("fp1").get.lastSuccessExecutionId == id,
+        "The resent completion completed the fold of the one that won");
 }
 
 unittest
@@ -1466,15 +1684,15 @@ unittest
     intake(stores, "a", "ra", ["compile"], "2026-10-20T10:00:00Z");
     reconcilerOf(stores).reconcile("ra");
     const fingerprint = fingerprintNow(stores, "a", "compile");
-    const id = stores.ledgers.get(fingerprint).get.activeExecutionId;
-    assert(!startExecution(stores.executions, id, "w1", testLease, fixedNow()).isNull);
+    const id = activeAt(stores, fingerprint).id;
+    assert(!startExecution(stores, fingerprint, "w1", testLease, fixedNow()).isNull);
 
-    // The completion's writes: the terminal compare-and-set, the fold, then the reconcile's commit
+    // The completion's writes: the record, the fold, then the reconcile's commit
     auto interleaving = new InterleavingDocumentStore(documents);
     auto racing = new StateStores(interleaving);
     bool wakeLost = false;
     beforeWrite(interleaving, 3, () { wakeLost = true; throw new Exception("The wake's write is lost"); });
-    const done = completeExecution(racing, id, succeededAt(1), fixedNow());
+    const done = completeExecution(racing, fingerprint, id, succeededAt(1), fixedNow());
     assert(wakeLost, "The wake's write was attempted and failed");
     assert(done.status == ExecutionStatus.succeeded, "The completion succeeds");
     assert(stores.ledgers.get(fingerprint).get.lastSuccessExecutionId == id, "The outcome is folded");
@@ -1501,16 +1719,16 @@ version (unittest)
     }
 
     /// Request "ra" over chain "a", reconciled, with its compile execution running as attempt 1.
-    /// Returns the execution's id.
-    private string runningRequest(StateStores stores)
+    /// Returns the execution's fingerprint and id.
+    private string[2] runningRequest(StateStores stores)
     {
         createChain(stores, "a");
         intake(stores, "a", "ra", ["compile"], "2026-10-20T10:00:00Z");
         reconcilerOf(stores).reconcile("ra");
         const fingerprint = fingerprintNow(stores, "a", "compile");
-        const id = stores.ledgers.get(fingerprint).get.activeExecutionId;
-        assert(!startExecution(stores.executions, id, "w1", testLease, fixedNow()).isNull);
-        return id;
+        const id = activeAt(stores, fingerprint).id;
+        assert(!startExecution(stores, fingerprint, "w1", testLease, fixedNow()).isNull);
+        return [fingerprint, id];
     }
 }
 
@@ -1520,12 +1738,12 @@ unittest
     // the outcome is recorded and folded, and the request stays open until a later reconcile
     auto documents = new QueryFailingStore();
     auto stores = new StateStores(documents);
-    const id = runningRequest(stores);
+    const running = runningRequest(stores);
 
     documents.failQueries = true;
-    const done = completeExecution(stores, id, succeededAt(1), fixedNow());
+    const done = completeExecution(stores, running[0], running[1], succeededAt(1), fixedNow());
     assert(done.status == ExecutionStatus.succeeded, "The completion succeeds");
-    assert(stores.ledgers.get(fingerprintNow(stores, "a", "compile")).get.lastSuccessExecutionId == id, "The outcome is folded");
+    assert(stores.ledgers.get(running[0]).get.lastSuccessExecutionId == running[1], "The outcome is folded");
     assert(stores.requestStates.get("ra").get.outcome == RequestOutcome.open, "The wake did not run");
 
     documents.failQueries = false;
@@ -1535,13 +1753,99 @@ unittest
 
 unittest
 {
-    // A lease expiry that fails the execution (the attempt limit is reached) takes the same
-    // terminal path as a completion, so its wake advances the open request with no reconcile
+    // A lease expiry that fails the execution (the attempt limit is reached) takes the same end as
+    // a completion, so its wake advances the open request with no reconcile
     auto stores = new StateStores(new InMemoryDocumentStore());
-    const id = runningRequest(stores);
+    const running = runningRequest(stores);
 
-    auto lost = expireLease(stores, id, 1, later(2.minutes));
+    auto lost = expireLease(stores, running[0], 1, later(2.minutes));
     assert(lost.disposition == LostLeaseDisposition.failed);
     const state = stores.requestStates.get("ra").get.value;
     assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
+}
+
+unittest
+{
+    // An execution whose stored definition is missing is failed with that cause before any worker
+    // holds it, and the next queued execution is handed out
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto broken = sampleClaim(stores, "2026-10-16T10:00:00Z");
+    broken.definitionId = "def_missing";
+    const brokenId = stores.ledgers.claim("fp_broken", 0, broken).executionId;
+    const healthyId = queueExecution(stores, "fp_healthy", "2026-10-16T10:00:05Z");
+
+    auto claimed = claimWork(stores, "w1", testLease, fixedNow());
+    assert(!claimed.isNull && claimed.get.workOrder.executionId == healthyId);
+    auto failed = stores.executions.get(brokenId).get;
+    assert(failed.status == ExecutionStatus.failed && failed.attempts == 0 && failed.worker.length == 0);
+    assert(failed.errorMessage.canFind("could not be dispatched") && failed.errorMessage.canFind("def_missing"), failed.errorMessage);
+    auto ledger = stores.ledgers.get("fp_broken").get;
+    assert(ledger.active.isNull && ledger.lastStoppedExecutionId == brokenId && ledger.stopSeq == 1);
+
+    // A definition without the task fails the same way
+    auto taskless = sampleClaim(stores, "2026-10-16T10:00:00Z");
+    taskless.taskId = "link";
+    const tasklessId = stores.ledgers.claim("fp_taskless", 0, taskless).executionId;
+    assert(claimWork(stores, "w2", testLease, fixedNow()).isNull);
+    assert(stores.executions.get(tasklessId).get.errorMessage.canFind("'link'"));
+}
+
+unittest
+{
+    // An expiry settles the ledger first: a running execution whose record already exists (its
+    // ender crashed before the fold) is folded, not requeued or counted as lost
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = runningExecution(stores);
+    stores.executions.create(endedExecution("fp1", activeAt(stores), ExecutionStatus.succeeded, fixedNow()));
+
+    assert(expireLease(stores, "fp1", 3, later(1.hours)).disposition == LostLeaseDisposition.nothingToDo);
+    auto ledger = stores.ledgers.get("fp1").get;
+    assert(ledger.active.isNull && ledger.lastSuccessExecutionId == id && ledger.stopSeq == 0);
+    assert(stores.executions.get(id).get.expiredLeases == 0);
+}
+
+unittest
+{
+    // A process that dies after counting a lost lease and before writing the failed record leaves
+    // the execution running with the count. The next expiry decides the same (it fails) and counts
+    // the lease again, which the message and the record carry
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    const id = runningExecution(stores);
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto crashing = new StateStores(interleaving);
+    // The expiry's writes: 1 counts the lost lease, 2 writes the record, which fails
+    beforeWrite(interleaving, 2, () { throw new Exception("The process died"); });
+    bool died = false;
+    try expireLease(crashing, "fp1", 1, later(1.hours));
+    catch (Exception e) died = e.msg == "The process died";
+    assert(died);
+    assert(activeAt(stores).status == ExecutionStatus.running && activeAt(stores).expiredLeases == 1);
+    assert(stores.executions.get(id).isNull);
+
+    auto again = expireLease(stores, "fp1", 1, later(2.hours));
+    assert(again.disposition == LostLeaseDisposition.failed);
+    assert(again.expiredLeases == 2 && again.ended.get.expiredLeases == 2);
+    assert(again.ended.get.errorMessage.canFind("lease lost 2 times (attempt limit 1)"), again.ended.get.errorMessage);
+    assert(stores.ledgers.get("fp1").get.active.isNull && stores.ledgers.get("fp1").get.lastStoppedExecutionId == id);
+}
+
+unittest
+{
+    // An outcome recorded after its execution moved on is noted for the log: the attempt it was
+    // decided for and the ledger's. Nothing to note while the execution is as it was read
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = runningExecution(stores);
+    const seen = activeAt(stores);
+    assert(supersessionNote(seen, stores.ledgers.get("fp1")).length == 0);
+
+    assert(expireLease(stores, "fp1", 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
+    const requeued = supersessionNote(seen, stores.ledgers.get("fp1"));
+    assert(requeued.canFind(id) && requeued.canFind("attempt 1") && requeued.canFind("queued"), requeued);
+    assert(claimWork(stores, "w2", testLease, later(2.minutes)).get.attempt == 2);
+    const started = supersessionNote(seen, stores.ledgers.get("fp1"));
+    assert(started.canFind("attempt 1") && started.canFind("attempt 2") && started.canFind("running"), started);
+
+    completeExecution(stores, "fp1", id, succeededAt(2), later(3.minutes));
+    assert(supersessionNote(seen, stores.ledgers.get("fp1")).length == 0, "An ended execution is not active");
 }
