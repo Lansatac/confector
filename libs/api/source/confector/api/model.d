@@ -31,7 +31,7 @@ enum InputKind : string
     taskOutput = "task_output"
 }
 
-// The ref grammar (design record: bead confector-z7z.56; AGENTS.md, "Branches"). Branch filters
+// The ref grammar (AGENTS.md, "Branches"). Branch filters
 // and ref specs are plain data with a compact text form, which is also how they are stored
 // (vibe.d serializes a type with `toString` and `fromString` as a string). Tokens are separated by
 // whitespace, so neither a pattern nor a ref name can contain whitespace.
@@ -186,7 +186,7 @@ private void requireInclude(in BranchFilter filter, lazy string what) pure @safe
 }
 
 /**
- * The kinds of ref spec (design record: bead confector-z7z.56).
+ * The kinds of ref spec.
  */
 enum RefSpecKind : string
 {
@@ -215,7 +215,7 @@ enum RefFallback : string
 }
 
 /**
- * Which ref of a repository a build uses (design record: bead confector-z7z.56; AGENTS.md,
+ * Which ref of a repository a build uses (AGENTS.md,
  * "Branches"): given by a trigger or a request, or as an input's default. Its text form is the
  * grammar
  *
@@ -382,7 +382,7 @@ void requireWellFormed(in BranchFilter filter, in RefSpec spec) pure @safe
  * - `repository`: `repository` (repository id), and optionally `branches` (a visibility filter:
  *   which refs of the repository the task may be built from) and `default` (the ref spec used
  *   when the trigger or request gives none for the input). The input never chooses the ref
- *   itself: the trigger or request does (design record: bead confector-z7z.56; AGENTS.md,
+ *   itself: the trigger or request does (AGENTS.md,
  *   "Branches"). Both are stored in their text forms; "" is the empty filter and no default.
  * - `value`: `value`.
  * - `task_output`: `task` (upstream task id) and `artifact` (id of one of that task's
@@ -696,7 +696,7 @@ import vibe.data.json;
  *
  * A completion names its execution by id (the worker posts it to
  * `/executions/<execution id>/complete`), and the control plane reads the fingerprint and task
- * from its own execution record (design record: bead confector-z7z.2). The result deliberately
+ * from its own execution record. The result deliberately
  * has no fingerprint: a worker cannot name the cache key its result is stored under.
  */
 struct TaskExecutionResult
@@ -745,8 +745,7 @@ struct BuildTrigger
 {
     TriggerType type;
     /// The id of the trigger rule that matched; empty for a request made by hand or through the
-    /// API. One request is made per matched rule. (How trigger rules are declared is beads
-    /// confector-z7z.24.4 and confector-z7z.37.1.)
+    /// API. One request is made per matched rule.
     @optional @asName("rule_id") string ruleId;
     /// Event details as the trigger source reported them (ref, revision, sender, ...), for
     /// display and audit only: what the trigger pins is in `BuildRequest.pins`.
@@ -842,7 +841,7 @@ enum HeadlineKind : string
 }
 
 /**
- * The ref that groups chains into a history (design record: bead confector-z7z.56): the event's
+ * The ref that groups chains into a history: the event's
  * ref, or for a manual request the ref chosen for the primary (else the first) repository. It is
  * for display and history only: a request joins a chain by pin agreement, never by headline, and
  * two chains with one headline are possible and harmless. A project with no repositories has the
@@ -890,7 +889,7 @@ enum DefinitionLocation : string
 }
 
 /**
- * Which definition a request read (design record: bead confector-z7z.52): where it came from and,
+ * Which definition a request read: where it came from and,
  * for a definition file, the revision it was read at. For display and audit; what the request runs with is the stored
  * definition that `BuildRequest.definitionId` names.
  */
@@ -922,7 +921,7 @@ struct ProjectDefinition
 }
 
 /**
- * What a build request asks of one task it covers (bead confector-z7z.49.2): the task's fingerprint
+ * What a build request asks of one task it covers: the task's fingerprint
  * when the request was made, and the `stopSeq` of that fingerprint's ledger then, read after
  * settling it (`LedgerStore.settle`) so a stop that had already happened is counted. A later
  * failure or cancellation at that fingerprint (the ledger's `stopSeq` grows past it) settles the
@@ -944,7 +943,7 @@ struct TaskDemand
 }
 
 /**
- * Who asked for what (beads confector-z7z.14 and confector-z7z.52). Immutable: written once, after
+ * Who asked for what. Immutable: written once, after
  * the input resolver has found or created the chain the request runs on and added to it every pin
  * the request supplies.
  */
@@ -1273,7 +1272,7 @@ struct RequestState
 }
 
 /**
- * Kinds of ref (beads confector-z7z.19 and confector-z7z.56): of a tracked branch, of a pin's ref
+ * Kinds of ref: of a tracked branch, of a pin's ref
  * (`RepositoryRef`) and of a headline.
  */
 enum RefKind : string
@@ -1298,7 +1297,7 @@ enum BranchStatus : string
 }
 
 /**
- * A ref of a repository that Confector tracks (bead confector-z7z.19), independent of the
+ * A ref of a repository that Confector tracks, independent of the
  * version control system: git branches, Plastic branches and Perforce streams all map onto it.
  * Kept current by webhooks and polling. Identified by repository, kind and ref name, which never
  * change.
@@ -1319,7 +1318,7 @@ struct TrackedBranch
 }
 
 /**
- * Global roles (bead confector-z7z.10). Per-project permissions come later.
+ * Global roles.
  */
 enum Role : string
 {
@@ -1332,7 +1331,7 @@ enum Role : string
 }
 
 /**
- * An API token (bead confector-z7z.10). Only a hash of the token's secret is stored, never the
+ * An API token. Only a hash of the token's secret is stored, never the
  * secret itself; the hash identifies the token, so authenticating a request is a read by id.
  */
 struct ApiToken

@@ -1,7 +1,7 @@
 module confector.core.state_stores;
 
 /**
- * Every state store the core keeps in the DocumentStore (design record: bead confector-z7z.4),
+ * Every state store the core keeps in the DocumentStore,
  * built over one store at startup and passed explicitly to what needs it. Constructing it
  * declares every collection and index, so a misconfigured store fails at startup rather than on
  * first use.

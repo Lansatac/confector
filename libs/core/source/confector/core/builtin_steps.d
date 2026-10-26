@@ -3,7 +3,7 @@ module confector.core.builtin_steps;
 /**
  * The step types built into the runner (AGENTS.md, "Build steps"), shared by the runner, which
  * runs them, and the task editor, which offers them and validates their configs on save. Step
- * programs with their own manifests are bead confector-z7z.35.1.
+ * programs with their own manifests are not implemented yet.
  */
 
 import confector.api.document_store : jsonTypeName;

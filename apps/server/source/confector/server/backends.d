@@ -2,7 +2,7 @@ module confector.server.backends;
 
 /**
  * The backends the server runs on, built once at startup from deployment configuration and
- * passed explicitly to whatever needs them (design record: bead confector-z7z.3). Nothing is
+ * passed explicitly to whatever needs them. Nothing is
  * loaded at runtime and nothing is registered globally.
  *
  * Every setting is required: a missing or invalid one stops startup with an error naming it.

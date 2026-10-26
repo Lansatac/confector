@@ -1,7 +1,7 @@
 module confector.testing.conformance.scheduler;
 
 /**
- * Conformance suite for Scheduler backends (design record: bead confector-z7z.4). Every backend
+ * Conformance suite for Scheduler backends. Every backend
  * must pass it. It only stores and lists entries, far in the future, so nothing fires:
  *
  *     checkScheduler(new LocalScheduler("secret", "http://127.0.0.1:8080"));

@@ -88,7 +88,7 @@ private void putCanonical(Out)(ref Out app, in Json value) @trusted
  * Computes a node's base fingerprint: SHA256 over the node's identity (project id and task id)
  * and its resolved inputs, sorted by input name, each as `name=pinned`. Nothing else contributes; in particular, build
  * configuration (steps, environment, outputs) does not. The node's fingerprint is
- * `computeFingerprint` of the base and the base's rerun generation (bead confector-z7z.15).
+ * `computeFingerprint` of the base and the base's rerun generation.
  *
  * A task_output input's pinned value is the upstream task's full fingerprint, so hashing, and
  * with it a rerun, is transitive. Fields are length-prefixed so distinct inputs can never
@@ -130,7 +130,7 @@ string computeBaseFingerprint(in string projectId, in string nodeId, in Resolved
 
 /**
  * Computes a node's fingerprint from its base fingerprint (`computeBaseFingerprint`) and the
- * base's current rerun generation (design record: bead confector-z7z.15; AGENTS.md, "Re-running
+ * base's current rerun generation (AGENTS.md, "Re-running
  * a task"). A rerun increments the generation, so the node gets a new fingerprint, and every
  * downstream node a new base, without a special-case graph walk. Generation 0, a node never
  * rerun, is hashed like any other generation.

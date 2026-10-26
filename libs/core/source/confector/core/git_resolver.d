@@ -1,8 +1,7 @@
 module confector.core.git_resolver;
 
 /**
- * The built-in git RepositoryResolver (design records: beads confector-z7z.13,
- * confector-z7z.7 and confector-z7z.56): turns a ref of a repository into a commit SHA with
+ * The built-in git RepositoryResolver: turns a ref of a repository into a commit SHA with
  * `git ls-remote`.
  *
  * The pinned value is the commit SHA alone, as a Json string; the full ref that was selected goes

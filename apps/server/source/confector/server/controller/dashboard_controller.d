@@ -363,7 +363,7 @@ string[][] taskStepRowIssues(in TaskStepRow[] rows, in InputDecl[string] inputs)
         const type = row.type.strip();
         if (!builtinStepTypes.canFind(type))
         {
-            issues[i] ~= format("step type '%s' is not a built-in step type (%-(%s, %)); step programs are bead confector-z7z.35.1",
+            issues[i] ~= format("step type '%s' is not a built-in step type (%-(%s, %)); step programs are not implemented yet",
                 type, builtinStepTypes);
         }
         Json config;
@@ -839,7 +839,7 @@ unittest
 
     // Only the built-in step types are offered and accepted
     auto unknownType = collectExceptionMsg!TaskFormException(parseTaskStepRows([TaskStepRow("Image", "docker:build", "{}")], inputs));
-    assert(unknownType.canFind("'docker:build' is not a built-in step type") && unknownType.canFind("confector-z7z.35.1"), unknownType);
+    assert(unknownType.canFind("'docker:build' is not a built-in step type") && unknownType.canFind("step programs are not implemented yet"), unknownType);
     assert(collectExceptionMsg!TaskFormException(parseTaskStepRows([TaskStepRow("", "", "{}")], inputs)).canFind("Step 1 ()"));
 
     // A checkout step's config may have only its own keys, and must name a declared repository

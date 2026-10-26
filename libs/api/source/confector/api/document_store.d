@@ -2,7 +2,7 @@ module confector.api.document_store;
 
 /**
  * The state store backend interface: a small document store with versioned
- * compare-and-set and declared index queries (design record: bead confector-z7z.4).
+ * compare-and-set and declared index queries.
  *
  * Domain logic (chains, executions, branches, ...) is core code written on top of this
  * interface, so a new backend (DynamoDB, Postgres, SQLite) only has to provide these

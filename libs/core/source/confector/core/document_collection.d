@@ -2,7 +2,7 @@ module confector.core.document_collection;
 
 /**
  * Typed access to one DocumentStore collection, the building block of the core's domain stores
- * (design record: bead confector-z7z.4). A document is a plain data type serialized with
+ * A document is a plain data type serialized with
  * vibe.data.json, plus any derived index key fields the collection adds next to the type's own
  * fields (for example a fixed-width sort key made from a timestamp); derived fields are written
  * on every write and stripped before the content is deserialized.

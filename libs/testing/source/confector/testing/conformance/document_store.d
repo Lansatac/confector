@@ -2,7 +2,7 @@ module confector.testing.conformance.document_store;
 
 /**
  * Conformance suite for DocumentStore backends. Every backend, including in-memory test fakes,
- * must pass it (design record: bead confector-z7z.4).
+ * must pass it.
  *
  * Run it from a backend's tests:
  *

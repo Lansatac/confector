@@ -23,12 +23,12 @@ final class BuiltinStepRunner : StepRunner
                 return runCheckout(step, context);
             case "bash":
             case "powershell":
-                throw new NotImplementedException("built-in bash/PowerShell steps", "confector-z7z.35.6");
+                throw new NotImplementedException("Built-in bash/PowerShell step");
             default:
                 StepResult result;
                 result.success = false;
                 result.exitCode = 1;
-                result.errorMessage = format("Step type '%s' is not supported: the runner has only the built-in checkout step until step programs are implemented (bead confector-z7z.35.1)",
+                result.errorMessage = format("Step type '%s' is not supported: the runner has only the built-in checkout step until step programs are implemented",
                     step.type);
                 context.log(format("[confector] Error: %s", result.errorMessage));
                 return result;
@@ -46,23 +46,23 @@ unittest
     context.log = (string line) { logged ~= line; };
     auto runner = new BuiltinStepRunner();
 
-    // Steps that are programs fail the task, naming the bead that implements them
+    // Steps that are programs fail the task
     BuildStep docker;
     docker.type = "docker:build";
     auto result = runner.run(docker, context);
     assert(!result.success && result.exitCode != 0);
-    assert(result.errorMessage.canFind("'docker:build'") && result.errorMessage.canFind("confector-z7z.35.1"), result.errorMessage);
-    assert(logged.length == 1 && logged[0].canFind("confector-z7z.35.1"));
+    assert(result.errorMessage.canFind("'docker:build'") && result.errorMessage.canFind("is not supported"));
+    assert(logged.length == 1 && logged[0].canFind("is not supported"));
 
     // Built-in bash and PowerShell are not implemented yet
     foreach (type; ["bash", "powershell"])
     {
         BuildStep script;
         script.type = type;
-        string bead;
+        string message;
         try runner.run(script, context);
-        catch (NotImplementedException e) bead = e.bead;
-        assert(bead == "confector-z7z.35.6", type);
+        catch (NotImplementedException e) message = e.msg;
+        assert(message == "Built-in bash/PowerShell step is not implemented yet", type);
     }
 
     // checkout runs the built-in checkout step, which fails here before running git: the step

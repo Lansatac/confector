@@ -1,8 +1,7 @@
 module confector.core.build_stores;
 
 /**
- * State stores for the build model (design records: beads confector-z7z.4, confector-z7z.14,
- * confector-z7z.2 and confector-z7z.52; AGENTS.md, "What a build is" and "Coordinating builds"):
+ * State stores for the build model (AGENTS.md, "What a build is" and "Coordinating builds"):
  * build chains, build requests and task executions, each a typed collection in the DocumentStore.
  * The definitions requests run with are in confector.core.definition_store.
  *
@@ -65,7 +64,7 @@ class InvalidStateTransitionException : Exception
  * Build chains. A chain's identity (id, project, number, headline, creation time) never changes;
  * its pins are only added (`addPins`), and once set never change; its labels change and its events
  * are only appended (`update`). A request finds the chain it joins by pin agreement, not by
- * headline (bead confector-z7z.53.2); the headline only groups chains into a history
+ * headline; the headline only groups chains into a history
  * (`listForHeadline`).
  */
 final class ChainStore
@@ -221,7 +220,7 @@ final class ChainStore
      * Lists project `projectId`'s chains with headline `headline` (its history) by number, newest
      * first unless `newestFirst` is false, at most `limit` of them. Discovery: may lag behind
      * writes, so a chain just created may be missing; never use it to decide whether a chain
-     * exists (bead confector-z7z.53.2 finds chains through a head document read by id).
+     * exists. Read the chain by id to check that.
      *
      * Throws: InvalidStateTransitionException if `headline` is malformed (see `validateHeadline`).
      */
@@ -292,7 +291,7 @@ void validateChain(in BuildChain chain)
  * and no repository; any other kind has a name, and a repository exactly when it is a change
  * request. `owner` names whose headline it is, for the message ("chain 'c1'").
  *
- * The input resolver (bead confector-z7z.53.2) chooses `default` exactly when the project has no
+ * The input resolver chooses `default` exactly when the project has no
  * repository inputs; the store cannot see the definition, but it holds a `default` chain to having
  * no pins (`validateChain`, `ChainStore.addPins`).
  */

@@ -477,8 +477,7 @@ unittest
 
 unittest
 {
-    // With the built-in step runner, a step type that is not built in fails the task, naming
-    // the bead that implements step programs
+    // With the built-in step runner, a step type that is not built in fails the task.
     import confector.runner_core.steps.builtin : BuiltinStepRunner;
 
     TaskNode task;
@@ -489,6 +488,6 @@ unittest
     string[] logged;
     auto engine = new TaskExecutor(null, new BuiltinStepRunner());
     auto res = engine.executeTask("exe_d", task, ".", "fp", [], null, (string line) { logged ~= line; });
-    assert(res.status == ExecutionStatus.failed && res.errorMessage.canFind("confector-z7z.35.1"), res.errorMessage);
-    assert(logged.canFind!(line => line.canFind("confector-z7z.35.1")));
+    assert(res.status == ExecutionStatus.failed && res.errorMessage.canFind("is not supported"), res.errorMessage);
+    assert(logged.canFind!(line => line.canFind("is not supported")));
 }

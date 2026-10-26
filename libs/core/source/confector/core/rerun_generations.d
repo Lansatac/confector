@@ -1,7 +1,7 @@
 module confector.core.rerun_generations;
 
 /**
- * Rerun generations (design record: bead confector-z7z.15; AGENTS.md, "Re-running a task"): the
+ * Rerun generations (AGENTS.md, "Re-running a task"): the
  * durable record of each base fingerprint's reruns, and the shell that reads it to compute a
  * graph's fingerprints with the pure core (confector.core.input_resolution.graphResolution).
  *
@@ -13,7 +13,7 @@ module confector.core.rerun_generations;
  * A base's current generation is its last record's; a base without a document is at
  * generation 0. Records are only ever appended, by compare-and-set on the document's version,
  * so concurrent bumps of one base each get their own generation and none is lost. Correctness
- * depends only on reads by id and compare-and-set (bead confector-z7z.4), so the collection
+ * depends only on reads by id and compare-and-set, so the collection
  * declares no index.
  */
 

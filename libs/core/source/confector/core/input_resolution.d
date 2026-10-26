@@ -21,7 +21,7 @@ module confector.core.input_resolution;
  * different refs hash alike. Which ref an input is bound to is the trigger's or request's choice,
  * or the input's default; nothing here chooses a ref.
  *
- * Rerun generations (bead confector-z7z.15) are read by the shell in
+ * Rerun generations are read by the shell in
  * confector.core.rerun_generations.
  */
 
@@ -75,7 +75,7 @@ struct GraphResolution
 }
 
 /**
- * The current rerun generation of each base fingerprint (design record: bead confector-z7z.15),
+ * The current rerun generation of each base fingerprint,
  * keyed by base. A base that was never rerun is at generation 0 and must still be present: a
  * missing base means its generation has not been read, never that it is 0. The shell reads
  * generations from the store (confector.core.rerun_generations); the pure core only receives
@@ -200,8 +200,8 @@ ResolvedInput[][string] resolveGraphInputs(const TaskGraph graph, in RepositoryR
  * repository, its visibility filter and default ref spec are well formed, and the default is
  * `same [else ...]` or a fixed ref: never `event`, since an input's default cannot make events
  * fire a trigger (only a trigger's own spec does). An input needs no default: the trigger or
- * request chooses its ref, and a request that cannot is refused when the definition loads (bead
- * confector-z7z.53.2), never defaulted to "HEAD", "main" or the repository's default branch.
+ * request chooses its ref, and a request that cannot is refused when the definition loads,
+ * never defaulted to "HEAD", "main" or the repository's default branch.
  */
 void requireRepositorySpec(string taskId, string name, in InputDecl decl) pure @safe
 {

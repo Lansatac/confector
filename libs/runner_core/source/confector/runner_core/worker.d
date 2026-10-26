@@ -962,9 +962,9 @@ unittest
 unittest
 {
     // With the runner's built-in steps, a step type that is not built in fails the task and a
-    // built-in that is not implemented yet fails it loudly; both are reported, naming the bead.
-    // The server does not store log lines yet (bead confector-z7z.31.12) and answers 501: the
-    // worker only warns, and still reports each execution
+    // built-in that is not implemented yet fails it loudly; both are reported.
+    // The server does not store log lines yet and answers 501: the worker only warns, and still
+    // reports each execution
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
@@ -981,7 +981,7 @@ unittest
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
         ++logUploads;
         res.statusCode = 501;
-        res.writeJsonBody(["error": "Build logs are not implemented", "bead": "confector-z7z.31.12"]);
+        res.writeJsonBody(["error": "Build logs are not implemented"]);
     });
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         reported[req.params["execution_id"]] = deserializeJson!TaskExecutionResult(req.json);
@@ -1017,11 +1017,11 @@ unittest
         runOffThread({ worker.initialize(); worker.processOneMessage(work); });
     }
     assert(reported["exe_unknown"].status == ExecutionStatus.failed);
-    assert(reported["exe_unknown"].errorMessage.canFind("confector-z7z.35.1"), reported["exe_unknown"].errorMessage);
+    assert(reported["exe_unknown"].errorMessage.canFind("is not supported"), reported["exe_unknown"].errorMessage);
     foreach (execution; ["exe_bash", "exe_powershell"])
     {
         assert(reported[execution].status == ExecutionStatus.failed, execution);
-        assert(reported[execution].errorMessage.canFind("confector-z7z.35.6"), reported[execution].errorMessage);
+        assert(reported[execution].errorMessage.canFind("Built-in bash/PowerShell step is not implemented yet"), reported[execution].errorMessage);
     }
     assert(logUploads > 0, "The worker tried to upload its log lines");
 }

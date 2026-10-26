@@ -1,9 +1,8 @@
 module confector.core.project_stores;
 
 /**
- * State stores for what builds are made from (design records: beads confector-z7z.4 and
- * confector-z7z.19): projects, repositories and tracked branches, each a typed collection in the
- * DocumentStore.
+ * State stores for what builds are made from: projects, repositories and tracked branches, each
+ * a typed collection in the DocumentStore.
  *
  * Projects and repositories are configuration that people edit: they are written whole, and the
  * last edit wins (`put`). Tracked branches are written by webhooks and polling with

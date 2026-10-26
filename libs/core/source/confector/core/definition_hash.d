@@ -6,10 +6,9 @@ import confector.api.model;
 import vibe.data.json : Json;
 
 /**
- * Computes the hash of a task's build configuration (design records: beads confector-z7z.1 and
- * confector-z7z.20.4): its steps (type and config), the task environment and its output
- * declarations (id and path). Display names, the timeout and inputs do not contribute: names
- * are cosmetic, and inputs are already part of the fingerprint.
+ * Computes the hash of a task's build configuration: its steps (type and config), the task
+ * environment and its output declarations (id and path). Display names, the timeout and inputs do
+ * not contribute: names are cosmetic, and inputs are already part of the fingerprint.
  *
  * It is never part of the fingerprint. The hash is over canonical JSON, so it does not depend on
  * the order of any map or config key; the order of steps and of output declarations does matter. A

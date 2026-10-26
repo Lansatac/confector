@@ -2,8 +2,7 @@ module confector.api.input_resolver;
 
 /**
  * The repository resolver contract: how a version control provider turns a ref of a repository
- * into a pinned value (design records: beads confector-z7z.13, confector-z7z.7 and
- * confector-z7z.56).
+ * into a pinned value.
  *
  * Resolution is split along the functional-core/imperative-shell line. A request binds each
  * repository input it needs to a ref (from the trigger's or request's ref spec, else the input's
@@ -28,8 +27,7 @@ struct ResolvedRef
 }
 
 /**
- * Resolves refs of repositories for one version control provider. How the shell selects the
- * resolver for a repository is left to the provider wiring (z7z.20.6).
+ * Resolves refs of repositories for one version control provider.
  *
  * Ref names are the provider's short names, as tracked branches and events report them: for git
  * `main`, `release/1.2` or `v1.0`, never `refs/heads/main`, `refs/tags/v1.0` or `HEAD`. A resolver

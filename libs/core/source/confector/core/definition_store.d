@@ -1,7 +1,7 @@
 module confector.core.definition_store;
 
 /**
- * Stored project definitions (design record: bead confector-z7z.52; AGENTS.md, "Pipeline
+ * Stored project definitions (AGENTS.md, "Pipeline
  * definitions"). Each request reads its project's definition once and runs every task with it,
  * so the definition is kept as an immutable document whose id is a hash of its content, and
  * requests refer to it by that id (`BuildRequest.definitionId`). Identical definitions are stored
@@ -13,7 +13,7 @@ module confector.core.definition_store;
  * and display names included, unlike a task's definition hash
  * (`confector.core.definition_hash.computeDefinitionHash`), which covers only build configuration.
  * A definition is never replaced or removed. (Removing definitions no request references is
- * retention's job, bead confector-z7z.43.)
+ * retention's job.)
  */
 
 import confector.core.dag : TaskGraph;

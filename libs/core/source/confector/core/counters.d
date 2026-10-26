@@ -1,7 +1,7 @@
 module confector.core.counters;
 
 /**
- * Named counters in the state store (design record: bead confector-z7z.4), such as the
+ * Named counters in the state store, such as the
  * per-project chain numbers. Each counter is one document, `{"value": n}`, with the counter's
  * name as its id, incremented by compare-and-set on the document's version, so concurrent
  * increments each get their own value and none is lost. A counter that was never incremented is

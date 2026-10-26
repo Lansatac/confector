@@ -1,7 +1,7 @@
 module confector.core.api_token_store;
 
 /**
- * API tokens in the state store (design record: bead confector-z7z.10). Only the SHA-256 of a
+ * API tokens in the state store. Only the SHA-256 of a
  * token's secret is stored, and it is the document id, so authenticating a request is one read by
  * id. Tokens are revoked, never removed, so a revoked token keeps failing to authenticate.
  */

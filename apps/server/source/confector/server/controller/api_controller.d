@@ -30,17 +30,17 @@ import std.datetime.systime : Clock;
  */
 NotImplementedException scheduledBuildsNotImplemented()
 {
-    return new NotImplementedException("Scheduled builds", "confector-z7z.24.4");
+    return new NotImplementedException("Scheduled builds");
 }
 
 /**
- * Why the build log routes fail: build logs live in the log store, which is bead
- * confector-z7z.31.12. The routes answer 501 Not Implemented with this exception's message; a
- * worker only warns when its log lines are refused.
+ * Why the build log routes fail: build logs live in the log store, which is not written yet. The
+ * routes answer 501 Not Implemented with this exception's message; a worker only warns when its
+ * log lines are refused.
  */
 NotImplementedException logsNotImplemented()
 {
-    return new NotImplementedException("Build logs", "confector-z7z.31.12");
+    return new NotImplementedException("Build logs");
 }
 
 /// The answer to a request that was recorded.
@@ -176,13 +176,12 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         router.delete_(apiPrefix ~ path, role, handler);
     }
 
-    // A stub route answers 501 Not Implemented, naming the bead that implements it.
+    // A stub route answers 501 Not Implemented with the exception's message.
     void writeNotImplemented(HTTPServerResponse res, NotImplementedException e)
     {
         res.statusCode = HTTPStatus.notImplemented;
         Json err = Json.emptyObject;
         err["error"] = Json(e.msg);
-        err["bead"] = Json(e.bead);
         res.writeJsonBody(err);
     }
 
@@ -1180,21 +1179,20 @@ unittest
         assert(postReply(null, "/queue/receive", `{"worker_id": "w-batch", "lease_seconds": 30}`).status == HTTPStatus.noContent);
     }
 
-    // Build logs fail loudly until the log store lands, naming its bead: uploading lines and
-    // reading a log both answer 501
+    // Build logs fail loudly until the log store exists: uploading lines and reading a log both
+    // answer 501
     {
         assert(post("/executions/" ~ executionId ~ "/logs", `{"lines": ["compiling", "linking"]}`) == HTTPStatus.notImplemented);
         foreach (method; [HTTPMethod.POST, HTTPMethod.GET])
         {
             const written = answer(method, "/executions/" ~ executionId ~ "/logs", `{"lines": ["compiling"]}`);
-            assert(written.canFind(`"bead":"confector-z7z.31.12"`), written);
             assert(written.canFind(logsNotImplemented().msg), written);
         }
     }
 
     // A worker's completion names its execution in the route. An unknown execution, a cache hit
     // or a completion naming another task is rejected and records nothing. A fingerprint in the
-    // body is not part of the completion and cannot choose the cache key (bug confector-1oj)
+    // body is not part of the completion and cannot choose the cache key
     const completion = `{"task_id": "n1", "status": "succeeded", "attempt": 1, "exit_code": 0, "duration_ms": 85,`
         ~ ` "fingerprint": "fp_chosen_by_the_worker"}`;
     assert(post("/executions/exe_unknown/complete", completion) == HTTPStatus.notFound, "An unknown execution is rejected");
