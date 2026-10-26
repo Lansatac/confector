@@ -212,8 +212,9 @@ A build is three distinct things:
 
 - **Build request** — who asked for what: target tasks, intent (build, retry, rerun), trigger and
   its payload, the ref each repository input is bound to, the pin of every repository and ref
-  those bindings use, and the project definition it runs with. Immutable, and evaluable from
-  itself.
+  those bindings use, and the project definition it runs with. What was asked is immutable and
+  evaluable from itself. The request also carries its state: the last evaluation's task states
+  and, once settled, its outcome. Recording a request is one write.
 - **Build chain** — one build: the requests made for it and an index of their pins (for every
   repository and ref, its revision). A chain never holds two revisions of one ref, so a task
   added later builds from the same revision as the tasks before it. It holds no tasks or edges.
@@ -253,7 +254,8 @@ How they fit together:
   that need the same fingerprint share its execution.
 - **Request state is derived from authoritative inputs**: the request, the executions for its
   fingerprints, and the rerun generations. Whatever is cached about a request can always be
-  rebuilt from those.
+  rebuilt from those. It lives on the request itself rather than in a second document, so no
+  crash can leave a request without its state.
 - **What a chain shows is derived for display**: the union of its requests' states (with no
   request open, today's definition over its pins). It is never an input to a decision. An old
   chain's view can change when the definition changes; what actually ran stays in the execution
