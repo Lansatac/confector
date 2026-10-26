@@ -128,6 +128,23 @@ Points worth asking about:
 - stale docs;
 - line endings.
 
+### Design pressure
+
+Implementers and reviewers look at one bead, so they make awkward code correct rather than asking
+whether it should exist. Ask the reviewer to also flag design pressure: code that is correct, but
+suggests the design is fighting the work. Signs include:
+
+- repair or reconciliation paths;
+- consistency checks across documents;
+- special cases;
+- one component compensating for another;
+- a bead that grew well beyond what its description implied.
+
+Design pressure is not a fix-round item, so don't ask the implementer to fix it. Note it in the
+epic's bead comments and mention it in your report. When it builds up on an epic (a few flags, or
+one serious one), say so and suggest revisiting the design before cutting more work. Catching this
+early is much cheaper than a redesign halfway through an epic.
+
 ## 5. Fix and commit
 
 - **Fix round.** Send the findings to the same implementer with `SendMessage`. Resuming is far
@@ -155,6 +172,20 @@ Start the stronger agent on the current tree with the bead, the findings and the
 and tell it to keep what is sound. If opus also struggles, stop and tell the user what is
 unresolved. Mention escalations in your report: they are the evidence for tuning the model choice.
 
+## Epic checkpoint
+
+When the last implementation bead of an epic closes, step back before starting the next one. Have
+an opus reviewer read the code as it now stands (not the diff) against AGENTS.md and the epic's
+design, along with the design-pressure notes collected on the epic. Ask it three questions:
+
+1. What is more complex than its purpose needs?
+2. Where do the code and the design disagree?
+3. What will the next epic find awkward?
+
+Bring its answers to the user as candidate design questions, with your recommendation. Don't file
+them as implementation beads: design changes are the user's call. A checkpoint that finds nothing
+is a good result, so say so briefly and move on.
+
 ## 6. Report
 
 Report concisely:
@@ -162,6 +193,7 @@ Report concisely:
 - the commits and the beads closed;
 - the findings that mattered;
 - the follow-ups filed, with their ids;
+- any design pressure, and whether it is building up on the epic;
 - anything unverified;
 - the token usage per agent.
 

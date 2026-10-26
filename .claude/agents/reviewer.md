@@ -23,5 +23,8 @@ Check, in this order:
 7. Style and line-ending churn (`git diff --stat` versus `--ignore-cr-at-eol`).
 
 Report ranked findings, each with file:line, a concrete
-failure scenario and a severity (blocker / should-fix / nit). State explicitly if there are no
+failure scenario and a severity (blocker / should-fix / nit). Separately, list any design
+pressure: code that is correct but suggests the design is fighting the work, such as repair paths,
+cross-document consistency checks, special cases, or one component compensating for another. Say
+what in the design seems to cause it. These are observations for the owner, not fixes. State explicitly if there are no
 blockers, and give a one-line quality verdict. Be concise.
