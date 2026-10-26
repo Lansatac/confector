@@ -12,6 +12,7 @@ import confector.core.request_evaluator;
 import confector.core.dag : TaskGraph;
 import confector.core.chain_pins : bindingMap, inputKeyLess, pinMap, refsOf, selectPins;
 import confector.core.request_reconciler : Dispatched, RequestReconciler;
+import confector.core.request_state : withEvaluation, withFailure;
 import confector.core.document_collection : Versioned;
 import confector.core.fingerprint_ledger : ClaimOutcome, endedExecution;
 import confector.core.input_resolution : GraphResolution, requiredPins;
@@ -101,8 +102,8 @@ string fingerprintNow(StateStores stores, string chainId, string taskId)
 }
 
 /// Records request `id` as an intake does: its pins and demands, from the chain's pins and the
-/// settled ledgers, then the request. Its state is not yet created (`intake` does both).
-BuildRequest recordRequest(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
+/// settled ledgers. It is recorded open, with no tasks, and is not yet reconciled.
+BuildRequest intake(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
     ProjectDefinition definition = sampleDefinition())
 {
     const chain = stores.chains.get(chainId).get.value;
@@ -129,15 +130,6 @@ BuildRequest recordRequest(StateStores stores, string chainId, string id, string
     request.requestedBy = "jason";
     request.requestedAt = requestedAt;
     return stores.requests.create(request).value;
-}
-
-/// Records request `id` and creates its open state.
-BuildRequest intake(StateStores stores, string chainId, string id, string[] targets, string requestedAt,
-    ProjectDefinition definition = sampleDefinition())
-{
-    auto request = recordRequest(stores, chainId, id, targets, requestedAt, definition);
-    stores.requestStates.createFor(request);
-    return request;
 }
 
 /// Request `id` with its definition, read by id.
@@ -176,9 +168,22 @@ Dispatched dispatch(StateStores stores, in NeededExecution needed, string reques
 }
 
 /// Reconciles request `requestId` with the real reconciler and returns its state.
-Versioned!RequestState reconcile(StateStores stores, string requestId)
+Versioned!BuildRequest reconcile(StateStores stores, string requestId)
 {
-    return reconcilerOf(stores).reconcile(requestId).state;
+    return reconcilerOf(stores).reconcile(requestId).request;
+}
+
+/// Commits `evaluation` to request `read`, as the reconciler does: by compare-and-set at the version read.
+Versioned!BuildRequest commitEvaluation(StateStores stores, in Versioned!BuildRequest read, in RequestEvaluation evaluation)
+{
+    return stores.requests.replaceState(read, withEvaluation(read.value, evaluation));
+}
+
+/// Settles request `read` failed with `error`, as the reconciler does: by compare-and-set at the version read.
+Versioned!BuildRequest failEvaluation(StateStores stores, in Versioned!BuildRequest read, in RequestEvaluation evaluation,
+    string error)
+{
+    return stores.requests.replaceState(read, withFailure(read.value, evaluation, error));
 }
 
 /// Ends the active execution of `taskId`'s current fingerprint in chain `chain` with `status`:
@@ -192,7 +197,7 @@ void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionSta
     stores.ledgers.fold(ended);
 }
 
-RequestTaskState taskOf(in RequestState state, string taskId)
+RequestTaskState taskOf(in BuildRequest state, string taskId)
 {
     foreach (ref task; state.tasks)
     {

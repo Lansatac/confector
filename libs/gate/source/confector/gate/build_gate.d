@@ -226,7 +226,7 @@ private final class GateEnvironment
 
     RequestOutcome outcomeOf(string requestId)
     {
-        return stores.requestStates.get(requestId).get.value.outcome;
+        return stores.requests.get(requestId).get.value.outcome;
     }
 
     /// How many executions were ever claimed at `fingerprint`.

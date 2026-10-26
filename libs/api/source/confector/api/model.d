@@ -718,9 +718,9 @@ struct TaskExecutionResult
 
 // The build model (AGENTS.md, "What a build is"). A request joins or creates a chain. Request
 // state is derived from authoritative inputs (the request's pins and definition, the rerun
-// generations, and the fingerprint ledgers and executions for its fingerprints), with a
-// small mutable RequestState document per request holding whether it is open, its cached task
-// states and its outcome. Each type is stored as its own document. Timestamps are ISO 8601 UTC
+// generations, and the fingerprint ledgers and executions for its fingerprints). It is cached on
+// the BuildRequest itself, which holds whether the request is open, its cached task states and its
+// outcome. Each type is stored as its own document. Timestamps are ISO 8601 UTC
 // strings (`SysTime.toISOExtString` of a UTC time). They do not sort as text, because
 // toISOExtString leaves out zero fractional seconds: parse them to compare.
 
@@ -943,9 +943,10 @@ struct TaskDemand
 }
 
 /**
- * Who asked for what. Immutable: written once, after
+ * Who asked for what, and how the request stands. What was asked is immutable: written once, after
  * the input resolver has found or created the chain the request runs on and added to it every pin
- * the request supplies.
+ * the request supplies. The state (`outcome`, `tasks`, `error`) is changed only by reconciling, by
+ * compare-and-set (confector.core.request_state).
  */
 struct BuildRequest
 {
@@ -979,6 +980,15 @@ struct BuildRequest
     /// The identity that made the request: a user, an API token, or the trigger source.
     @asName("requested_by") string requestedBy;
     @asName("requested_at") string requestedAt;
+
+    /// Whether the request is still open or how it settled. Settled is final. Recording a request
+    /// writes it open.
+    RequestOutcome outcome;
+    /// The last evaluation's task states, in topological order; empty until the first evaluation
+    /// commits.
+    @optional RequestTaskState[] tasks;
+    /// failed because a needed execution could not be recorded: why. Empty otherwise.
+    @optional string error;
 }
 
 /**
@@ -1184,7 +1194,7 @@ struct FingerprintLedger
 
 /**
  * A request task's state, as the request evaluator derives it (confector.core.request_evaluator)
- * and RequestState caches it. Only tasks the request covers (its targets and their upstream
+ * and the request caches it. Only tasks the request covers (its targets and their upstream
  * tasks) have one. Not an execution status: it is derived from the request and the fingerprint's
  * ledger.
  */
@@ -1215,8 +1225,8 @@ enum RequestTaskStatus : string
 }
 
 /**
- * One request task's derived state (confector.core.request_evaluator.evaluateRequest), cached in
- * RequestState.
+ * One request task's derived state (confector.core.request_evaluator.evaluateRequest), cached on
+ * the BuildRequest.
  */
 struct RequestTaskState
 {
@@ -1244,31 +1254,11 @@ enum RequestOutcome : string
     /// Every target succeeded.
     succeeded = "succeeded",
     /// Every target settled and some target failed or was cancelled, or a needed execution could
-    /// not be recorded (`RequestState.error`).
+    /// not be recorded (`BuildRequest.error`).
     failed = "failed",
     /// Every target settled, none failed, and some is blocked by an upstream task that failed
     /// or was cancelled.
     blocked = "blocked"
-}
-
-/**
- * The request state (AGENTS.md, "What a build is"): one small mutable document per request, with
- * the request id as its id (confector.core.request_state), written only by compare-and-set. It
- * caches the last evaluation and the request's outcome. It is a projection: the request, its
- * pins, the ledgers and the rerun generations stay authoritative.
- */
-struct RequestState
-{
-    /// The request, which is also the document's id.
-    @asName("request_id") string requestId;
-    @asName("project_id") string projectId;
-    /// Whether the request is still open or how it settled. Settled is final.
-    RequestOutcome outcome;
-    /// The last evaluation's task states, in topological order; empty until the first evaluation
-    /// commits.
-    @optional RequestTaskState[] tasks;
-    /// failed because a needed execution could not be recorded: why. Empty otherwise.
-    @optional string error;
 }
 
 /**
@@ -1667,9 +1657,10 @@ unittest
         "intent": "retry", "trigger": {"type": "manual"},
         "definition_id": "d1", "definition_source": {"location": "confector"},
         "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1"}],
-        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
     }`);
     assert(request.demands == [TaskDemand("internal", "fp1", "b1", 0, 0)], "A demand without a generation or stop_seq saw none");
+    assert(request.outcome == RequestOutcome.open && request.tasks.length == 0 && request.error.length == 0);
     assert(request.intent == BuildIntent.retry && request.trigger.type == TriggerType.manual);
     assert(request.trigger.ruleId.length == 0 && request.trigger.payload.length == 0);
     assert(request.pins.length == 0 && request.bindings.length == 0 && request.targets == ["internal"]);
@@ -1685,7 +1676,7 @@ unittest
         "bindings": [{"task_id": "compile", "input": "src", "ref": {"kind": "branch", "name": "main"}}],
         "definition_id": "d1", "definition_source": {"location": "confector"},
         "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1", "stop_seq": 1}],
-        "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z"
+        "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
     }`);
     assert(pinned.pins.length == 1 && repositoryAt(pinned.pins[0]) == RepositoryAt("game", RepositoryRef(RefKind.branch, "main")));
     assert(pinned.bindings.length == 1 && inputKey(pinned.bindings[0]) == InputKey("compile", "src"));
@@ -1698,7 +1689,7 @@ unittest
     try deserializeJson!BuildRequest(`{
         "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
         "intent": "retry", "trigger": {"type": "manual"},
-        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
     }`);
     catch (Exception) undefinedThrew = true;
     assert(undefinedThrew, "A request without a definition must not deserialize");
@@ -1707,7 +1698,7 @@ unittest
         "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
         "intent": "retry", "trigger": {"type": "manual"},
         "definition_id": "d1", "definition_source": {"location": "confector"},
-        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z"
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
     }`);
     catch (Exception) undemandedThrew = true;
     assert(undemandedThrew, "A request without its demands must not deserialize");
@@ -1845,27 +1836,25 @@ unittest
 
 unittest
 {
-    // A request state round-trips its outcome, cached task states and error
-    RequestState state;
-    state.requestId = "r1";
-    state.projectId = "game";
-    state.outcome = RequestOutcome.failed;
-    state.tasks = [
+    // A request's state round-trips its outcome, cached task states and error with the request
+    BuildRequest request;
+    request.id = "r1";
+    request.projectId = "game";
+    request.outcome = RequestOutcome.failed;
+    request.tasks = [
         RequestTaskState("compile", "fp1", RequestTaskStatus.succeeded, false, "e1"),
         RequestTaskState("test", "fp2", RequestTaskStatus.blocked, true, null, ["compile"]),
     ];
-    state.error = "no address";
-    auto json = serializeToJson(state);
-    assert(json["request_id"].get!string == "r1" && json["outcome"].get!string == "failed" && json["error"].get!string == "no address");
+    request.error = "no address";
+    auto json = serializeToJson(request);
+    assert(json["outcome"].get!string == "failed" && json["error"].get!string == "no address");
     assert(json["tasks"][0]["status"].get!string == "succeeded" && json["tasks"][0]["execution_id"].get!string == "e1");
     assert(json["tasks"][1]["blocked_by"][0].get!string == "compile" && json["tasks"][1]["target"].get!bool);
-    assert(roundTrip(state) == state);
+    assert(roundTrip(request) == request);
 
-    // A new request's state is open, with no evaluation
-    auto fresh = deserializeJson!RequestState(`{"request_id": "r2", "project_id": "game", "outcome": "open"}`);
-    assert(fresh.outcome == RequestOutcome.open && fresh.tasks.length == 0 && fresh.error.length == 0);
-    auto waiting = deserializeJson!RequestTaskState(`{"task_id": "t", "fingerprint": "f", "status": "waiting_upstream"}`);
-    assert(waiting.status == RequestTaskStatus.waitingUpstream && !waiting.target && waiting.blockedBy.length == 0);
+    // A task state left out of a document is not a target and blocks nothing
+    auto fresh = deserializeJson!RequestTaskState(`{"task_id": "t", "fingerprint": "f", "status": "waiting_upstream"}`);
+    assert(fresh.status == RequestTaskStatus.waitingUpstream && !fresh.target && fresh.blockedBy.length == 0);
 }
 
 unittest

@@ -1333,9 +1333,11 @@ unittest
 
 unittest
 {
-    // A tick that logged an error answers 500 with its summary. Here an open request whose record
-    // is missing cannot be reconciled, so every tick answers 500 until it is fixed
-    import confector.api.model : BuildRequest, ProjectRecord;
+    // A tick that logged an error answers 500 with its summary. Here an open request whose chain is
+    // gone cannot be reconciled, so every tick answers 500 until it is fixed
+    import confector.api.model : BuildChain, BuildIntent, BuildRequest, DefinitionLocation, DefinitionSource, HeadlineKind, HeadlineRef,
+        ProjectDefinition, ProjectRecord, TaskDemand, TaskNode, TriggerType;
+    import confector.core.build_stores : buildChainsCollection;
     import confector.core.work_orders : defaultMaxAttempts;
     import confector.server.authenticator : FixedAuthenticator, testIdentity;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
@@ -1343,15 +1345,35 @@ unittest
 
     enum workerTokenKey = "0123456789abcdef0123456789abcdef";
     enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
-    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
     ProjectRecord proj;
     proj.id = "proj";
     proj.name = "proj";
     stores.projects.put(proj);
+    BuildChain chain;
+    chain.id = "c1";
+    chain.projectId = "proj";
+    chain.number = 1;
+    chain.headline = HeadlineRef(HeadlineKind.default_);
+    chain.createdAt = "2026-10-20T10:00:00Z";
+    stores.chains.create(chain);
+    TaskNode build;
+    build.id = "build";
     BuildRequest ghost;
     ghost.id = "ghost";
     ghost.projectId = "proj";
-    stores.requestStates.createFor(ghost);
+    ghost.chainId = "c1";
+    ghost.targets = ["build"];
+    ghost.intent = BuildIntent.build;
+    ghost.trigger.type = TriggerType.manual;
+    ghost.definitionId = stores.definitions.put(ProjectDefinition([build]));
+    ghost.definitionSource = DefinitionSource(DefinitionLocation.confector);
+    ghost.demands = [TaskDemand("build", "fp-build", "b-build")];
+    ghost.requestedBy = "admin";
+    ghost.requestedAt = "2026-10-20T10:00:00Z";
+    stores.requests.create(ghost);
+    documents.remove(buildChainsCollection.name, "c1", documents.get(buildChainsCollection.name, "c1").get.version_);
     auto router = apiRouter(new FixedAuthenticator(testIdentity(Role.admin)), "test-scheduler-secret",
         workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
 

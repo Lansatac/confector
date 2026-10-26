@@ -37,9 +37,11 @@ import std.typecons : Nullable;
 enum CollectionSpec buildChainsCollection = CollectionSpec("build_chains",
     [IndexSpec("by_project", "project_id", "number_key"), IndexSpec("by_headline", "headline_key", "number_key")]);
 
-/// Build requests, by request id; indexed by chain and by project, in request order.
+/// Build requests, by request id; indexed by chain and by project, in request order, and by project
+/// while open (sparse: a settled request is in no index named "open").
 enum CollectionSpec buildRequestsCollection = CollectionSpec("build_requests",
-    [IndexSpec("by_chain", "chain_id", "requested_key"), IndexSpec("by_project", "project_id", "requested_key")]);
+    [IndexSpec("by_chain", "chain_id", "requested_key"), IndexSpec("by_project", "project_id", "requested_key"),
+     IndexSpec("open", "open_project", "requested_key")]);
 
 /// Finished task executions, by execution id; indexed by fingerprint and by project and task, each
 /// in creation order.
@@ -318,10 +320,12 @@ void validateHeadline(in HeadlineRef headline, lazy string owner)
 }
 
 /**
- * Build requests. Immutable: written once, never replaced or removed. A request is recorded only
- * once its chain and definition are stored and the chain holds every pin the request supplies,
- * so a crash between those writes and the request's never leaves a request whose pins or
- * definition are lost.
+ * Build requests. What a request asks for is written once, when it is recorded, and never changes.
+ * Its state (`outcome`, `tasks`, `error`) is the only thing that changes, by `replaceState`, and
+ * only while the request is open. A request is recorded only once its chain and definition are
+ * stored and the chain holds every pin the request supplies, so a crash between those writes and
+ * the request's never leaves a request whose pins or definition are lost. Recording it is one
+ * write, open, so no crash can leave a request without its state.
  */
 final class BuildRequestStore
 {
@@ -337,10 +341,18 @@ final class BuildRequestStore
         {
             throw new Exception("BuildRequestStore requires the chain store and the definition store");
         }
-        m_requests = new DocumentCollection!BuildRequest(store, buildRequestsCollection, ["requested_key"],
-            (in BuildRequest request) => ["requested_key": sortableTimestamp(request.requestedAt)]);
+        m_requests = new DocumentCollection!BuildRequest(store, buildRequestsCollection, ["requested_key", "open_project"],
+            &derivedFields);
         m_chains = chains;
         m_definitions = definitions;
+    }
+
+    /// The derived fields of a request: its request time, for ordering, and its project while open.
+    private static string[string] derivedFields(in BuildRequest request)
+    {
+        string[string] fields = ["requested_key": sortableTimestamp(request.requestedAt)];
+        if (request.outcome == RequestOutcome.open) fields["open_project"] = request.projectId;
+        return fields;
     }
 
     /// Reads a request by id. Null if it does not exist.
@@ -350,22 +362,26 @@ final class BuildRequestStore
     }
 
     /**
-     * Records `request`, after checking it against its chain and its definition, both read by id.
-     * Its pins must be exactly the (repository, ref) pairs its bindings use, each agreeing with
-     * the chain's pin of that ref, and the chain must already hold them all.
+     * Records `request` open, with no tasks, after checking it against its chain and its
+     * definition, both read by id. Its pins must be exactly the (repository, ref) pairs its
+     * bindings use, each agreeing with the chain's pin of that ref, and the chain must already hold
+     * them all.
      *
      * Throws: DocumentConflictException if a request with its id exists;
-     * InvalidStateTransitionException if it is incomplete or malformed (see `validateRequest`),
-     * its chain does not exist or belongs to another project, its definition is not stored, a
-     * target is not a task of its definition, its bindings leave a repository input of its targets
-     * or their upstream tasks unbound or bind an input outside them, its pins do not cover exactly
-     * the refs its bindings use, its chain lacks one of its pins or pins that ref to another
-     * revision, or its demands are not for exactly its targets and their upstream tasks;
+     * InvalidStateTransitionException if it is incomplete or malformed (see `validateRequest`), it
+     * is not open or has tasks or an error, its chain does not exist or belongs to another project,
+     * its definition is not stored, a target is not a task of its definition, its bindings leave a
+     * repository input of its targets or their upstream tasks unbound or bind an input outside them,
+     * its pins do not cover exactly the refs its bindings use, its chain lacks one of its pins or
+     * pins that ref to another revision, or its demands are not for exactly its targets and their
+     * upstream tasks;
      * InvalidPinsException if its pins or bindings are not a well-formed list.
      */
     Versioned!BuildRequest create(BuildRequest request)
     {
         validateRequest(request);
+        requireValid(request.outcome == RequestOutcome.open && request.tasks.length == 0 && request.error.length == 0,
+            format("Request '%s' is recorded open, with no tasks and no error", request.id));
 
         auto chain = m_chains.get(request.chainId);
         requireValid(!chain.isNull, format("Request '%s' names chain '%s', which does not exist", request.id, request.chainId));
@@ -467,6 +483,39 @@ final class BuildRequestStore
         return m_requests.create(request.id, request);
     }
 
+    /**
+     * Writes the state `next` of the request `read` was read as, by compare-and-set at the version
+     * read. Every recorded field of `next` must equal `read`'s: only the state may change. A
+     * settled request never changes, and nothing is written when `next` is what was read.
+     *
+     * Throws: DocumentConflictException if the request changed since `read`: read it again and
+     * evaluate again; InvalidStateTransitionException if a recorded field differs, the request is
+     * settled and `next` changes it, or `next`'s state is malformed (see `validateRequestState`).
+     */
+    Versioned!BuildRequest replaceState(in Versioned!BuildRequest read, BuildRequest next)
+    {
+        BuildRequest current = cast(BuildRequest) read.value;
+        requireValid(withoutState(next) == withoutState(current), format(
+            "Request '%s' cannot change what was asked of it: only its state (outcome, tasks, error) may be written", current.id));
+        validateRequestState(next);
+        if (next == current) return cast(Versioned!BuildRequest) read;
+        requireValid(current.outcome == RequestOutcome.open, format(
+            "Request '%s' is settled (%s), and a settled request never changes", current.id, current.outcome));
+        return m_requests.replace(current.id, next, read.version_);
+    }
+
+    /// Lists the open requests of project `projectId`, oldest first, at most `pageSize` of them.
+    /// Discovery: may lag behind writes, so a request it misses is found by a later look.
+    BuildRequest[] listOpen(string projectId)
+    {
+        requireValid(projectId.length > 0, "Open requests are listed for a project");
+        IndexQuery lookup;
+        lookup.index = "open";
+        lookup.partitionKey = projectId;
+        lookup.limit = pageSize;
+        return values(m_requests.queryAll(lookup, pageSize));
+    }
+
     /// Lists chain `chainId`'s requests, oldest first. Discovery: may lag behind writes, which a
     /// level-triggered evaluation tolerates (a request not yet listed is seen next time).
     BuildRequest[] listForChain(string chainId)
@@ -488,6 +537,40 @@ final class BuildRequestStore
         lookup.limit = pageSize;
         return values(m_requests.queryAll(lookup, limit));
     }
+}
+
+/**
+ * `request` with its state reset to a new request's, so two versions of one request compare equal
+ * exactly when their recorded fields do.
+ */
+private BuildRequest withoutState(in BuildRequest request)
+{
+    BuildRequest recorded = cast(BuildRequest) request;
+    recorded.outcome = RequestOutcome.open;
+    recorded.tasks = null;
+    recorded.error = null;
+    return recorded;
+}
+
+/**
+ * Throws InvalidStateTransitionException unless `request`'s state is well formed: cached tasks that
+ * appear once, with a fingerprint and blocking tasks exactly when blocked; and an error only on a
+ * failed request.
+ */
+void validateRequestState(in BuildRequest request)
+{
+    bool[string] seen;
+    foreach (ref task; request.tasks)
+    {
+        requireValid(task.taskId.length > 0 && task.fingerprint.length > 0,
+            format("A task state of request '%s' needs a task id and a fingerprint", request.id));
+        requireValid(task.taskId !in seen, format("The state of request '%s' has task '%s' twice", request.id, task.taskId));
+        seen[task.taskId] = true;
+        requireValid((task.status == RequestTaskStatus.blocked) == (task.blockedBy.length > 0), format(
+            "Task '%s' of request '%s' is %s and names %s blocking tasks", task.taskId, request.id, task.status, task.blockedBy.length));
+    }
+    requireValid(request.error.length == 0 || request.outcome == RequestOutcome.failed,
+        format("Request '%s' is %s but records an error", request.id, request.outcome));
 }
 
 /**
@@ -1424,6 +1507,114 @@ unittest
 
     assert(throwsA!Exception({ new BuildRequestStore(documents, null, definitions); }));
     assert(throwsA!Exception({ new BuildRequestStore(documents, chains, null); }));
+}
+
+unittest
+{
+    // Recording a request is one write, and it is open and listed as open at once: its state needs no
+    // write of its own
+    import confector.testing.memory_document_store : InterleavingDocumentStore;
+
+    auto documents = new InMemoryDocumentStore();
+    auto chains = new ChainStore(documents);
+    auto definitions = new DefinitionStore(documents);
+    chains.create(sampleChain("game", 1));
+    const definitionId = definitions.put(sampleDefinition());
+    auto interleaving = new InterleavingDocumentStore(documents);
+    auto requests = new BuildRequestStore(interleaving, chains, definitions);
+
+    size_t writes;
+    void countWrites()
+    {
+        interleaving.beforeNextWrite = () { writes += 1; countWrites(); };
+    }
+    countWrites();
+    auto created = requests.create(sampleRequest("r1", "game-1", definitionId));
+    assert(writes == 1, "Recording a request is one write");
+    assert(created.outcome == RequestOutcome.open && created.tasks.length == 0 && created.error.length == 0);
+    assert(requests.listOpen("game") == [created.value], "A recorded request is open at once");
+
+    // A request is recorded open, with no tasks and no error
+    auto settledAtBirth = sampleRequest("r2", "game-1", definitionId);
+    settledAtBirth.outcome = RequestOutcome.failed;
+    assert(throwsA!InvalidStateTransitionException({ requests.create(settledAtBirth); }));
+    auto tasked = sampleRequest("r3", "game-1", definitionId);
+    tasked.tasks = [RequestTaskState("compile", "fp-compile", RequestTaskStatus.queued)];
+    assert(throwsA!InvalidStateTransitionException({ requests.create(tasked); }));
+}
+
+unittest
+{
+    // Only the state of a request changes, by compare-and-set at the version read: a write that
+    // changes what was asked is refused, a stale read loses, and a settled request leaves the open
+    // index and never changes again
+    auto documents = new InMemoryDocumentStore();
+    auto chains = new ChainStore(documents);
+    auto definitions = new DefinitionStore(documents);
+    auto requests = new BuildRequestStore(documents, chains, definitions);
+    chains.create(sampleChain("game", 1));
+    const definitionId = definitions.put(sampleDefinition());
+    requests.create(sampleRequest("r1", "game-1", definitionId));
+
+    auto read = requests.get("r1").get;
+    auto retargeted = read.value;
+    retargeted.targets = ["lint"];
+    assert(throwsA!InvalidStateTransitionException({ requests.replaceState(read, retargeted); }),
+        "A recorded field cannot change");
+    auto retimed = read.value;
+    retimed.requestedAt = "2026-10-15T15:00:00Z";
+    assert(throwsA!InvalidStateTransitionException({ requests.replaceState(read, retimed); }),
+        "A recorded field cannot change, even with a state write");
+
+    auto queued = read.value;
+    queued.tasks = [RequestTaskState("compile", "fp-compile", RequestTaskStatus.queued)];
+    auto written = requests.replaceState(read, queued);
+    assert(written.version_ == read.version_ + 1 && written.tasks.length == 1);
+    assert(throwsA!DocumentConflictException({ requests.replaceState(read, queued); }), "A stale read loses");
+    assert(requests.replaceState(written, written.value).version_ == written.version_, "An unchanged state writes nothing");
+
+    auto errored = written.value;
+    errored.error = "no address";
+    assert(throwsA!InvalidStateTransitionException({ requests.replaceState(written, errored); }),
+        "An error on a request that did not fail is refused");
+
+    auto settled = written.value;
+    settled.outcome = RequestOutcome.failed;
+    settled.error = "no address";
+    auto failed = requests.replaceState(written, settled);
+    assert(requests.listOpen("game").length == 0, "A settled request leaves the open index");
+    assert(requests.get("r1").get.value == settled);
+
+    auto reopened = failed.value;
+    reopened.outcome = RequestOutcome.open;
+    reopened.error = null;
+    assert(throwsA!InvalidStateTransitionException({ requests.replaceState(failed, reopened); }), "Settled is final");
+    assert(requests.listOpen("game").length == 0);
+}
+
+unittest
+{
+    // Malformed request states are refused: tasks twice, blocking tasks that disagree with the status,
+    // a task without a fingerprint, and an error on a request that did not fail
+    BuildRequest state;
+    state.id = "r1";
+    state.projectId = "game";
+    validateRequestState(state);
+
+    auto twice = state;
+    twice.tasks = [RequestTaskState("compile", "fp1", RequestTaskStatus.queued), RequestTaskState("compile", "fp1", RequestTaskStatus.queued)];
+    assert(throwsA!InvalidStateTransitionException({ validateRequestState(twice); }));
+    auto blocked = state;
+    blocked.tasks = [RequestTaskState("test", "fp2", RequestTaskStatus.blocked)];
+    assert(throwsA!InvalidStateTransitionException({ validateRequestState(blocked); }));
+    auto unfingerprinted = state;
+    unfingerprinted.tasks = [RequestTaskState("test", "", RequestTaskStatus.queued)];
+    assert(throwsA!InvalidStateTransitionException({ validateRequestState(unfingerprinted); }));
+    auto errored = state;
+    errored.error = "why";
+    assert(throwsA!InvalidStateTransitionException({ validateRequestState(errored); }));
+    errored.outcome = RequestOutcome.failed;
+    validateRequestState(errored);
 }
 
 unittest

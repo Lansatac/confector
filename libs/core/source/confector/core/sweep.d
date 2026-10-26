@@ -18,7 +18,7 @@ module confector.core.sweep;
  * failure to list what a step works on; the other step still runs.
  */
 
-import confector.api.model : FingerprintLedger, ProjectRecord, RequestState;
+import confector.api.model : FingerprintLedger, ProjectRecord;
 import confector.core.document_collection : Page;
 import confector.core.request_reconciler : reconcileOpenRequests;
 import confector.core.state_stores : StateStores;
@@ -117,7 +117,8 @@ private void reconcileEveryProject(StateStores stores, string now, ref SweepSumm
 
 version (unittest)
 {
-    import confector.api.model : ActiveExecution, BuildRequest, ExecutionStatus, RequestOutcome, RequestTaskStatus, TaskExecutionResult;
+    import confector.api.model : ActiveExecution, ExecutionStatus, RequestOutcome, RequestTaskStatus, TaskExecutionResult;
+    import confector.core.build_stores : buildChainsCollection;
     import confector.core.fingerprint_ledger : endedExecution;
     import std.datetime.systime : SysTime;
     import confector.api.document_store : DocumentStore;
@@ -188,7 +189,7 @@ unittest
     assert(summary.errors == 0 && summary.requestsReconciled == 1);
     auto ledger = stores.ledgers.get(fingerprint).get;
     assert(ledger.active.isNull && ledger.lastSuccessExecutionId == id);
-    auto state = stores.requestStates.get("ra").get.value;
+    auto state = stores.requests.get("ra").get.value;
     assert(state.outcome == RequestOutcome.succeeded && taskOf(state, "compile").status == RequestTaskStatus.succeeded);
 }
 
@@ -206,11 +207,11 @@ unittest
     // The writes of the completion: 1 the execution's record, 2 the fold, 3 the reconcile's commit
     beforeWrite(interleaving, 3, () { throw new Exception("The wake's write is lost"); });
     assert(completeExecution(racing, fingerprint, id, succeededFirstAttempt(), fixedNow()).status == ExecutionStatus.succeeded);
-    assert(stores.requestStates.get("ra").get.outcome == RequestOutcome.open, "The lost wake leaves the request open");
+    assert(stores.requests.get("ra").get.outcome == RequestOutcome.open, "The lost wake leaves the request open");
 
     auto summary = sweepCoordination(stores, 3, fixedNow());
     assert(summary.errors == 0 && summary.requestsReconciled == 1);
-    auto state = stores.requestStates.get("ra").get.value;
+    auto state = stores.requests.get("ra").get.value;
     assert(state.outcome == RequestOutcome.succeeded && taskOf(state, "compile").status == RequestTaskStatus.succeeded);
 }
 
@@ -227,13 +228,13 @@ unittest
     assert(requeued.leasesRequeued == 1 && requeued.leasesFailed == 0 && requeued.errors == 0);
     auto queued = activeAt(stores, fingerprint);
     assert(queued.status == ExecutionStatus.queued && queued.expiredLeases == 1);
-    assert(stores.requestStates.get("ra").get.outcome == RequestOutcome.open);
+    assert(stores.requests.get("ra").get.outcome == RequestOutcome.open);
 
     assert(!claimWork(stores, "w2", 1.minutes, later(2.minutes)).isNull);
     auto failed = sweepCoordination(stores, 2, later(4.minutes));
     assert(failed.leasesRequeued == 0 && failed.leasesFailed == 1 && failed.errors == 0);
     assert(stores.executions.get(id).get.status == ExecutionStatus.failed && stores.ledgers.get(fingerprint).get.active.isNull);
-    auto state = stores.requestStates.get("ra").get.value;
+    auto state = stores.requests.get("ra").get.value;
     assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
     assert(stores.executions.get(id).get.errorMessage.canFind("lease lost 2 times"));
 
@@ -252,7 +253,7 @@ unittest
     // The first tick sees the execution running, which changes the request's cached state once
     auto first = sweepCoordination(stores, 1, later(30.seconds));
     assert(first.leasesRequeued == 0 && first.leasesFailed == 0 && first.errors == 0 && first.requestsReconciled == 1);
-    const version_ = stores.requestStates.get("ra").get.version_;
+    const version_ = stores.requests.get("ra").get.version_;
 
     foreach (tick; 0 .. 2)
     {
@@ -262,21 +263,21 @@ unittest
         auto held = activeAt(stores, fingerprint);
         assert(held.status == ExecutionStatus.running && held.attempt == 1 && held.worker == "w1");
         assert(held.leaseExpiresAt == before.leaseExpiresAt);
-        assert(stores.requestStates.get("ra").get.version_ == version_, "An unchanged request is not written");
+        assert(stores.requests.get("ra").get.version_ == version_, "An unchanged request is not written");
     }
 }
 
 unittest
 {
-    // A request that cannot be reconciled is logged and counted, and the tick still reconciles the
-    // other open requests
-    auto stores = projectStores(new InMemoryDocumentStore());
+    // A request whose chain is gone cannot be reconciled: it is logged and counted, and the tick still
+    // reconciles the other open requests
+    auto documents = new InMemoryDocumentStore();
+    auto stores = projectStores(documents);
     createChain(stores, "a");
     intake(stores, "a", "ra", ["compile"], "2026-10-20T10:00:00Z");
-    BuildRequest ghost;
-    ghost.id = "ghost";
-    ghost.projectId = "game";
-    stores.requestStates.createFor(ghost);
+    createChain(stores, "b");
+    intake(stores, "b", "rb", ["compile"], "2026-10-20T10:00:01Z");
+    documents.remove(buildChainsCollection.name, "b", documents.get(buildChainsCollection.name, "b").get.version_);
 
     auto summary = sweepCoordination(stores, 3, fixedNow());
     assert(summary.errors == 1 && summary.requestsReconciled == 1);

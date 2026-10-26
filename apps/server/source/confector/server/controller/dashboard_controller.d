@@ -1890,7 +1890,7 @@ unittest
 
     // A build recorded but not reconciled redirects with a warning, not an error that invites a repeat
     const before = stores.requests.listForProject("game", 100).length;
-    beforeWrite(documents, 3, () { throw new Exception("store unavailable"); });
+    beforeWrite(documents, 2, () { throw new Exception("store unavailable"); });
     auto pending = ask(HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"], ["chain_number", "1"]]);
     assert(pending.status == HTTPStatus.found && pending.body.canFind("build=1&warning=1"), pending.body);
     assert(stores.requests.listForProject("game", 100).length == before + 1);

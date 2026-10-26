@@ -627,7 +627,6 @@ final class RequestIntake
         recorded.requestedBy = request.requestedBy;
         recorded.requestedAt = m_now();
         m_stores.requests.create(recorded);
-        m_stores.requestStates.createFor(recorded);
 
         const result = IntakeResult(recorded.id, chain.id, chain.number, created);
         try m_reconciler.reconcile(recorded.id);
@@ -840,7 +839,7 @@ unittest
     assert(!w.stores.definitions.get(request.definitionId).isNull);
     assert(request.demands.length == 2);
 
-    auto state = w.stores.requestStates.get(result.requestId).get.value;
+    auto state = w.stores.requests.get(result.requestId).get.value;
     assert(state.outcome == RequestOutcome.open && state.tasks.length == 2, "The request was reconciled");
     const compile = w.stores.ledgers.get(demandOf(request, "compile").fingerprint);
     assert(!compile.isNull && !compile.get.active.isNull, "An execution is claimed for the needed fingerprint");
@@ -1156,11 +1155,14 @@ unittest
 
     auto w = world();
     w.intake.intake(build(["test"]));
-    beforeWrite(w.documents, 3, () { throw new Exception("store unavailable"); });
+    // The next write after the request is recorded is its reconcile's commit (joining an execution
+    // that is already active writes nothing)
+    beforeWrite(w.documents, 2, () { throw new Exception("store unavailable"); });
     auto failure = refusedBy({ w.intake.intake(build(["test"], 1)); });
     assert(failure.failure == IntakeFailure.reconcileFailed && failure.msg.canFind("store unavailable"), failure.msg);
     assert(failure.recorded.chainNumber == 1 && !w.stores.requests.get(failure.recorded.requestId).isNull);
-    assert(!w.stores.requestStates.get(failure.recorded.requestId).isNull);
+    assert(w.stores.requests.get(failure.recorded.requestId).get.outcome == RequestOutcome.open, "The request stays open");
+    assert(w.stores.requests.listOpen("game").canFind!(r => r.id == failure.recorded.requestId), "and it is still in the open index");
 }
 
 unittest
