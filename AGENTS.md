@@ -313,9 +313,9 @@ subscriptions.
   as an attempt, up to an admin-configured limit. A task that fails is retried only when a user
   asks.
 - **A request that can never progress fails** with the error recorded, rather than being retried
-  on every sweep: a task that cannot be dispatched, a missing definition, or an evaluation that
-  fails on what the request recorded. A transient store error leaves it open for the sweep. The
-  user fixes the cause and retries.
+  on every sweep: a task that cannot be dispatched, a missing definition, an evaluation that
+  fails on what the request recorded, or its project being deleted. A transient store error
+  leaves it open for the sweep. The user fixes the cause and retries.
 - **A periodic sweep provides liveness.** It expires lost leases and re-evaluates open requests,
   so any lost step is eventually redone. Scheduler calls may be duplicated or missed; the sweep is
   idempotent.
