@@ -16,20 +16,26 @@ import confector.api.model;
 import confector.api.scheduler : schedulerSecretHeader;
 import confector.core.intake : RequestIntake;
 import confector.core.state_stores : StateStores;
-import confector.core.work_orders : defaultMaxAttempts;
+import confector.core.work_orders : ClaimedWork, LeaseAnswer, defaultMaxAttempts;
 import confector.core.worker_pool_credential : workerPoolCredentialHeader;
 import confector.core.worker_token : workerTokenHeader;
+import confector.runner_core.steps.step : StepContext, StepResult, StepRunner;
+import confector.runner_core.worker : CompletionReport, HttpWorkerClient, HttpWorkerConfig, HttpWorkerDaemon;
 import confector.server.authenticator : Authenticator, Identity;
 import confector.server.controller.api_controller : apiRouter;
 import confector.server.route_access : AuthorizedRoutes;
 import confector.testing.fake_repository_resolver : FakeRepositoryResolver;
 import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+import confector.testing.threads : freePort, loopbackServerSettings, runOffThread;
 
-import std.algorithm.searching : canFind;
+import std.algorithm.searching : canFind, endsWith;
 import std.datetime.systime : SysTime;
+import std.file : exists, rmdirRecurse;
 import std.format : format;
 import std.typecons : Nullable;
-import core.time : Duration, seconds;
+import core.atomic : atomicLoad, atomicOp;
+import core.sync.semaphore : Semaphore;
+import core.time : Duration, minutes, seconds;
 
 import vibe.vibe;
 
@@ -132,6 +138,12 @@ private final class GateEnvironment
 
         m_routes = apiRouter(new MemberAuthenticator(), schedulerSecret, workerTokenKey, poolCredential,
             defaultMaxAttempts, stores, new RequestIntake(stores, resolver, &clock.now), &clock.now);
+    }
+
+    /// The control plane's routes, for a scenario that serves them over a real socket.
+    AuthorizedRoutes routes()
+    {
+        return m_routes;
     }
 
     static TaskNode compileTask()
@@ -453,6 +465,199 @@ private void lostWorkerIsRetriedThenFails(FreshStore fresh)
     assert(env.receive("worker-d", 30).isNull, "A failed execution is not handed out again");
 }
 
+/// A step runner for the runner scenarios. When `awaitHeartbeat` is set, each step holds its
+/// execution until a heartbeat has been answered, so the worker's heartbeat runs while it is held.
+private final class HeartbeatStepRunner : StepRunner
+{
+    private Semaphore m_heartbeat;
+    shared size_t heartbeats;
+    size_t stepsRun;
+    bool awaitHeartbeat = true;
+
+    this()
+    {
+        m_heartbeat = new Semaphore();
+    }
+
+    /// Called on the control plane's side each time it answers a heartbeat.
+    void heartbeatAnswered()
+    {
+        atomicOp!"+="(heartbeats, 1);
+        m_heartbeat.notify();
+    }
+
+    StepResult run(in BuildStep step, ref StepContext context)
+    {
+        ++stepsRun;
+        StepResult result;
+        if (awaitHeartbeat && !m_heartbeat.wait(30.seconds))
+        {
+            result.success = false;
+            result.exitCode = 1;
+            result.errorMessage = "No heartbeat reached the control plane";
+        }
+        return result;
+    }
+}
+
+/// The workspace the runner scenarios use, cleared before and after each one.
+private enum runnerWorkspace = "test_gate_runner";
+
+/// A runner that serves `workerId` against the control plane on `port`, in the runner workspace.
+private HttpWorkerConfig runnerConfig(ushort port, string workerId)
+{
+    HttpWorkerConfig config;
+    config.serverUrl = format("http://127.0.0.1:%d", port);
+    config.workerId = workerId;
+    config.workspaceDir = runnerWorkspace;
+    config.maxTasksToProcess = 1;
+    config.pollIntervalSeconds = 1;
+    config.heartbeatIntervalSeconds = 1;
+    config.workerPoolCredential = poolCredential;
+    return config;
+}
+
+/// The name a control-plane request is counted under: its route ("heartbeat", "release", "complete",
+/// "queue/receive"), or its whole path for any other request.
+private string routeOf(string path)
+{
+    foreach (route; ["heartbeat", "release", "complete", "queue/receive"])
+    {
+        if (path.endsWith("/" ~ route)) return route;
+    }
+    return path;
+}
+
+/// The control plane's traffic, as the scenarios count it.
+private final class ControlPlaneCounts
+{
+    /// Requests by route ("heartbeat", "complete", ...).
+    int[string] calls;
+    /// Answers by route and status (for example "complete 409").
+    int[string] answers;
+}
+
+/// Serves the control plane's routes on `port`, as a worker reaches them over HTTP, counting each
+/// request into `counts`. Each heartbeat answer is passed to `steps`.
+private HTTPListener serveControlPlane(GateEnvironment env, ushort port, HeartbeatStepRunner steps, ControlPlaneCounts counts)
+{
+    return listenHTTP(loopbackServerSettings(port), (HTTPServerRequest req, HTTPServerResponse res) {
+        env.routes.handleRequest(req, res);
+        const route = routeOf(req.path);
+        counts.calls[route] += 1;
+        counts.answers[format("%s %s", route, res.statusCode)] += 1;
+        if (route == "heartbeat") steps.heartbeatAnswered();
+    });
+}
+
+/// A build requested through the API is received by a runner over HTTP, run, heartbeated and
+/// completed, and its request settles succeeded.
+private void runnerRunsBuildOverHttp()
+{
+    auto env = new GateEnvironment(new InMemoryDocumentStore());
+    const requestId = requestIdOf(env.build(`{"project_id": "game", "targets": ["compile"]}`));
+    const fingerprint = env.fingerprintOf(requestId, "compile");
+
+    const port = freePort();
+    auto steps = new HeartbeatStepRunner();
+    auto counts = new ControlPlaneCounts();
+    auto listener = serveControlPlane(env, port, steps, counts);
+    scope(exit) listener.stopListening();
+
+    if (exists(runnerWorkspace)) rmdirRecurse(runnerWorkspace);
+    scope(exit) if (exists(runnerWorkspace)) rmdirRecurse(runnerWorkspace);
+
+    auto runner = new HttpWorkerDaemon(runnerConfig(port, "gate-runner"), steps);
+    runOffThread({ runner.run(); }, { runner.requestStop(); });
+
+    assert(runner.tasksProcessed == 1 && steps.stepsRun == 1, "The runner ran the one task it was given");
+    assert(atomicLoad(steps.heartbeats) > 0, "A heartbeat reached the control plane while the task ran");
+    assert(counts.answers.get("complete 200", 0) == 1, "The completion was recorded");
+    assert(env.outcomeOf(requestId) == RequestOutcome.succeeded, "The request settles succeeded");
+    const execution = env.onlyExecutionAt(fingerprint);
+    assert(execution.status == ExecutionStatus.succeeded, format("The execution ended %s", execution.status));
+    assert(execution.attempts == 1 && execution.worker == "gate-runner", "The execution records the runner's one attempt");
+}
+
+/// A worker whose attempt was superseded while it ran: its heartbeat is answered superseded, so it
+/// neither reports its result nor gives the execution back. The attempt holding it now is untouched.
+private void supersededWorkerReportsNothing()
+{
+    auto env = new GateEnvironment(new InMemoryDocumentStore());
+    const requestId = requestIdOf(env.build(`{"project_id": "game", "targets": ["compile"]}`));
+    const fingerprint = env.fingerprintOf(requestId, "compile");
+    auto first = env.receive("gate-runner", 60);
+    assert(!first.isNull && first.get.attempt == 1, "The first worker is given attempt 1");
+    env.clock.advance(2.minutes);
+    assert(env.sweep()["leasesRequeued"].get!long == 1, "The lease ran out and the execution was requeued");
+    auto second = env.receive("gate-other", 60);
+    assert(!second.isNull && second.get.attempt == 2, "Another worker is given attempt 2");
+
+    const port = freePort();
+    auto steps = new HeartbeatStepRunner();
+    auto counts = new ControlPlaneCounts();
+    auto listener = serveControlPlane(env, port, steps, counts);
+    scope(exit) listener.stopListening();
+
+    if (exists(runnerWorkspace)) rmdirRecurse(runnerWorkspace);
+    scope(exit) if (exists(runnerWorkspace)) rmdirRecurse(runnerWorkspace);
+
+    auto runner = new HttpWorkerDaemon(runnerConfig(port, "gate-runner"), steps);
+    runOffThread({
+        runner.initialize();
+        runner.processOneMessage(ClaimedWork(deserializeJson!WorkOrder(first.get.workOrder), 1));
+    });
+
+    assert(steps.stepsRun == 1 && atomicLoad(steps.heartbeats) > 0, "The task ran until its heartbeat was answered");
+    assert(counts.answers.get("heartbeat 200", 0) > 0, "The heartbeat was answered");
+    assert(counts.calls.get("complete", 0) == 0, "A superseded worker reports no completion");
+    assert(counts.calls.get("release", 0) == 0, "A superseded worker gives nothing back");
+
+    // The worker's own heartbeat for attempt 1 is answered superseded
+    LeaseAnswer answer;
+    runOffThread({ answer = runner.client.heartbeat(first.get.executionId, 1, 60, first.get.token); });
+    assert(answer == LeaseAnswer.superseded, format("A superseded heartbeat was answered %s", answer));
+
+    const holder = env.onlyExecutionAt(fingerprint);
+    assert(holder.status == ExecutionStatus.running && holder.attempts == 2 && holder.worker == "gate-other",
+        "The attempt that holds the execution is untouched");
+    assert(env.outcomeOf(requestId) == RequestOutcome.open, "The request still waits for the attempt holding it");
+}
+
+/// A completion the server already recorded is sent again: the server answers 409, and the worker
+/// takes the rejection as final. With nothing queued, asking for work is answered 204.
+private void repeatedCompletionIsRejected()
+{
+    auto env = new GateEnvironment(new InMemoryDocumentStore());
+    const requestId = requestIdOf(env.build(`{"project_id": "game", "targets": ["compile"]}`));
+    auto held = env.receive("gate-runner", 60);
+    assert(!held.isNull, "The worker is given the execution");
+    env.complete(held.get, ExecutionStatus.succeeded);
+
+    const port = freePort();
+    auto steps = new HeartbeatStepRunner();
+    auto counts = new ControlPlaneCounts();
+    auto listener = serveControlPlane(env, port, steps, counts);
+    scope(exit) listener.stopListening();
+
+    auto client = new HttpWorkerClient(format("http://127.0.0.1:%d", port), "gate-runner", poolCredential);
+    TaskExecutionResult result;
+    result.taskId = "compile";
+    result.status = ExecutionStatus.succeeded;
+    result.attempt = held.get.attempt;
+    CompletionReport report;
+    Nullable!ClaimedWork idle;
+    runOffThread({
+        report = client.reportCompletion(held.get.executionId, result, held.get.token);
+        idle = client.receiveWork(60);
+    });
+
+    assert(report == CompletionReport.rejected, format("A repeated completion was %s", report));
+    assert(counts.answers.get("complete 409", 0) == 1, "The server answers a repeated completion 409");
+    assert(idle.isNull && counts.answers.get("queue/receive 204", 0) == 1, "With nothing queued, the receive is answered 204");
+    assert(env.outcomeOf(requestId) == RequestOutcome.succeeded, "The first completion stands");
+}
+
 /// Every scenario, over the store `fresh` makes for each one.
 private void runGate(FreshStore fresh)
 {
@@ -467,6 +672,15 @@ private void runGate(FreshStore fresh)
 unittest
 {
     runGate(() => cast(DocumentStore) new InMemoryDocumentStore());
+}
+
+unittest
+{
+    // The runner scenarios run over the in-memory store only: the MongoDB variant runs runGate, which
+    // involves no worker
+    runnerRunsBuildOverHttp();
+    supersededWorkerReportsNothing();
+    repeatedCompletionIsRejected();
 }
 
 version (ConfectorGateMongo)

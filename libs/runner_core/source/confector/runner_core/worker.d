@@ -91,6 +91,18 @@ void requireUsableLease(in HttpWorkerConfig config)
     }
 }
 
+/// Longest a control-plane request may take to connect, and in all. A server that stops answering
+/// fails the request, so the worker retries or gives the execution back instead of waiting forever.
+enum controlConnectTimeout = 10.seconds;
+enum controlRequestTimeout = 60.seconds;
+
+/// The start of a server's answer, for an error message: a long answer is cut short.
+private string prefixOf(string text) pure nothrow @safe
+{
+    enum shownLength = 200;
+    return text.length > shownLength ? text[0 .. shownLength] ~ "..." : text;
+}
+
 /**
  * HTTP client for worker-to-server control plane protocol.
  * Handles receiving work orders, heartbeats, releasing work, log streaming, and completion reporting.
@@ -156,6 +168,8 @@ class HttpWorkerClient
     {
         string fullUrl = resolveEndpointUrl(endpointPath);
         auto http = HTTP(fullUrl);
+        http.connectTimeout = controlConnectTimeout;
+        http.operationTimeout = controlRequestTimeout;
 
         http.addRequestHeader("Content-Type", "application/json");
         http.addRequestHeader("Accept", "application/json");
@@ -201,20 +215,17 @@ class HttpWorkerClient
 
         http.perform();
 
+        // 204 has no body: it is how the server says no work is queued
+        if (http.statusLine.code == 204) return Json.emptyObject;
         if (http.statusLine.code >= 200 && http.statusLine.code < 300)
         {
-            if (responseData.length > 0)
+            const text = responseData.idup;
+            try return parseJsonString(text);
+            catch (Exception e)
             {
-                try
-                {
-                    return parseJsonString(responseData.idup);
-                }
-                catch (Exception)
-                {
-                    return Json.emptyObject;
-                }
+                throw new Exception(format("Server request to '%s' answered HTTP %d with a body that is not JSON (%s): %s",
+                    fullUrl, http.statusLine.code, e.msg, prefixOf(text)));
             }
-            return Json.emptyObject;
         }
         else
         {
@@ -363,7 +374,7 @@ class HttpWorkerDaemon
     private StepRunner m_steps;
     private TaskExecutor m_executor;
     private HttpArtifactStorage m_storage;
-    private bool m_stopRequested = false;
+    private shared bool m_stopRequested = false;
     private bool m_running = false;
     private size_t m_tasksProcessed = 0;
 
@@ -383,9 +394,10 @@ class HttpWorkerDaemon
     @property size_t tasksProcessed() const pure nothrow @safe { return m_tasksProcessed; }
     @property bool isRunning() const pure nothrow @safe { return m_running; }
 
-    void requestStop() pure nothrow @safe
+    /// Asks the loop in `run` to return after its current iteration. Safe to call from another thread.
+    void requestStop() nothrow @safe
     {
-        m_stopRequested = true;
+        atomicStore(m_stopRequested, true);
     }
 
     void initialize()
@@ -575,7 +587,7 @@ class HttpWorkerDaemon
 
         logInfo("[worker] Remote worker '%s' started, polling server '%s'...", m_client.workerId, m_client.serverUrl);
 
-        while (!m_stopRequested)
+        while (!atomicLoad(m_stopRequested))
         {
             try
             {
@@ -622,6 +634,7 @@ version (unittest)
     }
 
     import vibe.http.server : HTTPServerResponse;
+    import confector.testing.threads : freePort, loopbackServerSettings, runOffThread;
 
     /// Answers a /queue/receive with nothing queued.
     private void answerNoWork(HTTPServerResponse res)
@@ -674,35 +687,6 @@ version (unittest)
     {
         return BuildStep(name, "scripted", Json(["command": Json(command)]));
     }
-
-    /// A TCP port nothing listens on at the moment, for a test server.
-    private ushort freePort()
-    {
-        import std.socket : InternetAddress, Socket, TcpSocket;
-
-        auto probe = new TcpSocket();
-        scope(exit) probe.close();
-        probe.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
-        return (cast(InternetAddress) probe.localAddress).port;
-    }
-
-    /// Runs `work` on a thread of its own while this thread's event loop serves the mock
-    /// control plane, and returns once it is done. Rethrows what `work` threw.
-    private void runOffThread(void delegate() work)
-    {
-        import vibe.core.core : sleep;
-        import core.time : msecs;
-
-        Throwable thrown;
-        auto thread = new Thread({
-            try work();
-            catch (Throwable t) thrown = t;
-        });
-        thread.start();
-        while (thread.isRunning) sleep(10.msecs);
-        thread.join();
-        if (thrown !is null) throw thrown;
-    }
 }
 
 unittest
@@ -714,7 +698,7 @@ unittest
     // thread, so a wrong value fails the test.
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
-    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
 
     string testDir = "test_http_worker_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -828,10 +812,7 @@ unittest
         res.writeJsonBody(["answer": "released"]);
     });
 
-    auto settings = new HTTPServerSettings();
-    settings.port = port;
-    settings.bindAddresses = ["127.0.0.1"];
-    auto listener = listenHTTP(settings, router);
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
@@ -863,7 +844,7 @@ unittest
 
     auto steps = new ScriptedStepRunner();
     auto workerRunner = new HttpWorkerDaemon(config, steps);
-    runOffThread({ workerRunner.run(); });
+    runOffThread({ workerRunner.run(); }, { workerRunner.requestStop(); });
 
     assert(workerRunner.tasksProcessed == 1);
     assert(dequeueCalled);
@@ -967,7 +948,7 @@ unittest
     // reports each execution
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
-    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import confector.runner_core.steps.builtin : BuiltinStepRunner;
 
     string testDir = "test_http_worker_builtin";
@@ -988,11 +969,8 @@ unittest
         res.writeJsonBody(["status": "recorded"]);
     });
 
-    auto settings = new HTTPServerSettings();
     const port = freePort();
-    settings.port = port;
-    settings.bindAddresses = ["127.0.0.1"];
-    auto listener = listenHTTP(settings, router);
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
@@ -1033,7 +1011,7 @@ unittest
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.array : join;
     import vibe.http.router : URLRouter;
-    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
 
     string testDir = "test_http_multistep_suite";
     if (exists(testDir)) rmdirRecurse(testDir);
@@ -1088,11 +1066,8 @@ unittest
         res.writeJsonBody(["status": "recorded"]);
     });
 
-    auto settings = new HTTPServerSettings();
     const port = freePort();
-    settings.port = port;
-    settings.bindAddresses = ["127.0.0.1"];
-    auto listener = listenHTTP(settings, router);
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
@@ -1105,7 +1080,7 @@ unittest
     config.workerPoolCredential = testWorkerPoolCredential;
 
     auto workerRunner = new HttpWorkerDaemon(config, new ScriptedStepRunner());
-    runOffThread({ workerRunner.run(); });
+    runOffThread({ workerRunner.run(); }, { workerRunner.requestStop(); });
 
     assert(workerRunner.tasksProcessed == 2);
     assert(completedExecutions == ["exe_step_1", "exe_step_2"]);
@@ -1134,7 +1109,7 @@ unittest
     // 401 or 403 is an authorization error, not a missing artifact and not a cue to try another route.
     import std.exception : collectException;
     import vibe.http.router : URLRouter;
-    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
 
     const port = freePort();
     const serverUrl = format("http://127.0.0.1:%d", port);
@@ -1178,10 +1153,7 @@ unittest
         res.writeVoidBody();
     });
 
-    auto settings = new HTTPServerSettings();
-    settings.port = port;
-    settings.bindAddresses = ["127.0.0.1"];
-    auto listener = listenHTTP(settings, router);
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
     scope(exit) listener.stopListening();
 
     auto storage = new HttpArtifactStorage(serverUrl);
@@ -1240,7 +1212,7 @@ unittest
     // runner finds nothing queued, and a late completion of the finished execution is refused.
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import vibe.http.router : URLRouter;
-    import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import confector.core.fingerprint_ledger : ClaimOutcome;
     import confector.core.state_stores : StateStores;
     import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution, releaseExecution;
@@ -1298,10 +1270,7 @@ unittest
     });
 
     const port = freePort();
-    auto settings = new HTTPServerSettings();
-    settings.port = port;
-    settings.bindAddresses = ["127.0.0.1"];
-    auto listener = listenHTTP(settings, router);
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
     scope(exit) listener.stopListening();
 
     HttpWorkerConfig config;
@@ -1315,7 +1284,7 @@ unittest
 
     auto steps = new ScriptedStepRunner();
     auto runner = new HttpWorkerDaemon(config, steps);
-    runOffThread({ runner.run(); });
+    runOffThread({ runner.run(); }, { runner.requestStop(); });
 
     assert(runner.tasksProcessed == 1 && steps.stepsRun == 2);
     auto finished = stores.executions.get(claimed.executionId).get;
@@ -1336,4 +1305,65 @@ unittest
     }
     catch (StaleCompletionException e) rejected = true;
     assert(rejected && stores.executions.get(claimed.executionId).get.status == ExecutionStatus.succeeded);
+}
+
+unittest
+{
+    // The mock control plane's listeners never share a port: a port another listener holds fails
+    // the bind, so a worker cannot be answered by a different server. The other listener is a
+    // socket with address reuse, as another process's listener would be. This proves the fix only
+    // on Windows: Linux refuses any second bind on the port regardless of reuse
+    import std.exception : assertThrown;
+    import std.socket : InternetAddress, SocketOption, SocketOptionLevel, TcpSocket;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : listenHTTP;
+
+    const port = freePort();
+    auto other = new TcpSocket();
+    scope(exit) other.close();
+    other.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
+    other.bind(new InternetAddress("127.0.0.1", port));
+    other.listen(1);
+
+    assertThrown(listenHTTP(loopbackServerSettings(port), new URLRouter()));
+}
+
+unittest
+{
+    // A 2xx answer must be JSON. 204 is the only answer without a body, and it is how the server
+    // says no work is queued. Any other body is not the control plane's answer: it fails loudly
+    // rather than reading as no work
+    import std.exception : collectException;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
+
+    const port = freePort();
+    auto router = new URLRouter();
+    router.post("/api/v1/answers/text", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.statusCode = 200;
+        res.writeBody("not json at all");
+    });
+    router.post("/api/v1/answers/empty", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.statusCode = 200;
+        res.writeVoidBody();
+    });
+    router.post("/api/v1/answers/none", (HTTPServerRequest req, HTTPServerResponse res) {
+        answerNoWork(res);
+    });
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
+    scope(exit) listener.stopListening();
+
+    auto client = new HttpWorkerClient(format("http://127.0.0.1:%d", port), "test_answers", testWorkerPoolCredential);
+    string textFailure;
+    string emptyFailure;
+    Json none;
+    runOffThread({
+        textFailure = collectException(client.sendJson("/answers/text")).msg;
+        emptyFailure = collectException(client.sendJson("/answers/empty")).msg;
+        none = client.sendJson("/answers/none");
+    });
+    assert(textFailure.canFind("/api/v1/answers/text") && textFailure.canFind("HTTP 200") && textFailure.canFind("not json at all"),
+        textFailure);
+    assert(emptyFailure.canFind("/api/v1/answers/empty") && emptyFailure.canFind("not JSON"), emptyFailure);
+    assert(none.type == Json.Type.object && none.length == 0, "204 is no work");
 }

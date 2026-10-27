@@ -660,6 +660,29 @@ TaskExecution finishExecution(StateStores stores, string fingerprint, string exe
 }
 
 /**
+ * Fails attempt `attempt` of execution `executionId` at `fingerprint` because no worker could be
+ * given it (its work order could not be signed), recording `errorMessage`. Only the attempt that
+ * holds the execution may fail it, as for a completion: an attempt a later one superseded is
+ * rejected and nothing is recorded, so a stale claim never fails the attempt that holds the
+ * execution now.
+ *
+ * Throws: SupersededAttemptException if the execution is not running attempt `attempt`; as
+ * `finishExecution` otherwise.
+ */
+TaskExecution failClaimedAttempt(StateStores stores, string fingerprint, string executionId, ulong attempt, string errorMessage,
+    string now = null)
+{
+    const active = requireActiveExecution(stores, fingerprint, executionId);
+    if (active.status != ExecutionStatus.running || active.attempt != attempt)
+    {
+        throw new SupersededAttemptException(format(
+            "Execution '%s' is %s at attempt %s; the failure of attempt %s is rejected",
+            executionId, active.status, active.attempt, attempt));
+    }
+    return endExecution(stores, fingerprint, active, ExecutionStatus.failed, 1, errorMessage, null, now.length > 0 ? now : utcNow());
+}
+
+/**
  * Checks that `status`, as a worker reported it, is one a worker can report: a terminal status
  * (succeeded, failed or cancelled), since the worker finished running the execution. Returns it.
  *
@@ -722,7 +745,8 @@ private void requireTerminal(ExecutionStatus status)
 /**
  * What to log when an outcome decided for `seen` (the active execution as the ender read it) is
  * recorded after the ledger's execution moved on: a lost lease requeued it or a newer attempt
- * started it. Empty when it did not. The outcome stands, since the worker did finish the execution.
+ * started it. Empty when it did not. The outcome stands: the attempt that ended the execution decided
+ * it on its own attempt.
  */
 string supersessionNote(in ActiveExecution seen, in Nullable!(Versioned!FingerprintLedger) ledger)
 {
@@ -1788,6 +1812,30 @@ unittest
     const tasklessId = stores.ledgers.claim("fp_taskless", 0, taskless).executionId;
     assert(claimWork(stores, "w2", testLease, fixedNow()).isNull);
     assert(stores.executions.get(tasklessId).get.errorMessage.canFind("'link'"));
+}
+
+unittest
+{
+    // A failure of a worker's claim (its token could not be signed) is fenced by attempt: after the
+    // lease expired and attempt 2 started, attempt 1's failure is rejected and records nothing, so
+    // attempt 2 still holds the execution and its own failure is the one recorded
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    const id = runningExecution(stores);
+    assert(expireLease(stores, "fp1", 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
+    assert(claimWork(stores, "w2", testLease, later(2.minutes)).get.attempt == 2);
+
+    bool rejected = false;
+    try failClaimedAttempt(stores, "fp1", id, 1, "The execution could not be dispatched: stale", later(2.minutes));
+    catch (SupersededAttemptException e) rejected = e.msg.canFind("attempt 1");
+    assert(rejected, "A stale attempt's failure is rejected");
+    auto held = activeAt(stores);
+    assert(held.status == ExecutionStatus.running && held.attempt == 2 && held.worker == "w2", "The current attempt still holds it");
+    assert(stores.executions.get(id).isNull, "The rejected failure records nothing");
+
+    // The attempt holding the execution fails it
+    auto failed = failClaimedAttempt(stores, "fp1", id, 2, "The execution could not be dispatched: current", later(2.minutes));
+    assert(failed.status == ExecutionStatus.failed && failed.attempts == 2 && failed.errorMessage.canFind("current"));
+    assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
 }
 
 unittest

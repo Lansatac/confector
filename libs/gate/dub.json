@@ -20,6 +20,9 @@
 		"confector:document-store-mongo": {
 			"path": "../.."
 		},
+		"confector:runner-core": {
+			"path": "../.."
+		},
 		"vibe-d": "~>0.10.3"
 	},
 	"subConfigurations": {

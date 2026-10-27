@@ -17,8 +17,8 @@ import confector.server.worker_auth : authenticateWorker, authenticateWorkerPool
 import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
 import confector.core.sweep : sweepCoordination;
-import confector.core.work_orders : InvalidLeaseRequestException, LeaseAnswer, UnknownExecutionException, claimWork, completeExecution,
-    finishExecution, heartbeatExecution, leaseOfSeconds, releaseExecution, requireAttemptLimit, utcNow;
+import confector.core.work_orders : InvalidLeaseRequestException, LeaseAnswer, StaleCompletionException, UnknownExecutionException, claimWork,
+    completeExecution, failClaimedAttempt, heartbeatExecution, leaseOfSeconds, releaseExecution, requireAttemptLimit, utcNow;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -258,11 +258,19 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
                 catch (Exception e)
                 {
                     // This execution cannot be run (say, an input without a resolved
-                    // value), and would fail every receive that meets it. Fail it, recording why,
-                    // and hand out the next one.
+                    // value), and would fail every receive that meets it. Fail the attempt that was
+                    // claimed, recording why, and hand out the next one. An attempt that a later one
+                    // superseded no longer holds the execution, so it fails nothing.
                     logError("[api] Failing execution '%s': it cannot be given a worker token: %s", work.workOrder.executionId, e.msg);
-                    finishExecution(stores, work.workOrder.fingerprint, work.workOrder.executionId, ExecutionStatus.failed, 1,
-                        "The execution could not be dispatched: " ~ e.msg, null, clock());
+                    try
+                    {
+                        failClaimedAttempt(stores, work.workOrder.fingerprint, work.workOrder.executionId, work.attempt,
+                            "The execution could not be dispatched: " ~ e.msg, clock());
+                    }
+                    catch (StaleCompletionException superseded)
+                    {
+                        logWarn("[api] Execution '%s' moved on before its failure was recorded: %s", work.workOrder.executionId, superseded.msg);
+                    }
                     continue;
                 }
                 Json answer = Json.emptyObject;

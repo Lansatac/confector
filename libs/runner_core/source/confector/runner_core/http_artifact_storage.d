@@ -6,6 +6,7 @@ import std.json : JSONType, parseJSON;
 import std.net.curl : HTTP;
 import std.array : Appender;
 import std.format : format;
+import core.time : seconds;
 import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
 
 /**
@@ -60,6 +61,11 @@ class HttpArtifactStorage : ArtifactStorage
         this.m_serverUrl = url;
     }
 
+    /// Artifacts can be large, so transfers have no total time limit: a transfer fails when it
+    /// stops moving for `artifactInactivityTimeout`, and a connection fails after `artifactConnectTimeout`.
+    private enum artifactConnectTimeout = 10.seconds;
+    private enum artifactInactivityTimeout = 60.seconds;
+
     private string apiPath(string subPath) const
     {
         import std.string : startsWith;
@@ -75,6 +81,8 @@ class HttpArtifactStorage : ArtifactStorage
     private string doRequest(string url, HTTP.Method method = HTTP.Method.get, ubyte[] body = null, bool toServer = true)
     {
         auto http = HTTP(url);
+        http.connectTimeout = artifactConnectTimeout;
+        http.dataTimeout = artifactInactivityTimeout;
         http.method = method;
         http.addRequestHeader("Accept", "application/json");
         if (toServer)
@@ -133,6 +141,8 @@ class HttpArtifactStorage : ArtifactStorage
     private int doHeadRequest(string url)
     {
         auto http = HTTP(url);
+        http.connectTimeout = artifactConnectTimeout;
+        http.dataTimeout = artifactInactivityTimeout;
         http.method = HTTP.Method.head;
         http.addRequestHeader(workerTokenHeader, requireWorkerToken());
         // The token never follows a redirect: a redirect is a failed request (uint.max turns
