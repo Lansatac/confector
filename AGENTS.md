@@ -538,6 +538,9 @@ untrusted contributors are handled by trust levels.
 - **Stopping is graceful, then total.** On cancel or timeout the runner asks the step to stop,
   waits a grace period, then kills the whole process tree — build tools spawn helpers that
   outlive their parent.
+- **Nothing outlives its step.** When a step ends, normally or not, any processes it left running
+  are killed. *Why:* a leftover process can hold workspace files or leak into the next task; the
+  cost is that build daemons start cold and a step cannot start a service for a later one.
 - **Workspaces start clean.** The runner stages the upstream outputs the task's inputs name,
   runs the steps in order, and collects declared outputs. A task can opt into *named caches* —
   directories that persist on a worker between runs of that task (for example Unity's `Library`).
