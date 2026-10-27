@@ -1333,11 +1333,12 @@ unittest
 
 unittest
 {
-    // A tick that logged an error answers 500 with its summary. Here an open request whose chain is
-    // gone cannot be reconciled, so every tick answers 500 until it is fixed
-    import confector.api.model : BuildChain, BuildIntent, BuildRequest, DefinitionLocation, DefinitionSource, HeadlineKind, HeadlineRef,
-        ProjectDefinition, ProjectRecord, TaskDemand, TaskNode, TriggerType;
-    import confector.core.build_stores : buildChainsCollection;
+    // An open request whose definition is missing cannot be evaluated: it settles failed on the first
+    // tick, with the error in its state, so the tick logs nothing and answers success, and the next
+    // tick finds nothing to do
+    import confector.api.model : BuildChain, BuildIntent, BuildRequest, DefinitionLocation, DefinitionSource, HeadlineKind,
+        HeadlineRef, ProjectDefinition, ProjectRecord, RequestOutcome, TaskDemand, TaskNode, TriggerType;
+    import confector.core.definition_store : projectDefinitionsCollection;
     import confector.core.work_orders : defaultMaxAttempts;
     import confector.server.authenticator : FixedAuthenticator, testIdentity;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
@@ -1373,15 +1374,17 @@ unittest
     ghost.requestedBy = "admin";
     ghost.requestedAt = "2026-10-20T10:00:00Z";
     stores.requests.create(ghost);
-    documents.remove(buildChainsCollection.name, "c1", documents.get(buildChainsCollection.name, "c1").get.version_);
+    documents.remove(projectDefinitionsCollection.name, ghost.definitionId,
+        documents.get(projectDefinitionsCollection.name, ghost.definitionId).get.version_);
     auto router = apiRouter(new FixedAuthenticator(testIdentity(Role.admin)), "test-scheduler-secret",
         workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
 
     auto answered = sweepTick(router, "test-scheduler-secret");
-    assert(answered.status == HTTPStatus.internalServerError, answered.body);
-    assert(parseJsonString(answered.body)["errors"].get!long == 1, answered.body);
-    assert(parseJsonString(answered.body)["requestsReconciled"].get!long == 0, answered.body);
-    assert(sweepTick(router, "test-scheduler-secret").status == HTTPStatus.internalServerError, "It stays 500 until fixed");
+    assert(answered.status == HTTPStatus.ok, answered.body);
+    assert(parseJsonString(answered.body)["errors"].get!long == 0, answered.body);
+    assert(parseJsonString(answered.body)["requestsReconciled"].get!long == 1, answered.body);
+    assert(stores.requests.get("ghost").get.value.outcome == RequestOutcome.failed);
+    assert(sweepTick(router, "test-scheduler-secret").status == HTTPStatus.ok, "The settled request is not looked at again");
 }
 
 version (unittest)

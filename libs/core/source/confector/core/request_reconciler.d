@@ -14,9 +14,9 @@ module confector.core.request_reconciler;
  * 1. Read the request by id. If it is settled, nothing more can change: stop. The request is read
  *    before anything else, so a concurrent reconcile that commits after this read changes its
  *    version and makes step 4 fail.
- * 2. Read by id its definition, its chain, the rerun generations, and each
- *    fingerprint's ledger, settled (completing a half-finished fold), with the finished
- *    executions it names. Evaluate.
+ * 2. Read by id its definition, the rerun generations, and each fingerprint's ledger, settled
+ *    (completing a half-finished fold), with the finished executions it names. Evaluate. A request
+ *    that cannot be evaluated as recorded settles failed here (see below).
  * 3. If anything is needed, dispatch each (whatever a claim finds) and start the next pass: an
  *    evaluation that still needs executions is never committed.
  * 4. Commit the evaluation's state by compare-and-set at the version read in step 1
@@ -41,6 +41,12 @@ module confector.core.request_reconciler;
  * instead of being retried on every look: the user fixes the cause and requests again. Every other
  * needed execution is dispatched first.
  *
+ * A request that can never progress as recorded settles failed the same way, with the error in its
+ * state: its definition is missing, or evaluating it fails on what it recorded
+ * (RequestEvaluationException, InputResolutionException). It is not retried on every look; the user
+ * fixes the cause and requests again. A store error is not of that kind: it leaves the request open,
+ * and the next reconcile tries again.
+ *
  * Other failures leave the state as it was, so the request is reconciled again later and the
  * error stays visible:
  *
@@ -51,6 +57,7 @@ module confector.core.request_reconciler;
 
 import confector.core.document_collection : Page, Versioned;
 import confector.core.fingerprint_ledger : ClaimOutcome;
+import confector.core.input_resolution : InputResolutionException;
 import confector.core.request_evaluator;
 import confector.core.request_state : withEvaluation, withFailure;
 import confector.core.state_stores : StateStores;
@@ -68,6 +75,18 @@ import vibe.core.log : logError;
  * from. Nothing was written.
  */
 class UndispatchableExecutionException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * The definition a request runs with does not exist in the definition store, so the request cannot
+ * be evaluated. Nothing was written.
+ */
+class MissingDefinitionException : Exception
 {
     this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
     {
@@ -201,8 +220,9 @@ final class RequestReconciler
      * documentation.
      *
      * Throws: RequestReconcileException if executions could not be dispatched; Exception if the
-     * request, its definition or its chain does not exist, or maxPasses passes did not commit;
-     * whatever the evaluator and the stores throw.
+     * request does not exist or maxPasses passes did not commit; whatever the stores throw; and what
+     * the evaluator throws other than the errors that settle an unevaluable request failed (see the
+     * module documentation).
      */
     Reconciled reconcile(string requestId)
     {
@@ -213,10 +233,18 @@ final class RequestReconciler
             auto read = found.get;
             if (read.outcome != RequestOutcome.open) return Reconciled(read, pass, false);
 
-            auto entry = definedRequest(read.value);
-            auto chain = m_stores.chains.get(entry.request.chainId);
-            if (chain.isNull) throw new Exception(format("Request '%s' belongs to chain '%s', which does not exist", requestId, entry.request.chainId));
-            auto evaluation = evaluate(chain.get.value, entry);
+            auto evaluated = evaluateRecorded(read.value);
+            if (evaluated.unevaluable)
+            {
+                try return Reconciled(m_stores.requests.replaceState(read, withFailure(read.value, evaluated.error)), pass, true);
+                catch (DocumentConflictException)
+                {
+                    // Another reconcile committed since the state was read: reconcile again.
+                    continue;
+                }
+            }
+            const entry = evaluated.entry;
+            const evaluation = evaluated.evaluation;
 
             Handled handled;
             if (evaluation.needed.length > 0) dispatchNeeded(evaluation, entry, handled);
@@ -237,7 +265,7 @@ final class RequestReconciler
                 {
                     // Cache what this pass left behind (claimed executions), and keep the
                     // dispatch failures in the error beside the undispatchable ones
-                    auto settled = evaluate(chain.get.value, entry);
+                    auto settled = evaluate(entry);
                     const error = format("%-(%s
 %)", handled.undispatchable ~ handled.failures);
                     return Reconciled(m_stores.requests.replaceState(read, withFailure(read.value, settled, error)), pass, true);
@@ -324,27 +352,66 @@ final class RequestReconciler
         }
     }
 
+    /// What reading and evaluating a request found: the evaluation, or the error that makes the
+    /// request unevaluable (its definition is missing, or evaluating it fails on what it recorded).
+    private struct Evaluated
+    {
+        DefinedRequest entry;
+        RequestEvaluation evaluation;
+        bool unevaluable;
+        string error;
+    }
+
+    /// Reads the definition of `request` and evaluates it. Only the errors that can never change
+    /// for the request as recorded are caught: they settle it (see the module documentation). Store
+    /// errors and anything else propagate, and leave the request open.
+    private Evaluated evaluateRecorded(BuildRequest request)
+    {
+        Evaluated result;
+        try
+        {
+            result.entry = definedRequest(request);
+            result.evaluation = evaluate(result.entry);
+        }
+        catch (MissingDefinitionException e)
+        {
+            result.unevaluable = true;
+            result.error = e.msg;
+        }
+        catch (RequestEvaluationException e)
+        {
+            result.unevaluable = true;
+            result.error = e.msg;
+        }
+        catch (InputResolutionException e)
+        {
+            result.unevaluable = true;
+            result.error = e.msg;
+        }
+        return result;
+    }
+
     /// `request` with the definition it runs with, read by id.
     private DefinedRequest definedRequest(BuildRequest request)
     {
         auto definition = m_stores.definitions.get(request.definitionId);
         if (definition.isNull)
         {
-            throw new Exception(format("Definition '%s' of request '%s' does not exist", request.definitionId, request.id));
+            throw new MissingDefinitionException(format("Definition '%s' of request '%s' does not exist", request.definitionId, request.id));
         }
         return DefinedRequest(request, definition.get);
     }
 
-    /// Evaluates `entry` on `chain` from the generations and ledgers, read by id now.
-    private RequestEvaluation evaluate(in BuildChain chain, in DefinedRequest entry)
+    /// Evaluates `entry` from the generations and ledgers, read by id now.
+    private RequestEvaluation evaluate(in DefinedRequest entry)
     {
-        auto generations = readRequestGenerations(chain, entry, (in string[] bases) => m_stores.rerunGenerations.read(bases));
+        auto generations = readRequestGenerations(entry, (in string[] bases) => m_stores.rerunGenerations.read(bases));
         LedgerSummary[string] summaries;
-        foreach (fingerprint; requestFingerprints(chain, entry, generations))
+        foreach (fingerprint; requestFingerprints(entry, generations))
         {
             summaries[fingerprint] = readLedgerSummary(m_stores.ledgers, m_stores.executions, fingerprint);
         }
-        return evaluateRequest(chain, entry, generations, summaries);
+        return evaluateRequest(entry, generations, summaries);
     }
 }
 
@@ -402,9 +469,23 @@ version (unittest)
 {
     import confector.core.request_fixtures;
     import confector.core.fingerprint_ledger : executionIdFor;
+    import confector.api.document_store : Document;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
 
     import std.algorithm.searching : canFind;
+    import std.typecons : Nullable;
+
+    /// A document store whose reads of collection `failing` throw, as an unavailable store's would.
+    private final class ReadFailingStore : InMemoryDocumentStore
+    {
+        string failing;
+
+        override Nullable!Document get(string collection, string id)
+        {
+            if (collection == failing) throw new Exception("The store is unavailable");
+            return super.get(collection, id);
+        }
+    }
 
     /// The active execution of task `taskId` of chain `chainId`, as its ledger names it now.
     private string activeOf(StateStores stores, string chainId, string taskId)
@@ -883,4 +964,179 @@ unittest
     assert(second.claim == ClaimOutcome.active && second.executionId == first.executionId);
     assert(direct.ledgers.get(needed.fingerprint).get.executionSeq == 1);
     assert(queuedIds(direct) == [first.executionId]);
+}
+
+unittest
+{
+    // A request whose definition is missing settles failed with the error in its state, and leaves
+    // the open index. Nothing is evaluated or dispatched for it, and a later reconcile finds it settled
+    import confector.core.definition_store : projectDefinitionsCollection;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    const definitionId = stores.requests.get("r1").get.value.definitionId;
+    documents.remove(projectDefinitionsCollection.name, definitionId,
+        documents.get(projectDefinitionsCollection.name, definitionId).get.version_);
+
+    auto failed = reconcilerOf(stores).reconcile("r1");
+    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
+    assert(failed.request.error.canFind(definitionId) && failed.request.error.canFind("does not exist"), failed.request.error);
+    assert(failed.request.tasks.length == 0, "Nothing was evaluated");
+    assert(stores.requests.listOpen("game").length == 0, "A settled request leaves the open index");
+    assert(queuedIds(stores).length == 0, "Nothing was dispatched");
+
+    auto again = reconcilerOf(stores).reconcile("r1");
+    assert(!again.committed && again.request.outcome == RequestOutcome.failed && again.request.version_ == failed.request.version_);
+}
+
+unittest
+{
+    // A request whose recorded demand no rerun explains cannot be evaluated: it settles failed with
+    // the error, and keeps the tasks its last evaluation cached
+    import confector.core.build_stores : buildRequestsCollection;
+    import vibe.data.json : Json;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    auto first = reconcilerOf(stores).reconcile("r1");
+    assert(taskOf(first.request, "compile").status == RequestTaskStatus.queued);
+
+    auto stored = documents.get(buildRequestsCollection.name, "r1");
+    Json content = stored.get.content;
+    content["demands"][0]["fingerprint"] = "fp-recorded-wrong";
+    documents.replace(buildRequestsCollection.name, "r1", content, stored.get.version_);
+
+    auto failed = reconcilerOf(stores).reconcile("r1");
+    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
+    assert(failed.request.error.canFind("was rerun"), failed.request.error);
+    assert(taskOf(failed.request, "compile").status == RequestTaskStatus.queued, "The cached tasks are kept");
+    assert(stores.requests.listOpen("game").length == 0);
+}
+
+unittest
+{
+    // A request whose recorded pins do not cover its bindings cannot be evaluated: it settles failed
+    // with the error, and keeps the tasks its last evaluation cached
+    import confector.core.build_stores : buildRequestsCollection;
+    import vibe.data.json : Json;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    reconcilerOf(stores).reconcile("r1");
+
+    auto stored = documents.get(buildRequestsCollection.name, "r1");
+    Json content = stored.get.content;
+    content["pins"] = Json.emptyArray;
+    documents.replace(buildRequestsCollection.name, "r1", content, stored.get.version_);
+
+    auto failed = reconcilerOf(stores).reconcile("r1");
+    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
+    assert(failed.request.error.canFind("Task 'compile' input 'src'") && failed.request.error.canFind("is not pinned"), failed.request.error);
+    assert(taskOf(failed.request, "compile").status == RequestTaskStatus.queued, "The cached tasks are kept");
+    assert(stores.requests.listOpen("game").length == 0);
+}
+
+unittest
+{
+    // A store error while the request settles leaves it open: nothing is written, and a reconcile on
+    // a store that works settles it
+    import confector.core.definition_store : projectDefinitionsCollection;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    const definitionId = stores.requests.get("r1").get.value.definitionId;
+    documents.remove(projectDefinitionsCollection.name, definitionId,
+        documents.get(projectDefinitionsCollection.name, definitionId).get.version_);
+    const before = stores.requests.get("r1").get;
+
+    auto interleaving = new InterleavingDocumentStore(documents);
+    beforeWrite(interleaving, 1, () { throw new Exception("The store is unavailable"); });
+    try
+    {
+        reconcilerOf(new StateStores(interleaving)).reconcile("r1");
+        assert(false, "A store error while settling must be reported");
+    }
+    catch (Exception e) assert(e.msg == "The store is unavailable", e.msg);
+    const after = stores.requests.get("r1").get;
+    assert(after.outcome == RequestOutcome.open && after.version_ == before.version_, "The request is left open");
+    assert(stores.requests.listOpen("game").length == 1);
+
+    assert(reconcilerOf(stores).reconcile("r1").request.outcome == RequestOutcome.failed);
+}
+
+unittest
+{
+    // A ledger that names an execution the store does not return is a fault in the store, not in the
+    // request: the reconcile throws, and the request stays open for the sweep to try again
+    import confector.core.build_stores : taskExecutionsCollection;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["compile"], "2026-10-20T10:00:00Z");
+    reconcilerOf(stores).reconcile("r1");
+    const compileAt = fingerprintNow(stores, "c1", "compile");
+    finish(stores, stores.chains.get("c1").get.value, "compile", ExecutionStatus.succeeded);
+    const id = ledgerOf(stores, "c1", "compile").lastSuccessExecutionId;
+    assert(id == executionIdFor(compileAt, 1) && id.length > 0);
+    documents.remove(taskExecutionsCollection.name, id, documents.get(taskExecutionsCollection.name, id).get.version_);
+
+    bool threw;
+    try reconcilerOf(stores).reconcile("r1");
+    catch (InconsistentStateException e)
+    {
+        threw = e.msg.canFind(id);
+    }
+    assert(threw, "The reconcile must throw, naming the execution");
+    const still = stores.requests.get("r1").get;
+    assert(still.outcome == RequestOutcome.open && stores.requests.listOpen("game").length == 1, "The request stays open");
+}
+
+unittest
+{
+    // A store error while reading the definition is not a definition that is missing: it propagates,
+    // the request stays open, and a later reconcile on a store that works evaluates it
+    import confector.core.definition_store : projectDefinitionsCollection;
+
+    auto documents = new ReadFailingStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+
+    documents.failing = projectDefinitionsCollection.name;
+    try
+    {
+        reconcilerOf(stores).reconcile("r1");
+        assert(false, "A store error while reading must be reported");
+    }
+    catch (Exception e) assert(e.msg == "The store is unavailable", e.msg);
+    assert(stores.requests.get("r1").get.outcome == RequestOutcome.open && stores.requests.listOpen("game").length == 1);
+
+    documents.failing = null;
+    auto reconciled = reconcilerOf(stores).reconcile("r1");
+    assert(reconciled.request.outcome == RequestOutcome.open && taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
+}
+
+unittest
+{
+    // The reconciler reads no chain: a request is reconciled after its chain is removed
+    import confector.core.build_stores : buildChainsCollection;
+
+    auto documents = new InMemoryDocumentStore();
+    auto stores = new StateStores(documents);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    documents.remove(buildChainsCollection.name, "c1", documents.get(buildChainsCollection.name, "c1").get.version_);
+
+    auto reconciled = reconcilerOf(stores).reconcile("r1");
+    assert(reconciled.committed && reconciled.request.outcome == RequestOutcome.open);
+    assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
 }

@@ -153,14 +153,13 @@ DefinedRequest definedRequest(StateStores stores, string id)
 RequestEvaluation evaluateFrom(StateStores stores, string requestId)
 {
     auto entry = definedRequest(stores, requestId);
-    const chain = stores.chains.get(entry.request.chainId).get.value;
-    auto generations = readRequestGenerations(chain, entry, readerOf(stores));
+    auto generations = readRequestGenerations(entry, readerOf(stores));
     LedgerSummary[string] summaries;
-    foreach (fingerprint; requestFingerprints(chain, entry, generations))
+    foreach (fingerprint; requestFingerprints(entry, generations))
     {
         summaries[fingerprint] = readLedgerSummary(stores.ledgers, stores.executions, fingerprint);
     }
-    return evaluateRequest(chain, entry, generations, summaries);
+    return evaluateRequest(entry, generations, summaries);
 }
 
 /// A reconciler over `stores`, on the fixed clock.

@@ -270,8 +270,8 @@ unittest
 
 unittest
 {
-    // A request whose chain is gone cannot be reconciled: it is logged and counted, and the tick still
-    // reconciles the other open requests
+    // A request whose chain is gone is reconciled like any other: the reconciler reads no chain, so the
+    // tick logs nothing and reconciles every open request
     auto documents = new InMemoryDocumentStore();
     auto stores = projectStores(documents);
     createChain(stores, "a");
@@ -281,9 +281,10 @@ unittest
     documents.remove(buildChainsCollection.name, "b", documents.get(buildChainsCollection.name, "b").get.version_);
 
     auto summary = sweepCoordination(stores, 3, fixedNow());
-    assert(summary.errors == 1 && summary.requestsReconciled == 1);
+    assert(summary.errors == 0 && summary.requestsReconciled == 2);
     assert(!stores.ledgers.get(fingerprintNow(stores, "a", "compile")).get.active.isNull,
         "The reconciled request dispatched its execution");
+    assert(taskOf(stores.requests.get("rb").get.value, "compile").status == RequestTaskStatus.queued);
 }
 
 unittest
@@ -339,23 +340,35 @@ unittest
 
 unittest
 {
-    // A request whose chain is gone throws on every tick. Over pages of two it is the first open request,
-    // and the requests on the pages after it are still reconciled
+    // A request whose definition is missing settles failed on the tick that finds it, with the error in
+    // its state, and is not looked at again. Over pages of two it is the first open request, and the
+    // requests on the pages after it are reconciled by the same tick
+    import confector.core.definition_store : definitionId, projectDefinitionsCollection;
+    import confector.api.model : BuildStep;
+    import vibe.data.json : Json;
+
     auto documents = new InMemoryDocumentStore();
     auto stores = projectStores(documents, 2);
     createChain(stores, "a");
-    intake(stores, "a", "r0", ["compile"], "2026-10-20T10:00:00Z");
-    documents.remove(buildChainsCollection.name, "a", documents.get(buildChainsCollection.name, "a").get.version_);
+    auto own = sampleDefinition();
+    own.tasks[0].steps = [BuildStep("Build", "bash", Json(["script": Json("make release")]))];
+    const ownId = definitionId(own);
+    intake(stores, "a", "r0", ["compile"], "2026-10-20T10:00:00Z", own);
+    documents.remove(projectDefinitionsCollection.name, ownId, documents.get(projectDefinitionsCollection.name, ownId).get.version_);
     createChainAt(stores, "b", 2, "rev-b");
     foreach (ulong i; 1 .. 5) intake(stores, "b", format("r%s", i), ["compile"], format("2026-10-20T10:00:0%sZ", i));
 
     auto summary = sweepCoordination(stores, 3, fixedNow());
-    assert(summary.errors == 1 && summary.requestsReconciled == 4);
-    assert(stores.requests.get("r0").get.value.tasks.length == 0, "The request that cannot be reconciled stays as it was");
+    assert(summary.errors == 0 && summary.requestsReconciled == 5, format("%s", summary));
+    const failed = stores.requests.get("r0").get.value;
+    assert(failed.outcome == RequestOutcome.failed && failed.error.canFind(ownId), failed.error);
     foreach (ulong i; 1 .. 5)
     {
         assert(stores.requests.get(format("r%s", i)).get.value.tasks.length == 1);
     }
+
+    auto next = sweepCoordination(stores, 3, fixedNow());
+    assert(next.errors == 0 && next.requestsReconciled == 4, "The settled request is not reconciled again");
 }
 
 unittest

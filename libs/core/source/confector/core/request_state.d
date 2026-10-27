@@ -18,7 +18,9 @@ module confector.core.request_state;
  * - **Reconciling** (confector.core.request_reconciler) reads the request, evaluates, dispatches what
  *   is needed and commits the evaluation with `withEvaluation` at the version read. A reconcile that
  *   loses the compare-and-set (another reconcile committed) reads again and evaluates again. A needed
- *   execution that cannot be built settles the request with `withFailure`, the error kept.
+ *   execution that cannot be built settles the request with `withFailure`, the error kept. So does a
+ *   request that cannot be evaluated at all (its definition is missing, or it fails on what it
+ *   recorded): `withFailure` without an evaluation keeps the tasks the last evaluation cached.
  * - **Finding work**: BuildRequestStore.listOpen reads the open index of a project. It is discovery
  *   and may lag; a request it misses is found by a later look.
  */
@@ -65,6 +67,24 @@ BuildRequest withFailure(in BuildRequest state, in RequestEvaluation evaluation,
     requireValid(error.length > 0, format("Request '%s' cannot fail without an error", state.id));
     BuildRequest next = cast(BuildRequest) state;
     next.tasks = (cast(RequestTaskState[]) evaluation.tasks).dup;
+    next.outcome = RequestOutcome.failed;
+    next.error = error;
+    validateRequestState(next);
+    return next;
+}
+
+/**
+ * `state` settled failed because it cannot be evaluated: its definition is missing, or evaluating
+ * it fails on what it recorded. No evaluation was made, so the tasks `state` caches stay as they
+ * are. Pure.
+ *
+ * Throws: InvalidStateTransitionException if `state` is settled already or `error` is empty.
+ */
+BuildRequest withFailure(in BuildRequest state, string error) @trusted
+{
+    requireOpen(state);
+    requireValid(error.length > 0, format("Request '%s' cannot fail without an error", state.id));
+    BuildRequest next = cast(BuildRequest) state;
     next.outcome = RequestOutcome.failed;
     next.error = error;
     validateRequestState(next);
@@ -172,4 +192,27 @@ unittest
     auto succeeded = commitEvaluation(stores, lint, evaluateFrom(stores, "r2"));
     assert(succeeded.outcome == RequestOutcome.succeeded && taskOf(succeeded, "lint").status == RequestTaskStatus.succeeded);
     assert(stores.requests.listOpen("game").length == 0);
+}
+
+unittest
+{
+    // A request that cannot be evaluated settles failed with its error, keeping the tasks its last
+    // evaluation cached; a settled request or an empty error is refused
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    intake(stores, "c1", "r2", ["test"], "2026-10-20T10:00:01Z");
+
+    auto read = stores.requests.get("r1").get;
+    assert(throwsA!InvalidStateTransitionException({ withFailure(read.value, ""); }), "A failure needs its error");
+    assert(withFailure(read.value, "no definition").tasks.length == 0, "An uncached request has no tasks");
+
+    auto needing = evaluateFrom(stores, "r1");
+    dispatch(stores, needing.needed[0], "r1");
+    auto committed = commitEvaluation(stores, stores.requests.get("r1").get, evaluateFrom(stores, "r1"));
+    auto failed = stores.requests.replaceState(committed, withFailure(committed.value, "The definition is missing"));
+    assert(failed.outcome == RequestOutcome.failed && failed.error == "The definition is missing");
+    assert(failed.tasks == committed.tasks, "The tasks cached by the last evaluation are kept");
+    assert(stores.requests.listOpen("game").length == 1 && stores.requests.listOpen("game")[0].id == "r2");
+    assert(throwsA!InvalidStateTransitionException({ withFailure(failed.value, "again"); }), "A settled request never changes");
 }

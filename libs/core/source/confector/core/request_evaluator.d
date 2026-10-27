@@ -10,7 +10,7 @@ module confector.core.request_evaluator;
  * in its own definition, and other requests only matter through the ledgers they share.
  *
  * The shell (the request reconciler) loads its inputs, all by id: the request and its definition,
- * its chain, the rerun generations (`readRequestGenerations`), and, for every fingerprint
+ * the rerun generations (`readRequestGenerations`), and, for every fingerprint
  * (`requestFingerprints`), the ledger settled and its last success and last stop (`readLedgerSummary`).
  *
  * Rules:
@@ -69,9 +69,27 @@ import std.format : format;
 import std.typecons : Nullable, nullable;
 
 /**
- * The request evaluator was given inputs that contradict each other or the persisted model.
+ * The request or the definition it runs with is at fault: it contradicts itself or its definition,
+ * or the demands it recorded do not fit its targets or the rerun generations. Such a request can
+ * never progress, so reconciling it settles it failed. Faults in the ledgers, executions and reads
+ * are InconsistentStateException instead.
  */
 class RequestEvaluationException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * The state the evaluation read contradicts itself or the request: a ledger names an execution the
+ * store does not return, a summary holds another fingerprint's ledger, a generation or stop sequence
+ * was not read, or the evaluator reached a state its own rules exclude. That is a fault in the store
+ * or the shell, not in the request, so it is never a reason to settle the request failed: the
+ * request stays open and the error is reported.
+ */
+class InconsistentStateException : Exception
 {
     this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
     {
@@ -176,12 +194,12 @@ TaskDemand[] requestDemands(in GraphResolution closure, in ulong[string] stopSeq
         auto fingerprint = taskId in closure.fingerprints;
         if (fingerprint is null)
         {
-            throw new RequestEvaluationException(format("Task '%s' has no fingerprint: its rerun generation was not read", taskId));
+            throw new InconsistentStateException(format("Task '%s' has no fingerprint: its rerun generation was not read", taskId));
         }
         auto stopSeq = *fingerprint in stopSeqs;
         if (stopSeq is null)
         {
-            throw new RequestEvaluationException(format("The stop sequence of task '%s' at fingerprint %s was not read", taskId, *fingerprint));
+            throw new InconsistentStateException(format("The stop sequence of task '%s' at fingerprint %s was not read", taskId, *fingerprint));
         }
         demands ~= TaskDemand(taskId, *fingerprint, closure.bases[taskId], closure.generations[taskId], *stopSeq);
     }
@@ -192,11 +210,11 @@ TaskDemand[] requestDemands(in GraphResolution closure, in ulong[string] stopSeq
  * Every fingerprint the request covers at `generations` (which must hold every base), sorted: the
  * ledgers the shell summarizes for `evaluateRequest`.
  *
- * Throws: as `evaluateRequest` for a request that does not fit the chain or a missing generation.
+ * Throws: as `evaluateRequest` for a request that does not fit its definition, or a missing generation.
  */
-string[] requestFingerprints(in BuildChain chain, in DefinedRequest entry, in RerunGenerations generations) @trusted
+string[] requestFingerprints(in DefinedRequest entry, in RerunGenerations generations) @trusted
 {
-    const resolution = completeGraphResolution(chain.projectId, closureOf(chain, entry), bindingMap(entry.request.bindings),
+    const resolution = completeGraphResolution(entry.request.projectId, closureOf(entry), bindingMap(entry.request.bindings),
         pinMap(entry.request.pins), generations);
     string[] fingerprints;
     foreach (fingerprint; resolution.fingerprints.byValue) fingerprints ~= fingerprint;
@@ -208,11 +226,11 @@ string[] requestFingerprints(in BuildChain chain, in DefinedRequest entry, in Re
  * at a time, and returns them all.
  *
  * Throws: Exception if `read` returns no generation for a base it was asked for; as
- * `evaluateRequest` for a request that does not fit the chain.
+ * `evaluateRequest` for a request that does not fit its definition.
  */
-RerunGenerations readRequestGenerations(in BuildChain chain, in DefinedRequest entry, scope RerunGenerationReader read) @trusted
+RerunGenerations readRequestGenerations(in DefinedRequest entry, scope RerunGenerationReader read) @trusted
 {
-    const resolution = readGraphResolution(chain.projectId, closureOf(chain, entry), bindingMap(entry.request.bindings),
+    const resolution = readGraphResolution(entry.request.projectId, closureOf(entry), bindingMap(entry.request.bindings),
         pinMap(entry.request.pins), read);
     RerunGenerations generations;
     foreach (taskId, base; resolution.bases) generations[base] = resolution.generations[taskId];
@@ -252,24 +270,23 @@ LedgerSummary readLedgerSummary(LedgerStore ledgers, ExecutionStore executions, 
  * Summaries of other fingerprints are ignored. Pure: performs no I/O and reads no clock; no
  * timestamp is ever compared.
  *
- * Throws: RequestEvaluationException if the request has no id, belongs to another chain or
- * project, runs with a definition other than the one given (its id is not the definition's hash),
- * targets a task its definition lacks, or records demands for other tasks than its targets and
- * their upstream tasks; if a covered fingerprint has no summary, or its summary contradicts itself
- * or the task (see `LedgerSummary`), including an active execution that has already ended (the
- * ledger was not settled). InputResolutionException if a generation is missing or the request lacks
- * a pin it needs.
+ * Throws: RequestEvaluationException if the request has no id, project or targets, runs with a
+ * definition other than the one given (its id is not the definition's hash),
+ * targets a task its definition lacks, records demands for other tasks than its targets and
+ * their upstream tasks, or records demands no rerun explains; InconsistentStateException if a covered
+ * fingerprint has no summary, or its summary contradicts itself or the task (see `LedgerSummary`),
+ * including an active execution that has already ended (the ledger was not settled).
+ * InputResolutionException if a generation is missing or the request lacks a pin it needs.
  */
 RequestEvaluation evaluateRequest(
-    in BuildChain chain,
     in DefinedRequest entry,
     in RerunGenerations generations,
     in LedgerSummary[string] ledgers
 ) @trusted
 {
     const request = entry.request;
-    auto graph = closureOf(chain, entry);
-    const resolution = completeGraphResolution(chain.projectId, graph, bindingMap(request.bindings), pinMap(request.pins), generations);
+    auto graph = closureOf(entry);
+    const resolution = completeGraphResolution(request.projectId, graph, bindingMap(request.bindings), pinMap(request.pins), generations);
 
     string[] demanded;
     foreach (ref demand; request.demands) demanded ~= demand.taskId;
@@ -279,7 +296,7 @@ RequestEvaluation evaluateRequest(
 
     TaskDemand[string] demandOf;
     foreach (ref demand; request.demands) demandOf[demand.taskId] = demand;
-    foreach (ref demand; request.demands) requireMovedByRerun(chain.id, request.id, graph, resolution, demandOf, demand);
+    foreach (ref demand; request.demands) requireMovedByRerun(request.chainId, request.id, graph, resolution, demandOf, demand);
 
     const order = graph.topologicalSort();
     LedgerFacts[string] facts;
@@ -288,9 +305,9 @@ RequestEvaluation evaluateRequest(
     {
         const fingerprint = resolution.fingerprints[taskId];
         auto summary = fingerprint in ledgers;
-        requireEvaluable(summary !is null, format("Task '%s' of request '%s' is at fingerprint %s, whose ledger was not summarized",
+        requireConsistent(summary !is null, format("Task '%s' of request '%s' is at fingerprint %s, whose ledger was not summarized",
             taskId, request.id, fingerprint));
-        facts[taskId] = factsOf(chain.projectId, taskId, fingerprint, *summary);
+        facts[taskId] = factsOf(request.projectId, taskId, fingerprint, *summary);
         // A demand recorded at another fingerprint saw no stop at this one: a rerun created it
         // since (requireMovedByRerun checked that)
         const demand = demandOf[taskId];
@@ -368,7 +385,7 @@ RequestEvaluation evaluateRequest(
                         upstreamPending = true;
                         break;
                     case RequestTaskStatus.notNeeded:
-                        throw new RequestEvaluationException(format(
+                        throw new InconsistentStateException(format(
                             "Task '%s' of request '%s' must run but its upstream task '%s' is not needed", taskId, request.id, upstream));
                 }
             }
@@ -417,7 +434,7 @@ private RequestOutcome outcomeOf(in RequestTaskState[] tasks) pure @safe
                 blocked = true;
                 break;
             case RequestTaskStatus.notNeeded:
-                throw new RequestEvaluationException(format("Target '%s' is not needed, but a target must run unless it is satisfied", task.taskId));
+                throw new InconsistentStateException(format("Target '%s' is not needed, but a target must run unless it is satisfied", task.taskId));
             case RequestTaskStatus.waitingUpstream:
             case RequestTaskStatus.needed:
             case RequestTaskStatus.queued:
@@ -464,14 +481,14 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
     LedgerFacts facts;
     if (summary.ledger.isNull)
     {
-        requireEvaluable(summary.lastSuccess.isNull && summary.lastStopped.isNull, format(
+        requireConsistent(summary.lastSuccess.isNull && summary.lastStopped.isNull, format(
             "The summary of fingerprint %s (task '%s') names executions but no ledger", fingerprint, taskId));
         return facts;
     }
     const ledger = summary.ledger.get;
-    requireEvaluable(ledger.fingerprint == fingerprint, format("The summary of fingerprint %s (task '%s') holds the ledger of fingerprint %s",
+    requireConsistent(ledger.fingerprint == fingerprint, format("The summary of fingerprint %s (task '%s') holds the ledger of fingerprint %s",
         fingerprint, taskId, ledger.fingerprint));
-    requireEvaluable((ledger.stopSeq > 0) == (ledger.lastStoppedExecutionId.length > 0), format(
+    requireConsistent((ledger.stopSeq > 0) == (ledger.lastStoppedExecutionId.length > 0), format(
         "The ledger of fingerprint %s (task '%s') counts %s stops but names %s as the last",
         fingerprint, taskId, ledger.stopSeq, ledger.lastStoppedExecutionId.length > 0 ? "'" ~ ledger.lastStoppedExecutionId ~ "'" : "none"));
     facts.stopSeq = ledger.stopSeq;
@@ -482,14 +499,14 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
     {
         if (id.length == 0)
         {
-            requireEvaluable(record.isNull, format("The summary of fingerprint %s (task '%s') has %s execution, but its ledger names none",
+            requireConsistent(record.isNull, format("The summary of fingerprint %s (task '%s') has %s execution, but its ledger names none",
                 fingerprint, taskId, what));
             return;
         }
-        requireEvaluable(!record.isNull, format("The %s execution '%s' of fingerprint %s (task '%s') was not read", what, id,
+        requireConsistent(!record.isNull, format("The %s execution '%s' of fingerprint %s (task '%s') was not read", what, id,
             fingerprint, taskId));
         const execution = record.get;
-        requireEvaluable(execution.id == id && execution.fingerprint == fingerprint && execution.taskId == taskId
+        requireConsistent(execution.id == id && execution.fingerprint == fingerprint && execution.taskId == taskId
             && execution.projectId == projectId, format(
             "The %s execution of fingerprint %s (task '%s' of project '%s') is '%s' at fingerprint %s for task '%s' of project '%s', not '%s'",
             what, fingerprint, taskId, projectId, execution.id, execution.fingerprint, execution.taskId, execution.projectId, id));
@@ -506,7 +523,7 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
     if (!summary.lastSuccess.isNull)
     {
         const success = summary.lastSuccess.get;
-        requireEvaluable(success.status == ExecutionStatus.succeeded, format(
+        requireConsistent(success.status == ExecutionStatus.succeeded, format(
             "The last success '%s' of fingerprint %s (task '%s') is %s", success.id, fingerprint, taskId, success.status));
         if (success.artifactsExpiredAt.length > 0) facts.expiredSuccessId = success.id;
         else facts.successId = success.id;
@@ -514,7 +531,7 @@ private LedgerFacts factsOf(string projectId, string taskId, string fingerprint,
     if (!summary.lastStopped.isNull)
     {
         const stopped = summary.lastStopped.get;
-        requireEvaluable(stopped.status == ExecutionStatus.failed || stopped.status == ExecutionStatus.cancelled, format(
+        requireConsistent(stopped.status == ExecutionStatus.failed || stopped.status == ExecutionStatus.cancelled, format(
             "The last stopped execution '%s' of fingerprint %s (task '%s') is %s", stopped.id, fingerprint, taskId, stopped.status));
         facts.stoppedId = stopped.id;
         facts.stoppedStatus = stopped.status;
@@ -558,30 +575,32 @@ private void requireMovedByRerun(string chainId, string requestId, const TaskGra
         requestId, chainId, taskId, demand.fingerprint, resolution.fingerprints[taskId]));
 }
 
-/// Checks that `entry` is a request on `chain` running with the definition given, and returns the
-/// graph of the tasks it covers.
-private TaskGraph closureOf(in BuildChain chain, in DefinedRequest entry) @trusted
+/// Checks that `entry` is a request running with the definition given, and returns the graph of the
+/// tasks it covers.
+private TaskGraph closureOf(in DefinedRequest entry) @trusted
 {
     const request = entry.request;
-    requireEvaluable(chain.id.length > 0 && chain.projectId.length > 0, "A chain to evaluate needs an id and a project id");
-    requireEvaluable(request.id.length > 0, format("A request on chain '%s' has no id", chain.id));
-    requireEvaluable(request.chainId == chain.id && request.projectId == chain.projectId, format(
-        "Request '%s' (project '%s', chain '%s') does not belong to chain '%s' of project '%s'",
-        request.id, request.projectId, request.chainId, chain.id, chain.projectId));
-    requireEvaluable(request.targets.length > 0, format("Request '%s' on chain '%s' has no targets", request.id, chain.id));
+    requireEvaluable(request.id.length > 0, "A request to evaluate has no id");
+    requireEvaluable(request.projectId.length > 0, format("Request '%s' has no project id", request.id));
+    requireEvaluable(request.targets.length > 0, format("Request '%s' has no targets", request.id));
     const actual = definitionId(entry.definition);
     requireEvaluable(actual == request.definitionId, format(
         "Request '%s' runs with definition '%s', but the definition given for it is '%s'", request.id, request.definitionId, actual));
     try return closureGraph(entry.definition, request.targets);
     catch (RequestEvaluationException e)
     {
-        throw new RequestEvaluationException(format("Request '%s' on chain '%s': %s", request.id, chain.id, e.msg));
+        throw new RequestEvaluationException(format("Request '%s': %s", request.id, e.msg));
     }
 }
 
 private void requireEvaluable(bool condition, lazy string message) @trusted
 {
     if (!condition) throw new RequestEvaluationException(message);
+}
+
+private void requireConsistent(bool condition, lazy string message) @trusted
+{
+    if (!condition) throw new InconsistentStateException(message);
 }
 
 version (unittest)
@@ -765,7 +784,7 @@ version (unittest)
     private LedgerSummary[string] summariesOf(ref World w, in DefinedRequest entry, in RerunGenerations generations)
     {
         LedgerSummary[string] summaries;
-        foreach (fingerprint; requestFingerprints(w.chain, entry, generations)) summaries[fingerprint] = summaryOf(w, fingerprint);
+        foreach (fingerprint; requestFingerprints(entry, generations)) summaries[fingerprint] = summaryOf(w, fingerprint);
         return summaries;
     }
 
@@ -773,8 +792,8 @@ version (unittest)
     private RequestEvaluation evaluate(ref World w, string id)
     {
         const entry = w.requests[id];
-        const generations = readRequestGenerations(w.chain, entry, readerOf(w));
-        return evaluateRequest(w.chain, entry, generations, summariesOf(w, entry, generations));
+        const generations = readRequestGenerations(entry, readerOf(w));
+        return evaluateRequest(entry, generations, summariesOf(w, entry, generations));
     }
 
     private RequestTaskState stateOf(in RequestEvaluation evaluation, string taskId)
@@ -1132,18 +1151,18 @@ unittest
 
 unittest
 {
-    // Inconsistent inputs fail loudly: a request of another chain, with another definition than
-    // it names, targeting a task its definition lacks, or with demands for other tasks than it
-    // covers; a missing generation, pin or ledger summary
+    // Inconsistent inputs fail loudly: a request without an id, a project or targets, with another
+    // definition than it names, targeting a task its definition lacks, or with demands for other
+    // tasks than it covers; a missing generation, pin or ledger summary
     auto w = world();
     request(w, "r1", ["test"]);
-    const generations = readRequestGenerations(w.chain, w.requests["r1"], readerOf(w));
+    const generations = readRequestGenerations(w.requests["r1"], readerOf(w));
     auto summaries = summariesOf(w, w.requests["r1"], generations);
-    evaluateRequest(w.chain, w.requests["r1"], generations, summaries);
+    evaluateRequest(w.requests["r1"], generations, summaries);
 
     RequestEvaluation evaluateWith(DefinedRequest entry)
     {
-        return evaluateRequest(w.chain, entry, generations, summaries);
+        return evaluateRequest(entry, generations, summaries);
     }
     DefinedRequest altered(void delegate(ref DefinedRequest) change)
     {
@@ -1153,8 +1172,7 @@ unittest
         return entry;
     }
 
-    assert(throwsWith!RequestEvaluationException("does not belong", { evaluateWith(altered((ref e) { e.request.chainId = "c2"; })); }));
-    assert(throwsWith!RequestEvaluationException("does not belong", { evaluateWith(altered((ref e) { e.request.projectId = "q"; })); }));
+    assert(throwsWith!RequestEvaluationException("has no project id", { evaluateWith(altered((ref e) { e.request.projectId = null; })); }));
     assert(throwsWith!RequestEvaluationException("has no id", { evaluateWith(altered((ref e) { e.request.id = null; })); }));
     assert(throwsWith!RequestEvaluationException("the definition given for it", { evaluateWith(altered((ref e) {
         e.definition.tasks[0].steps = [BuildStep("Build", "bash", Json(["script": Json("other")]))]; })); }));
@@ -1167,33 +1185,31 @@ unittest
     assert(throwsWith!RequestEvaluationException("no targets", { evaluateWith(altered((ref e) { e.request.targets = null; })); }));
 
     RerunGenerations none;
-    assert(throwsA!InputResolutionException({ evaluateRequest(w.chain, w.requests["r1"], none, summaries); }), "A missing generation is never 0");
+    assert(throwsA!InputResolutionException({ evaluateRequest(w.requests["r1"], none, summaries); }), "A missing generation is never 0");
     auto unpinned = DefinedRequest(w.requests["r1"].request, w.requests["r1"].definition);
     unpinned.request.pins = null;
-    assert(throwsA!InputResolutionException({ evaluateRequest(w.chain, unpinned, generations, summaries); }), "A request without its pins is not evaluated");
+    assert(throwsA!InputResolutionException({ evaluateRequest(unpinned, generations, summaries); }), "A request without its pins is not evaluated");
     LedgerSummary[string] missing;
-    assert(throwsWith!RequestEvaluationException("not summarized", { evaluateRequest(w.chain, w.requests["r1"], generations, missing); }));
+    assert(throwsWith!InconsistentStateException("not summarized", { evaluateRequest(w.requests["r1"], generations, missing); }));
 }
 
 unittest
 {
-    // The evaluator reads the request's pins, never its chain's: a chain whose pins change after
-    // the request was recorded gives the request the same fingerprints and the same evaluation
+    // The evaluator needs only the request and its definition: no chain is passed, so the
+    // fingerprints and the evaluation come from the request's pins alone, whatever the chain it was
+    // made on holds now
     auto w = world();
     request(w, "r1", ["report"]);
     const entry = w.requests["r1"];
-    auto generations = readRequestGenerations(w.chain, entry, readerOf(w));
+    auto generations = readRequestGenerations(entry, readerOf(w));
     const summaries = summariesOf(w, entry, generations);
-    const fingerprints = requestFingerprints(w.chain, entry, generations);
-    const evaluated = evaluateRequest(w.chain, entry, generations, summaries);
+    const fingerprints = requestFingerprints(entry, generations);
+    const evaluated = evaluateRequest(entry, generations, summaries);
 
-    auto moved = w.chain;
-    moved.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222")))];
-    assert(readRequestGenerations(moved, entry, readerOf(w)) == generations);
-    assert(requestFingerprints(moved, entry, generations) == fingerprints);
-    assert(evaluateRequest(moved, entry, generations, summaries) == evaluated);
-    moved.pins = null;
-    assert(evaluateRequest(moved, entry, generations, summaries) == evaluated);
+    w.chain.pins = [RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("bbb222")))];
+    assert(readRequestGenerations(entry, readerOf(w)) == generations);
+    assert(requestFingerprints(entry, generations) == fingerprints);
+    assert(evaluateRequest(entry, generations, summaries) == evaluated);
 }
 
 unittest
@@ -1206,15 +1222,15 @@ unittest
     const succeeded = run(w, "compile", ExecutionStatus.succeeded);
     start(w, compileAt, "compile");
     const entry = w.requests["r1"];
-    const generations = readRequestGenerations(w.chain, entry, readerOf(w));
+    const generations = readRequestGenerations(entry, readerOf(w));
     auto good = summaryOf(w, compileAt);
-    assert(statusOf(evaluateRequest(w.chain, entry, generations, [compileAt: good]), "compile") == RequestTaskStatus.succeeded);
+    assert(statusOf(evaluateRequest(entry, generations, [compileAt: good]), "compile") == RequestTaskStatus.succeeded);
 
     bool refused(string text, void delegate(ref LedgerSummary) change)
     {
         LedgerSummary summary = good;
         change(summary);
-        return throwsWith!RequestEvaluationException(text, { evaluateRequest(w.chain, entry, generations, [compileAt: summary]); });
+        return throwsWith!InconsistentStateException(text, { evaluateRequest(entry, generations, [compileAt: summary]); });
     }
 
     assert(refused("was not read", (ref s) { s.lastSuccess.nullify(); }));
@@ -1240,25 +1256,25 @@ unittest
     const testAt = closure.fingerprints["test"];
     assert(requestDemands(closure, [compileAt: 2UL, testAt: 0UL]) == [TaskDemand("compile", compileAt, closure.bases["compile"], 0, 2),
         TaskDemand("test", testAt, closure.bases["test"], 0, 0)]);
-    assert(throwsWith!RequestEvaluationException("was not read", { requestDemands(closure, [compileAt: 2UL]); }));
+    assert(throwsWith!InconsistentStateException("was not read", { requestDemands(closure, [compileAt: 2UL]); }));
     string[string] unread;
     RerunGenerations none;
     auto testGraph = closureGraph(sampleDefinition(), ["test"]);
     auto partial = graphResolution("p", testGraph, bindingMap(mainBindings(testGraph)),
         pinMap([RepositoryPin("game", RepositoryRef(RefKind.branch, "main"), InputPin(Json("aaa111")))]), none, unread);
-    assert(throwsWith!RequestEvaluationException("rerun generation", { requestDemands(partial, null); }));
+    assert(throwsWith!InconsistentStateException("rerun generation", { requestDemands(partial, null); }));
     assert(throwsWith!RequestEvaluationException("'nope'", { closureGraph(sampleDefinition(), ["nope"]); }));
 
     request(w, "r1", ["report"]);
     size_t reads;
     auto counting = readerOf(w);
-    auto generations = readRequestGenerations(w.chain, w.requests["r1"], (in string[] bases) { ++reads; return counting(bases); });
+    auto generations = readRequestGenerations(w.requests["r1"], (in string[] bases) { ++reads; return counting(bases); });
     assert(reads == 3, "compile, then test, then report");
     assert(generations.length == 3);
-    auto fingerprints = requestFingerprints(w.chain, w.requests["r1"], generations);
+    auto fingerprints = requestFingerprints(w.requests["r1"], generations);
     assert(fingerprints.length == 3 && fingerprints.canFind(compileAt) && fingerprints.canFind(testAt));
     RerunGenerationReader forgetful = (in string[] bases) { RerunGenerations nothing; return nothing; };
-    assert(throwsWith!Exception("returned none", { readRequestGenerations(w.chain, w.requests["r1"], forgetful); }));
+    assert(throwsWith!Exception("returned none", { readRequestGenerations(w.requests["r1"], forgetful); }));
 }
 
 unittest
