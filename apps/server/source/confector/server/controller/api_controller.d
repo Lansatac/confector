@@ -6,6 +6,7 @@ import confector.core.dag;
 import confector.core.document_collection : tryValue;
 import confector.core.intake : IntakeException, IntakeFailure, IntakeRequest, IntakeResult, RequestIntake;
 import confector.core.not_implemented : NotImplementedException;
+import confector.core.project_lifecycle : deleteProject;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_token : WorkerTokenClaims, mintWorkerToken, requireCurrentAttempt, requireExecution, requireSigningKey,
     workerTokenClaimsFor;
@@ -594,7 +595,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         try
         {
             string projId = req.params["id"];
-            bool ok = stores !is null && stores.projects.remove(projId);
+            bool ok = stores !is null && deleteProject(stores, projId);
             if (ok)
             {
                 Json resp = Json.emptyObject;
@@ -611,10 +612,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         }
         catch (Exception e)
         {
-            res.statusCode = HTTPStatus.badRequest;
-            Json err = Json.emptyObject;
-            err["error"] = Json(e.msg);
-            res.writeJsonBody(err);
+            writeError(res, HTTPStatus.internalServerError, e.msg);
         }
     });
 
@@ -1383,7 +1381,7 @@ unittest
     assert(answered.status == HTTPStatus.ok, answered.body);
     assert(parseJsonString(answered.body)["errors"].get!long == 0, answered.body);
     assert(parseJsonString(answered.body)["requestsReconciled"].get!long == 1, answered.body);
-    assert(stores.requests.get("ghost").get.value.outcome == RequestOutcome.failed);
+    assert(stores.requests.get("ghost").get.value.state.outcome == RequestOutcome.failed);
     assert(sweepTick(router, "test-scheduler-secret").status == HTTPStatus.ok, "The settled request is not looked at again");
 }
 
@@ -1539,4 +1537,102 @@ unittest
     const unresolvable = run(member, `{"project_id": "game", "targets": ["compile"], "refs": {"game": "missing"}}`);
     assert(unresolvable.status == HTTPStatus.unprocessableEntity && parseJsonString(unresolvable.body)["error"].get!string.canFind("game/missing"), unresolvable.body);
     assert(stores.chains.listForProject("game", 10).length == 1, "A refused request created no chain");
+}
+
+unittest
+{
+    // Deleting a project through the API settles its open requests failed over several pages and
+    // removes it; deleting it again finds no project; a store failure is a server error that keeps the
+    // project
+    import confector.api.document_store : DocumentStore;
+    import confector.api.model : BuildChain, BuildIntent, BuildRequest, DefinitionLocation, DefinitionSource, HeadlineKind,
+        HeadlineRef, ProjectDefinition, ProjectRecord, RequestOutcome, TaskDemand, TaskNode, TriggerType;
+    import confector.core.work_orders : defaultMaxAttempts;
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
+    import std.algorithm.searching : canFind, findSplit;
+    import std.format : format;
+    import vibe.data.json : parseJsonString;
+    import vibe.stream.memory : createMemoryOutputStream;
+
+    enum workerTokenKey = "0123456789abcdef0123456789abcdef";
+    enum workerPoolCredential = "pool-credential-0123456789abcdef0123456789abcdef";
+
+    // Stores over `documents` with project "proj" and three open requests, over pages of two
+    StateStores seeded(DocumentStore documents)
+    {
+        auto stores = new StateStores(documents, 2);
+        ProjectRecord proj;
+        proj.id = "proj";
+        proj.name = "proj";
+        stores.projects.put(proj);
+        BuildChain chain;
+        chain.id = "c1";
+        chain.projectId = "proj";
+        chain.number = 1;
+        chain.headline = HeadlineRef(HeadlineKind.default_);
+        chain.createdAt = "2026-10-20T10:00:00Z";
+        stores.chains.create(chain);
+        TaskNode build;
+        build.id = "build";
+        const definitionId = stores.definitions.put(ProjectDefinition([build]));
+        foreach (i; 0 .. 3)
+        {
+            BuildRequest open;
+            open.id = format("r%s", i);
+            open.projectId = "proj";
+            open.chainId = "c1";
+            open.targets = ["build"];
+            open.intent = BuildIntent.build;
+            open.trigger.type = TriggerType.manual;
+            open.definitionId = definitionId;
+            open.definitionSource = DefinitionSource(DefinitionLocation.confector);
+            open.demands = [TaskDemand("build", "fp-build", "b-build")];
+            open.requestedBy = "admin";
+            open.requestedAt = format("2026-10-20T10:00:0%sZ", i);
+            stores.requests.create(open);
+        }
+        return stores;
+    }
+
+    struct Answer { int status; string body; }
+    Answer remove(AuthorizedRoutes router, string path)
+    {
+        auto req = createTestHTTPServerRequest(URL("http://localhost/api/v1" ~ path), HTTPMethod.DELETE);
+        auto sink = createMemoryOutputStream();
+        auto res = createTestHTTPServerResponse(sink);
+        router.handleRequest(req, res);
+        res.finalize();
+        // The sink holds the status line and headers before the body
+        auto written = cast(string) sink.data.idup;
+        return Answer(res.statusCode, written.findSplit("\r\n\r\n")[2]);
+    }
+    AuthorizedRoutes routerOver(StateStores stores)
+    {
+        return apiRouter(new FixedAuthenticator(testIdentity(Role.admin)), "test-scheduler-secret",
+            workerTokenKey, workerPoolCredential, defaultMaxAttempts, stores);
+    }
+
+    auto stores = seeded(new InMemoryDocumentStore());
+    auto router = routerOver(stores);
+    auto deleted = remove(router, "/projects/proj");
+    assert(deleted.status == HTTPStatus.ok && parseJsonString(deleted.body)["deleted"].get!bool, deleted.body);
+    foreach (i; 0 .. 3)
+    {
+        auto request = stores.requests.get(format("r%s", i)).get.value;
+        assert(request.state.outcome == RequestOutcome.failed && request.state.error.canFind("was deleted"), request.state.error);
+    }
+    assert(stores.requests.listOpen("proj").length == 0, "Every open request was settled");
+    assert(stores.projects.get("proj").isNull, "The project is removed");
+
+    auto again = remove(router, "/projects/proj");
+    assert(again.status == HTTPStatus.notFound && again.body.canFind("Project not found"), again.body);
+
+    // A store failure while the project is deleted is a server error, and the project is kept
+    auto failing = new InterleavingDocumentStore(new InMemoryDocumentStore());
+    auto failingStores = seeded(failing);
+    failing.beforeNextWrite = () { throw new Exception("store unavailable"); };
+    auto broken = remove(routerOver(failingStores), "/projects/proj");
+    assert(broken.status == HTTPStatus.internalServerError && broken.body.canFind("store unavailable"), broken.body);
+    assert(!failingStores.projects.get("proj").isNull, "A project whose deletion failed still exists");
 }

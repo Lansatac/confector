@@ -945,8 +945,8 @@ struct TaskDemand
 /**
  * Who asked for what, and how the request stands. What was asked is immutable: written once, after
  * the input resolver has found or created the chain the request runs on and added to it every pin
- * the request supplies. The state (`outcome`, `tasks`, `error`) is changed only by reconciling, by
- * compare-and-set (confector.core.request_state).
+ * the request supplies. The state is changed only by reconciling, by compare-and-set
+ * (confector.core.request_state).
  */
 struct BuildRequest
 {
@@ -981,14 +981,9 @@ struct BuildRequest
     @asName("requested_by") string requestedBy;
     @asName("requested_at") string requestedAt;
 
-    /// Whether the request is still open or how it settled. Settled is final. Recording a request
-    /// writes it open.
-    RequestOutcome outcome;
-    /// The last evaluation's task states, in topological order; empty until the first evaluation
-    /// commits.
-    @optional RequestTaskState[] tasks;
-    /// failed because a needed execution could not be recorded: why. Empty otherwise.
-    @optional string error;
+    /// Whether the request is still open, and its cached evaluation. Recording a request writes it
+    /// open, with no tasks.
+    RequestState state;
 }
 
 /**
@@ -1242,6 +1237,22 @@ struct RequestTaskState
     @optional @asName("execution_id") string executionId;
     /// blocked: the upstream tasks that failed or were cancelled and block it, sorted.
     @optional @asName("blocked_by") string[] blockedBy;
+}
+
+/**
+ * A request's state: its last evaluation's task states and how it stands. It is the only part of a
+ * request that changes after it is recorded, and settled is final.
+ */
+struct RequestState
+{
+    /// Whether the request is still open or how it settled. Recording a request writes it open.
+    RequestOutcome outcome;
+    /// The last evaluation's task states, in topological order; empty until the first evaluation
+    /// commits.
+    @optional RequestTaskState[] tasks;
+    /// Why an error settled the request rather than a task outcome: a needed execution could not be
+    /// recorded, the request cannot be evaluated, or its project was deleted. Empty otherwise.
+    @optional string error;
 }
 
 /**
@@ -1657,10 +1668,10 @@ unittest
         "intent": "retry", "trigger": {"type": "manual"},
         "definition_id": "d1", "definition_source": {"location": "confector"},
         "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1"}],
-        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "state": {"outcome": "open"}
     }`);
     assert(request.demands == [TaskDemand("internal", "fp1", "b1", 0, 0)], "A demand without a generation or stop_seq saw none");
-    assert(request.outcome == RequestOutcome.open && request.tasks.length == 0 && request.error.length == 0);
+    assert(request.state.outcome == RequestOutcome.open && request.state.tasks.length == 0 && request.state.error.length == 0);
     assert(request.intent == BuildIntent.retry && request.trigger.type == TriggerType.manual);
     assert(request.trigger.ruleId.length == 0 && request.trigger.payload.length == 0);
     assert(request.pins.length == 0 && request.bindings.length == 0 && request.targets == ["internal"]);
@@ -1676,7 +1687,7 @@ unittest
         "bindings": [{"task_id": "compile", "input": "src", "ref": {"kind": "branch", "name": "main"}}],
         "definition_id": "d1", "definition_source": {"location": "confector"},
         "demands": [{"task_id": "internal", "fingerprint": "fp1", "base": "b1", "stop_seq": 1}],
-        "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
+        "requested_by": "webhook:github", "requested_at": "2026-10-15T14:02:00Z", "state": {"outcome": "open"}
     }`);
     assert(pinned.pins.length == 1 && repositoryAt(pinned.pins[0]) == RepositoryAt("game", RepositoryRef(RefKind.branch, "main")));
     assert(pinned.bindings.length == 1 && inputKey(pinned.bindings[0]) == InputKey("compile", "src"));
@@ -1689,7 +1700,7 @@ unittest
     try deserializeJson!BuildRequest(`{
         "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
         "intent": "retry", "trigger": {"type": "manual"},
-        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "state": {"outcome": "open"}
     }`);
     catch (Exception) undefinedThrew = true;
     assert(undefinedThrew, "A request without a definition must not deserialize");
@@ -1698,7 +1709,7 @@ unittest
         "id": "r1", "project_id": "game", "chain_id": "c1", "targets": ["internal"],
         "intent": "retry", "trigger": {"type": "manual"},
         "definition_id": "d1", "definition_source": {"location": "confector"},
-        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "outcome": "open"
+        "requested_by": "jason", "requested_at": "2026-10-15T14:02:00Z", "state": {"outcome": "open"}
     }`);
     catch (Exception) undemandedThrew = true;
     assert(undemandedThrew, "A request without its demands must not deserialize");
@@ -1840,16 +1851,16 @@ unittest
     BuildRequest request;
     request.id = "r1";
     request.projectId = "game";
-    request.outcome = RequestOutcome.failed;
-    request.tasks = [
+    request.state.outcome = RequestOutcome.failed;
+    request.state.tasks = [
         RequestTaskState("compile", "fp1", RequestTaskStatus.succeeded, false, "e1"),
         RequestTaskState("test", "fp2", RequestTaskStatus.blocked, true, null, ["compile"]),
     ];
-    request.error = "no address";
+    request.state.error = "no address";
     auto json = serializeToJson(request);
-    assert(json["outcome"].get!string == "failed" && json["error"].get!string == "no address");
-    assert(json["tasks"][0]["status"].get!string == "succeeded" && json["tasks"][0]["execution_id"].get!string == "e1");
-    assert(json["tasks"][1]["blocked_by"][0].get!string == "compile" && json["tasks"][1]["target"].get!bool);
+    assert(json["state"]["outcome"].get!string == "failed" && json["state"]["error"].get!string == "no address");
+    assert(json["state"]["tasks"][0]["status"].get!string == "succeeded" && json["state"]["tasks"][0]["execution_id"].get!string == "e1");
+    assert(json["state"]["tasks"][1]["blocked_by"][0].get!string == "compile" && json["state"]["tasks"][1]["target"].get!bool);
     assert(roundTrip(request) == request);
 
     // A task state left out of a document is not a target and blocks nothing

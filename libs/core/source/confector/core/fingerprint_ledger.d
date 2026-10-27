@@ -44,7 +44,8 @@ module confector.core.fingerprint_ledger;
  * for claiming over one.
  */
 
-import confector.core.build_stores : defaultPageSize, ExecutionStore, InvalidStateTransitionException;
+import confector.core.build_stores : defaultPageSize, ExecutionStore;
+import confector.core.state_validation : InvalidStateTransitionException;
 import confector.core.document_collection;
 import confector.api.document_store;
 import confector.api.model;

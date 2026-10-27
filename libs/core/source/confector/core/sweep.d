@@ -191,7 +191,7 @@ unittest
     auto ledger = stores.ledgers.get(fingerprint).get;
     assert(ledger.active.isNull && ledger.lastSuccessExecutionId == id);
     auto state = stores.requests.get("ra").get.value;
-    assert(state.outcome == RequestOutcome.succeeded && taskOf(state, "compile").status == RequestTaskStatus.succeeded);
+    assert(state.state.outcome == RequestOutcome.succeeded && taskOf(state, "compile").status == RequestTaskStatus.succeeded);
 }
 
 unittest
@@ -208,12 +208,12 @@ unittest
     // The writes of the completion: 1 the execution's record, 2 the fold, 3 the reconcile's commit
     beforeWrite(interleaving, 3, () { throw new Exception("The wake's write is lost"); });
     assert(completeExecution(racing, fingerprint, id, succeededFirstAttempt(), fixedNow()).status == ExecutionStatus.succeeded);
-    assert(stores.requests.get("ra").get.outcome == RequestOutcome.open, "The lost wake leaves the request open");
+    assert(stores.requests.get("ra").get.state.outcome == RequestOutcome.open, "The lost wake leaves the request open");
 
     auto summary = sweepCoordination(stores, 3, fixedNow());
     assert(summary.errors == 0 && summary.requestsReconciled == 1);
     auto state = stores.requests.get("ra").get.value;
-    assert(state.outcome == RequestOutcome.succeeded && taskOf(state, "compile").status == RequestTaskStatus.succeeded);
+    assert(state.state.outcome == RequestOutcome.succeeded && taskOf(state, "compile").status == RequestTaskStatus.succeeded);
 }
 
 unittest
@@ -229,14 +229,14 @@ unittest
     assert(requeued.leasesRequeued == 1 && requeued.leasesFailed == 0 && requeued.errors == 0);
     auto queued = activeAt(stores, fingerprint);
     assert(queued.status == ExecutionStatus.queued && queued.expiredLeases == 1);
-    assert(stores.requests.get("ra").get.outcome == RequestOutcome.open);
+    assert(stores.requests.get("ra").get.state.outcome == RequestOutcome.open);
 
     assert(!claimWork(stores, "w2", 1.minutes, later(2.minutes)).isNull);
     auto failed = sweepCoordination(stores, 2, later(4.minutes));
     assert(failed.leasesRequeued == 0 && failed.leasesFailed == 1 && failed.errors == 0);
     assert(stores.executions.get(id).get.status == ExecutionStatus.failed && stores.ledgers.get(fingerprint).get.active.isNull);
     auto state = stores.requests.get("ra").get.value;
-    assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
+    assert(state.state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
     assert(stores.executions.get(id).get.errorMessage.canFind("lease lost 2 times"));
 
     // A second tick finds nothing to do
@@ -334,7 +334,7 @@ unittest
     assert(summary.errors == 0 && summary.requestsReconciled == 5);
     foreach (ulong i; 0 .. 5)
     {
-        assert(stores.requests.get(format("r%s", i)).get.value.tasks.length == 1, "Every open request is reconciled");
+        assert(stores.requests.get(format("r%s", i)).get.value.state.tasks.length == 1, "Every open request is reconciled");
     }
 }
 
@@ -361,10 +361,10 @@ unittest
     auto summary = sweepCoordination(stores, 3, fixedNow());
     assert(summary.errors == 0 && summary.requestsReconciled == 5, format("%s", summary));
     const failed = stores.requests.get("r0").get.value;
-    assert(failed.outcome == RequestOutcome.failed && failed.error.canFind(ownId), failed.error);
+    assert(failed.state.outcome == RequestOutcome.failed && failed.state.error.canFind(ownId), failed.state.error);
     foreach (ulong i; 1 .. 5)
     {
-        assert(stores.requests.get(format("r%s", i)).get.value.tasks.length == 1);
+        assert(stores.requests.get(format("r%s", i)).get.value.state.tasks.length == 1);
     }
 
     auto next = sweepCoordination(stores, 3, fixedNow());
@@ -389,5 +389,5 @@ unittest
     assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
     assert(stores.ledgers.get(fingerprint).get.active.isNull);
     auto state = stores.requests.get("ra").get.value;
-    assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
+    assert(state.state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
 }

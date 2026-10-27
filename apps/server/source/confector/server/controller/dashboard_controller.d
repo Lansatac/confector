@@ -7,6 +7,7 @@ import confector.api.model;
 import confector.core.definition_store : currentDefinition;
 import confector.core.document_collection : tryValue;
 import confector.core.intake : IntakeException, IntakeFailure, IntakeRequest, RequestIntake, repositoryDefaults;
+import confector.core.project_lifecycle : deleteProject;
 import confector.core.state_stores : StateStores;
 import confector.core.dag;
 import confector.server.authenticator : Authenticator;
@@ -1205,7 +1206,7 @@ AuthorizedRoutes dashboardRouter(Authenticator authenticator, StateStores stores
             string projId = req.form.get("id", "");
             if (stores !is null && projId.length > 0)
             {
-                stores.projects.remove(projId);
+                deleteProject(stores, projId);
             }
         }
         catch (Exception e)
@@ -1902,4 +1903,72 @@ unittest
     assert(askAs(viewer, HTTPMethod.POST, "/projects/run", [["id", "game"], ["target_task_id", "test"]]).status == HTTPStatus.forbidden);
     assert(askAs(viewer, HTTPMethod.GET, "/projects/details?id=game").status == HTTPStatus.ok);
     assert(stores.chains.listForProject("game", 10).length == 3);
+}
+
+unittest
+{
+    // Deleting a project from the dashboard settles its open requests failed, over several pages, and
+    // removes it
+    import confector.api.model : BuildChain, BuildIntent, BuildRequest, DefinitionLocation, DefinitionSource, HeadlineKind,
+        HeadlineRef, ProjectDefinition, ProjectRecord, RequestOutcome, TaskDemand, TaskNode, TriggerType;
+    import confector.server.authenticator : FixedAuthenticator, testIdentity;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import std.algorithm.searching : canFind;
+    import std.format : format;
+    import std.uri : encodeComponent;
+    import vibe.inet.message : InetHeaderMap;
+    import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+    auto stores = new StateStores(new InMemoryDocumentStore(), 2);
+    ProjectRecord proj;
+    proj.id = "proj";
+    proj.name = "proj";
+    stores.projects.put(proj);
+    BuildChain chain;
+    chain.id = "c1";
+    chain.projectId = "proj";
+    chain.number = 1;
+    chain.headline = HeadlineRef(HeadlineKind.default_);
+    chain.createdAt = "2026-10-20T10:00:00Z";
+    stores.chains.create(chain);
+    TaskNode build;
+    build.id = "build";
+    const definitionId = stores.definitions.put(ProjectDefinition([build]));
+    foreach (i; 0 .. 3)
+    {
+        BuildRequest open;
+        open.id = format("r%s", i);
+        open.projectId = "proj";
+        open.chainId = "c1";
+        open.targets = ["build"];
+        open.intent = BuildIntent.build;
+        open.trigger.type = TriggerType.manual;
+        open.definitionId = definitionId;
+        open.definitionSource = DefinitionSource(DefinitionLocation.confector);
+        open.demands = [TaskDemand("build", "fp-build", "b-build")];
+        open.requestedBy = "admin";
+        open.requestedAt = format("2026-10-20T10:00:0%sZ", i);
+        stores.requests.create(open);
+    }
+    auto router = dashboardRouter(new FixedAuthenticator(testIdentity(Role.admin)), stores);
+
+    // The form the project page posts
+    InetHeaderMap headers;
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    auto body_ = "id=" ~ encodeComponent("proj");
+    auto req = createTestHTTPServerRequest(URL("http://localhost/projects/delete"), HTTPMethod.POST, headers,
+        createMemoryStream(cast(ubyte[]) body_.dup, false));
+    auto sink = createMemoryOutputStream();
+    auto res = createTestHTTPServerResponse(sink);
+    router.handleRequest(req, res);
+    res.finalize();
+    assert(res.statusCode == HTTPStatus.found, cast(string) sink.data.idup);
+
+    foreach (i; 0 .. 3)
+    {
+        auto request = stores.requests.get(format("r%s", i)).get.value;
+        assert(request.state.outcome == RequestOutcome.failed && request.state.error.canFind("was deleted"), request.state.error);
+    }
+    assert(stores.requests.listOpen("proj").length == 0, "Every open request was settled");
+    assert(stores.projects.get("proj").isNull, "The project is removed");
 }

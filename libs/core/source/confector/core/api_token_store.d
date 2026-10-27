@@ -6,7 +6,7 @@ module confector.core.api_token_store;
  * id. Tokens are revoked, never removed, so a revoked token keeps failing to authenticate.
  */
 
-import confector.core.build_stores : InvalidStateTransitionException;
+import confector.core.state_validation : InvalidStateTransitionException;
 import confector.core.document_collection;
 import confector.api.model;
 import confector.api.document_store;

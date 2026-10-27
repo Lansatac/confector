@@ -206,9 +206,9 @@ void finish(StateStores stores, in BuildChain chain, string taskId, ExecutionSta
     stores.ledgers.fold(ended);
 }
 
-RequestTaskState taskOf(in BuildRequest state, string taskId)
+RequestTaskState taskOf(in BuildRequest request, string taskId)
 {
-    foreach (ref task; state.tasks)
+    foreach (ref task; request.state.tasks)
     {
         if (task.taskId == taskId) return cast(RequestTaskState) task;
     }

@@ -21,6 +21,7 @@ import confector.core.dag : TaskGraph;
 import confector.core.input_resolution : InputResolutionException, requireRepositorySpec, requiredPins;
 import confector.core.counters : CounterStore;
 import confector.core.definition_store : DefinitionStore;
+import confector.core.state_validation : InvalidStateTransitionException, validateRequestState;
 import confector.core.document_collection;
 import confector.api.model;
 import confector.api.document_store;
@@ -51,16 +52,6 @@ enum CollectionSpec taskExecutionsCollection = CollectionSpec("task_executions",
 
 /// Page size of the queries that list everything they find, unless a store is given another.
 enum size_t defaultPageSize = 100;
-
-/// A write that would break the build model's rules: changing an immutable field, rewriting a
-/// chain's history, or changing a terminal execution.
-class InvalidStateTransitionException : Exception
-{
-    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
-    {
-        super(msg, file, line);
-    }
-}
 
 /**
  * Build chains. A chain's identity (id, project, number, headline, creation time) never changes;
@@ -321,7 +312,7 @@ void validateHeadline(in HeadlineRef headline, lazy string owner)
 
 /**
  * Build requests. What a request asks for is written once, when it is recorded, and never changes.
- * Its state (`outcome`, `tasks`, `error`) is the only thing that changes, by `replaceState`, and
+ * Its `state` (RequestState) is the only thing that changes, by `replaceState`, and
  * only while the request is open. A request is recorded only once its chain and definition are
  * stored and the chain holds every pin the request supplies, so a crash between those writes and
  * the request's never leaves a request whose pins or definition are lost. Recording it is one
@@ -355,7 +346,7 @@ final class BuildRequestStore
     private static string[string] derivedFields(in BuildRequest request)
     {
         string[string] fields = ["requested_key": sortableTimestamp(request.requestedAt)];
-        if (request.outcome == RequestOutcome.open) fields["open_project"] = request.projectId;
+        if (request.state.outcome == RequestOutcome.open) fields["open_project"] = request.projectId;
         return fields;
     }
 
@@ -384,7 +375,7 @@ final class BuildRequestStore
     Versioned!BuildRequest create(BuildRequest request)
     {
         validateRequest(request);
-        requireValid(request.outcome == RequestOutcome.open && request.tasks.length == 0 && request.error.length == 0,
+        requireValid(request.state.outcome == RequestOutcome.open && request.state.tasks.length == 0 && request.state.error.length == 0,
             format("Request '%s' is recorded open, with no tasks and no error", request.id));
 
         auto chain = m_chains.get(request.chainId);
@@ -488,24 +479,25 @@ final class BuildRequestStore
     }
 
     /**
-     * Writes the state `next` of the request `read` was read as, by compare-and-set at the version
-     * read. Every recorded field of `next` must equal `read`'s: only the state may change. A
-     * settled request never changes, and nothing is written when `next` is what was read.
+     * Writes `next` as the state of the request `read` was read as, by compare-and-set at the
+     * version read. The recorded fields are kept as `read` has them, so a write cannot change what
+     * was asked. A settled request never changes, and nothing is written when `next` is the state
+     * read.
      *
      * Throws: DocumentConflictException if the request changed since `read`: read it again and
-     * evaluate again; InvalidStateTransitionException if a recorded field differs, the request is
-     * settled and `next` changes it, or `next`'s state is malformed (see `validateRequestState`).
+     * evaluate again; InvalidStateTransitionException if the request is settled and `next` changes
+     * it, or `next` is malformed (see `validateRequestState`).
      */
-    Versioned!BuildRequest replaceState(in Versioned!BuildRequest read, BuildRequest next)
+    Versioned!BuildRequest replaceState(in Versioned!BuildRequest read, RequestState next)
     {
         BuildRequest current = cast(BuildRequest) read.value;
-        requireValid(withoutState(next) == withoutState(current), format(
-            "Request '%s' cannot change what was asked of it: only its state (outcome, tasks, error) may be written", current.id));
-        validateRequestState(next);
-        if (next == current) return cast(Versioned!BuildRequest) read;
-        requireValid(current.outcome == RequestOutcome.open, format(
-            "Request '%s' is settled (%s), and a settled request never changes", current.id, current.outcome));
-        return m_requests.replace(current.id, next, read.version_);
+        validateRequestState(current.id, next);
+        if (next == current.state) return cast(Versioned!BuildRequest) read;
+        requireValid(current.state.outcome == RequestOutcome.open, format(
+            "Request '%s' is settled (%s), and a settled request never changes", current.id, current.state.outcome));
+        BuildRequest stored = current;
+        stored.state = next;
+        return m_requests.replace(current.id, stored, read.version_);
     }
 
     /// One page of the open requests of project `projectId`, oldest first, from `cursor` (null for the
@@ -558,40 +550,6 @@ final class BuildRequestStore
         lookup.limit = m_pageSize;
         return values(m_requests.queryAll(lookup, limit));
     }
-}
-
-/**
- * `request` with its state reset to a new request's, so two versions of one request compare equal
- * exactly when their recorded fields do.
- */
-private BuildRequest withoutState(in BuildRequest request)
-{
-    BuildRequest recorded = cast(BuildRequest) request;
-    recorded.outcome = RequestOutcome.open;
-    recorded.tasks = null;
-    recorded.error = null;
-    return recorded;
-}
-
-/**
- * Throws InvalidStateTransitionException unless `request`'s state is well formed: cached tasks that
- * appear once, with a fingerprint and blocking tasks exactly when blocked; and an error only on a
- * failed request.
- */
-void validateRequestState(in BuildRequest request)
-{
-    bool[string] seen;
-    foreach (ref task; request.tasks)
-    {
-        requireValid(task.taskId.length > 0 && task.fingerprint.length > 0,
-            format("A task state of request '%s' needs a task id and a fingerprint", request.id));
-        requireValid(task.taskId !in seen, format("The state of request '%s' has task '%s' twice", request.id, task.taskId));
-        seen[task.taskId] = true;
-        requireValid((task.status == RequestTaskStatus.blocked) == (task.blockedBy.length > 0), format(
-            "Task '%s' of request '%s' is %s and names %s blocking tasks", task.taskId, request.id, task.status, task.blockedBy.length));
-    }
-    requireValid(request.error.length == 0 || request.outcome == RequestOutcome.failed,
-        format("Request '%s' is %s but records an error", request.id, request.outcome));
 }
 
 /**
@@ -1553,23 +1511,23 @@ unittest
     countWrites();
     auto created = requests.create(sampleRequest("r1", "game-1", definitionId));
     assert(writes == 1, "Recording a request is one write");
-    assert(created.outcome == RequestOutcome.open && created.tasks.length == 0 && created.error.length == 0);
+    assert(created.state.outcome == RequestOutcome.open && created.state.tasks.length == 0 && created.state.error.length == 0);
     assert(requests.listOpen("game") == [created.value], "A recorded request is open at once");
 
     // A request is recorded open, with no tasks and no error
     auto settledAtBirth = sampleRequest("r2", "game-1", definitionId);
-    settledAtBirth.outcome = RequestOutcome.failed;
+    settledAtBirth.state.outcome = RequestOutcome.failed;
     assert(throwsA!InvalidStateTransitionException({ requests.create(settledAtBirth); }));
     auto tasked = sampleRequest("r3", "game-1", definitionId);
-    tasked.tasks = [RequestTaskState("compile", "fp-compile", RequestTaskStatus.queued)];
+    tasked.state.tasks = [RequestTaskState("compile", "fp-compile", RequestTaskStatus.queued)];
     assert(throwsA!InvalidStateTransitionException({ requests.create(tasked); }));
 }
 
 unittest
 {
-    // Only the state of a request changes, by compare-and-set at the version read: a write that
-    // changes what was asked is refused, a stale read loses, and a settled request leaves the open
-    // index and never changes again
+    // Only the state of a request changes, by compare-and-set at the version read: the write keeps
+    // what was asked as it was read, a stale read loses, and a settled request leaves the open index
+    // and never changes again
     auto documents = new InMemoryDocumentStore();
     auto chains = new ChainStore(documents);
     auto definitions = new DefinitionStore(documents);
@@ -1579,64 +1537,33 @@ unittest
     requests.create(sampleRequest("r1", "game-1", definitionId));
 
     auto read = requests.get("r1").get;
-    auto retargeted = read.value;
-    retargeted.targets = ["lint"];
-    assert(throwsA!InvalidStateTransitionException({ requests.replaceState(read, retargeted); }),
-        "A recorded field cannot change");
-    auto retimed = read.value;
-    retimed.requestedAt = "2026-10-15T15:00:00Z";
-    assert(throwsA!InvalidStateTransitionException({ requests.replaceState(read, retimed); }),
-        "A recorded field cannot change, even with a state write");
-
-    auto queued = read.value;
+    RequestState queued;
     queued.tasks = [RequestTaskState("compile", "fp-compile", RequestTaskStatus.queued)];
     auto written = requests.replaceState(read, queued);
-    assert(written.version_ == read.version_ + 1 && written.tasks.length == 1);
+    BuildRequest kept = read.value;
+    kept.state = queued;
+    assert(written.version_ == read.version_ + 1 && written.value == kept, "The write keeps what was asked");
     assert(throwsA!DocumentConflictException({ requests.replaceState(read, queued); }), "A stale read loses");
-    assert(requests.replaceState(written, written.value).version_ == written.version_, "An unchanged state writes nothing");
+    assert(requests.replaceState(written, written.state).version_ == written.version_, "An unchanged state writes nothing");
 
-    auto errored = written.value;
+    auto errored = written.state;
     errored.error = "no address";
     assert(throwsA!InvalidStateTransitionException({ requests.replaceState(written, errored); }),
         "An error on a request that did not fail is refused");
 
-    auto settled = written.value;
+    auto settled = written.state;
     settled.outcome = RequestOutcome.failed;
     settled.error = "no address";
     auto failed = requests.replaceState(written, settled);
+    kept.state = settled;
     assert(requests.listOpen("game").length == 0, "A settled request leaves the open index");
-    assert(requests.get("r1").get.value == settled);
+    assert(requests.get("r1").get.value == kept);
 
-    auto reopened = failed.value;
+    auto reopened = failed.state;
     reopened.outcome = RequestOutcome.open;
     reopened.error = null;
     assert(throwsA!InvalidStateTransitionException({ requests.replaceState(failed, reopened); }), "Settled is final");
     assert(requests.listOpen("game").length == 0);
-}
-
-unittest
-{
-    // Malformed request states are refused: tasks twice, blocking tasks that disagree with the status,
-    // a task without a fingerprint, and an error on a request that did not fail
-    BuildRequest state;
-    state.id = "r1";
-    state.projectId = "game";
-    validateRequestState(state);
-
-    auto twice = state;
-    twice.tasks = [RequestTaskState("compile", "fp1", RequestTaskStatus.queued), RequestTaskState("compile", "fp1", RequestTaskStatus.queued)];
-    assert(throwsA!InvalidStateTransitionException({ validateRequestState(twice); }));
-    auto blocked = state;
-    blocked.tasks = [RequestTaskState("test", "fp2", RequestTaskStatus.blocked)];
-    assert(throwsA!InvalidStateTransitionException({ validateRequestState(blocked); }));
-    auto unfingerprinted = state;
-    unfingerprinted.tasks = [RequestTaskState("test", "", RequestTaskStatus.queued)];
-    assert(throwsA!InvalidStateTransitionException({ validateRequestState(unfingerprinted); }));
-    auto errored = state;
-    errored.error = "why";
-    assert(throwsA!InvalidStateTransitionException({ validateRequestState(errored); }));
-    errored.outcome = RequestOutcome.failed;
-    validateRequestState(errored);
 }
 
 unittest

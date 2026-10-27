@@ -9,7 +9,7 @@ module confector.core.project_stores;
  * compare-and-set. Listing is discovery and may lag behind writes.
  */
 
-import confector.core.build_stores : InvalidStateTransitionException;
+import confector.core.state_validation : InvalidStateTransitionException;
 import confector.core.document_collection;
 import confector.core.git : addressCarriesCredentials;
 import confector.api.model;

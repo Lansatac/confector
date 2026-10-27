@@ -231,7 +231,7 @@ final class RequestReconciler
             auto found = m_stores.requests.get(requestId);
             if (found.isNull) throw new Exception(format("Request '%s' does not exist, so it cannot be reconciled", requestId));
             auto read = found.get;
-            if (read.outcome != RequestOutcome.open) return Reconciled(read, pass, false);
+            if (read.state.outcome != RequestOutcome.open) return Reconciled(read, pass, false);
 
             auto evaluated = evaluateRecorded(read.value);
             if (evaluated.unevaluable)
@@ -520,7 +520,7 @@ unittest
     intake(stores, "c1", "r1", ["report"], "2026-10-20T10:00:00Z");
 
     auto first = reconciler.reconcile("r1");
-    assert(first.committed && first.passes == 2 && first.request.outcome == RequestOutcome.open);
+    assert(first.committed && first.passes == 2 && first.request.state.outcome == RequestOutcome.open);
     assert(taskOf(first.request, "compile").status == RequestTaskStatus.queued);
     assert(taskOf(first.request, "test").status == RequestTaskStatus.waitingUpstream);
     assert(queuedIds(stores) == [activeOf(stores, "c1", "compile")]);
@@ -540,7 +540,7 @@ unittest
         finish(stores, chain, taskId, ExecutionStatus.succeeded);
     }
     auto done = reconciler.reconcile("r1");
-    assert(done.committed && done.request.outcome == RequestOutcome.succeeded);
+    assert(done.committed && done.request.state.outcome == RequestOutcome.succeeded);
     foreach (taskId; ["compile", "test", "report"]) assert(taskOf(done.request, taskId).status == RequestTaskStatus.succeeded);
     assert(stores.requests.listOpen("game").length == 0, "A settled request leaves the open index");
 
@@ -581,7 +581,7 @@ unittest
         assert(!reconciled.committed, format("overtaken at write %s: the first finds nothing new", overtakenAt));
 
         auto state = direct.requests.get("r1").get;
-        assert(state.outcome == RequestOutcome.open && taskOf(state, "compile").status == RequestTaskStatus.queued);
+        assert(state.state.outcome == RequestOutcome.open && taskOf(state, "compile").status == RequestTaskStatus.queued);
         auto compile = ledgerOf(direct, "c1", "compile");
         assert(compile.executionSeq == 1, format("overtaken at write %s", overtakenAt));
         assert(queuedIds(direct) == [compile.active.get.id], format("overtaken at write %s", overtakenAt));
@@ -752,7 +752,7 @@ unittest
     assert(activeOf(stores, "c1", "lint").length > 0, "The other needed execution was dispatched");
 
     auto reconciled = reconcilerOf(new StateStores(documents.restart())).reconcile("r1");
-    assert(reconciled.committed && reconciled.request.outcome == RequestOutcome.open);
+    assert(reconciled.committed && reconciled.request.state.outcome == RequestOutcome.open);
     assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
     assert(taskOf(reconciled.request, "lint").status == RequestTaskStatus.queued);
 }
@@ -770,8 +770,8 @@ unittest
     addressless.name = "game";
     stores.repositories.put(addressless);
     auto failed = reconcilerOf(stores).reconcile("r1");
-    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
-    assert(failed.request.error.canFind("compile") && failed.request.error.canFind("no address"), failed.request.error);
+    assert(failed.committed && failed.request.state.outcome == RequestOutcome.failed);
+    assert(failed.request.state.error.canFind("compile") && failed.request.state.error.canFind("no address"), failed.request.state.error);
     assert(taskOf(failed.request, "compile").status == RequestTaskStatus.needed);
     assert(stores.ledgers.get(fingerprintNow(stores, "c1", "compile")).isNull, "Nothing was claimed");
     assert(stores.requests.listOpen("game").length == 0);
@@ -779,12 +779,12 @@ unittest
     addressless.address = gameAddress;
     stores.repositories.put(addressless);
     auto again = reconcilerOf(stores).reconcile("r1");
-    assert(!again.committed && again.request.outcome == RequestOutcome.failed, "A failed request is not retried by the next look");
+    assert(!again.committed && again.request.state.outcome == RequestOutcome.failed, "A failed request is not retried by the next look");
     assert(stores.ledgers.get(fingerprintNow(stores, "c1", "compile")).isNull);
 
     intake(stores, "c1", "r2", ["test"], "2026-10-20T10:00:01Z");
     auto retry = reconcilerOf(stores).reconcile("r2");
-    assert(retry.request.outcome == RequestOutcome.open && retry.request.error.length == 0);
+    assert(retry.request.state.outcome == RequestOutcome.open && retry.request.state.error.length == 0);
     assert(taskOf(retry.request, "compile").status == RequestTaskStatus.queued);
 
     // An unregistered repository fails the request the same way
@@ -793,8 +793,8 @@ unittest
     intake(other, "c1", "r1", ["compile"], "2026-10-20T10:00:00Z");
     other.repositories.remove("game");
     auto unregistered = reconcilerOf(other).reconcile("r1");
-    assert(unregistered.request.outcome == RequestOutcome.failed);
-    assert(unregistered.request.error.canFind("compile") && unregistered.request.error.canFind("not registered"), unregistered.request.error);
+    assert(unregistered.request.state.outcome == RequestOutcome.failed);
+    assert(unregistered.request.state.error.canFind("compile") && unregistered.request.state.error.canFind("not registered"), unregistered.request.state.error);
     assert(other.ledgers.get(fingerprintNow(other, "c1", "compile")).isNull, "Nothing was claimed");
 }
 
@@ -821,7 +821,7 @@ unittest
     assert(stores.chains.get("c1").get.value.pins[0].pin.pinned == Json("bbb222"));
 
     auto reconciled = reconcilerOf(stores).reconcile("r1");
-    assert(reconciled.request.outcome == RequestOutcome.open);
+    assert(reconciled.request.state.outcome == RequestOutcome.open);
     assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
     auto ledger = stores.ledgers.get(needed.fingerprint);
     assert(!ledger.isNull && !ledger.get.value.active.isNull, "The execution was claimed at the recorded fingerprint");
@@ -853,8 +853,8 @@ unittest
     auto interleaving = new InterleavingDocumentStore(documents);
     beforeWrite(interleaving, 1, () { throw new Exception("The store is unavailable"); });
     auto failed = reconcilerOf(new StateStores(interleaving)).reconcile("r1");
-    assert(failed.request.outcome == RequestOutcome.failed);
-    assert(failed.request.error.canFind("no address") && failed.request.error.canFind("unavailable"), failed.request.error);
+    assert(failed.request.state.outcome == RequestOutcome.failed);
+    assert(failed.request.state.error.canFind("no address") && failed.request.state.error.canFind("unavailable"), failed.request.state.error);
     assert(taskOf(failed.request, "compile").status == RequestTaskStatus.needed, "compile was not claimed");
     assert(taskOf(failed.request, "lint").status == RequestTaskStatus.needed);
 }
@@ -981,14 +981,14 @@ unittest
         documents.get(projectDefinitionsCollection.name, definitionId).get.version_);
 
     auto failed = reconcilerOf(stores).reconcile("r1");
-    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
-    assert(failed.request.error.canFind(definitionId) && failed.request.error.canFind("does not exist"), failed.request.error);
-    assert(failed.request.tasks.length == 0, "Nothing was evaluated");
+    assert(failed.committed && failed.request.state.outcome == RequestOutcome.failed);
+    assert(failed.request.state.error.canFind(definitionId) && failed.request.state.error.canFind("does not exist"), failed.request.state.error);
+    assert(failed.request.state.tasks.length == 0, "Nothing was evaluated");
     assert(stores.requests.listOpen("game").length == 0, "A settled request leaves the open index");
     assert(queuedIds(stores).length == 0, "Nothing was dispatched");
 
     auto again = reconcilerOf(stores).reconcile("r1");
-    assert(!again.committed && again.request.outcome == RequestOutcome.failed && again.request.version_ == failed.request.version_);
+    assert(!again.committed && again.request.state.outcome == RequestOutcome.failed && again.request.version_ == failed.request.version_);
 }
 
 unittest
@@ -1011,8 +1011,8 @@ unittest
     documents.replace(buildRequestsCollection.name, "r1", content, stored.get.version_);
 
     auto failed = reconcilerOf(stores).reconcile("r1");
-    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
-    assert(failed.request.error.canFind("was rerun"), failed.request.error);
+    assert(failed.committed && failed.request.state.outcome == RequestOutcome.failed);
+    assert(failed.request.state.error.canFind("was rerun"), failed.request.state.error);
     assert(taskOf(failed.request, "compile").status == RequestTaskStatus.queued, "The cached tasks are kept");
     assert(stores.requests.listOpen("game").length == 0);
 }
@@ -1036,8 +1036,8 @@ unittest
     documents.replace(buildRequestsCollection.name, "r1", content, stored.get.version_);
 
     auto failed = reconcilerOf(stores).reconcile("r1");
-    assert(failed.committed && failed.request.outcome == RequestOutcome.failed);
-    assert(failed.request.error.canFind("Task 'compile' input 'src'") && failed.request.error.canFind("is not pinned"), failed.request.error);
+    assert(failed.committed && failed.request.state.outcome == RequestOutcome.failed);
+    assert(failed.request.state.error.canFind("Task 'compile' input 'src'") && failed.request.state.error.canFind("is not pinned"), failed.request.state.error);
     assert(taskOf(failed.request, "compile").status == RequestTaskStatus.queued, "The cached tasks are kept");
     assert(stores.requests.listOpen("game").length == 0);
 }
@@ -1066,10 +1066,10 @@ unittest
     }
     catch (Exception e) assert(e.msg == "The store is unavailable", e.msg);
     const after = stores.requests.get("r1").get;
-    assert(after.outcome == RequestOutcome.open && after.version_ == before.version_, "The request is left open");
+    assert(after.state.outcome == RequestOutcome.open && after.version_ == before.version_, "The request is left open");
     assert(stores.requests.listOpen("game").length == 1);
 
-    assert(reconcilerOf(stores).reconcile("r1").request.outcome == RequestOutcome.failed);
+    assert(reconcilerOf(stores).reconcile("r1").request.state.outcome == RequestOutcome.failed);
 }
 
 unittest
@@ -1097,7 +1097,7 @@ unittest
     }
     assert(threw, "The reconcile must throw, naming the execution");
     const still = stores.requests.get("r1").get;
-    assert(still.outcome == RequestOutcome.open && stores.requests.listOpen("game").length == 1, "The request stays open");
+    assert(still.state.outcome == RequestOutcome.open && stores.requests.listOpen("game").length == 1, "The request stays open");
 }
 
 unittest
@@ -1118,11 +1118,11 @@ unittest
         assert(false, "A store error while reading must be reported");
     }
     catch (Exception e) assert(e.msg == "The store is unavailable", e.msg);
-    assert(stores.requests.get("r1").get.outcome == RequestOutcome.open && stores.requests.listOpen("game").length == 1);
+    assert(stores.requests.get("r1").get.state.outcome == RequestOutcome.open && stores.requests.listOpen("game").length == 1);
 
     documents.failing = null;
     auto reconciled = reconcilerOf(stores).reconcile("r1");
-    assert(reconciled.request.outcome == RequestOutcome.open && taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
+    assert(reconciled.request.state.outcome == RequestOutcome.open && taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
 }
 
 unittest
@@ -1137,6 +1137,6 @@ unittest
     documents.remove(buildChainsCollection.name, "c1", documents.get(buildChainsCollection.name, "c1").get.version_);
 
     auto reconciled = reconcilerOf(stores).reconcile("r1");
-    assert(reconciled.committed && reconciled.request.outcome == RequestOutcome.open);
+    assert(reconciled.committed && reconciled.request.state.outcome == RequestOutcome.open);
     assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.queued);
 }

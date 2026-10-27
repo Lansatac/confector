@@ -780,7 +780,7 @@ version (unittest)
     import confector.core.request_fixtures : beforeWrite, createChain, fingerprintNow, intake, reconcilerOf, taskOf;
     import confector.core.fingerprint_ledger : ClaimOutcome, FoldOutcome, executionIdFor;
     import confector.api.document_store : IndexQuery, QueryPage;
-    import confector.core.build_stores : InvalidStateTransitionException;
+    import confector.core.state_validation : InvalidStateTransitionException;
     import confector.testing.memory_document_store : InMemoryDocumentStore, InterleavingDocumentStore;
     import core.time : minutes;
     import std.algorithm.searching : canFind;
@@ -1145,7 +1145,7 @@ unittest
     auto ledger = stores.ledgers.get(fingerprint).get;
     assert(ledger.active.isNull && ledger.lastStoppedExecutionId == id);
     auto settled = reconcilerOf(stores).reconcile("rb");
-    assert(taskOf(settled.request, "compile").status == RequestTaskStatus.failed && settled.request.outcome == RequestOutcome.failed);
+    assert(taskOf(settled.request, "compile").status == RequestTaskStatus.failed && settled.request.state.outcome == RequestOutcome.failed);
 }
 
 unittest
@@ -1580,7 +1580,7 @@ version (unittest)
         reconciler.reconcile("rb");
         const fingerprint = fingerprintNow(stores, "a", "compile");
         assert(fingerprintNow(stores, "b", "compile") == fingerprint);
-        assert(stores.requests.get("ra").get.outcome == RequestOutcome.open && stores.requests.get("rb").get.outcome == RequestOutcome.open);
+        assert(stores.requests.get("ra").get.state.outcome == RequestOutcome.open && stores.requests.get("rb").get.state.outcome == RequestOutcome.open);
         return fingerprint;
     }
 }
@@ -1612,7 +1612,7 @@ unittest
         foreach (requestId; ["ra", "rb"])
         {
             const state = stores.requests.get(requestId).get.value;
-            assert(state.outcome != RequestOutcome.open && taskOf(state, "compile").status == expected, requestId);
+            assert(state.state.outcome != RequestOutcome.open && taskOf(state, "compile").status == expected, requestId);
         }
     }
 }
@@ -1633,7 +1633,7 @@ unittest
     assert(after.ledgers.get(fingerprint).get.active.get.id == id, "Nothing was folded");
 
     auto reconciled = reconcilerOf(after).reconcile("rb");
-    assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.succeeded && reconciled.request.outcome == RequestOutcome.succeeded);
+    assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.succeeded && reconciled.request.state.outcome == RequestOutcome.succeeded);
     assert(after.ledgers.get(fingerprint).get.active.isNull && after.ledgers.get(fingerprint).get.lastSuccessExecutionId == id);
 
     // Folding again is idempotent
@@ -1696,11 +1696,11 @@ unittest
     assert(wakeLost, "The wake's write was attempted and failed");
     assert(done.status == ExecutionStatus.succeeded, "The completion succeeds");
     assert(stores.ledgers.get(fingerprint).get.lastSuccessExecutionId == id, "The outcome is folded");
-    assert(stores.requests.get("ra").get.outcome == RequestOutcome.open, "The lost wake leaves the request open");
+    assert(stores.requests.get("ra").get.state.outcome == RequestOutcome.open, "The lost wake leaves the request open");
 
     // A later reconcile, as the sweep runs it, advances the request
     auto reconciled = reconcilerOf(stores).reconcile("ra");
-    assert(reconciled.committed && reconciled.request.outcome == RequestOutcome.succeeded);
+    assert(reconciled.committed && reconciled.request.state.outcome == RequestOutcome.succeeded);
     assert(taskOf(reconciled.request, "compile").status == RequestTaskStatus.succeeded);
 }
 
@@ -1744,11 +1744,11 @@ unittest
     const done = completeExecution(stores, running[0], running[1], succeededAt(1), fixedNow());
     assert(done.status == ExecutionStatus.succeeded, "The completion succeeds");
     assert(stores.ledgers.get(running[0]).get.lastSuccessExecutionId == running[1], "The outcome is folded");
-    assert(stores.requests.get("ra").get.outcome == RequestOutcome.open, "The wake did not run");
+    assert(stores.requests.get("ra").get.state.outcome == RequestOutcome.open, "The wake did not run");
 
     documents.failQueries = false;
     auto reconciled = reconcilerOf(stores).reconcile("ra");
-    assert(reconciled.committed && reconciled.request.outcome == RequestOutcome.succeeded);
+    assert(reconciled.committed && reconciled.request.state.outcome == RequestOutcome.succeeded);
 }
 
 unittest
@@ -1761,7 +1761,7 @@ unittest
     auto lost = expireLease(stores, running[0], 1, later(2.minutes));
     assert(lost.disposition == LostLeaseDisposition.failed);
     const state = stores.requests.get("ra").get.value;
-    assert(state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
+    assert(state.state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
 }
 
 unittest

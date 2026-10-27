@@ -840,7 +840,7 @@ unittest
     assert(request.demands.length == 2);
 
     auto state = w.stores.requests.get(result.requestId).get.value;
-    assert(state.outcome == RequestOutcome.open && state.tasks.length == 2, "The request was reconciled");
+    assert(state.state.outcome == RequestOutcome.open && state.state.tasks.length == 2, "The request was reconciled");
     const compile = w.stores.ledgers.get(demandOf(request, "compile").fingerprint);
     assert(!compile.isNull && !compile.get.active.isNull, "An execution is claimed for the needed fingerprint");
     assert(w.stores.ledgers.get(demandOf(request, "test").fingerprint).isNull, "Downstream waits for compile");
@@ -1161,7 +1161,7 @@ unittest
     auto failure = refusedBy({ w.intake.intake(build(["test"], 1)); });
     assert(failure.failure == IntakeFailure.reconcileFailed && failure.msg.canFind("store unavailable"), failure.msg);
     assert(failure.recorded.chainNumber == 1 && !w.stores.requests.get(failure.recorded.requestId).isNull);
-    assert(w.stores.requests.get(failure.recorded.requestId).get.outcome == RequestOutcome.open, "The request stays open");
+    assert(w.stores.requests.get(failure.recorded.requestId).get.state.outcome == RequestOutcome.open, "The request stays open");
     assert(w.stores.requests.listOpen("game").canFind!(r => r.id == failure.recorded.requestId), "and it is still in the open index");
 }
 
