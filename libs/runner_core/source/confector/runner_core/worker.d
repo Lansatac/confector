@@ -7,6 +7,7 @@ import confector.core.worker_token : workerTokenHeader;
 import confector.runner_core.task_executor;
 import confector.runner_core.http_artifact_storage;
 import confector.runner_core.logging;
+import confector.runner_core.steps.process : warnIfStopCannotBeSent;
 import confector.runner_core.steps.step : StepRunner;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, serializeToJsonString, parseJsonString;
@@ -517,7 +518,8 @@ class HttpWorkerDaemon
         // The work order's resolved inputs drive everything input-related: task_output inputs
         // name the upstream artifacts to stage (from the upstream fingerprint they pin), and the
         // checkout step checks repository inputs out by name. The fingerprint is the work
-        // order's; the worker never computes one.
+        // order's; the worker never computes one. The timeout is the work order's too: the
+        // executor stops the task at it, inside the lifetime of the token it was issued with.
         TaskExecutionResult result;
         try
         {
@@ -526,6 +528,7 @@ class HttpWorkerDaemon
                 taskNode,
                 taskWsDir,
                 msg.fingerprint,
+                msg.timeoutSeconds.seconds,
                 msg.payload.inputs,
                 msg.payload.repositoryAddresses,
                 &onLogLine
@@ -586,6 +589,7 @@ class HttpWorkerDaemon
         scope(exit) m_running = false;
 
         logInfo("[worker] Remote worker '%s' started, polling server '%s'...", m_client.workerId, m_client.serverUrl);
+        warnIfStopCannotBeSent();
 
         while (!atomicLoad(m_stopRequested))
         {
@@ -647,11 +651,12 @@ version (unittest)
 
 version (unittest)
 {
-    import confector.runner_core.steps.step : StepContext, StepResult;
+    import confector.runner_core.steps.step : StepContext, StepResult, StopLimits;
 
     /// A step runner for tests: each line of a step's `command` config is one line of its
     /// output. A step whose command is "fail" fails with exit code 4, and one whose command is
-    /// "sleep" takes a few seconds. Counts the steps it runs; it is
+    /// "sleep" takes a few seconds. A command of "sleep process" runs a process that outlasts the
+    /// task's deadline. Counts the steps it runs; it is
     /// passed to the worker explicitly, so the worker's thread sees it.
     private final class ScriptedStepRunner : StepRunner
     {
@@ -659,7 +664,10 @@ version (unittest)
 
         StepResult run(in BuildStep step, ref StepContext context)
         {
+            import std.process : environment;
             import std.string : splitLines;
+            import confector.runner_core.steps.process : runProcess;
+            import confector.testing.processes : shellArgs, sleepingCommand;
 
             ++stepsRun;
             StepResult result;
@@ -668,6 +676,13 @@ version (unittest)
             {
                 // Long enough for a heartbeat to go out
                 Thread.sleep(2500.msecs);
+                return result;
+            }
+            if (command == "sleep process")
+            {
+                // Throws StepTimeoutException once the task's deadline passes
+                runProcess(shellArgs(sleepingCommand), context.workingDirectory, environment.toAA, context.deadline,
+                    StopLimits(1.seconds, 5.seconds, 5.seconds), context.log);
                 return result;
             }
             if (command == "fail")
@@ -1366,4 +1381,93 @@ unittest
         textFailure);
     assert(emptyFailure.canFind("/api/v1/answers/empty") && emptyFailure.canFind("not JSON"), emptyFailure);
     assert(none.type == Json.Type.object && none.length == 0, "204 is no work");
+}
+
+unittest
+{
+    // A task that runs past its work order's timeout is stopped and its execution is recorded as
+    // failed, with the timeout as its error. The control plane does not requeue it: a failed task is
+    // retried only when a user asks, so no other runner is handed it
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
+    import confector.core.state_stores : StateStores;
+    import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution, releaseExecution;
+    import confector.core.fingerprint_ledger : ClaimOutcome;
+    import confector.testing.memory_document_store : InMemoryDocumentStore;
+    import core.time : seconds;
+
+    string testDir = "test_http_worker_timeout";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    TaskNode slow;
+    slow.id = "slow";
+    slow.timeoutSeconds = 3;
+    slow.steps = [scriptedStep("Wait", "sleep process")];
+    ActiveExecution queued;
+    queued.projectId = "game";
+    queued.taskId = "slow";
+    queued.definitionId = stores.definitions.put(ProjectDefinition([slow]));
+    queued.createdAt = "2026-10-16T10:00:00Z";
+    const claimed = stores.ledgers.claim("fp_timeout", 0, queued);
+    assert(claimed.outcome == ClaimOutcome.won);
+
+    auto router = new URLRouter();
+    router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
+        auto work = claimWork(stores, req.json["worker_id"].get!string, req.json["lease_seconds"].get!long.seconds);
+        if (work.isNull) return answerNoWork(res);
+        work.get.workOrder.workerToken = "token_" ~ work.get.workOrder.executionId;
+        res.writeJsonBody(testWork(work.get.attempt, work.get.workOrder));
+    });
+    router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+        const answer = heartbeatExecution(stores, "fp_timeout", req.params["execution_id"], req.json["attempt"].get!ulong,
+            req.json["lease_seconds"].get!long.seconds);
+        res.writeJsonBody(["answer": cast(string) answer]);
+    });
+    router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
+        const answer = releaseExecution(stores, "fp_timeout", req.params["execution_id"], req.json["attempt"].get!ulong);
+        res.writeJsonBody(["answer": cast(string) answer]);
+    });
+    router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.writeJsonBody(["status": "ok"]);
+    });
+    router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        try
+        {
+            completeExecution(stores, "fp_timeout", req.params["execution_id"], deserializeJson!TaskExecutionResult(req.json));
+            res.writeJsonBody(["status": "recorded"]);
+        }
+        catch (StaleCompletionException e)
+        {
+            res.statusCode = 409;
+            res.writeJsonBody(["error": e.msg]);
+        }
+    });
+
+    const port = freePort();
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
+    scope(exit) listener.stopListening();
+
+    HttpWorkerConfig config;
+    config.serverUrl = format("http://127.0.0.1:%d", port);
+    config.workerId = "runner_timeout";
+    config.workspaceDir = buildPath(testDir, "ws");
+    config.maxTasksToProcess = 1;
+    config.pollIntervalSeconds = 1;
+    config.heartbeatIntervalSeconds = 1;
+    config.workerPoolCredential = testWorkerPoolCredential;
+
+    auto runner = new HttpWorkerDaemon(config, new ScriptedStepRunner());
+    runOffThread({ runner.run(); }, { runner.requestStop(); });
+
+    assert(runner.tasksProcessed == 1);
+    auto finished = stores.executions.get(claimed.executionId).get;
+    assert(finished.status == ExecutionStatus.failed, format("Recorded %s", finished.status));
+    assert(finished.errorMessage.canFind("'slow' timed out after 3 seconds"), finished.errorMessage);
+    assert(finished.attempts == 1, "A timed-out task is not claimed again");
+    assert(stores.ledgers.get("fp_timeout").get.active.isNull, "The failure is folded, not left active");
+    assert(claimWork(stores, "runner_other", 60.seconds).isNull, "Nothing is queued for another runner");
 }

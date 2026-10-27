@@ -2,11 +2,12 @@ module confector.runner_core.task_executor;
 
 import confector.api.model;
 import confector.runner_core.artifacts;
-import confector.runner_core.steps.step : StepContext, StepResult, StepRunner;
+import confector.runner_core.steps.step : StepContext, StepResult, StepRunner, StepTimeoutException, StopLimits;
 
 import std.format : format;
 import std.algorithm.searching : canFind;
 import std.datetime.stopwatch : StopWatch, AutoStart;
+import core.time : Duration, MonoTime, seconds;
 import confector.runner_core.logging : LogDelegate, logInfo;
 
 /**
@@ -117,6 +118,9 @@ class TaskExecutor
     private ArtifactStorage m_artifactStorage;
     private StepRunner m_steps;
 
+    /// How long a step's processes are given after the task's deadline.
+    StopLimits stopLimits;
+
     /// Throws: Exception if `steps` is null.
     this(ArtifactStorage artifactStorage, StepRunner steps)
     {
@@ -140,19 +144,24 @@ class TaskExecutor
      *   workspaceDir = Workspace directory path where execution occurs.
      *   fingerprint = The task's fingerprint from the work order, computed by the control
      *                 plane; the runner never computes its own. Required.
+     *   timeout = The task's timeout, from the work order. It runs from the start of this call
+     *             and covers staging its inputs and running its steps. Past it, the steps'
+     *             processes are stopped and the task fails as timed out, with no outputs packed.
      *   inputs = The task's resolved inputs from the work order, one per declared input.
      *   repositoryAddresses = Where to fetch each repository input from, keyed by input name.
      *   logCallback = Receives each output line as it is produced; when null, lines are dropped.
      *   manageArtifacts = When true, the executor stages upstream artifacts and packs outputs.
      *
-     * Throws: Exception if `fingerprint` is empty or `inputs` do not match the task's declared
-     * inputs (see `bindInputs`); whatever the step runner throws for a step it cannot run.
+     * Throws: Exception if `fingerprint` is empty, `timeout` is not positive or `inputs` do not
+     * match the task's declared inputs (see `bindInputs`); whatever the step runner throws for a
+     * step it cannot run.
      */
     TaskExecutionResult executeTask(
         string executionId,
         in TaskNode task,
         string workspaceDir,
         string fingerprint,
+        Duration timeout,
         in ResolvedInput[] inputs,
         in string[string] repositoryAddresses = null,
         LogDelegate logCallback = null,
@@ -173,6 +182,13 @@ class TaskExecutor
             throw new Exception(format("Task '%s' of execution '%s' has no fingerprint; the work order must carry the one the control plane computed",
                 task.id, executionId));
         }
+
+        if (timeout <= Duration.zero)
+        {
+            throw new Exception(format("Task '%s' of execution '%s' has no positive timeout; the work order must carry the task's timeout",
+                task.id, executionId));
+        }
+        const MonoTime deadline = MonoTime.currTime + timeout;
 
         // 2. Bind the work order's resolved inputs to the task's declared inputs
         ResolvedInput[string] boundInputs = bindInputs(task, inputs, repositoryAddresses);
@@ -254,8 +270,14 @@ class TaskExecutor
         stepCtx.taskParameters = valueInputs.dup;
         stepCtx.log = log;
         stepCtx.inputs = boundInputs;
+        stepCtx.deadline = deadline;
+        stepCtx.stopLimits = stopLimits;
         foreach (name, address; repositoryAddresses) stepCtx.repositoryAddresses[name] = address;
 
+        // A step that runs past the deadline has its processes stopped by the step runner, which
+        // throws StepTimeoutException; a step that finishes after it, or none that starts after it,
+        // leaves the task timed out
+        bool timedOut = false;
         if (task.steps.length == 0)
         {
             taskSuccess = false;
@@ -267,10 +289,24 @@ class TaskExecutor
         {
             foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
             {
+                if (MonoTime.currTime >= deadline)
+                {
+                    timedOut = true;
+                    break;
+                }
                 string stepLabel = step.name.length > 0 ? step.name : format("Step %d (%s)", stepIdx + 1, step.type);
                 log(format("[confector] Running build step [%d/%d]: %s", stepIdx + 1, task.steps.length, stepLabel));
 
-                StepResult stepResult = m_steps.run(step, stepCtx);
+                StepResult stepResult;
+                try
+                {
+                    stepResult = m_steps.run(step, stepCtx);
+                }
+                catch (StepTimeoutException)
+                {
+                    timedOut = true;
+                    break;
+                }
                 if (!stepResult.success)
                 {
                     taskSuccess = false;
@@ -282,6 +318,19 @@ class TaskExecutor
                     break;
                 }
             }
+            if (taskSuccess && MonoTime.currTime >= deadline) timedOut = true;
+        }
+
+        if (timedOut)
+        {
+            taskErrorMessage = format("Task '%s' timed out after %d seconds", task.id, timeout.total!"seconds");
+            log(format("[confector] Error: %s", taskErrorMessage));
+            result.status = ExecutionStatus.failed;
+            result.exitCode = 1;
+            result.errorMessage = taskErrorMessage;
+            sw.stop();
+            result.durationMs = sw.peek.total!"msecs";
+            return result;
         }
 
         result.exitCode = taskExitCode;
@@ -336,20 +385,23 @@ version (unittest)
 {
     /// A step runner for tests: runs each step's `command` config as a shell command in the
     /// step's working directory, sending its output to the step's log, and records each step it
-    /// runs.
+    /// runs. The command's processes stop at the step's deadline.
     private final class ShellStepRunner : StepRunner
     {
         StepContext[] seen;
 
         StepResult run(in BuildStep step, ref StepContext context)
         {
-            import std.process : pipeShell, Redirect, Config, wait;
+            import std.process : environment;
+            import confector.runner_core.steps.process : runProcess;
+            import confector.testing.processes : shellArgs;
 
             seen ~= context;
+            string[string] env = environment.toAA;
+            foreach (key, value; context.environment) env[key] = value;
             StepResult res;
-            auto pipe = pipeShell(step.config["command"].get!string, Redirect.stdout | Redirect.stderrToStdout, null, Config.none, context.workingDirectory);
-            foreach (line; pipe.stdout.byLineCopy) context.log(line);
-            res.exitCode = wait(pipe.pid);
+            res.exitCode = runProcess(shellArgs(step.config["command"].get!string), context.workingDirectory, env,
+                context.deadline, context.stopLimits, context.log);
             res.success = res.exitCode == 0;
             return res;
         }
@@ -386,7 +438,7 @@ unittest
     node1.outputs.artifacts = [OutputArtifactDecl("output.txt", "output.txt")];
 
     string[] logged;
-    auto res1 = engine.executeTask("exe_1", node1, testDir, "fp_step1", [], null, (string line) { logged ~= line; });
+    auto res1 = engine.executeTask("exe_1", node1, testDir, "fp_step1", 60.seconds, [], null, (string line) { logged ~= line; });
     assert(res1.status == ExecutionStatus.succeeded, res1.errorMessage);
     assert(res1.producedArtifacts.length == 1);
     assert(res1.producedArtifacts[0].taskFingerprint == "fp_step1", "Outputs are stored under the work order's fingerprint");
@@ -397,7 +449,7 @@ unittest
 
     // The runner never computes a fingerprint of its own
     bool threw = false;
-    try engine.executeTask("exe_1", node1, testDir, "", []);
+    try engine.executeTask("exe_1", node1, testDir, "", 60.seconds, []);
     catch (Exception ex) threw = ex.msg.canFind("no fingerprint");
     assert(threw);
 
@@ -411,14 +463,14 @@ unittest
     string ws2 = buildPath(testDir, "ws2");
     mkdirRecurse(ws2);
     string[] staged;
-    auto res2 = engine.executeTask("exe_2", node2, ws2, "fp_step2", [ResolvedInput("out", InputKind.taskOutput, Json("fp_step1"))],
+    auto res2 = engine.executeTask("exe_2", node2, ws2, "fp_step2", 60.seconds, [ResolvedInput("out", InputKind.taskOutput, Json("fp_step1"))],
         null, (string line) { staged ~= line; });
     assert(res2.status == ExecutionStatus.succeeded, res2.errorMessage);
     assert(exists(buildPath(ws2, "output.txt")));
     assert(staged.canFind!(line => line.canFind("hello")), "The step read the staged artifact");
 
     // An upstream fingerprint with no such artifact fails the task
-    auto res3 = engine.executeTask("exe_3", node2, ws2, "fp_step2", [ResolvedInput("out", InputKind.taskOutput, Json("fp_other"))]);
+    auto res3 = engine.executeTask("exe_3", node2, ws2, "fp_step2", 60.seconds, [ResolvedInput("out", InputKind.taskOutput, Json("fp_other"))]);
     assert(res3.status == ExecutionStatus.failed && res3.errorMessage.canFind("fp_other"));
     assert(res3.errorMessage.canFind("'step1'") && res3.errorMessage.canFind("'output.txt'") && res3.errorMessage.canFind("Re-run task 'step1'"));
 
@@ -427,14 +479,14 @@ unittest
     failing.id = "failing";
     failing.steps = [shellStep("Fail", "exit 3"), shellStep("Never", "echo never")];
     steps.seen = null;
-    auto res4 = engine.executeTask("exe_4", failing, testDir, "fp_failing", []);
+    auto res4 = engine.executeTask("exe_4", failing, testDir, "fp_failing", 60.seconds, []);
     assert(res4.status == ExecutionStatus.failed && res4.exitCode == 3, res4.errorMessage);
     assert(res4.errorMessage.canFind("'Fail'") && steps.seen.length == 1);
 
     // A task without steps fails rather than succeeding vacuously
     TaskNode empty;
     empty.id = "empty";
-    auto res5 = engine.executeTask("exe_5", empty, testDir, "fp_empty", []);
+    auto res5 = engine.executeTask("exe_5", empty, testDir, "fp_empty", 60.seconds, []);
     assert(res5.status == ExecutionStatus.failed && res5.errorMessage.canFind("no build steps"));
 
     // An engine needs a step runner
@@ -459,7 +511,7 @@ unittest
     auto flavor = ResolvedInput("flavor", InputKind.value, Json("internal"));
     auto steps = new ShellStepRunner();
     auto engine = new TaskExecutor(null, steps);
-    auto res = engine.executeTask("exe_c", task, ".", "fp", [flavor, src], ["src": "https://example.test/game.git"]);
+    auto res = engine.executeTask("exe_c", task, ".", "fp", 60.seconds, [flavor, src], ["src": "https://example.test/game.git"]);
     assert(res.status == ExecutionStatus.succeeded, res.errorMessage);
     assert(steps.seen.length == 1);
     auto seen = steps.seen[0];
@@ -470,7 +522,7 @@ unittest
     // Inputs that do not match the declaration are refused before any step runs
     steps.seen = null;
     bool threw = false;
-    try engine.executeTask("exe_c", task, ".", "fp", [flavor]);
+    try engine.executeTask("exe_c", task, ".", "fp", 60.seconds, [flavor]);
     catch (Exception ex) threw = ex.msg.canFind("'src'");
     assert(threw && steps.seen.length == 0);
 }
@@ -487,7 +539,56 @@ unittest
     task.steps = [docker];
     string[] logged;
     auto engine = new TaskExecutor(null, new BuiltinStepRunner());
-    auto res = engine.executeTask("exe_d", task, ".", "fp", [], null, (string line) { logged ~= line; });
+    auto res = engine.executeTask("exe_d", task, ".", "fp", 60.seconds, [], null, (string line) { logged ~= line; });
     assert(res.status == ExecutionStatus.failed && res.errorMessage.canFind("is not supported"), res.errorMessage);
     assert(logged.canFind!(line => line.canFind("is not supported")));
+}
+
+unittest
+{
+    // A task that runs past its timeout has its processes stopped, is reported failed as timed out,
+    // and packs no outputs; a task that finishes in time succeeds. The timeout is short, and the
+    // step that would outlast it is a process
+    import std.file : exists, mkdirRecurse, rmdirRecurse;
+    import std.exception : assertThrown;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+    import confector.testing.processes : sleepingCommand;
+
+    string testDir = "test_runner_core_executor_timeout";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    auto storage = new InMemoryArtifactStorage();
+    auto steps = new ShellStepRunner();
+    auto engine = new TaskExecutor(storage, steps);
+    engine.stopLimits = StopLimits(1.seconds, 5.seconds, 5.seconds);
+
+    TaskNode slow;
+    slow.id = "slow";
+    slow.outputs.artifacts = [OutputArtifactDecl("out.txt", "out.txt")];
+    slow.steps = [
+        shellStep("Write", "echo partial> out.txt"),
+        shellStep("Wait", sleepingCommand),
+        shellStep("Never", "echo never"),
+    ];
+    string[] logged;
+    const started = MonoTime.currTime;
+    auto res = engine.executeTask("exe_slow", slow, testDir, "fp_slow", 4.seconds, [], null, (string line) { logged ~= line; });
+    assert(res.status == ExecutionStatus.failed, res.errorMessage);
+    assert(res.errorMessage.canFind("'slow' timed out after 4 seconds"), res.errorMessage);
+    assert(MonoTime.currTime - started < 60.seconds, "The task was not stopped at its timeout");
+    assert(logged.canFind!(line => line.canFind("Running build step [2/3]: Wait")));
+    assert(!logged.canFind!(line => line.canFind("[3/3]")), "A step after the timeout started");
+    assert(!storage.artifactExists("fp_slow", "out.txt"), "A task that timed out packed its outputs");
+
+    // A task that finishes within its timeout is unaffected
+    TaskNode quick;
+    quick.id = "quick";
+    quick.steps = [shellStep("Quick", "echo done")];
+    auto done = engine.executeTask("exe_quick", quick, testDir, "fp_quick", 60.seconds, []);
+    assert(done.status == ExecutionStatus.succeeded && done.errorMessage.length == 0, done.errorMessage);
+
+    // A timeout must be positive
+    assertThrown!Exception(engine.executeTask("exe_quick", quick, testDir, "fp_quick", 0.seconds, []));
 }

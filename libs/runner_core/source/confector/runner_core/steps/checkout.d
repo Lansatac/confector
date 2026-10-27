@@ -6,12 +6,14 @@ import std.file;
 import std.path : buildPath, baseName, isAbsolute, buildNormalizedPath, absolutePath, relativePath, dirSeparator;
 import std.algorithm.searching : canFind, startsWith;
 import std.string : strip, toLower;
+import core.time : MonoTime, minutes, seconds;
 
 import confector.api.model : BuildStep, InputKind, ResolvedInput;
 import confector.core.git : isFullSha, redactUserInfo;
 import confector.core.builtin_steps : checkoutConfig, checkoutConfigIssues, checkoutStepType;
 import confector.runner_core.logging : LogDelegate;
-import confector.runner_core.steps.step : StepContext, StepResult;
+import confector.runner_core.steps.process : runProcess;
+import confector.runner_core.steps.step : StepContext, StepResult, StepTimeoutException, StopLimits;
 import vibe.data.json : Json;
 
 private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
@@ -205,7 +207,7 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
     {
         int run(string[] args)
         {
-            return runGit(["git"] ~ hermeticGitOptions ~ args, checkoutDir, gitEnv, context.log);
+            return runGit(["git"] ~ hermeticGitOptions ~ args, checkoutDir, gitEnv, context.deadline, context.stopLimits, context.log);
         }
 
         // No templates: the fresh repository has no hooks
@@ -258,6 +260,11 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
             }
         }
     }
+    catch (StepTimeoutException e)
+    {
+        // The task's deadline is reported by the executor, not as a git failure
+        throw e;
+    }
     catch (Exception e)
     {
         res.exitCode = -1;
@@ -270,18 +277,10 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
 }
 
 /// Runs one git command in `dir` with standard input closed, sending its output, with any
-/// credentials in URLs redacted, to `log`. Returns its exit code.
-private int runGit(string[] args, string dir, string[string] env, LogDelegate log)
+/// credentials in URLs redacted, to `log`. Returns its exit code. Stops it at `deadline`.
+private int runGit(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, LogDelegate log)
 {
-    // newEnv: git sees exactly nv, never the runner's unfiltered environment
-    auto pipe = pipeProcess(args, Redirect.stdin | Redirect.stdout | Redirect.stderrToStdout, env,
-        Config.newEnv, dir);
-    pipe.stdin.close();
-    foreach (line; pipe.stdout.byLineCopy)
-    {
-        log(redactUserInfo(line));
-    }
-    return wait(pipe.pid);
+    return runProcess(args, dir, env, deadline, limits, (string line) { log(redactUserInfo(line)); });
 }
 
 version (unittest)
@@ -302,6 +301,7 @@ version (unittest)
         ctx.inputs["flavor"] = ResolvedInput("flavor", InputKind.value, Json("internal"));
         ctx.inputs["bin"] = ResolvedInput("bin", InputKind.taskOutput, Json("fp_upstream"));
         ctx.repositoryAddresses["src"] = address;
+        ctx.deadline = MonoTime.currTime + 10.minutes;
         return ctx;
     }
 
@@ -399,6 +399,23 @@ unittest
     try runCheckout(checkoutStep(["input": "src"]), noLog);
     catch (Exception e) refused = e.msg.canFind("StepContext.log is null");
     assert(refused);
+}
+
+unittest
+{
+    // A checkout whose task has run out of time throws StepTimeoutException, not a failed result
+    import std.uuid : randomUUID;
+
+    string workspace = buildPath(tempDir(), "cfx" ~ randomUUID().toString()[0 .. 6]);
+    mkdirRecurse(workspace);
+    scope(exit) if (exists(workspace)) removeTree(workspace);
+
+    auto ctx = checkoutContext(workspace);
+    ctx.deadline = MonoTime.currTime - 1.seconds;
+    bool timedOut = false;
+    try runCheckout(checkoutStep(["input": "src", "target_dir": "late"]), ctx);
+    catch (StepTimeoutException e) timedOut = true;
+    assert(timedOut, "A checkout past its deadline did not throw StepTimeoutException");
 }
 
 unittest
