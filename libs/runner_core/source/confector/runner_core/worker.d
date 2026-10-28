@@ -46,13 +46,18 @@ enum CompletionReport
     /// The server recorded it.
     recorded,
     /// The server rejected it for good: the execution already finished or a later attempt holds
-    /// it (409), the completion is invalid (400, 422), or the execution does not exist (404).
-    /// Reporting it again would be rejected the same way.
+    /// it (409), the completion is invalid (400, 422), the execution does not exist (404), or the
+    /// worker token does not allow it (401, 403). Reporting it again would be rejected the same way.
     rejected,
-    /// It did not reach the server, or the server failed (5xx, or any other status): the work is
-    /// given back so another attempt can run it.
+    /// It did not reach the server, or the server failed (5xx, or any other status). The server did
+    /// not record it, so the worker may report it again. It is never released: if the worker gives up,
+    /// the lease expires, which requeues the execution as an infrastructure failure counted against
+    /// the attempt limit.
     notRecorded
 }
+
+/// The longest wait between two reports of a completion the server did not record, in seconds.
+enum size_t completionRetryBackoffCapSeconds = 60;
 
 /**
  * Configuration options for the HTTP-based remote worker daemon.
@@ -71,6 +76,12 @@ struct HttpWorkerConfig
     /// The worker pool credential the server admits this worker's receives with. Required: the
     /// client refuses to start without one of at least 32 bytes.
     string workerPoolCredential = "";
+    /// How many times the worker reports a completion the server did not record before it gives
+    /// up. Reports are spaced by the backoff below, while the worker still holds the execution.
+    size_t completionAttempts = 5;
+    /// The wait before the first repeated completion report, doubled before each further one up to
+    /// `completionRetryBackoffCapSeconds`.
+    size_t completionRetryBackoffSeconds = 2;
 }
 
 /**
@@ -89,6 +100,18 @@ void requireUsableLease(in HttpWorkerConfig config)
     {
         throw new Exception(format("The heartbeat interval of %s seconds must be at least 1 and shorter than the lease of %s seconds",
             config.heartbeatIntervalSeconds, config.leaseSeconds));
+    }
+}
+
+/**
+ * Throws, naming the setting, unless the worker reports a completion at least once: with no
+ * attempts a finished execution would never be reported.
+ */
+void requireUsableCompletionAttempts(in HttpWorkerConfig config)
+{
+    if (config.completionAttempts < 1)
+    {
+        throw new Exception("The completion attempts must be at least 1, or a finished execution is never reported");
     }
 }
 
@@ -282,29 +305,6 @@ class HttpWorkerClient
         return answerOf(sendJson(format("/executions/%s/heartbeat", executionId), "POST", req, workerToken));
     }
 
-    /// Gives attempt `attempt` of execution `executionId` back so any worker can claim it again.
-    /// Returns false, logging why, if the server did not take it.
-    bool release(string executionId, ulong attempt, string workerToken)
-    {
-        try
-        {
-            Json req = Json.emptyObject;
-            req["attempt"] = Json(attempt);
-            req["worker_id"] = Json(m_workerId);
-            const answer = answerOf(sendJson(format("/executions/%s/release", executionId), "POST", req, workerToken));
-            if (answer != LeaseAnswer.released)
-            {
-                logWarn("[HttpWorkerClient] Execution '%s' was not released: the server answered %s", executionId, cast(string) answer);
-            }
-            return answer == LeaseAnswer.released;
-        }
-        catch (Exception e)
-        {
-            logError("[HttpWorkerClient] Failed to release execution '%s': %s", executionId, e.msg);
-            return false;
-        }
-    }
-
     private static LeaseAnswer answerOf(in Json response)
     {
         if (response.type != Json.Type.object || "answer" !in response)
@@ -349,7 +349,10 @@ class HttpWorkerClient
         }
         catch (ServerResponseException e)
         {
-            const permanent = e.statusCode == 400 || e.statusCode == 404 || e.statusCode == 409 || e.statusCode == 422;
+            // The token of an execution does not change while it is held, so 401 and 403 would refuse
+            // the same report again
+            const permanent = e.statusCode == 400 || e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404
+                || e.statusCode == 409 || e.statusCode == 422;
             logError("[HttpWorkerClient] The server %s the completion of execution '%s' (task: %s): %s",
                 permanent ? "rejected" : "did not record", executionId, result.taskId, e.msg);
             return permanent ? CompletionReport.rejected : CompletionReport.notRecorded;
@@ -380,11 +383,13 @@ class HttpWorkerDaemon
     private size_t m_tasksProcessed = 0;
 
     /// Throws: Exception if `steps` is null or the lease and heartbeat interval cannot work
-    /// (see `requireUsableLease`).
+    /// (see `requireUsableLease`), or the completion attempts are zero (see
+    /// `requireUsableCompletionAttempts`).
     this(in HttpWorkerConfig config, StepRunner steps, HttpWorkerClient client = null)
     {
         if (steps is null) throw new Exception("A worker needs a step runner");
         requireUsableLease(config);
+        requireUsableCompletionAttempts(config);
         this.m_config = config;
         this.m_steps = steps;
         this.m_client = client !is null ? client : new HttpWorkerClient(config.serverUrl, config.workerId, config.workerPoolCredential);
@@ -563,23 +568,59 @@ class HttpWorkerDaemon
             logError("[worker] Not reporting task '%s' (execution '%s'): the server no longer holds attempt %s for this worker",
                 taskId, msg.executionId, attempt);
         }
-        else final switch (m_client.reportCompletion(msg.executionId, result, workerToken))
+        else final switch (reportCompletionWithRetries(msg.executionId, result, workerToken, () => !atomicLoad(lostExecution)))
         {
             case CompletionReport.recorded:
             case CompletionReport.rejected:
                 // A rejection is permanent: running the task again would only be rejected again
                 break;
             case CompletionReport.notRecorded:
-                // Give the execution back, rather than leave it held until the lease runs out
-                // with its completion never recorded
-                logError("[worker] Completion of task '%s' (execution '%s') was not recorded; giving the execution back",
-                    taskId, msg.executionId);
-                m_client.release(msg.executionId, attempt, workerToken);
+                // Not released: a release would hand the finished execution to another worker to run
+                // again. Giving up leaves the lease to expire instead, which requeues the execution as
+                // an infrastructure failure counted against the attempt limit
+                logError("[worker] Completion of task '%s' (execution '%s') was not recorded after the worker gave up reporting it; "
+                    ~ "its lease will expire and requeue it as an infrastructure failure", taskId, msg.executionId);
                 break;
         }
 
         m_tasksProcessed++;
         return result;
+    }
+
+    /**
+     * Reports the completion of `executionId`. While the server does not record it (`notRecorded`),
+     * waits and reports it again, for at most `completionAttempts` reports in all. The wait starts at
+     * `completionRetryBackoffSeconds` and doubles, up to `completionRetryBackoffCapSeconds`. Stops at
+     * once on a report the server rejects, and when `stillHeld` says the worker no longer holds the
+     * execution, checked again after each wait so a lost lease seen by the heartbeat stops the retries.
+     * Returns the last report.
+     */
+    private CompletionReport reportCompletionWithRetries(string executionId, in TaskExecutionResult result, string workerToken,
+        bool delegate() stillHeld)
+    {
+        import std.algorithm.comparison : min;
+        size_t backoff = min(m_config.completionRetryBackoffSeconds, completionRetryBackoffCapSeconds);
+        CompletionReport report = CompletionReport.notRecorded;
+        foreach (reports; 1 .. m_config.completionAttempts + 1)
+        {
+            report = m_client.reportCompletion(executionId, result, workerToken);
+            if (report != CompletionReport.notRecorded || reports == m_config.completionAttempts)
+            {
+                return report;
+            }
+            logWarn("[worker] Reporting the completion of execution '%s' again in %s seconds (report %s of %s)",
+                executionId, backoff, reports + 1, m_config.completionAttempts);
+            Thread.sleep(backoff.seconds);
+            if (!stillHeld())
+            {
+                logError("[worker] The worker lost execution '%s' while its completion was unrecorded; not reporting it again",
+                    executionId);
+                return report;
+            }
+            // Doubling stops at the cap, so no backoff overflows
+            backoff = backoff > completionRetryBackoffCapSeconds / 2 ? completionRetryBackoffCapSeconds : backoff * 2;
+        }
+        return report;
     }
 
     void run()
@@ -753,6 +794,11 @@ unittest
     usable.workerPoolCredential = testWorkerPoolCredential;
     new HttpWorkerDaemon(usable, new ScriptedStepRunner());
 
+    // A worker that reports a completion at least once: zero attempts would never report one
+    HttpWorkerConfig noCompletionAttempts = usable;
+    noCompletionAttempts.completionAttempts = 0;
+    assertThrown!Exception(new HttpWorkerDaemon(noCompletionAttempts, new ScriptedStepRunner()));
+
     const port = freePort();
     auto router = new URLRouter();
     // A redirect from the server is not followed, so a credential never goes to its target
@@ -766,12 +812,13 @@ unittest
     string[] completedExecutions;
     TaskExecutionResult[] reported;
     bool[] reportedFingerprint;
-    string[] releasedExecutions;
     string[] heartbeatExecutions;
     long[] heartbeatAttempts;
     string heartbeatAnswer = "continue";
     Json[] receiveRequests;
-    int rejectCompletion = 0;
+    // The answers the next completion reports get, in order: an HTTP status, or 0 to record it.
+    // Once they run out, reports are recorded.
+    int[] completionAnswers;
     string[] presentedTokens;
     string[] receivePoolCredentials;
     string[] otherPoolCredentials;
@@ -812,21 +859,19 @@ unittest
         completedExecutions ~= req.params["execution_id"];
         reportedFingerprint ~= ("fingerprint" in req.json) !is null;
         reported ~= deserializeJson!TaskExecutionResult(req.json);
-        if (rejectCompletion != 0)
+        if (completionAnswers.length > 0)
         {
-            res.statusCode = rejectCompletion;
-            res.writeJsonBody(["error": format("Completion of 'exe_mock_1' answered with HTTP %s", rejectCompletion)]);
-            return;
+            const answer = completionAnswers[0];
+            completionAnswers = completionAnswers[1 .. $];
+            if (answer != 0)
+            {
+                res.statusCode = answer;
+                res.writeJsonBody(["error": format("Completion of 'exe_mock_1' answered with HTTP %s", answer)]);
+                return;
+            }
         }
         res.writeJsonBody(["status": "recorded"]);
     });
-    router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
-        recordToken(req);
-        assert(req.json["attempt"].get!long == 1);
-        releasedExecutions ~= req.params["execution_id"];
-        res.writeJsonBody(["answer": "released"]);
-    });
-
     auto listener = listenHTTP(loopbackServerSettings(port), router);
     scope(exit) listener.stopListening();
 
@@ -838,6 +883,9 @@ unittest
     config.pollIntervalSeconds = 1;
     config.heartbeatIntervalSeconds = 1;
     config.workerPoolCredential = testWorkerPoolCredential;
+    // Three reports in all, with no wait between them, so a retry that gives up is quick to see
+    config.completionAttempts = 3;
+    config.completionRetryBackoffSeconds = 0;
 
     // A redirect answer is a failed request with its status, and the credential is not sent to
     // the location it names: the receive route the redirect points at is never reached
@@ -873,7 +921,6 @@ unittest
     assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("Reported %s", reported));
     assert(reported[0].taskId == "task_test_1" && reported[0].exitCode == 0 && reported[0].errorMessage.length == 0);
     assert(reportedFingerprint == [false], "The completion carries no fingerprint");
-    assert(releasedExecutions.length == 0, "A recorded completion is not given back");
     assert(receiveRequests[0]["worker_id"].get!string == "test_worker_runner" && receiveRequests[0]["lease_seconds"].get!long == 60,
         "Receiving names the worker and the lease it asks for");
     assert(reported[0].attempt == 1, "The completion carries the attempt the work order was claimed as");
@@ -887,23 +934,52 @@ unittest
     // The workspace is the execution's own directory
     assert(exists(buildPath(config.workspaceDir, "exe_mock_1")));
 
-    // A completion the server failed to record (5xx) gives the execution back, so another attempt
-    // runs it instead of it staying held. One the server rejected for good (a duplicate or late
-    // completion, 409; an invalid one, 422) is not given back: running the work order again would
-    // only be rejected again
+    // A completion the server does not record (5xx) is reported again, after its backoff, until the
+    // server records it
     auto work = ClaimedWork(mockOrder, 1);
-    foreach (status, givenBack; [500: true, 503: true, 409: false, 422: false])
+    completionAnswers = [500, 503];
+    reported = null;
+    runOffThread({ workerRunner.processOneMessage(work); });
+    assert(reported.length == 3, format("Two refusals, then a record: reported %s times", reported.length));
+    assert(reported[2].status == ExecutionStatus.succeeded, format("The third report: %s", reported[2].status));
+
+    // With the server refusing every report, the worker gives up after completionAttempts (3) reports
+    completionAnswers = [500, 500, 500, 500];
+    reported = null;
+    runOffThread({ workerRunner.processOneMessage(work); });
+    assert(reported.length == 3, format("Gave up after %s reports", reported.length));
+
+    // A report the server rejects for good ends the retries: the attempt was superseded in the meantime
+    completionAnswers = [500, 409];
+    reported = null;
+    runOffThread({ workerRunner.processOneMessage(work); });
+    assert(reported.length == 2, format("A rejected retry is the last report: %s reports", reported.length));
+
+    // A heartbeat that answers superseded while a completion waits to be reported again stops the
+    // retries: the worker no longer holds the execution. The backoff is long enough for a heartbeat
+    // to come in between two reports
+    HttpWorkerConfig lostConfig = config;
+    lostConfig.completionAttempts = 5;
+    lostConfig.completionRetryBackoffSeconds = 2;
+    auto lostRunner = new HttpWorkerDaemon(lostConfig, steps);
+    completionAnswers = [500, 500, 500, 500, 500];
+    heartbeatAnswer = "superseded";
+    reported = null;
+    runOffThread({ lostRunner.initialize(); lostRunner.processOneMessage(work); });
+    heartbeatAnswer = "continue";
+    completionAnswers = null;
+    assert(reported.length == 1, format("A lost lease stops the retries after one report: %s reports", reported.length));
+
+    // A report rejected for good is not repeated: a duplicate or late completion (409), an invalid
+    // one (400, 422), or one the token does not allow (401, 403)
+    foreach (status; [400, 401, 403, 409, 422])
     {
-        rejectCompletion = status;
-        releasedExecutions = null;
+        completionAnswers = [status];
         reported = null;
         runOffThread({ workerRunner.processOneMessage(work); });
-        assert(reported.length == 1 && reported[0].status == ExecutionStatus.succeeded, format("HTTP %s: reported %s", status, reported));
-        string[] expectedReleases;
-        if (givenBack) expectedReleases = ["exe_mock_1"];
-        assert(releasedExecutions == expectedReleases, format("HTTP %s: released %s", status, releasedExecutions));
+        assert(reported.length == 1, format("HTTP %s: reported %s times", status, reported.length));
     }
-    rejectCompletion = 0;
+    completionAnswers = null;
 
     // A heartbeat the server answers superseded (or cancel) means the worker lost the execution:
     // its result is not reported, since the server would reject it
@@ -911,13 +987,12 @@ unittest
     {
         heartbeatAnswer = answered;
         heartbeatExecutions = null;
-        releasedExecutions = null;
         reported = null;
         WorkOrder slow = mockOrder;
         slow.taskNode.steps = [scriptedStep("Slow", "sleep")];
         runOffThread({ workerRunner.processOneMessage(ClaimedWork(slow, 1)); });
         assert(heartbeatExecutions.length > 0 && heartbeatExecutions[0] == "exe_mock_1", answered);
-        assert(reported.length == 0 && releasedExecutions.length == 0, "A lost execution is not reported: " ~ answered);
+        assert(reported.length == 0, "A lost execution is not reported: " ~ answered);
     }
     heartbeatAnswer = "continue";
 
@@ -936,14 +1011,13 @@ unittest
     // A work order naming no execution is refused before anything runs: its completion could
     // not say what it completes
     reported = null;
-    releasedExecutions = null;
     WorkOrder anonymous = mockOrder;
     anonymous.executionId = null;
     string refusal;
     try runOffThread({ workerRunner.processOneMessage(ClaimedWork(anonymous, 1)); });
     catch (Exception e) refusal = e.msg;
     assert(refusal.canFind("names no execution"), refusal);
-    assert(reported.length == 0 && releasedExecutions.length == 0);
+    assert(reported.length == 0);
 
     // So is one without a token: the server would refuse every call it made
     WorkOrder untokened = mockOrder;
@@ -952,7 +1026,7 @@ unittest
     try runOffThread({ workerRunner.processOneMessage(ClaimedWork(untokened, 1)); });
     catch (Exception e) refusal = e.msg;
     assert(refusal.canFind("no worker token"), refusal);
-    assert(reported.length == 0 && releasedExecutions.length == 0);
+    assert(reported.length == 0);
 }
 
 unittest
@@ -1195,7 +1269,7 @@ unittest
 
     // A refusal throws an authorization error from every call: no "missing artifact", and no
     // silent fallback to the proxy upload
-    foreach (status; [401, 403])
+    foreach (status; [401, 403, 409])
     {
         refuseWith = status;
         proxyUploads = 0;
@@ -1230,7 +1304,7 @@ unittest
     import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import confector.core.fingerprint_ledger : ClaimOutcome;
     import confector.core.state_stores : StateStores;
-    import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution, releaseExecution;
+    import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
 
     string testDir = "test_http_worker_end_to_end";
@@ -1262,10 +1336,6 @@ unittest
     router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
         const answer = heartbeatExecution(stores, "fp_e2e", req.params["execution_id"], req.json["attempt"].get!ulong,
             req.json["lease_seconds"].get!long.seconds);
-        res.writeJsonBody(["answer": cast(string) answer]);
-    });
-    router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
-        const answer = releaseExecution(stores, "fp_e2e", req.params["execution_id"], req.json["attempt"].get!ulong);
         res.writeJsonBody(["answer": cast(string) answer]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -1392,7 +1462,7 @@ unittest
     import vibe.http.router : URLRouter;
     import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
     import confector.core.state_stores : StateStores;
-    import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution, releaseExecution;
+    import confector.core.work_orders : StaleCompletionException, claimWork, completeExecution, heartbeatExecution;
     import confector.core.fingerprint_ledger : ClaimOutcome;
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import core.time : seconds;
@@ -1425,10 +1495,6 @@ unittest
     router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
         const answer = heartbeatExecution(stores, "fp_timeout", req.params["execution_id"], req.json["attempt"].get!ulong,
             req.json["lease_seconds"].get!long.seconds);
-        res.writeJsonBody(["answer": cast(string) answer]);
-    });
-    router.post("/api/v1/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
-        const answer = releaseExecution(stores, "fp_timeout", req.params["execution_id"], req.json["attempt"].get!ulong);
         res.writeJsonBody(["answer": cast(string) answer]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {

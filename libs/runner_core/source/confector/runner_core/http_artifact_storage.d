@@ -11,8 +11,8 @@ import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
 
 /**
  * The server refused the worker token (HTTP 401 or 403): it is missing, expired or altered, or does
- * not allow this artifact or this attempt. Never a missing artifact, and never worth falling back
- * to another route.
+ * not allow this artifact or this attempt. HTTP 409 is the server refusing a superseded attempt, the
+ * same refusal. Never a missing artifact, and never worth falling back to another route.
  */
 class ArtifactAuthException : Exception
 {
@@ -122,8 +122,10 @@ class HttpArtifactStorage : ArtifactStorage
             {
                 errMsg = format("HTTP %d %s", http.statusLine.code, http.statusLine.reason);
             }
-            if (toServer && (http.statusLine.code == 401 || http.statusLine.code == 403))
-                throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token (HTTP %d): %s", http.statusLine.code, errMsg));
+            // A refusal of the token or of its attempt is permanent: a presigned upload refused this way
+            // must not fall back to the proxy route, which the same attempt would be refused on too
+            if (toServer && (http.statusLine.code == 401 || http.statusLine.code == 403 || http.statusLine.code == 409))
+                throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token or its attempt (HTTP %d): %s", http.statusLine.code, errMsg));
             throw new Exception(format("HTTP %d %s: %s", http.statusLine.code, http.statusLine.reason, errMsg));
         }
     }
@@ -149,8 +151,8 @@ class HttpArtifactStorage : ArtifactStorage
         // following off; 0 would follow one)
         http.maxRedirects = uint.max;
         http.perform();
-        if (http.statusLine.code == 401 || http.statusLine.code == 403)
-            throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token (HTTP %d)", http.statusLine.code));
+        if (http.statusLine.code == 401 || http.statusLine.code == 403 || http.statusLine.code == 409)
+            throw new ArtifactAuthException(http.statusLine.code, format("The server refused the worker token or its attempt (HTTP %d)", http.statusLine.code));
         return http.statusLine.code;
     }
 

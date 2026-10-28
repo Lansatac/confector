@@ -198,10 +198,12 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
     }
 
     // The worker routes answer with a status that tells a worker what to do: 400 for a malformed
-    // request, 404 for an unknown execution, 409 for a report that came too late (the execution
-    // already finished, or a later attempt holds it), 422 for a completion that can never be
-    // recorded as reported, and 500 for anything else (a store failure), which the worker may
-    // retry. A completion rejected with 409 or 422 would be rejected again, so it is not retried.
+    // request, 401 for a token that is missing, altered or expired, 403 for a token that does not
+    // allow the request, 404 for an unknown execution, 409 for a report that came too late (the
+    // execution already finished, or a later attempt holds it), 422 for a completion that can never
+    // be recorded as reported, and 500 for anything else (a store failure), which the worker may
+    // retry. A completion rejected with 401, 403, 409 or 422 would be rejected again, so it is not
+    // retried.
     void writeError(HTTPServerResponse res, HTTPStatus status, string message)
     {
         res.statusCode = status;
@@ -394,7 +396,8 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
     // from the worker's token and the task from the ledger's active execution, and anything that
     // does not match them is rejected. A completion records the execution, folds it into its
     // fingerprint's ledger; see confector.core.work_orders.completeExecution. A completion from a
-    // superseded attempt is rejected.
+    // superseded attempt is answered 409, as the ledger answers one that arrives after its attempt
+    // was superseded.
     workerRoute(HTTPMethod.POST, "/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         import confector.core.work_orders : InvalidCompletionException, OutcomeNotFoldedException, StaleCompletionException;
 
@@ -1083,13 +1086,13 @@ unittest
         assert(activeAt(stores, "fp_token").status == ExecutionStatus.running, "A refused request changes nothing");
 
         // A token for a superseded attempt may not complete or log, even though it is genuine and
-        // unexpired
+        // unexpired: its attempt is no longer the execution's, so the answer is 409, not 403
         auto superseded = cast() issuedClaims;
         superseded.attempt = issuedClaims.attempt + 1;
         const supersededToken = mintWorkerToken(workerTokenKey, superseded);
         foreach (route; ["/logs", "/complete"])
         {
-            assert(postWith(supersededToken, "/executions/" ~ tokenExecutionId ~ route, `{}`) == HTTPStatus.forbidden, route);
+            assert(postWith(supersededToken, "/executions/" ~ tokenExecutionId ~ route, `{}`) == HTTPStatus.conflict, route);
         }
         assert(activeAt(stores, "fp_token").status == ExecutionStatus.running);
 
@@ -1153,14 +1156,19 @@ unittest
         assert(activeAt(stores, "fp_lease").worker == "w-two");
 
         // The first attempt can neither heartbeat, release nor complete, whether it names its own
-        // attempt or the current one; the second completes
+        // attempt or the current one; the second completes. A completion from the first attempt is
+        // answered 409 (superseded), while a heartbeat or release that names another attempt than its
+        // token's is out of scope (403)
         assert(postWith(firstToken, heartbeat, `{"attempt": 2, "lease_seconds": 30}`) == HTTPStatus.forbidden,
             "A token for attempt 1 cannot heartbeat attempt 2");
         assert(postWith(firstToken, release, `{"attempt": 2}`) == HTTPStatus.forbidden, "A token for attempt 1 cannot release attempt 2");
         assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(answerOf(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 30}`) == "superseded");
         const completeLeased = "/executions/" ~ leasedId ~ "/complete";
-        assert(postWith(firstToken, completeLeased, `{"status": "succeeded", "attempt": 1}`) == HTTPStatus.forbidden);
+        assert(postWith(firstToken, completeLeased, `{"status": "succeeded", "attempt": 1}`) == HTTPStatus.conflict,
+            "A completion from a superseded attempt is answered 409");
+        assert(postWith(firstToken, completeLeased, `{"status": "succeeded", "attempt": 2}`) == HTTPStatus.conflict,
+            "A superseded token cannot complete the attempt that holds the execution");
         assert(postWith(secondToken, completeLeased, `{"status": "succeeded", "attempt": 1}`) == HTTPStatus.conflict);
         assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(postWith(secondToken, completeLeased, `{"status": "succeeded", "attempt": 2}`) == HTTPStatus.ok);

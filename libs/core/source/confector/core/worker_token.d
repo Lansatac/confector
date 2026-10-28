@@ -86,6 +86,16 @@ class WorkerTokenScopeException : WorkerAuthException
     }
 }
 
+/// The token is genuine but its attempt no longer holds its execution (the lease ran out and the
+/// execution was started again, or it was released): 409, the same answer a stale report gets.
+class WorkerTokenSupersededException : WorkerAuthException
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(409, msg, file, line);
+    }
+}
+
 /**
  * The claims for the token of `order`, claimed at `issuedAt` (seconds since the Unix epoch) for
  * execution attempt `attempt`. The token expires when the task's timeout and `workerTokenGrace`
@@ -207,12 +217,21 @@ void requireExecution(in WorkerTokenClaims claims, string executionId)
         throw new WorkerTokenScopeException(format("The worker token is for execution '%s', not '%s'", claims.executionId, executionId));
 }
 
-/// Throws WorkerTokenScopeException unless the token's attempt is `currentAttempt`, the attempt
-/// the execution is on now: a worker from a superseded attempt may not report or upload.
-void requireCurrentAttempt(in WorkerTokenClaims claims, ulong currentAttempt)
+/// Throws WorkerTokenScopeException unless the token's attempt is `attempt`, the attempt a request
+/// names in its body: a token and a request that disagree are refused as out of scope.
+void requireCurrentAttempt(in WorkerTokenClaims claims, ulong attempt)
+{
+    if (claims.attempt != attempt)
+        throw new WorkerTokenScopeException(format("The worker token is for attempt %d of execution '%s', not attempt %d",
+            claims.attempt, claims.executionId, attempt));
+}
+
+/// Throws WorkerTokenSupersededException unless the token's attempt is `currentAttempt`, the
+/// attempt the execution is on now: a worker from a superseded attempt may not report or upload.
+void requireNotSuperseded(in WorkerTokenClaims claims, ulong currentAttempt)
 {
     if (claims.attempt != currentAttempt)
-        throw new WorkerTokenScopeException(format("The worker token is for attempt %d of execution '%s', which is on attempt %d now",
+        throw new WorkerTokenSupersededException(format("The worker token is for attempt %d of execution '%s', which is on attempt %d now",
             claims.attempt, claims.executionId, currentAttempt));
 }
 
@@ -373,4 +392,12 @@ unittest
     refused({ requireInputArtifact(claims, "fp_engine", "other.zip"); });
     refused({ requireInputArtifact(claims, "fp_1", "engine.zip"); });
     refused({ requireInputArtifact(claims, "fp_setup", "setup"); });
+
+    // A token whose attempt the execution has moved past is genuine but superseded: 409, not 403
+    requireNotSuperseded(claims, 1);
+    auto superseded = cast(WorkerAuthException) collectException(requireNotSuperseded(claims, 2));
+    assert(superseded !is null && superseded.statusCode == 409, "A superseded attempt is answered 409");
+    assert(cast(WorkerTokenSupersededException) superseded !is null);
+    auto scopeOnly = cast(WorkerAuthException) collectException(requireCurrentAttempt(claims, 2));
+    assert(scopeOnly !is null && scopeOnly.statusCode == 403, "A request naming another attempt is out of scope: 403");
 }

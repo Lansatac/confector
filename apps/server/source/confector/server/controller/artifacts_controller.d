@@ -344,13 +344,14 @@ unittest
     assert(call(HTTPMethod.GET, "/api/v1/artifacts/fp_up/other.zip/download").status == HTTPStatus.forbidden,
         "Only the artifact an input names");
 
-    // A token from a superseded attempt may not upload, though it may still read its inputs
+    // A token from a superseded attempt may not upload, though it may still read its inputs: the
+    // refusal is 409, since the attempt is superseded rather than out of scope
     auto oldClaims = claims;
     oldClaims.attempt = 1;
     const oldAttemptToken = mintWorkerToken(signingKey, oldClaims);
-    assert(callWith(oldAttemptToken, HTTPMethod.POST, "/api/v1/artifacts/fp1/other/upload", "bytes").status == HTTPStatus.forbidden);
+    assert(callWith(oldAttemptToken, HTTPMethod.POST, "/api/v1/artifacts/fp1/other/upload", "bytes").status == HTTPStatus.conflict);
     assert(callWith(oldAttemptToken, HTTPMethod.GET, "/api/v1/artifacts/presign-upload?fingerprint=fp1&artifactId=other").status
-        == HTTPStatus.forbidden);
+        == HTTPStatus.conflict);
     assert(!storage.artifactExists("fp1", "other"));
     assert(callWith(oldAttemptToken, HTTPMethod.GET, "/api/v1/artifacts/fp_up/in.zip/download").status == HTTPStatus.ok);
 

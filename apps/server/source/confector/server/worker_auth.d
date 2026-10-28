@@ -4,7 +4,7 @@ import vibe.vibe;
 import confector.core.state_stores : StateStores;
 import confector.core.worker_pool_credential : matchesWorkerPoolCredential, workerPoolCredentialHeader;
 import confector.core.work_orders : currentAttempt;
-import confector.core.worker_token : WorkerAuthException, WorkerTokenClaims, WorkerTokenScopeException, requireCurrentAttempt,
+import confector.core.worker_token : WorkerAuthException, WorkerTokenClaims, WorkerTokenScopeException, requireNotSuperseded,
     verifyWorkerToken, workerTokenHeader;
 import std.datetime.systime : Clock;
 import std.format : format;
@@ -49,7 +49,8 @@ bool authenticateWorker(string key, HTTPServerRequest req, HTTPServerResponse re
 
 /**
  * Runs `requireScope`, which checks that an authenticated worker's claims allow the request. If
- * it throws WorkerAuthException, answers 403 with the reason and returns false.
+ * it throws WorkerAuthException, answers the exception's status (403, or 409 for a superseded
+ * attempt) with the reason and returns false.
  */
 bool permitWorker(HTTPServerRequest req, HTTPServerResponse res, void delegate() requireScope)
 {
@@ -66,9 +67,9 @@ bool permitWorker(HTTPServerRequest req, HTTPServerResponse res, void delegate()
 }
 
 /**
- * Throws WorkerTokenScopeException unless the token's attempt is the one its execution is on, so
- * a worker from a superseded attempt cannot report or upload. An execution that does not exist
- * is refused when `missingIsRefused`; otherwise the route is left to answer for it.
+ * Throws WorkerTokenSupersededException (409) unless the token's attempt is the one its execution
+ * is on, so a worker from a superseded attempt cannot report or upload. An execution that does not
+ * exist is refused when `missingIsRefused` (403); otherwise the route is left to answer for it.
  */
 void requireCurrentExecutionAttempt(StateStores stores, in WorkerTokenClaims claims, bool missingIsRefused)
 {
@@ -79,7 +80,7 @@ void requireCurrentExecutionAttempt(StateStores stores, in WorkerTokenClaims cla
             throw new WorkerTokenScopeException(format("Execution '%s' does not exist", claims.executionId));
         return;
     }
-    requireCurrentAttempt(claims, attempt.get);
+    requireNotSuperseded(claims, attempt.get);
 }
 
 private void refuseWorker(HTTPServerRequest req, HTTPServerResponse res, WorkerAuthException e)
