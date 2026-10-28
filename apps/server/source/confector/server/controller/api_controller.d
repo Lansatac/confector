@@ -18,7 +18,7 @@ import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
 import confector.core.sweep : sweepCoordination;
 import confector.core.work_orders : InvalidLeaseRequestException, LeaseAnswer, StaleCompletionException, UnknownExecutionException, claimWork,
-    completeExecution, failClaimedAttempt, heartbeatExecution, leaseOfSeconds, releaseExecution, requireAttemptLimit, utcNow;
+    completeExecution, failClaimedAttempt, heartbeatExecution, leaseOfSeconds, requireAttemptLimit, utcNow;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -123,8 +123,8 @@ IntakeRequest parseRunRequest(in Json body)
  *
  * Receiving work (/queue/receive) needs the worker pool credential, `workerPoolCredential`, which
  * is checked before anything else. Receiving mints the worker token of the execution it hands
- * out; the routes a worker calls once it holds a work order (heartbeat, release, logs,
- * completion) need that token, signed with `workerTokenKey`. Neither is reached by a user
+ * out; the routes a worker calls once it holds a work order (heartbeat, logs, completion) need
+ * that token, signed with `workerTokenKey`. Neither is reached by a user
  * identity.
  *
  * The worker and sweep routes read lease and sweep times from `now` (default `utcNow`), so that a
@@ -293,15 +293,14 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         }
     });
 
-    // The attempt, and for a heartbeat the lease, a worker's request carries. Answers 400 and
-    // returns false if the body lacks them or they are out of range. The attempt must be the
-    // token's, which the callers check.
-    bool readLeaseRequest(HTTPServerRequest req, HTTPServerResponse res, bool withLease, out ulong attempt, out Duration lease)
+    // The attempt and the lease a heartbeat carries. Answers 400 and returns false if the body lacks
+    // them or they are out of range. The attempt must be the token's, which the callers check.
+    bool readLeaseRequest(HTTPServerRequest req, HTTPServerResponse res, out ulong attempt, out Duration lease)
     {
         try
         {
             attempt = req.json["attempt"].get!ulong;
-            if (withLease) lease = leaseOfSeconds(req.json["lease_seconds"].get!long);
+            lease = leaseOfSeconds(req.json["lease_seconds"].get!long);
             return true;
         }
         catch (InvalidLeaseRequestException e)
@@ -311,15 +310,13 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         }
         catch (Exception e)
         {
-            writeError(res, HTTPStatus.badRequest, format("Malformed request: it needs an integer attempt%s: %s",
-                withLease ? " and an integer lease_seconds" : "", e.msg));
+            writeError(res, HTTPStatus.badRequest, format("Malformed request: it needs an integer attempt and an integer lease_seconds: %s", e.msg));
             return false;
         }
     }
 
-    // What a worker is told about the execution it holds: continue, cancel or superseded (a
-    // release answers released instead of continue). Superseded and cancel are answers, not
-    // errors: the worker stops.
+    // What a worker is told about the execution it holds: continue, cancel or superseded.
+    // Superseded and cancel are answers, not errors: the worker stops.
     void writeLeaseAnswer(HTTPServerResponse res, LeaseAnswer answer)
     {
         Json resp = Json.emptyObject;
@@ -337,7 +334,7 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         if (!permitWorker(req, res, { requireExecution(claims, executionId); })) return;
         ulong attempt;
         Duration lease;
-        if (!readLeaseRequest(req, res, true, attempt, lease)) return;
+        if (!readLeaseRequest(req, res, attempt, lease)) return;
         if (!permitWorker(req, res, { requireCurrentAttempt(claims, attempt); })) return;
         try
         {
@@ -348,29 +345,6 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
         catch (Exception e)
         {
             logError("[api] Could not extend the lease of execution '%s': %s", executionId, e.msg);
-            writeError(res, HTTPStatus.internalServerError, e.msg);
-        }
-    });
-
-    // A worker that cannot run its execution gives it back at once, with the attempt it was given.
-    workerRoute(HTTPMethod.POST, "/executions/:execution_id/release", (HTTPServerRequest req, HTTPServerResponse res) {
-        WorkerTokenClaims claims;
-        if (!authenticateWorker(workerTokenKey, req, res, claims)) return;
-        if (!requireStores(res)) return;
-        const executionId = req.params["execution_id"];
-        if (!permitWorker(req, res, { requireExecution(claims, executionId); })) return;
-        ulong attempt;
-        Duration unused;
-        if (!readLeaseRequest(req, res, false, attempt, unused)) return;
-        if (!permitWorker(req, res, { requireCurrentAttempt(claims, attempt); })) return;
-        try
-        {
-            writeLeaseAnswer(res, releaseExecution(stores, claims.fingerprint, executionId, attempt));
-        }
-        catch (UnknownExecutionException e) writeError(res, HTTPStatus.notFound, e.msg);
-        catch (Exception e)
-        {
-            logError("[api] Could not release execution '%s': %s", executionId, e.msg);
             writeError(res, HTTPStatus.internalServerError, e.msg);
         }
     });
@@ -807,7 +781,7 @@ unittest
 {
     import confector.testing.memory_document_store : InMemoryDocumentStore;
     import confector.server.authenticator : FixedAuthenticator, Identity, testIdentity;
-    import confector.core.work_orders : defaultMaxAttempts;
+    import confector.core.work_orders : defaultMaxAttempts, expireLease, LostLeaseDisposition;
     import std.file : exists, rmdirRecurse, mkdirRecurse;
     import std.path : buildPath;
     import std.typecons : Nullable;
@@ -1057,7 +1031,7 @@ unittest
     assert(!received.isNull && received.get.workOrder.executionId == executionId && received.get.attempt == 1);
 
     // Receiving a work order mints the token for that execution, fingerprint and attempt; the
-    // heartbeat and release routes accept only that execution's token
+    // heartbeat route accepts only that execution's token
     {
         const tokenExecutionId = queueExecution(stores, "fp_token");
 
@@ -1068,21 +1042,17 @@ unittest
         assert(issuedClaims.executionId == tokenExecutionId && issuedClaims.fingerprint == "fp_token" && issuedClaims.attempt == 1);
 
         const heartbeat = "/executions/" ~ tokenExecutionId ~ "/heartbeat";
-        const release = "/executions/" ~ tokenExecutionId ~ "/release";
         const body = `{"attempt": 1, "lease_seconds": 60}`;
         auto lapsed = cast() issuedClaims;
         lapsed.expiresAt = 1;
         const lapsedToken = mintWorkerToken(workerTokenKey, lapsed);
         const alteredToken = issued[0 .. 10] ~ (issued[10] == 'A' ? "B" : "A") ~ issued[11 .. $];
-        foreach (route; [heartbeat, release])
-        {
-            assert(postWith(null, route, body) == HTTPStatus.unauthorized, route ~ " without a token");
-            assert(postWith("garbage", route, body) == HTTPStatus.unauthorized, route ~ " with a malformed token");
-            assert(postWith(lapsedToken, route, body) == HTTPStatus.unauthorized, route ~ " with an expired token");
-            assert(postWith(alteredToken, route, body) == HTTPStatus.unauthorized, route ~ " with an altered token");
-            assert(postWith(issued, route.replace(tokenExecutionId, executionId), body) == HTTPStatus.forbidden,
-                route ~ " with another execution's token");
-        }
+        assert(postWith(null, heartbeat, body) == HTTPStatus.unauthorized, "heartbeat without a token");
+        assert(postWith("garbage", heartbeat, body) == HTTPStatus.unauthorized, "heartbeat with a malformed token");
+        assert(postWith(lapsedToken, heartbeat, body) == HTTPStatus.unauthorized, "heartbeat with an expired token");
+        assert(postWith(alteredToken, heartbeat, body) == HTTPStatus.unauthorized, "heartbeat with an altered token");
+        assert(postWith(issued, heartbeat.replace(tokenExecutionId, executionId), body) == HTTPStatus.forbidden,
+            "heartbeat with another execution's token");
         assert(activeAt(stores, "fp_token").status == ExecutionStatus.running, "A refused request changes nothing");
 
         // A token for a superseded attempt may not complete or log, even though it is genuine and
@@ -1114,16 +1084,15 @@ unittest
             "A refused completion records nothing");
     }
 
-    // Heartbeat and release carry the attempt and answer what the worker is to do. An attempt
-    // that no longer holds the execution is superseded, and a release requeues it at once for
-    // the next receive; the superseded attempt's completion is refused
+    // Heartbeat carries the attempt and answers what the worker is to do. An attempt that no longer
+    // holds the execution is superseded: once its lease runs out the execution is queued again, and
+    // a receive starts the next attempt. The superseded attempt's completion is refused
     {
         const leasedId = queueExecution(stores, "fp_lease");
         const first = bodyOf(postReply(null, "/queue/receive", `{"worker_id": "w-one", "lease_seconds": 30}`));
         assert(first["work_order"]["execution_id"].get!string == leasedId && first["attempt"].get!long == 1);
         const firstToken = first["work_order"]["worker_token"].get!string;
         const heartbeat = "/executions/" ~ leasedId ~ "/heartbeat";
-        const release = "/executions/" ~ leasedId ~ "/release";
 
         string answerOf(string token, string path, string body)
         {
@@ -1136,17 +1105,17 @@ unittest
         assert(activeAt(stores, "fp_lease").leaseExpiresAt.length > 0);
         // The body's attempt must be the token's, as for completion and logs
         assert(postWith(firstToken, heartbeat, `{"attempt": 2, "lease_seconds": 30}`) == HTTPStatus.forbidden);
-        assert(postWith(firstToken, release, `{"attempt": 2}`) == HTTPStatus.forbidden);
         assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(postWith(firstToken, heartbeat, `{"lease_seconds": 30}`) == HTTPStatus.badRequest, "A heartbeat carries the attempt");
         assert(postWith(firstToken, heartbeat, `{"attempt": 1}`) == HTTPStatus.badRequest, "A heartbeat carries the lease");
-        assert(postWith(firstToken, release, `{}`) == HTTPStatus.badRequest, "A release carries the attempt");
         assert(postWith(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 0}`) == HTTPStatus.badRequest);
         assert(postWith(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": "soon"}`) == HTTPStatus.badRequest);
         assert(postWith(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 9223372036854775807}`) == HTTPStatus.badRequest);
         assert(postWith(firstToken, heartbeat, `{"attempt": "one", "lease_seconds": 30}`) == HTTPStatus.badRequest);
 
-        assert(answerOf(firstToken, release, `{"attempt": 1}`) == "released");
+        // The lease runs out: the execution is queued again, and the attempt that held it is superseded
+        assert(expireLease(stores, "fp_lease", defaultMaxAttempts, (Clock.currTime + 2.hours).toISOExtString()).disposition
+            == LostLeaseDisposition.requeued);
         assert(activeAt(stores, "fp_lease").status == ExecutionStatus.queued);
         assert(answerOf(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 30}`) == "superseded");
 
@@ -1155,13 +1124,11 @@ unittest
         const secondToken = second["work_order"]["worker_token"].get!string;
         assert(activeAt(stores, "fp_lease").worker == "w-two");
 
-        // The first attempt can neither heartbeat, release nor complete, whether it names its own
-        // attempt or the current one; the second completes. A completion from the first attempt is
-        // answered 409 (superseded), while a heartbeat or release that names another attempt than its
-        // token's is out of scope (403)
+        // The first attempt can neither heartbeat nor complete, whether it names its own attempt or the
+        // current one; the second completes. A completion from the first attempt is answered 409
+        // (superseded), while a heartbeat that names another attempt than its token's is refused (403)
         assert(postWith(firstToken, heartbeat, `{"attempt": 2, "lease_seconds": 30}`) == HTTPStatus.forbidden,
             "A token for attempt 1 cannot heartbeat attempt 2");
-        assert(postWith(firstToken, release, `{"attempt": 2}`) == HTTPStatus.forbidden, "A token for attempt 1 cannot release attempt 2");
         assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(answerOf(firstToken, heartbeat, `{"attempt": 1, "lease_seconds": 30}`) == "superseded");
         const completeLeased = "/executions/" ~ leasedId ~ "/complete";
@@ -1172,7 +1139,7 @@ unittest
         assert(postWith(secondToken, completeLeased, `{"status": "succeeded", "attempt": 1}`) == HTTPStatus.conflict);
         assert(activeAt(stores, "fp_lease").status == ExecutionStatus.running);
         assert(postWith(secondToken, completeLeased, `{"status": "succeeded", "attempt": 2}`) == HTTPStatus.ok);
-        assert(answerOf(secondToken, release, `{"attempt": 2}`) == "superseded", "A finished execution is not released");
+        assert(answerOf(secondToken, heartbeat, `{"attempt": 2, "lease_seconds": 30}`) == "superseded", "A finished execution holds no lease");
 
         // An unknown execution is a 404 for a token that names it
         WorkerTokenClaims unknown;
@@ -1182,7 +1149,6 @@ unittest
         unknown.expiresAt = Clock.currTime.toUnixTime() + 600;
         const unknownToken = mintWorkerToken(workerTokenKey, unknown);
         assert(postWith(unknownToken, "/executions/exe_unknown/heartbeat", `{"attempt": 1, "lease_seconds": 30}`) == HTTPStatus.notFound);
-        assert(postWith(unknownToken, "/executions/exe_unknown/release", `{"attempt": 1}`) == HTTPStatus.notFound);
     }
 
     // An execution that cannot be given a token (its input has no resolved value) is failed,
@@ -1293,7 +1259,7 @@ unittest
     InetHeaderMap headers;
     headers["Content-Type"] = "application/json";
     headers[workerTokenHeader] = tokenForPath("/executions/" ~ executionId ~ "/complete");
-    foreach (route; ["/complete", "/heartbeat", "/release"])
+    foreach (route; ["/complete", "/heartbeat"])
     {
         auto noStoresReq = createTestHTTPServerRequest(URL("http://localhost/api/v1/executions/" ~ executionId ~ route),
             HTTPMethod.POST, headers, createMemoryStream(cast(ubyte[]) completion.dup, false));

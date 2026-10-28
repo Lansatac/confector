@@ -517,11 +517,11 @@ private HttpWorkerConfig runnerConfig(ushort port, string workerId)
     return config;
 }
 
-/// The name a control-plane request is counted under: its route ("heartbeat", "release", "complete",
+/// The name a control-plane request is counted under: its route ("heartbeat", "complete",
 /// "queue/receive"), or its whole path for any other request.
 private string routeOf(string path)
 {
-    foreach (route; ["heartbeat", "release", "complete", "queue/receive"])
+    foreach (route; ["heartbeat", "complete", "queue/receive"])
     {
         if (path.endsWith("/" ~ route)) return route;
     }
@@ -580,7 +580,7 @@ private void runnerRunsBuildOverHttp()
 }
 
 /// A worker whose attempt was superseded while it ran: its heartbeat is answered superseded, so it
-/// neither reports its result nor gives the execution back. The attempt holding it now is untouched.
+/// reports nothing. The attempt holding it now is untouched.
 private void supersededWorkerReportsNothing()
 {
     auto env = new GateEnvironment(new InMemoryDocumentStore());
@@ -611,7 +611,6 @@ private void supersededWorkerReportsNothing()
     assert(steps.stepsRun == 1 && atomicLoad(steps.heartbeats) > 0, "The task ran until its heartbeat was answered");
     assert(counts.answers.get("heartbeat 200", 0) > 0, "The heartbeat was answered");
     assert(counts.calls.get("complete", 0) == 0, "A superseded worker reports no completion");
-    assert(counts.calls.get("release", 0) == 0, "A superseded worker gives nothing back");
 
     // The worker's own heartbeat for attempt 1 is answered superseded
     LeaseAnswer answer;

@@ -50,9 +50,8 @@ enum CompletionReport
     /// worker token does not allow it (401, 403). Reporting it again would be rejected the same way.
     rejected,
     /// It did not reach the server, or the server failed (5xx, or any other status). The server did
-    /// not record it, so the worker may report it again. It is never released: if the worker gives up,
-    /// the lease expires, which requeues the execution as an infrastructure failure counted against
-    /// the attempt limit.
+    /// not record it, so the worker may report it again. If the worker gives up, the lease expires,
+    /// which requeues the execution as an infrastructure failure counted against the attempt limit.
     notRecorded
 }
 
@@ -129,7 +128,7 @@ private string prefixOf(string text) pure nothrow @safe
 
 /**
  * HTTP client for worker-to-server control plane protocol.
- * Handles receiving work orders, heartbeats, releasing work, log streaming, and completion reporting.
+ * Handles receiving work orders, heartbeats, log streaming, and completion reporting.
  */
 class HttpWorkerClient
 {
@@ -575,9 +574,8 @@ class HttpWorkerDaemon
                 // A rejection is permanent: running the task again would only be rejected again
                 break;
             case CompletionReport.notRecorded:
-                // Not released: a release would hand the finished execution to another worker to run
-                // again. Giving up leaves the lease to expire instead, which requeues the execution as
-                // an infrastructure failure counted against the attempt limit
+                // Giving up leaves the lease to expire, which requeues the execution as an infrastructure
+                // failure counted against the attempt limit
                 logError("[worker] Completion of task '%s' (execution '%s') was not recorded after the worker gave up reporting it; "
                     ~ "its lease will expire and requeue it as an infrastructure failure", taskId, msg.executionId);
                 break;
@@ -1295,7 +1293,7 @@ unittest
 unittest
 {
     // A runner runs a task end to end against the in-memory backends: the control plane's routes
-    // are backed by the core's claim, heartbeat, release and completion over the state stores in
+    // are backed by the core's claim, heartbeat and completion over the state stores in
     // an in-memory document store. The runner claims the queued execution, runs its steps,
     // heartbeats, and its completion records the execution and folds it into the ledger. A second
     // runner finds nothing queued, and a late completion of the finished execution is refused.

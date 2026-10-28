@@ -200,7 +200,7 @@ AuthorizedRoutes artifactsRouter(Authenticator authenticator, ArtifactStorage st
 unittest
 {
     import confector.api.model : ActiveExecution;
-    import confector.core.work_orders : releaseExecution, startExecution;
+    import confector.core.work_orders : defaultMaxAttempts, expireLease, startExecution;
     import confector.backends.artifact.local : LocalArtifactStorage;
     import confector.server.authenticator : FixedAuthenticator, Identity;
     import std.typecons : Nullable;
@@ -221,7 +221,7 @@ unittest
     enum signingKey = "0123456789abcdef0123456789abcdef";
     auto storage = new LocalArtifactStorage(base);
     auto stores = new StateStores(new InMemoryDocumentStore());
-    // Fingerprint "fp1" has an execution on its second attempt: started, released, started again
+    // Fingerprint "fp1" has an execution on its second attempt: started, its lease expired, started again
     ActiveExecution execution;
     execution.projectId = "proj";
     execution.taskId = "task";
@@ -229,7 +229,7 @@ unittest
     execution.createdAt = "2026-10-16T10:00:00Z";
     const executionId = stores.ledgers.claim("fp1", 0, execution).executionId;
     startExecution(stores, "fp1", "w1", 1.minutes, "2026-10-16T10:00:00Z");
-    releaseExecution(stores, "fp1", executionId, 1);
+    expireLease(stores, "fp1", defaultMaxAttempts, "2026-10-16T10:05:00Z");
     startExecution(stores, "fp1", "w1", 1.minutes, "2026-10-16T10:00:00Z");
     // The worker routes answer the same with or without a user identity: they never consult it
     auto router = artifactsRouter(new FixedAuthenticator(Nullable!Identity.init), storage, signingKey, stores);

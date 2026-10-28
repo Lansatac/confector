@@ -335,7 +335,6 @@ unittest
 
         "POST /api/v1/queue/receive worker-pool-credential",
         "POST /api/v1/executions/:execution_id/heartbeat worker-token",
-        "POST /api/v1/executions/:execution_id/release worker-token",
         "GET /api/v1/executions/:execution_id/logs viewer",
         "POST /api/v1/executions/:execution_id/logs worker-token",
         "POST /api/v1/executions/:execution_id/complete worker-token",

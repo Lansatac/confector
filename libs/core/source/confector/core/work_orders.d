@@ -14,12 +14,12 @@ module confector.core.work_orders;
  * execution's claim and the task of its stored definition.
  *
  * `ActiveExecution.attempt` counts starts, and the current start's number is its attempt. A
- * worker's heartbeat, release and completion carry the attempt it was given; one from an earlier
- * attempt (the lease expired and the execution was started again, or released) is answered
- * `LeaseAnswer.superseded` or rejected, so a worker that lost its lease cannot extend it or report.
+ * worker's heartbeat and completion carry the attempt it was given; one from an earlier attempt
+ * (the lease expired and the execution was started again) is answered `LeaseAnswer.superseded` or
+ * rejected, so a worker that lost its lease cannot extend it or report.
  *
  * A lease that runs out (`expireLease`, which a sweep calls) is an infrastructure failure, counted
- * in `ActiveExecution.expiredLeases` (a release is not counted): within the limit the execution
+ * in `ActiveExecution.expiredLeases`: within the limit the execution
  * goes back to queued; with the limit reached it fails with the reason "lease lost N times" (a
  * failed execution is never a cache hit, and only a user retries it) through the same end as a
  * completion.
@@ -40,7 +40,7 @@ module confector.core.work_orders;
 import confector.core.build_stores : ExecutionStore;
 import confector.core.document_collection : Versioned;
 import confector.api.model;
-import confector.core.fingerprint_ledger : claimedOn, endedExecution, withLease, withLostLease, withRequeue, withStart;
+import confector.core.fingerprint_ledger : claimedOn, endedExecution, withLease, withLostLease, withStart;
 import confector.core.request_reconciler : reconcileOpenRequests;
 import confector.core.state_stores : StateStores;
 import confector.api.document_store : DocumentConflictException;
@@ -254,13 +254,11 @@ Nullable!ActiveExecution startExecution(StateStores stores, string fingerprint, 
         fingerprint, maxWriteAttempts));
 }
 
-/// What a worker is told about the execution it holds, by a heartbeat or a release.
+/// What a worker is told about the execution it holds, by a heartbeat.
 enum LeaseAnswer : string
 {
     /// The attempt still holds the execution: keep running. A heartbeat extended its lease.
     continue_ = "continue",
-    /// A release was accepted: the execution is queued again, for any worker to start.
-    released = "released",
     /// The execution was cancelled: stop the work.
     cancel = "cancel",
     /// The attempt no longer holds the execution (its lease expired and the execution was queued
@@ -296,36 +294,6 @@ LeaseAnswer heartbeatExecution(StateStores stores, string fingerprint, string ex
         }
     }
     throw new Exception(format("Could not extend the lease of execution '%s': it lost %s compare-and-sets in a row",
-        executionId, maxWriteAttempts));
-}
-
-/**
- * Gives up attempt `attempt` of execution `executionId` at `fingerprint`: if that attempt still
- * holds it, the execution goes back to queued at once, for any worker to start, and the answer is
- * `released`. A release is not a lost lease: it does not count toward the attempt limit. Writes
- * nothing for any other answer.
- *
- * Throws: UnknownExecutionException if the fingerprint has no ledger or never claimed the
- * execution.
- */
-LeaseAnswer releaseExecution(StateStores stores, string fingerprint, string executionId, ulong attempt)
-{
-    foreach (_; 0 .. maxWriteAttempts)
-    {
-        auto current = readLedger(stores, fingerprint, executionId, "A release");
-        const answer = holderAnswer(stores, current.value, executionId, attempt, "A release");
-        if (answer != LeaseAnswer.continue_) return answer;
-        try
-        {
-            stores.ledgers.update(current, withRequeue(current.value));
-            return LeaseAnswer.released;
-        }
-        catch (DocumentConflictException)
-        {
-            continue;
-        }
-    }
-    throw new Exception(format("Could not release execution '%s': it lost %s compare-and-sets in a row",
         executionId, maxWriteAttempts));
 }
 
@@ -509,7 +477,7 @@ class StaleCompletionException : Exception
 
 /**
  * A completion came from an attempt that no longer holds its execution: the lease expired and the
- * execution was queued or started again, or it was released. Its report is rejected and nothing
+ * execution was queued or started again. Its report is rejected and nothing
  * is recorded.
  */
 class SupersededAttemptException : StaleCompletionException
@@ -992,7 +960,7 @@ unittest
     assert(heartbeatExecution(stores, "fp1", id, 0, testLease, later(40.seconds)) == LeaseAnswer.superseded);
     assert(activeAt(stores).leaseExpiresAt == lease, "A superseded heartbeat extends nothing");
 
-    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.released);
+    assert(expireLease(stores, "fp1", 3, later(2.hours)).disposition == LostLeaseDisposition.requeued);
     assert(heartbeatExecution(stores, "fp1", id, 1, testLease) == LeaseAnswer.superseded, "A queued execution is held by no attempt");
 
     const cancelledId = runningExecution(stores, "w1", "fp2");
@@ -1016,25 +984,24 @@ unittest
 
 unittest
 {
-    // A release requeues the execution at once, for any worker to claim. The releasing attempt is
-    // superseded the moment it is claimed again: its heartbeat, release and completion are
-    // rejected and change nothing
+    // An expired lease requeues the execution at once, for any worker to claim. The expired attempt
+    // is superseded the moment it is claimed again: its heartbeat and completion are rejected and
+    // change nothing
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = runningExecution(stores);
 
-    assert(releaseExecution(stores, "fp1", id, 2) == LeaseAnswer.superseded, "Only the holding attempt releases");
+    assert(heartbeatExecution(stores, "fp1", id, 2, testLease) == LeaseAnswer.superseded, "Only the holding attempt holds the lease");
     assert(activeAt(stores).status == ExecutionStatus.running);
-    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.released);
-    auto released = activeAt(stores);
-    assert(released.status == ExecutionStatus.queued && released.attempt == 1);
-    assert(released.worker.length == 0 && released.startedAt.length == 0 && released.leaseExpiresAt.length == 0);
-    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.superseded, "A released attempt does not release again");
+    assert(expireLease(stores, "fp1", 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
+    auto requeued = activeAt(stores);
+    assert(requeued.status == ExecutionStatus.queued && requeued.attempt == 1);
+    assert(requeued.worker.length == 0 && requeued.startedAt.length == 0 && requeued.leaseExpiresAt.length == 0);
+    assert(heartbeatExecution(stores, "fp1", id, 1, testLease) == LeaseAnswer.superseded, "A queued execution is held by no attempt");
 
     auto again = claimWork(stores, "w2", testLease, fixedNow());
     assert(!again.isNull && again.get.workOrder.executionId == id && again.get.attempt == 2);
 
     assert(heartbeatExecution(stores, "fp1", id, 1, testLease) == LeaseAnswer.superseded);
-    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.superseded);
     bool rejected = false;
     try completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
     catch (SupersededAttemptException e) rejected = e.msg.canFind(id) && e.msg.canFind("attempt 1");
@@ -1043,17 +1010,17 @@ unittest
     assert(held.status == ExecutionStatus.running && held.attempt == 2 && held.worker == "w2");
 
     assert(completeExecution(stores, "fp1", id, succeededAt(2), fixedNow()).status == ExecutionStatus.succeeded);
-    assert(releaseExecution(stores, "fp1", id, 2) == LeaseAnswer.superseded, "A finished execution is not released");
+    assert(heartbeatExecution(stores, "fp1", id, 2, testLease) == LeaseAnswer.superseded, "A finished execution holds no lease");
 
     bool unknown = false;
-    try releaseExecution(stores, "fp1", "exe_missing", 1);
+    try heartbeatExecution(stores, "fp1", "exe_missing", 1, testLease);
     catch (UnknownExecutionException e) unknown = e.msg.canFind("'exe_missing'");
     assert(unknown);
 }
 
 unittest
 {
-    // Start, heartbeat, release and a lost lease are each one compare-and-set on the ledger
+    // Start, heartbeat and a lost lease are each one compare-and-set on the ledger
     auto documents = new InMemoryDocumentStore();
     auto interleaving = new InterleavingDocumentStore(documents);
     auto stores = new StateStores(interleaving);
@@ -1067,7 +1034,7 @@ unittest
     countWrites();
     assert(!startExecution(stores, "fp1", "w1", testLease, fixedNow()).isNull && writes == 1);
     assert(heartbeatExecution(stores, "fp1", id, 1, testLease, later(10.seconds)) == LeaseAnswer.continue_ && writes == 2);
-    assert(releaseExecution(stores, "fp1", id, 1) == LeaseAnswer.released && writes == 3);
+    assert(expireLease(stores, "fp1", 3, later(5.minutes)).disposition == LostLeaseDisposition.requeued && writes == 3);
     assert(!startExecution(stores, "fp1", "w1", testLease, fixedNow()).isNull && writes == 4);
     assert(expireLease(stores, "fp1", 3, later(5.minutes)).disposition == LostLeaseDisposition.requeued && writes == 5);
 }
@@ -1174,28 +1141,18 @@ unittest
 
 unittest
 {
-    // A release is not a lost lease: any number of releases leave the limit untouched, and the
-    // execution fails only when `maxAttempts` leases have expired
+    // The attempt limit counts expired leases and nothing else: each start is one more attempt, and
+    // with `maxAttempts` 2 the second lost lease fails the execution
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = queueExecution(stores);
-    foreach (round; 1 .. 6)
-    {
-        assert(claimWork(stores, "w1", testLease, fixedNow()).get.attempt == round);
-        assert(releaseExecution(stores, "fp1", id, round) == LeaseAnswer.released);
-    }
-    assert(activeAt(stores).expiredLeases == 0 && activeAt(stores).attempt == 5);
-
-    foreach (lost; 1 .. 3)
-    {
-        assert(claimWork(stores, "w1", testLease, later(lost * 10.minutes)).get.attempt == 5 + lost);
-        auto expired = expireLease(stores, "fp1", 3, later(lost * 10.minutes + 5.minutes));
-        assert(expired.disposition == LostLeaseDisposition.requeued && expired.expiredLeases == lost);
-        assert(releaseExecution(stores, "fp1", id, 5 + lost) == LeaseAnswer.superseded);
-    }
-    assert(claimWork(stores, "w1", testLease, later(1.hours)).get.attempt == 8);
-    auto last = expireLease(stores, "fp1", 3, later(2.hours));
-    assert(last.disposition == LostLeaseDisposition.failed);
-    assert(last.ended.get.errorMessage.canFind("lease lost 3 times"), last.ended.get.errorMessage);
+    assert(claimWork(stores, "w1", testLease, fixedNow()).get.attempt == 1);
+    auto first = expireLease(stores, "fp1", 2, later(10.minutes));
+    assert(first.disposition == LostLeaseDisposition.requeued && first.expiredLeases == 1);
+    assert(claimWork(stores, "w2", testLease, later(10.minutes)).get.attempt == 2);
+    auto last = expireLease(stores, "fp1", 2, later(20.minutes));
+    assert(last.disposition == LostLeaseDisposition.failed && last.expiredLeases == 2);
+    assert(last.ended.get.errorMessage.canFind("lease lost 2 times"), last.ended.get.errorMessage);
+    assert(stores.executions.get(id).get.attempts == 2);
 }
 
 unittest
@@ -1567,8 +1524,8 @@ unittest
 unittest
 {
     // A finished execution is never written again: the record stays at version 1, unchanged, through
-    // everything that can still reach its fingerprint (heartbeats, releases, expiries, completions,
-    // and a newer execution's whole life)
+    // everything that can still reach its fingerprint (heartbeats, expiries, completions, and a
+    // newer execution's whole life)
     auto stores = new StateStores(new InMemoryDocumentStore());
     const id = runningExecution(stores);
     auto done = completeExecution(stores, "fp1", id, succeededAt(1), fixedNow());
@@ -1576,7 +1533,6 @@ unittest
     assert(stored.version_ == 1 && stored.value == done);
 
     heartbeatExecution(stores, "fp1", id, 1, testLease);
-    releaseExecution(stores, "fp1", id, 1);
     expireLease(stores, "fp1", 3, later(1.hours));
     bool lateRejected = false;
     try completeExecution(stores, "fp1", id, succeededAt(1));

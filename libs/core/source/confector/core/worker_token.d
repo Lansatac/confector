@@ -16,7 +16,7 @@ import vibe.data.json : Json, parseJsonString;
  * Format: `<claims>.<mac>`, both base64url without padding. The claims are a JSON object; the mac
  * is HMAC-SHA256 over a version label and the encoded claims, keyed by the server's signing key.
  * Verification checks the mac before it parses the claims. The token allows only what its claims
- * name: the execution's own logs, heartbeats, release and completion, uploads under the
+ * name: the execution's own logs, heartbeats and completion, uploads under the
  * execution's fingerprint, and downloads of the artifacts its inputs name.
  */
 
@@ -87,7 +87,7 @@ class WorkerTokenScopeException : WorkerAuthException
 }
 
 /// The token is genuine but its attempt no longer holds its execution (the lease ran out and the
-/// execution was started again, or it was released): 409, the same answer a stale report gets.
+/// execution was started again): 409, the same answer a stale report gets.
 class WorkerTokenSupersededException : WorkerAuthException
 {
     this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe

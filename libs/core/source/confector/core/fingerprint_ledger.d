@@ -23,8 +23,8 @@ module confector.core.fingerprint_ledger;
  *   re-evaluates and waits on the active execution, which reconciles its request again when it
  *   ends.
  * - `withStart`: a worker starts it (queued to running, one more attempt, a lease).
- *   `withLease`: a heartbeat extends the lease. `withRequeue`: a release, or `withLostLease`: an
- *   expired lease, puts it back to queued.
+ *   `withLease`: a heartbeat extends the lease. `withLostLease`: an expired lease is counted and,
+ *   with a requeue, puts it back to queued (through `withRequeue`).
  * - It ends by writing the immutable TaskExecution (`ExecutionStore.create`, which only one ender
  *   can win) and then `fold`, which in one compare-and-set clears the active execution and records
  *   the outcome as `lastSuccessExecutionId` or `lastStoppedExecutionId` (with `stopSeq`
@@ -147,15 +147,15 @@ FingerprintLedger withLease(in FingerprintLedger ledger, string leaseExpiresAt) 
 }
 
 /**
- * `ledger` with its running active execution given back: queued again, for any worker to start. A
- * release is not a lost lease (`withLostLease`): it does not count toward the attempt limit.
+ * `ledger` with its running active execution put back to queued, for any worker to start. It counts
+ * nothing: `withLostLease` counts the lost lease and requeues through this.
  *
  * Throws: InvalidStateTransitionException if the active execution is not running.
  */
 FingerprintLedger withRequeue(in FingerprintLedger ledger) @trusted
 {
-    auto active = activeOf(ledger, "release");
-    requireValid(active.status == ExecutionStatus.running, format("Execution '%s' is %s, so it cannot be released", active.id, active.status));
+    auto active = activeOf(ledger, "requeue");
+    requireValid(active.status == ExecutionStatus.running, format("Execution '%s' is %s, so it cannot be requeued", active.id, active.status));
     active.status = ExecutionStatus.queued;
     active.worker = null;
     active.leaseExpiresAt = null;
@@ -859,7 +859,7 @@ unittest
 unittest
 {
     // The transitions of the active execution, each one compare-and-set on the ledger: start,
-    // heartbeat, release, a lost lease with a requeue or counted alone; the claim's own fields
+    // heartbeat, a lost lease with a requeue or counted alone; the claim's own fields
     // never change, and what a transition cannot do is refused
     auto documents = new InMemoryDocumentStore();
     auto interleaving = new InterleavingDocumentStore(documents);
@@ -879,25 +879,25 @@ unittest
     auto extended = stores.ledgers.update(started, withLease(started.value, "2026-10-18T10:05:00Z"));
     assert(writes == 2 && extended.active.get.leaseExpiresAt == "2026-10-18T10:05:00Z" && extended.active.get.attempt == 1);
 
-    auto released = stores.ledgers.update(extended, withRequeue(extended.value));
-    const back = released.active.get;
-    assert(back.status == ExecutionStatus.queued && back.attempt == 1 && back.expiredLeases == 0, "A release keeps the attempt and counts nothing");
+    auto requeued = stores.ledgers.update(extended, withLostLease(extended.value, true));
+    const back = requeued.active.get;
+    assert(back.status == ExecutionStatus.queued && back.attempt == 1 && back.expiredLeases == 1, "A lost lease with a requeue keeps the attempt and counts once");
     assert(back.worker.length == 0 && back.leaseExpiresAt.length == 0 && back.startedAt.length == 0);
 
-    auto second = stores.ledgers.update(released, withStart(released.value, "w2", "2026-10-18T10:06:00Z", "2026-10-18T10:05:00Z"));
+    auto second = stores.ledgers.update(requeued, withStart(requeued.value, "w2", "2026-10-18T10:06:00Z", "2026-10-18T10:05:00Z"));
     assert(second.active.get.attempt == 2);
     auto lostAndQueued = stores.ledgers.update(second, withLostLease(second.value, true));
-    assert(lostAndQueued.active.get.status == ExecutionStatus.queued && lostAndQueued.active.get.expiredLeases == 1);
+    assert(lostAndQueued.active.get.status == ExecutionStatus.queued && lostAndQueued.active.get.expiredLeases == 2);
     auto third = stores.ledgers.update(lostAndQueued, withStart(lostAndQueued.value, "w3", "2026-10-18T10:08:00Z", "2026-10-18T10:07:00Z"));
-    assert(third.active.get.attempt == 3 && third.active.get.expiredLeases == 1);
+    assert(third.active.get.attempt == 3 && third.active.get.expiredLeases == 2);
     auto counted = stores.ledgers.update(third, withLostLease(third.value, false));
-    assert(counted.active.get.status == ExecutionStatus.running && counted.active.get.expiredLeases == 2 && counted.active.get.attempt == 3);
+    assert(counted.active.get.status == ExecutionStatus.running && counted.active.get.expiredLeases == 3 && counted.active.get.attempt == 3);
 
     // Transitions that cannot apply
     assert(throwsA!InvalidStateTransitionException({ withStart(counted.value, "w4", "2026-10-18T10:08:00Z", "2026-10-18T10:07:00Z"); }));
     assert(throwsA!InvalidStateTransitionException({ withLease(lostAndQueued.value, "2026-10-18T10:09:00Z"); }));
-    assert(throwsA!InvalidStateTransitionException({ withRequeue(released.value); }));
-    assert(throwsA!InvalidStateTransitionException({ withLostLease(released.value, true); }));
+    assert(throwsA!InvalidStateTransitionException({ withRequeue(requeued.value); }));
+    assert(throwsA!InvalidStateTransitionException({ withLostLease(requeued.value, true); }));
     assert(throwsA!InvalidStateTransitionException({ withClaim(counted.value, proposal()); }), "An active execution cannot be claimed over");
 
     // update refuses what is not a transition of the active execution

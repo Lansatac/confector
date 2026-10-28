@@ -1120,7 +1120,7 @@ struct TaskExecution
 /**
  * The execution a fingerprint's ledger holds queued or running: at most one per fingerprint. It
  * is created by the ledger's claim, changed only by compare-and-set on the ledger (a worker
- * starting it, its heartbeat, a release, an expired lease), and removed when it ends, when its
+ * starting it, its heartbeat, an expired lease), and removed when it ends, when its
  * outcome is written as a `TaskExecution` and folded into the ledger.
  */
 struct ActiveExecution
@@ -1132,17 +1132,16 @@ struct ActiveExecution
     /// queued (waiting for a worker) or running (held by `worker` under a lease).
     ExecutionStatus status;
     /// How many times a worker has started the execution; the current start's number is its
-    /// attempt. A worker's heartbeat, release and completion carry the attempt, and one from
-    /// another attempt is rejected. It fences workers only: a release raises it too, so it is not
-    /// the retry limit (see `expiredLeases`).
+    /// attempt. A worker's heartbeat and completion carry the attempt, and one from another attempt
+    /// is rejected. It fences workers only, so it is not the retry limit (see `expiredLeases`).
     ulong attempt;
     /// The worker holding it and when its lease expires unless a heartbeat extends it (ISO 8601
     /// UTC); both empty unless running.
     @optional string worker;
     @optional @asName("lease_expires_at") string leaseExpiresAt;
     /// How many leases expired on the execution (a lost worker). Infrastructure failures retry
-    /// within the same execution until this reaches an admin-configured limit; a release does not
-    /// count. A user's retry is a new execution.
+    /// within the same execution until this reaches an admin-configured limit. A user's retry is a
+    /// new execution.
     @optional @asName("expired_leases") ulong expiredLeases;
     /// The stored definition (`BuildRequest.definitionId`) of the request that claimed it, and the
     /// task in it. The execution runs with that definition's task as it was then.
