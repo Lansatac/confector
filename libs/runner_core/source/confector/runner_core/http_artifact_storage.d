@@ -7,7 +7,7 @@ import std.net.curl : HTTP;
 import std.array : Appender;
 import std.format : format;
 import core.time : seconds;
-import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
+import vibe.core.log : logDebug, logError, logInfo, logWarn;
 
 /**
  * The server refused the worker token (HTTP 401 or 403): it is missing, expired or altered, or does

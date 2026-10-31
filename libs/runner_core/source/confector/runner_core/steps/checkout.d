@@ -11,9 +11,8 @@ import core.time : MonoTime, minutes, seconds;
 import confector.api.model : BuildStep, InputKind, ResolvedInput;
 import confector.core.git : isFullSha, redactUserInfo;
 import confector.core.builtin_steps : checkoutConfig, checkoutConfigIssues, checkoutStepType;
-import confector.runner_core.logging : LogDelegate;
-import confector.runner_core.steps.process : runProcess;
-import confector.runner_core.steps.step : StepContext, StepResult, StepTimeoutException, StopLimits;
+import confector.core.process : DeadlineException, LogDelegate, runProcess, StopLimits;
+import confector.runner_core.steps.step : StepContext, StepResult;
 import vibe.data.json : Json;
 
 private bool isWithinDirectory(string targetPath, string baseDir) pure @safe
@@ -260,7 +259,7 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
             }
         }
     }
-    catch (StepTimeoutException e)
+    catch (DeadlineException e)
     {
         // The task's deadline is reported by the executor, not as a git failure
         throw e;
@@ -280,7 +279,12 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
 /// credentials in URLs redacted, to `log`. Returns its exit code. Stops it at `deadline`.
 private int runGit(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, LogDelegate log)
 {
-    return runProcess(args, dir, env, deadline, limits, (string line) { log(redactUserInfo(line)); });
+    const result = runProcess(args, dir, env, deadline, limits, (string line) { log(redactUserInfo(line)); });
+    if (result.outputAbandoned)
+    {
+        log(format("[confector] The output of '%s' was cut off: a process it started still held it open", args[0]));
+    }
+    return result.exitCode;
 }
 
 version (unittest)
@@ -403,7 +407,7 @@ unittest
 
 unittest
 {
-    // A checkout whose task has run out of time throws StepTimeoutException, not a failed result
+    // A checkout whose task has run out of time throws DeadlineException, not a failed result
     import std.uuid : randomUUID;
 
     string workspace = buildPath(tempDir(), "cfx" ~ randomUUID().toString()[0 .. 6]);
@@ -414,8 +418,8 @@ unittest
     ctx.deadline = MonoTime.currTime - 1.seconds;
     bool timedOut = false;
     try runCheckout(checkoutStep(["input": "src", "target_dir": "late"]), ctx);
-    catch (StepTimeoutException e) timedOut = true;
-    assert(timedOut, "A checkout past its deadline did not throw StepTimeoutException");
+    catch (DeadlineException e) timedOut = true;
+    assert(timedOut, "A checkout past its deadline did not throw DeadlineException");
 }
 
 unittest

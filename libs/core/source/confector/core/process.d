@@ -1,7 +1,4 @@
-module confector.runner_core.steps.process;
-
-import confector.runner_core.logging : LogDelegate, logError, logWarn;
-import confector.runner_core.steps.step : StepTimeoutException, StopLimits;
+module confector.core.process;
 
 import core.sync.event : Event;
 import core.thread : Thread;
@@ -10,6 +7,49 @@ import std.algorithm.searching : canFind;
 import std.conv : to;
 import std.format : format;
 import std.string : indexOf, split;
+import vibe.core.log : logError, logWarn;
+
+/// Receives each line of a process's output, without its line break.
+alias LogDelegate = void delegate(string message);
+
+/// The waits `runProcess` applies after the deadline: how long a process is given to stop, how
+/// long its killed tree is given to disappear, and how long its output is given to end. All three
+/// are required.
+struct StopLimits
+{
+    @disable this();
+
+    Duration stopGrace;
+    Duration reapLimit;
+    Duration drainLimit;
+
+    this(Duration stopGrace, Duration reapLimit, Duration drainLimit) pure nothrow @safe @nogc
+    {
+        this.stopGrace = stopGrace;
+        this.reapLimit = reapLimit;
+        this.drainLimit = drainLimit;
+    }
+}
+
+/// What `runProcess` returns once the process has exited.
+struct ProcessResult
+{
+    int exitCode;
+    /// Whether the output did not end within `drainLimit` of the process exiting, so the rest of
+    /// it was dropped.
+    bool outputAbandoned;
+}
+
+/**
+ * A process ran past its deadline; its processes were stopped.
+ */
+class DeadlineException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
 
 /// How often the supervising thread looks at the process and its output.
 private enum Duration pollInterval = 10.msecs;
@@ -26,29 +66,27 @@ private enum size_t maxPendingOutput = 1 << 20;
  *
  * At `deadline` the process is asked to stop (Ctrl+Break on Windows, SIGTERM on POSIX), given
  * `limits.stopGrace` to do so, and then its whole tree is killed; the call then throws
- * StepTimeoutException. See `postDeadlineBudget` (confector.runner_core.steps.step) for how long
- * that takes at most. Output is read on its own thread, with a bounded backlog, and a slow `log`
- * delays neither the stop nor the kill. It ends the call at most `limits.drainLimit` after the
- * process has gone: a process that escaped the containment and still holds the output open is
- * abandoned with an error in the runner's log.
+ * DeadlineException. Output is read on its own thread, with a bounded backlog, and a slow `log`
+ * delays neither the stop nor the kill. The call ends at most `limits.drainLimit` after the
+ * process has gone. If the output has not ended by then, the rest of it is dropped and the result
+ * has `outputAbandoned` set: a process that escaped the containment still holds the output open,
+ * or `log` was too slow to take it. An error is logged as well.
  *
- * Steps must run every process through this function, so that the task's timeout reaches it.
- *
- * Throws: StepTimeoutException if `deadline` has passed already (nothing is started), or if the
+ * Throws: DeadlineException if `deadline` has passed already (nothing is started), or if the
  * process ran past it. Exception if `log` is null, `deadline` was never set or the process
  * cannot be started. Anything `log` throws stops the process and is rethrown.
  */
-int runProcess(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, LogDelegate log)
+ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, LogDelegate log)
 {
     if (args.length == 0) throw new Exception("Cannot run a process without a command");
     if (log is null) throw new Exception(format("Running '%s' needs a log for its output (the log delegate is null)", args[0]));
     if (deadline == MonoTime.init)
     {
-        throw new Exception(format("Running '%s' needs the task's deadline, and none was set (StepContext.deadline)", args[0]));
+        throw new Exception(format("Running '%s' needs a deadline, and none was set", args[0]));
     }
     if (MonoTime.currTime >= deadline)
     {
-        throw new StepTimeoutException(format("'%s' was not started: the task's deadline had passed", args[0]));
+        throw new DeadlineException(format("'%s' was not started: the deadline had passed", args[0]));
     }
 
     auto child = new ChildProcess;
@@ -168,9 +206,9 @@ int runProcess(string[] args, string dir, string[string] env, MonoTime deadline,
 
     if (timedOut)
     {
-        throw new StepTimeoutException(format("'%s' ran past the task's deadline; its processes were stopped", args[0]));
+        throw new DeadlineException(format("'%s' ran past the deadline; its processes were stopped", args[0]));
     }
-    return exitCode;
+    return ProcessResult(exitCode, abandoned);
 }
 
 /// Output passed from the reader thread to the supervising thread.
@@ -282,7 +320,7 @@ version (Windows)
     /**
      * A child process on Windows. It is created suspended, put in a job object, and only then
      * resumed, so nothing it starts can be outside the job. The job kills its processes when the
-     * last handle to it closes, so they do not outlive a runner that dies. The child leads its
+     * last handle to it closes, so they do not outlive a parent that dies. The child leads its
      * own process group so that it alone can be sent Ctrl+Break.
      */
     private final class ChildProcess
@@ -329,8 +367,12 @@ version (Windows)
             startup.hStdOutput = writeEnd;
             startup.hStdError = writeEnd;
             PROCESS_INFORMATION info;
+            // With a console the child shares it, so Ctrl+Break reaches it; without one the child
+            // would open a window of its own, and no Ctrl+Break can be sent anyway
+            const creationFlags = CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT
+                | (consoleAttached ? 0 : CREATE_NO_WINDOW);
             if (!CreateProcessW(null, commandLine.ptr, null, null, TRUE,
-                    CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+                    creationFlags,
                     cast(void*) block.ptr, dir.length > 0 ? toUTF16z(dir) : null, &startup, &info))
             {
                 throw windowsError(format("start '%s'", args[0]));
@@ -387,7 +429,7 @@ version (Windows)
             return cast(int) code;
         }
 
-        /// Sends Ctrl+Break to the child's process group. That needs the runner to have a
+        /// Sends Ctrl+Break to the child's process group. That needs the parent to have a
         /// console, as it has when started from one; false if the event could not be sent.
         bool requestStop()
         {
@@ -556,7 +598,7 @@ unittest
 {
     // A process that runs past the deadline is stopped with the process it started: the call
     // throws, and both processes are gone
-    string testDir = freshDir("test_runner_core_process_tree");
+    string testDir = freshDir("test_core_process_tree");
     scope(exit) cleanup(testDir);
 
     // The process writes this file from its own working directory, so the path is absolute
@@ -566,7 +608,7 @@ unittest
     const started = MonoTime.currTime;
     try runProcess(chattyProcessTree(pidFile), testDir, environment.toAA, MonoTime.currTime + 6.seconds,
         quickLimits(), (string line) { logged ~= line; });
-    catch (StepTimeoutException e) stopped = true;
+    catch (DeadlineException e) stopped = true;
     assert(stopped, "A process past its deadline is not stopped");
     assert(MonoTime.currTime - started < 60.seconds, "The call did not return promptly");
     assert(exists(pidFile), "The process tree had not started by the deadline; the test needs a longer one");
@@ -582,25 +624,25 @@ unittest
 unittest
 {
     // A process within its deadline runs to completion: its output and exit code are returned
-    string testDir = freshDir("test_runner_core_process_exit");
+    string testDir = freshDir("test_core_process_exit");
     scope(exit) cleanup(testDir);
 
     string[] logged;
-    auto code = runProcess(shellArgs("echo finished & exit 3"), testDir, environment.toAA,
+    auto result = runProcess(shellArgs("echo finished & exit 3"), testDir, environment.toAA,
         MonoTime.currTime + 60.seconds, quickLimits(), (string line) { logged ~= line; });
-    assert(code == 3, format("Exit code %d", code));
+    assert(result.exitCode == 3 && !result.outputAbandoned, format("Exit code %d", result.exitCode));
     assert(logged.canFind!(line => line.canFind("finished")), format("Logged %s", logged));
 
     // A deadline that has passed starts nothing
     bool refused = false;
     try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.currTime - 1.seconds, quickLimits(), (string line) {});
-    catch (StepTimeoutException e) refused = true;
+    catch (DeadlineException e) refused = true;
     assert(refused && !exists(buildPath(testDir, "ran.txt")), "A process started after its deadline");
 
     // A deadline that was never set is an error, not a deadline that has passed
     bool unset = false;
     try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.init, quickLimits(), (string line) {});
-    catch (StepTimeoutException e) assert(false, "An unset deadline is not a timeout");
+    catch (DeadlineException e) assert(false, "An unset deadline is not a timeout");
     catch (Exception e) unset = e.msg.canFind("deadline");
     assert(unset && !exists(buildPath(testDir, "ran.txt")));
 }
@@ -609,14 +651,14 @@ unittest
 {
     // A process the root left behind holds the output open after the root has exited: the call
     // still returns promptly, with the root's output and exit code, and the helper is killed
-    string testDir = freshDir("test_runner_core_process_helper");
+    string testDir = freshDir("test_core_process_helper");
     scope(exit) cleanup(testDir);
 
     string[] logged;
     const started = MonoTime.currTime;
-    const code = runProcess(shellArgs("echo root done & " ~ backgroundHelperCommand), testDir, environment.toAA,
+    const result = runProcess(shellArgs("echo root done & " ~ backgroundHelperCommand), testDir, environment.toAA,
         MonoTime.currTime + 60.seconds, quickLimits(), (string line) { logged ~= line; });
-    assert(code == 0, format("Exit code %d", code));
+    assert(result.exitCode == 0, format("Exit code %d", result.exitCode));
     assert(MonoTime.currTime - started < 25.seconds, "A helper holding the output kept the call waiting");
     assert(logged.canFind!(line => line.canFind("root done")), format("Logged %s", logged));
 }
@@ -624,7 +666,7 @@ unittest
 unittest
 {
     // A log that throws stops the process and its tree instead of leaking them
-    string testDir = freshDir("test_runner_core_process_log_throws");
+    string testDir = freshDir("test_core_process_log_throws");
     scope(exit) cleanup(testDir);
 
     string pidFile = absolutePath(buildPath(testDir, "pids.txt"));
@@ -646,14 +688,14 @@ version (Posix)
     unittest
     {
         // A process is asked to stop before it is killed: one that handles SIGTERM gets to finish
-        string testDir = freshDir("test_runner_core_process_graceful");
+        string testDir = freshDir("test_core_process_graceful");
         scope(exit) cleanup(testDir);
 
         string marker = absolutePath(buildPath(testDir, "stopped.txt"));
         bool stopped = false;
         try runProcess(["sh", "-c", format("trap 'echo stopped > %s; exit 0' TERM; echo ready; while true; do sleep 1; done", marker)],
             testDir, environment.toAA, MonoTime.currTime + 3.seconds, StopLimits(10.seconds, 5.seconds, 5.seconds), (string line) {});
-        catch (StepTimeoutException e) stopped = true;
+        catch (DeadlineException e) stopped = true;
         assert(stopped && exists(marker), "The process was killed without being asked to stop");
     }
 }
@@ -661,14 +703,14 @@ version (Posix)
 unittest
 {
     // The sleeping command is a real process that outlasts a short deadline
-    string testDir = freshDir("test_runner_core_process_sleep");
+    string testDir = freshDir("test_core_process_sleep");
     scope(exit) cleanup(testDir);
 
     bool stopped = false;
     const started = MonoTime.currTime;
     try runProcess(shellArgs(sleepingCommand), testDir, environment.toAA, MonoTime.currTime + 5.seconds,
         quickLimits(), (string line) {});
-    catch (StepTimeoutException e) stopped = true;
+    catch (DeadlineException e) stopped = true;
     assert(stopped && MonoTime.currTime - started < 25.seconds);
 }
 
@@ -676,7 +718,7 @@ unittest
 {
     // A log that is slower than the output arrives delays neither the stop nor the kill: the
     // process is stopped near its deadline, not after its backlog has been delivered
-    string testDir = freshDir("test_runner_core_process_slow_log");
+    string testDir = freshDir("test_core_process_slow_log");
     scope(exit) cleanup(testDir);
 
     size_t delivered = 0;
@@ -684,7 +726,7 @@ unittest
     const started = MonoTime.currTime;
     try runProcess(manyLinesThenSleep(5000), testDir, environment.toAA, MonoTime.currTime + 4.seconds,
         quickLimits(), (string line) { ++delivered; Thread.sleep(20.msecs); });
-    catch (StepTimeoutException e) stopped = true;
+    catch (DeadlineException e) stopped = true;
     assert(stopped);
     // Delivering all the lines would take 100 s; the budget is the deadline plus the limits
     assert(MonoTime.currTime - started < 25.seconds, "A slow log held up the stop");
@@ -717,6 +759,31 @@ unittest
     total += taken.length;
     writer.join();
     assert(total == 2 * maxPendingOutput);
+}
+
+unittest
+{
+    // Output that is still arriving when the process exits is cut off at the drain limit when
+    // `log` is too slow to take it: the exit code comes back, flagged as cut off, and the rest of
+    // the output is dropped. The first line keeps `log` busy past the exit, so the rest is left
+    // for the drain
+    string testDir = freshDir("test_core_process_cut_off");
+    scope(exit) cleanup(testDir);
+
+    version (Windows) auto args = ["powershell", "-NoProfile", "-Command",
+        "'first'; Start-Sleep -Seconds 2; 1..200 | ForEach-Object { 'burst' + $_ }"];
+    else auto args = ["sh", "-c", "echo first; sleep 2; i=0; while [ $i -lt 200 ]; do echo burst$i; i=$((i+1)); done"];
+
+    size_t delivered = 0;
+    const result = runProcess(args, testDir, environment.toAA, MonoTime.currTime + 60.seconds,
+        StopLimits(60.seconds, 5.seconds, 1.seconds), (string line) {
+            ++delivered;
+            if (line == "first") Thread.sleep(4.seconds);
+            else Thread.sleep(20.msecs);
+        });
+    assert(result.exitCode == 0, format("Exit code %d", result.exitCode));
+    assert(result.outputAbandoned, "Output that did not end within the drain limit was not flagged");
+    assert(delivered < 201, format("The whole output was delivered (%s lines)", delivered));
 }
 
 version (Windows) version (unittest)
@@ -755,7 +822,7 @@ version (Windows) version (unittest)
         // its handler runs, which a kill would not allow. Without a console no request can be sent
         import std.file : thisExePath;
 
-        string testDir = freshDir("test_runner_core_process_break");
+        string testDir = freshDir("test_core_process_break");
         scope(exit) cleanup(testDir);
 
         string marker = absolutePath(buildPath(testDir, "stopped.txt"));
@@ -765,7 +832,7 @@ version (Windows) version (unittest)
         const started = MonoTime.currTime;
         try runProcess([thisExePath], testDir, env, MonoTime.currTime + 8.seconds,
             StopLimits(40.seconds, 5.seconds, 5.seconds), (string line) {});
-        catch (StepTimeoutException e) stopped = true;
+        catch (DeadlineException e) stopped = true;
         assert(stopped);
         assert(MonoTime.currTime - started < 30.seconds, "The child waited out the grace");
         if (stopCanBeSent) assert(exists(marker), "The child was killed instead of being asked to stop");

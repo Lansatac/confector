@@ -2,13 +2,14 @@ module confector.runner_core.task_executor;
 
 import confector.api.model;
 import confector.runner_core.artifacts;
-import confector.runner_core.steps.step : StepContext, StepResult, StepRunner, StepTimeoutException, StopLimits;
+import confector.core.process : DeadlineException, LogDelegate, StopLimits;
+import confector.runner_core.steps.step : productionStopLimits, StepContext, StepResult, StepRunner;
 
 import std.format : format;
 import std.algorithm.searching : canFind;
 import std.datetime.stopwatch : StopWatch, AutoStart;
 import core.time : Duration, MonoTime, seconds;
-import confector.runner_core.logging : LogDelegate, logInfo;
+import vibe.core.log : logInfo;
 
 /**
  * Binds a work order's resolved inputs to the task's declared inputs, keyed by input name.
@@ -119,7 +120,7 @@ class TaskExecutor
     private StepRunner m_steps;
 
     /// How long a step's processes are given after the task's deadline.
-    StopLimits stopLimits;
+    StopLimits stopLimits = productionStopLimits;
 
     /// Throws: Exception if `steps` is null.
     this(ArtifactStorage artifactStorage, StepRunner steps)
@@ -275,7 +276,7 @@ class TaskExecutor
         foreach (name, address; repositoryAddresses) stepCtx.repositoryAddresses[name] = address;
 
         // A step that runs past the deadline has its processes stopped by the step runner, which
-        // throws StepTimeoutException; a step that finishes after it, or none that starts after it,
+        // throws DeadlineException; a step that finishes after it, or none that starts after it,
         // leaves the task timed out
         bool timedOut = false;
         if (task.steps.length == 0)
@@ -302,7 +303,7 @@ class TaskExecutor
                 {
                     stepResult = m_steps.run(step, stepCtx);
                 }
-                catch (StepTimeoutException)
+                catch (DeadlineException)
                 {
                     timedOut = true;
                     break;
@@ -393,15 +394,21 @@ version (unittest)
         StepResult run(in BuildStep step, ref StepContext context)
         {
             import std.process : environment;
-            import confector.runner_core.steps.process : runProcess;
+            import confector.core.process : runProcess;
             import confector.testing.processes : shellArgs;
 
             seen ~= context;
             string[string] env = environment.toAA;
             foreach (key, value; context.environment) env[key] = value;
             StepResult res;
-            res.exitCode = runProcess(shellArgs(step.config["command"].get!string), context.workingDirectory, env,
+            const command = step.config["command"].get!string;
+            const result = runProcess(shellArgs(command), context.workingDirectory, env,
                 context.deadline, context.stopLimits, context.log);
+            if (result.outputAbandoned)
+            {
+                context.log(format("[confector] The output of '%s' was cut off: a process it started still held it open", command));
+            }
+            res.exitCode = result.exitCode;
             res.success = res.exitCode == 0;
             return res;
         }

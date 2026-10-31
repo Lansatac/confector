@@ -10,7 +10,7 @@ import std.array : Appender;
 import std.datetime.systime : Clock;
 import std.digest.sha : SHA256;
 import std.digest : toHexString, LetterCase;
-import confector.runner_core.logging : logInfo, logError, logWarn, logDebug;
+import vibe.core.log : logDebug, logError, logInfo, logWarn;
 
 /**
  * Utility for staging upstream artifacts and packaging output artifacts.

@@ -8,6 +8,7 @@ import confector.core.worker_pool_credential : minimumWorkerPoolCredentialLength
 import std.format : format;
 import std.getopt;
 import std.stdio : writeln, writefln, stderr;
+import vibe.core.log : LogLevel, setLogLevel;
 
 enum VERSION = "1.0.0";
 
@@ -106,6 +107,8 @@ int handleWorker(string[] args)
         defaultGetoptPrinter("Usage: confector-runner worker [options]", helpInfo.options);
         return 0;
     }
+
+    if (verbose) setLogLevel(LogLevel.debug_);
 
     if (workspaceDir.length == 0)
     {

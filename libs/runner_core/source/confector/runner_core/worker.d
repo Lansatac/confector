@@ -6,8 +6,8 @@ import confector.core.worker_pool_credential : requireWorkerPoolCredential, work
 import confector.core.worker_token : workerTokenHeader;
 import confector.runner_core.task_executor;
 import confector.runner_core.http_artifact_storage;
-import confector.runner_core.logging;
-import confector.runner_core.steps.process : warnIfStopCannotBeSent;
+import vibe.core.log : logError, logInfo, logWarn;
+import confector.core.process : warnIfStopCannotBeSent;
 import confector.runner_core.steps.step : StepRunner;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, serializeToJsonString, parseJsonString;
@@ -690,7 +690,8 @@ version (unittest)
 
 version (unittest)
 {
-    import confector.runner_core.steps.step : StepContext, StepResult, StopLimits;
+    import confector.core.process : StopLimits;
+    import confector.runner_core.steps.step : StepContext, StepResult;
 
     /// A step runner for tests: each line of a step's `command` config is one line of its
     /// output. A step whose command is "fail" fails with exit code 4, and one whose command is
@@ -705,7 +706,7 @@ version (unittest)
         {
             import std.process : environment;
             import std.string : splitLines;
-            import confector.runner_core.steps.process : runProcess;
+            import confector.core.process : runProcess;
             import confector.testing.processes : shellArgs, sleepingCommand;
 
             ++stepsRun;
@@ -719,7 +720,7 @@ version (unittest)
             }
             if (command == "sleep process")
             {
-                // Throws StepTimeoutException once the task's deadline passes
+                // Throws DeadlineException once the task's deadline passes
                 runProcess(shellArgs(sleepingCommand), context.workingDirectory, environment.toAA, context.deadline,
                     StopLimits(1.seconds, 5.seconds, 5.seconds), context.log);
                 return result;

@@ -27,9 +27,9 @@ import confector.core.git : isFullSha, redactUserInfo;
 
 import vibe.data.json : Json;
 
-import core.time : Duration, msecs, seconds;
+import core.time : Duration, seconds;
 import std.algorithm.searching : canFind, startsWith;
-import std.array : appender;
+import std.array : appender, join;
 import std.ascii : isHexDigit;
 import std.format : format;
 import std.string : lineSplitter, indexOf, strip, toLower;
@@ -189,85 +189,65 @@ GitRef selectNamedRef(string name, const GitRef[] refs, out RefKind kind) pure @
     return found[0];
 }
 
-/// How long `git ls-remote` may run before it is killed. A remote that does not answer within
+/// How long `git ls-remote` may run before it is stopped. A remote that does not answer within
 /// this time fails resolution; it is generous because large repositories advertise many refs.
 enum Duration lsRemoteTimeout = 120.seconds;
 
 /**
- * Runs the real `git ls-remote`, unable to wait for a person: standard input is not
- * inherited, terminal prompts are disabled (`GIT_TERMINAL_PROMPT=0`), ssh runs with
- * `BatchMode=yes` unless the environment already sets `GIT_SSH_COMMAND` or `GIT_SSH`, and git is
- * killed after `timeout`. Credentials in `address` are redacted from error messages.
+ * Runs the real `git ls-remote`, unable to wait for a person: standard input is not inherited,
+ * terminal prompts are disabled (`GIT_TERMINAL_PROMPT=0`), ssh runs with `BatchMode=yes` unless
+ * the environment already sets `GIT_SSH_COMMAND` or `GIT_SSH`, and git is stopped after
+ * `timeout` (see `runProcess`). Credentials in `address` are redacted from error messages.
  *
  * Throws: GitResolutionException if git cannot be run, exits non-zero or times out.
  */
 string runGitLsRemote(string address, string[] patterns, Duration timeout = lsRemoteTimeout)
 {
-    import core.thread : Thread;
-    import std.datetime.stopwatch : AutoStart, StopWatch;
-    import std.process : Config, Redirect, environment, kill, pipeProcess, tryWait, wait;
+    import confector.core.process : DeadlineException, ProcessResult, runProcess, StopLimits;
+    import core.time : MonoTime;
+    import std.process : environment;
 
     const shown = redactUserInfo(address);
-    const command = ["git", "ls-remote", "--"] ~ address ~ patterns;
+    auto command = ["git", "ls-remote", "--"] ~ address ~ patterns;
 
-    string[string] env = ["GIT_TERMINAL_PROMPT": "0"];
+    string[string] env = environment.toAA;
+    env["GIT_TERMINAL_PROMPT"] = "0";
     if (environment.get("GIT_SSH_COMMAND") is null && environment.get("GIT_SSH") is null)
     {
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes";
     }
 
+    // Server resolution must not stall far past its timeout; git exits promptly on a stop
+    const limits = StopLimits(2.seconds, 5.seconds, 5.seconds);
+    auto lines = appender!(string[]);
+    ProcessResult result;
     try
     {
-        auto pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout | Redirect.stderrToStdout, env,
-            Config.suppressConsole);
-        pipes.stdin.close();
-
-        // Read on a separate thread so the deadline is enforced even while git produces no
-        // output. If git is killed, a helper it spawned (ssh, git-remote-https) may keep the
-        // pipe open; the daemon reader is then abandoned rather than waited for.
-        string output;
-        auto reader = new Thread({
-            foreach (chunk; pipes.stdout.byChunk(4096)) output ~= cast(const(char)[]) chunk;
-        });
-        reader.isDaemon = true;
-        reader.start();
-
-        auto clock = StopWatch(AutoStart.yes);
-        auto status = tryWait(pipes.pid);
-        while (!status.terminated)
-        {
-            if (clock.peek > timeout)
-            {
-                kill(pipes.pid);
-                wait(pipes.pid);
-                throw new GitResolutionException(format("git ls-remote %s timed out after %s", shown, timeout));
-            }
-            Thread.sleep(20.msecs);
-            status = tryWait(pipes.pid);
-        }
-        while (reader.isRunning)
-        {
-            if (clock.peek > timeout)
-            {
-                throw new GitResolutionException(format(
-                    "git ls-remote %s exited but its output did not end within %s", shown, timeout));
-            }
-            Thread.sleep(5.msecs);
-        }
-        reader.join();
-
-        if (status.status != 0)
-        {
-            throw new GitResolutionException(format(
-                "git ls-remote %s failed with exit code %s: %s", shown, status.status, redactUserInfo(output.strip)));
-        }
-        return output;
+        result = runProcess(command, null, env, MonoTime.currTime + timeout, limits,
+            (string line) { lines.put(line); });
     }
-    catch (GitResolutionException e) throw e;
+    catch (DeadlineException e)
+    {
+        throw new GitResolutionException(format("git ls-remote %s timed out after %s", shown, timeout));
+    }
     catch (Exception e)
     {
         throw new GitResolutionException(format("Could not run git ls-remote %s: %s", shown, redactUserInfo(e.msg)));
     }
+
+    // Truncated output could resolve to a wrong commit, so it is an error, not a partial answer
+    if (result.outputAbandoned)
+    {
+        throw new GitResolutionException(format(
+            "git ls-remote %s: its output did not end within %s of git exiting", shown, limits.drainLimit));
+    }
+    const output = lines.data.join("\n");
+    if (result.exitCode != 0)
+    {
+        throw new GitResolutionException(format(
+            "git ls-remote %s failed with exit code %s: %s", shown, result.exitCode, redactUserInfo(output.strip)));
+    }
+    return output;
 }
 
 /**
@@ -566,4 +546,8 @@ unittest // real git against a local repository (skipped when git is unavailable
     assertThrown!GitResolutionException(resolver.resolve(addr, branch("light")), "A tag is not a branch");
     assertThrown!GitResolutionException(resolver.resolve(addr, branch("missing")));
     assertThrown!GitResolutionException(resolver.resolve(repo(buildPath(dir, "nonexistent")), branch("main")));
+
+    // The output is the advertised lines in git's order, joined by newlines, with none at the end
+    assert(runGitLsRemote(dir, ["refs/heads/main", "refs/tags/light"]) == first ~ "\trefs/heads/main\n" ~ first ~ "\trefs/tags/light",
+        "Unexpected ls-remote output");
 }
