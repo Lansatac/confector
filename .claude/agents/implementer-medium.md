@@ -22,6 +22,11 @@ but have clear acceptance criteria.
 - Run `dub test` for every affected subpackage (names are in each `dub.json`) and `dub build`, and
   fix until green. Never report success without running them.
 - Never run git write commands (add, commit, checkout, stash, rm) and never close beads.
+- Bead ids and bead details never go in code, comments, test names, error messages or commit
+  messages: beads are local and unsynced, so ids point at nothing for anyone else.
+- Replace rather than add: when you introduce a new path for existing behavior, move its callers
+  and delete the old path in the same change. If that reaches well outside the bead, stop and
+  report rather than keeping both.
 - If a bead needs a design decision (concurrency, compare-and-set or crash-recovery protocols,
   security design) or grows beyond its stated area, stop, record what you found in the bead notes
   and report it rather than deciding.

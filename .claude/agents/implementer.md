@@ -18,6 +18,11 @@ You implement beads in the Confector repository (D language, dub, Windows).
 - Run `dub test` for each affected subpackage (names are in each `dub.json`) and `dub build`, and fix
   until green. Never report success without running them.
 - Never run git write commands (add, commit, checkout, stash, rm) and never close beads.
+- Bead ids and bead details never go in code, comments, test names, error messages or commit
+  messages: beads are local and unsynced, so ids point at nothing for anyone else.
+- Replace rather than add: when you introduce a new path for existing behavior, move its callers
+  and delete the old path in the same change. If that reaches well outside the bead, stop and
+  report rather than keeping both.
 - If a bead needs a design decision or grows beyond a small area, stop, record what you found in
   the bead notes and move on.
 - Do not guess silently. If you resolve an ambiguity by guessing, or change behavior beyond the

@@ -669,3 +669,25 @@ Outputs land in `build/out/server/` and `build/out/runner/`. Release builds shou
 
 **The server's `.dt` templates are compiled into the binary,** so it needs no `views` directory at
 runtime; do not "fix" a missing one next to the executable.
+
+## Agent workflow
+
+Project specifics for the shared `next-bead` and `design-session` skills.
+
+- **Tests.** An implementer runs `dub test` for each affected subpackage and `dub build`.
+- **Version control.** git. Implementers and reviewers run no git write commands; the orchestrator
+  commits only the work's paths, never `git add -A`. See a change with `git diff`; check
+  line-ending churn by comparing `git diff --stat` with and without `--ignore-cr-at-eol`.
+- **Parallel work.** dub builds collide in one tree. Parallel implementers each get a git worktree
+  (`git worktree add -b wt-<name> <folder>/<name> HEAD`) in a short folder the owner names, since
+  long paths break on Windows; the harness's `isolation: "worktree"` can't choose the folder. Merge
+  back with `git add -N .` and `git diff --binary` in the worktree, then `git apply --3way` in the
+  main tree. In a worktree without `bd`, agents put bead notes in their report.
+- **High-risk areas** (opus reviewer, their own run): concurrency, compare-and-set, crash
+  recovery, security.
+- **Design decisions** are recorded in a closed design bead's `design` field and summarized in a
+  section of this file; undecided topics are listed under "Open questions". Commit this file after
+  each decision.
+- **Gate tests** drive the system through the API, the worker protocol and the real stores, with
+  both the memory and the Mongo configuration.
+- **Environment.** Windows with Git Bash: there's no `/tmp`, so use the session scratchpad.

@@ -11,6 +11,11 @@ judgment.
   bead cites (`bd show <id> --json`). Follow the recorded decisions; do not re-litigate them. The
   project is in early development: backward compatibility does not matter, best design wins.
 - Never run git write commands and never close beads.
+- Bead ids and bead details never go in code, comments, test names, error messages or commit
+  messages: beads are local and unsynced, so ids point at nothing for anyone else.
+- Replace rather than add: when you introduce a new path for existing behavior, move its callers
+  and delete the old path in the same change. If that reaches well outside the bead, stop and
+  report rather than keeping both.
 - Respect the consistency rules in AGENTS.md: correctness depends only on reads by id and
   single-document compare-and-set; prefer message passing to locks; fail loudly.
 - Write thorough tests, including forced interleavings for races (use the interleaving document

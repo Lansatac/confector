@@ -17,14 +17,15 @@ Check, in this order:
 1. Acceptance criteria met, and the tests actually fail without the change (reason about it).
 2. Correctness: races, crash points, error paths, edge cases; compare-and-set and consistency rules.
 3. Fail-fast: silent fallbacks, swallowed exceptions, invented defaults, logged secrets.
-4. Behavior changes the implementer did not flag; scope creep; half-removed things.
+4. Behavior changes the implementer did not flag; scope creep; half-removed things; a new path
+   with no production caller, or an old path kept alive beside its replacement (should-fix).
 5. Existing tests changed or weakened; test quality and coverage gaps.
-6. Dead code, stale docs and references, unused parameters.
+6. Dead code, stale docs and references, unused parameters, bead ids in code or comments.
 7. Style and line-ending churn (`git diff --stat` versus `--ignore-cr-at-eol`).
 
-Report ranked findings, each with file:line, a concrete
-failure scenario and a severity (blocker / should-fix / nit). Separately, list any design
-pressure: code that is correct but suggests the design is fighting the work, such as repair paths,
-cross-document consistency checks, special cases, or one component compensating for another. Say
-what in the design seems to cause it. These are observations for the owner, not fixes. State explicitly if there are no
-blockers, and give a one-line quality verdict. Be concise.
+Report ranked findings, each with file:line, a concrete failure scenario and a severity
+(blocker / should-fix / nit). Separately, list any design pressure: code that is correct but
+suggests the design is fighting the work, such as repair paths, cross-document consistency checks,
+special cases, or one component compensating for another. Say what in the design seems to cause it.
+These are observations for the owner, not fixes. State explicitly if there are no blockers, and give
+a one-line quality verdict. Be concise.
