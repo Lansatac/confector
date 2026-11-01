@@ -1,5 +1,6 @@
 module confector.core.process;
 
+import core.atomic : atomicLoad, atomicStore;
 import core.sync.event : Event;
 import core.thread : Thread;
 import core.time : Duration, MonoTime, msecs, seconds;
@@ -51,6 +52,45 @@ class DeadlineException : Exception
     }
 }
 
+/**
+ * A process was asked to stop through a `StopSignal`; it was not started, or its processes were
+ * stopped.
+ */
+class StopRequestedException : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+    {
+        super(msg, file, line);
+    }
+}
+
+/**
+ * A request, made from any thread, that a running process be stopped. `runProcess` checks it as
+ * it checks the deadline. Once requested it stays requested.
+ */
+final class StopSignal
+{
+    private shared bool m_requested;
+
+    /// Asks the process to stop.
+    void request() nothrow @safe @nogc
+    {
+        atomicStore(m_requested, true);
+    }
+
+    /// Whether a stop has been requested.
+    bool requested() nothrow @safe @nogc
+    {
+        return atomicLoad(m_requested);
+    }
+}
+
+/// Whether `stop` is set and has been requested; a null signal is never requested.
+private bool stopRequested(StopSignal stop) nothrow @safe @nogc
+{
+    return stop !is null && stop.requested();
+}
+
 /// How often the supervising thread looks at the process and its output.
 private enum Duration pollInterval = 10.msecs;
 
@@ -64,19 +104,22 @@ private enum size_t maxPendingOutput = 1 << 20;
  * group on POSIX), and everything it started that is still running when it exits is killed, so
  * nothing outlives the call.
  *
- * At `deadline` the process is asked to stop (Ctrl+Break on Windows, SIGTERM on POSIX), given
- * `limits.stopGrace` to do so, and then its whole tree is killed; the call then throws
- * DeadlineException. Output is read on its own thread, with a bounded backlog, and a slow `log`
- * delays neither the stop nor the kill. The call ends at most `limits.drainLimit` after the
- * process has gone. If the output has not ended by then, the rest of it is dropped and the result
- * has `outputAbandoned` set: a process that escaped the containment still holds the output open,
- * or `log` was too slow to take it. An error is logged as well.
+ * At `deadline`, or as soon as `stop` is requested, the process is asked to stop (Ctrl+Break on
+ * Windows, SIGTERM on POSIX), given `limits.stopGrace` to do so, and then its whole tree is
+ * killed. The call then throws DeadlineException if the deadline came first, otherwise
+ * StopRequestedException. `stop` may be null, when the process is never asked to stop. Output is
+ * read on its own thread, with a bounded backlog, and a slow `log` delays neither the stop nor the
+ * kill. The call ends at most `limits.drainLimit` after the process has gone. If the output has not
+ * ended by then, the rest of it is dropped and the result has `outputAbandoned` set: a process
+ * that escaped the containment still holds the output open, or `log` was too slow to take it. An
+ * error is logged as well.
  *
  * Throws: DeadlineException if `deadline` has passed already (nothing is started), or if the
- * process ran past it. Exception if `log` is null, `deadline` was never set or the process
- * cannot be started. Anything `log` throws stops the process and is rethrown.
+ * process ran past it. StopRequestedException if `stop` was requested before the process started
+ * (nothing is started), or while it ran. Exception if `log` is null, `deadline` was never set or
+ * the process cannot be started. Anything `log` throws stops the process and is rethrown.
  */
-ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, LogDelegate log)
+ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, StopSignal stop, LogDelegate log)
 {
     if (args.length == 0) throw new Exception("Cannot run a process without a command");
     if (log is null) throw new Exception(format("Running '%s' needs a log for its output (the log delegate is null)", args[0]));
@@ -87,6 +130,10 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
     if (MonoTime.currTime >= deadline)
     {
         throw new DeadlineException(format("'%s' was not started: the deadline had passed", args[0]));
+    }
+    if (stopRequested(stop))
+    {
+        throw new StopRequestedException(format("'%s' was not started: it was asked to stop", args[0]));
     }
 
     auto child = new ChildProcess;
@@ -111,10 +158,10 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
     reader.start();
 
     char[] partial;
-    // Hands the lines that have arrived to `log` one at a time, and stops delivering at `due`
-    // (a slow `log` must not hold up the stop or the kill). True once the output has ended and
-    // every line has been delivered.
-    bool forward(MonoTime due)
+    // Hands the lines that have arrived to `log` one at a time, and stops delivering at `due`, or
+    // when `stopCuts` and a stop is requested (a slow `log` must not hold up the stop or the kill).
+    // True once the output has ended and every line has been delivered.
+    bool forward(MonoTime due, bool stopCuts)
     {
         bool ended = false;
         if (partial.length < maxPendingOutput)
@@ -129,7 +176,7 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
         {
             const newline = partial.indexOf('\n');
             if (newline < 0) break;
-            if (MonoTime.currTime >= due) return false;
+            if (MonoTime.currTime >= due || (stopCuts && stopRequested(stop))) return false;
             auto line = partial[0 .. newline];
             if (line.length > 0 && line[$ - 1] == '\r') line = line[0 .. $ - 1];
             log(line.idup);
@@ -139,20 +186,23 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
     }
 
     bool timedOut = false;
+    bool stoppedOnRequest = false;
     bool abandoned = false;
     int exitCode = -1;
     try
     {
-        bool stopRequested = false;
+        bool stopping = false;
         MonoTime killAt;
         while (!child.exited)
         {
-            forward(stopRequested ? killAt : deadline);
+            forward(stopping ? killAt : deadline, !stopping);
             const now = MonoTime.currTime;
-            if (!stopRequested && now >= deadline)
+            if (!stopping && (now >= deadline || stopRequested(stop)))
             {
-                timedOut = true;
-                stopRequested = true;
+                // The deadline takes precedence over a request made at the same time
+                timedOut = now >= deadline;
+                stoppedOnRequest = !timedOut;
+                stopping = true;
                 if (child.requestStop()) killAt = now + limits.stopGrace;
                 else
                 {
@@ -161,7 +211,7 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
                     killAt = now;
                 }
             }
-            if (stopRequested && now >= killAt) break;
+            if (stopping && now >= killAt) break;
             pump.activity.wait(pollInterval);
         }
 
@@ -171,7 +221,7 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
         else logError("[process] '%s' did not exit within %s of being killed", args[0], limits.reapLimit);
 
         const drainEnd = MonoTime.currTime + limits.drainLimit;
-        while (!forward(drainEnd))
+        while (!forward(drainEnd, false))
         {
             if (MonoTime.currTime >= drainEnd)
             {
@@ -207,6 +257,10 @@ ProcessResult runProcess(string[] args, string dir, string[string] env, MonoTime
     if (timedOut)
     {
         throw new DeadlineException(format("'%s' ran past the deadline; its processes were stopped", args[0]));
+    }
+    if (stoppedOnRequest)
+    {
+        throw new StopRequestedException(format("'%s' was asked to stop; its processes were stopped", args[0]));
     }
     return ProcessResult(exitCode, abandoned);
 }
@@ -607,7 +661,7 @@ unittest
     string[] logged;
     const started = MonoTime.currTime;
     try runProcess(chattyProcessTree(pidFile), testDir, environment.toAA, MonoTime.currTime + 6.seconds,
-        quickLimits(), (string line) { logged ~= line; });
+        quickLimits(), null, (string line) { logged ~= line; });
     catch (DeadlineException e) stopped = true;
     assert(stopped, "A process past its deadline is not stopped");
     assert(MonoTime.currTime - started < 60.seconds, "The call did not return promptly");
@@ -629,19 +683,19 @@ unittest
 
     string[] logged;
     auto result = runProcess(shellArgs("echo finished & exit 3"), testDir, environment.toAA,
-        MonoTime.currTime + 60.seconds, quickLimits(), (string line) { logged ~= line; });
+        MonoTime.currTime + 60.seconds, quickLimits(), null, (string line) { logged ~= line; });
     assert(result.exitCode == 3 && !result.outputAbandoned, format("Exit code %d", result.exitCode));
     assert(logged.canFind!(line => line.canFind("finished")), format("Logged %s", logged));
 
     // A deadline that has passed starts nothing
     bool refused = false;
-    try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.currTime - 1.seconds, quickLimits(), (string line) {});
+    try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.currTime - 1.seconds, quickLimits(), null, (string line) {});
     catch (DeadlineException e) refused = true;
     assert(refused && !exists(buildPath(testDir, "ran.txt")), "A process started after its deadline");
 
     // A deadline that was never set is an error, not a deadline that has passed
     bool unset = false;
-    try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.init, quickLimits(), (string line) {});
+    try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.init, quickLimits(), null, (string line) {});
     catch (DeadlineException e) assert(false, "An unset deadline is not a timeout");
     catch (Exception e) unset = e.msg.canFind("deadline");
     assert(unset && !exists(buildPath(testDir, "ran.txt")));
@@ -657,7 +711,7 @@ unittest
     string[] logged;
     const started = MonoTime.currTime;
     const result = runProcess(shellArgs("echo root done & " ~ backgroundHelperCommand), testDir, environment.toAA,
-        MonoTime.currTime + 60.seconds, quickLimits(), (string line) { logged ~= line; });
+        MonoTime.currTime + 60.seconds, quickLimits(), null, (string line) { logged ~= line; });
     assert(result.exitCode == 0, format("Exit code %d", result.exitCode));
     assert(MonoTime.currTime - started < 25.seconds, "A helper holding the output kept the call waiting");
     assert(logged.canFind!(line => line.canFind("root done")), format("Logged %s", logged));
@@ -672,7 +726,7 @@ unittest
     string pidFile = absolutePath(buildPath(testDir, "pids.txt"));
     bool rethrown = false;
     try runProcess(chattyProcessTree(pidFile), testDir, environment.toAA, MonoTime.currTime + 120.seconds,
-        quickLimits(), (string line) { throw new Exception("log is full"); });
+        quickLimits(), null, (string line) { throw new Exception("log is full"); });
     catch (Exception e) rethrown = e.msg == "log is full";
     assert(rethrown, "The log's exception was not rethrown");
 
@@ -694,7 +748,7 @@ version (Posix)
         string marker = absolutePath(buildPath(testDir, "stopped.txt"));
         bool stopped = false;
         try runProcess(["sh", "-c", format("trap 'echo stopped > %s; exit 0' TERM; echo ready; while true; do sleep 1; done", marker)],
-            testDir, environment.toAA, MonoTime.currTime + 3.seconds, StopLimits(10.seconds, 5.seconds, 5.seconds), (string line) {});
+            testDir, environment.toAA, MonoTime.currTime + 3.seconds, StopLimits(10.seconds, 5.seconds, 5.seconds), null, (string line) {});
         catch (DeadlineException e) stopped = true;
         assert(stopped && exists(marker), "The process was killed without being asked to stop");
     }
@@ -709,7 +763,7 @@ unittest
     bool stopped = false;
     const started = MonoTime.currTime;
     try runProcess(shellArgs(sleepingCommand), testDir, environment.toAA, MonoTime.currTime + 5.seconds,
-        quickLimits(), (string line) {});
+        quickLimits(), null, (string line) {});
     catch (DeadlineException e) stopped = true;
     assert(stopped && MonoTime.currTime - started < 25.seconds);
 }
@@ -725,7 +779,7 @@ unittest
     bool stopped = false;
     const started = MonoTime.currTime;
     try runProcess(manyLinesThenSleep(5000), testDir, environment.toAA, MonoTime.currTime + 4.seconds,
-        quickLimits(), (string line) { ++delivered; Thread.sleep(20.msecs); });
+        quickLimits(), null, (string line) { ++delivered; Thread.sleep(20.msecs); });
     catch (DeadlineException e) stopped = true;
     assert(stopped);
     // Delivering all the lines would take 100 s; the budget is the deadline plus the limits
@@ -776,7 +830,7 @@ unittest
 
     size_t delivered = 0;
     const result = runProcess(args, testDir, environment.toAA, MonoTime.currTime + 60.seconds,
-        StopLimits(60.seconds, 5.seconds, 1.seconds), (string line) {
+        StopLimits(60.seconds, 5.seconds, 1.seconds), null, (string line) {
             ++delivered;
             if (line == "first") Thread.sleep(4.seconds);
             else Thread.sleep(20.msecs);
@@ -784,6 +838,55 @@ unittest
     assert(result.exitCode == 0, format("Exit code %d", result.exitCode));
     assert(result.outputAbandoned, "Output that did not end within the drain limit was not flagged");
     assert(delivered < 201, format("The whole output was delivered (%s lines)", delivered));
+}
+
+unittest
+{
+    // A stop requested from another thread, once the process tree is running, stops the tree like
+    // a deadline does: the call throws StopRequestedException long before its deadline, and both
+    // processes are gone
+    string testDir = freshDir("test_core_process_stop_requested");
+    scope(exit) cleanup(testDir);
+
+    string pidFile = absolutePath(buildPath(testDir, "pids.txt"));
+    auto stop = new StopSignal;
+    auto requester = new Thread({
+        const waitUntil = MonoTime.currTime + 30.seconds;
+        while (!exists(pidFile) && MonoTime.currTime < waitUntil) Thread.sleep(50.msecs);
+        Thread.sleep(1.seconds);
+        stop.request();
+    });
+    requester.start();
+
+    bool stopped = false;
+    const started = MonoTime.currTime;
+    try runProcess(chattyProcessTree(pidFile), testDir, environment.toAA, MonoTime.currTime + 60.seconds,
+        quickLimits(), stop, (string line) {});
+    catch (StopRequestedException e) stopped = true;
+    requester.join();
+    assert(stopped, "A process asked to stop was not stopped");
+    assert(MonoTime.currTime - started < 30.seconds, "The stop request did not stop the process promptly");
+    assert(exists(pidFile), "The process tree had not started when the stop was requested");
+    foreach (pid; readText(pidFile).split)
+    {
+        assert(waitForStop(pid.to!int, 10.seconds), format("Process %s survived the stop", pid));
+    }
+}
+
+unittest
+{
+    // A stop requested before the process starts starts nothing, and the call throws
+    string testDir = freshDir("test_core_process_stop_before");
+    scope(exit) cleanup(testDir);
+
+    auto stop = new StopSignal;
+    stop.request();
+    assert(stop.requested());
+    bool refused = false;
+    try runProcess(shellArgs("echo never > ran.txt"), testDir, environment.toAA, MonoTime.currTime + 60.seconds,
+        quickLimits(), stop, (string line) {});
+    catch (StopRequestedException e) refused = true;
+    assert(refused && !exists(buildPath(testDir, "ran.txt")), "A process started after a stop was requested");
 }
 
 version (Windows) version (unittest)
@@ -831,7 +934,7 @@ version (Windows) version (unittest)
         bool stopped = false;
         const started = MonoTime.currTime;
         try runProcess([thisExePath], testDir, env, MonoTime.currTime + 8.seconds,
-            StopLimits(40.seconds, 5.seconds, 5.seconds), (string line) {});
+            StopLimits(40.seconds, 5.seconds, 5.seconds), null, (string line) {});
         catch (DeadlineException e) stopped = true;
         assert(stopped);
         assert(MonoTime.currTime - started < 30.seconds, "The child waited out the grace");

@@ -1,7 +1,7 @@
 module confector.runner_core.steps.step;
 
 import confector.api.model : BuildStep, ResolvedInput;
-import confector.core.process : LogDelegate, StopLimits;
+import confector.core.process : LogDelegate, StopLimits, StopSignal;
 import confector.core.worker_token : workerTokenGrace;
 import core.time : Duration, MonoTime, seconds;
 
@@ -53,6 +53,10 @@ struct StepContext
     MonoTime deadline;
     /// How long `runProcess` waits after the deadline.
     StopLimits stopLimits = productionStopLimits;
+    /// Requested when the attempt is no longer this worker's. A step's processes are stopped as
+    /// at the deadline (`runProcess`), and the step then throws StopRequestedException. Null
+    /// means the step is never asked to stop.
+    StopSignal stop;
 }
 
 /**
@@ -69,8 +73,9 @@ struct StepResult
  * Runs the steps of a task. The executor is given one explicitly, so tests can supply fakes.
  *
  * A step that starts a process must do so through `runProcess` (confector.core.process)
- * with `StepContext.deadline`. That is what stops the process, and everything it started, when the
- * task times out; a process started any other way outlives the timeout.
+ * with `StepContext.deadline` and `StepContext.stop`. That is what stops the process, and everything
+ * it started, when the task times out or its attempt is superseded or cancelled; a process started
+ * any other way outlives both.
  */
 interface StepRunner
 {

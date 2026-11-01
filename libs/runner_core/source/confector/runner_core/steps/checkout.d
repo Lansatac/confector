@@ -11,7 +11,7 @@ import core.time : MonoTime, minutes, seconds;
 import confector.api.model : BuildStep, InputKind, ResolvedInput;
 import confector.core.git : isFullSha, redactUserInfo;
 import confector.core.builtin_steps : checkoutConfig, checkoutConfigIssues, checkoutStepType;
-import confector.core.process : DeadlineException, LogDelegate, runProcess, StopLimits;
+import confector.core.process : DeadlineException, LogDelegate, runProcess, StopLimits, StopRequestedException, StopSignal;
 import confector.runner_core.steps.step : StepContext, StepResult;
 import vibe.data.json : Json;
 
@@ -206,7 +206,7 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
     {
         int run(string[] args)
         {
-            return runGit(["git"] ~ hermeticGitOptions ~ args, checkoutDir, gitEnv, context.deadline, context.stopLimits, context.log);
+            return runGit(["git"] ~ hermeticGitOptions ~ args, checkoutDir, gitEnv, context.deadline, context.stopLimits, context.stop, context.log);
         }
 
         // No templates: the fresh repository has no hooks
@@ -264,6 +264,11 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
         // The task's deadline is reported by the executor, not as a git failure
         throw e;
     }
+    catch (StopRequestedException e)
+    {
+        // Nor is a stop: the attempt is no longer this worker's to report
+        throw e;
+    }
     catch (Exception e)
     {
         res.exitCode = -1;
@@ -276,10 +281,11 @@ StepResult runCheckout(in BuildStep step, ref StepContext context)
 }
 
 /// Runs one git command in `dir` with standard input closed, sending its output, with any
-/// credentials in URLs redacted, to `log`. Returns its exit code. Stops it at `deadline`.
-private int runGit(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, LogDelegate log)
+/// credentials in URLs redacted, to `log`. Returns its exit code. Stops it at `deadline`, or when
+/// `stop` is requested.
+private int runGit(string[] args, string dir, string[string] env, MonoTime deadline, StopLimits limits, StopSignal stop, LogDelegate log)
 {
-    const result = runProcess(args, dir, env, deadline, limits, (string line) { log(redactUserInfo(line)); });
+    const result = runProcess(args, dir, env, deadline, limits, stop, (string line) { log(redactUserInfo(line)); });
     if (result.outputAbandoned)
     {
         log(format("[confector] The output of '%s' was cut off: a process it started still held it open", args[0]));
@@ -420,6 +426,18 @@ unittest
     try runCheckout(checkoutStep(["input": "src", "target_dir": "late"]), ctx);
     catch (DeadlineException e) timedOut = true;
     assert(timedOut, "A checkout past its deadline did not throw DeadlineException");
+
+    // A checkout whose attempt was stopped throws StopRequestedException, not a failed result
+    import confector.core.process : StopSignal;
+
+    auto stopped = checkoutContext(workspace);
+    stopped.stop = new StopSignal;
+    stopped.stop.request();
+    bool stopThrown = false;
+    try runCheckout(checkoutStep(["input": "src", "target_dir": "stopped"]), stopped);
+    catch (StopRequestedException e) stopThrown = true;
+    assert(stopThrown, "A checkout whose attempt was stopped did not throw StopRequestedException");
+    assert(!exists(buildPath(workspace, "stopped", ".git")), "A checkout started after its attempt was stopped");
 }
 
 unittest

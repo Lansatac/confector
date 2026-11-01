@@ -223,7 +223,7 @@ string runGitLsRemote(string address, string[] patterns, Duration timeout = lsRe
     ProcessResult result;
     try
     {
-        result = runProcess(command, null, env, MonoTime.currTime + timeout, limits,
+        result = runProcess(command, null, env, MonoTime.currTime + timeout, limits, null,
             (string line) { lines.put(line); });
     }
     catch (DeadlineException e)

@@ -7,7 +7,7 @@ import confector.core.worker_token : workerTokenHeader;
 import confector.runner_core.task_executor;
 import confector.runner_core.http_artifact_storage;
 import vibe.core.log : logError, logInfo, logWarn;
-import confector.core.process : warnIfStopCannotBeSent;
+import confector.core.process : StopRequestedException, StopSignal, warnIfStopCannotBeSent;
 import confector.runner_core.steps.step : StepRunner;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, serializeToJsonString, parseJsonString;
@@ -419,8 +419,9 @@ class HttpWorkerDaemon
     }
 
     /// Runs the work order `work` holds, heartbeating while it runs, and reports its completion
-    /// with the attempt the order was claimed as. Returns the task's result.
-    TaskExecutionResult processOneMessage(in ClaimedWork work)
+    /// with the attempt the order was claimed as. An attempt the server answers superseded or
+    /// cancel is stopped, and nothing is reported for it.
+    void processOneMessage(in ClaimedWork work)
     {
         const WorkOrder msg = work.workOrder;
         if (msg.executionId.length == 0)
@@ -448,16 +449,17 @@ class HttpWorkerDaemon
         logInfo("[worker] Processing task '%s' for execution '%s' (attempt %s)", taskId, executionId, attempt);
 
         // Heartbeat periodic timer. The server answers whether the worker still holds the
-        // execution; once it says otherwise, the worker has lost it.
+        // execution; once it says otherwise, the attempt is stopped.
         Thread heartbeatThread;
         shared bool heartbeatRunning = false;
-        shared bool lostExecution = false;
+        auto stop = new StopSignal;
         {
             atomicStore(heartbeatRunning, true);
             size_t intervalSec = m_config.heartbeatIntervalSeconds;
             size_t leaseSeconds = m_config.leaseSeconds;
             heartbeatThread = new Thread({
-                while (atomicLoad(heartbeatRunning))
+                // Once the attempt is stopped there is no lease left to extend
+                while (atomicLoad(heartbeatRunning) && !stop.requested())
                 {
                     Thread.sleep(intervalSec.seconds);
                     if (!atomicLoad(heartbeatRunning)) break;
@@ -466,8 +468,8 @@ class HttpWorkerDaemon
                         const answer = m_client.heartbeat(executionId, attempt, leaseSeconds, workerToken);
                         if (answer != LeaseAnswer.continue_)
                         {
-                            atomicStore(lostExecution, true);
-                            logWarn("[worker] The server answered %s to the heartbeat of execution '%s' (attempt %s)",
+                            stop.request();
+                            logWarn("[worker] The server answered %s to the heartbeat of execution '%s' (attempt %s); stopping the task",
                                 cast(string) answer, executionId, attempt);
                         }
                     }
@@ -494,27 +496,20 @@ class HttpWorkerDaemon
         // The task's steps, environment and declared outputs come from its definition
         TaskNode taskNode = deserializeJson!TaskNode(serializeToJson(msg.taskNode));
 
-        // Live Log streaming buffer
+        // Live log streaming buffer. Lines arrive only on this thread: steps log from the thread
+        // that runs them, and the heartbeat thread never touches it.
         string[] logBuffer;
-        auto logLock = new Object();
         void onLogLine(string line)
         {
-            synchronized (logLock)
-            {
-                logBuffer ~= line;
-            }
+            logBuffer ~= line;
             if (m_config.verbose)
             {
                 writeln(line);
             }
             if (logBuffer.length >= 10)
             {
-                string[] flushLines;
-                synchronized (logLock)
-                {
-                    flushLines = logBuffer.dup;
-                    logBuffer.length = 0;
-                }
+                string[] flushLines = logBuffer;
+                logBuffer = null;
                 m_client.streamLogs(executionId, flushLines, workerToken);
             }
         }
@@ -525,6 +520,7 @@ class HttpWorkerDaemon
         // order's; the worker never computes one. The timeout is the work order's too: the
         // executor stops the task at it, inside the lifetime of the token it was issued with.
         TaskExecutionResult result;
+        bool stopped = false;
         try
         {
             result = m_executor.executeTask(
@@ -535,8 +531,13 @@ class HttpWorkerDaemon
                 msg.timeoutSeconds.seconds,
                 msg.payload.inputs,
                 msg.payload.repositoryAddresses,
-                &onLogLine
+                &onLogLine,
+                stop
             );
+        }
+        catch (StopRequestedException)
+        {
+            stopped = true;
         }
         catch (Exception e)
         {
@@ -547,27 +548,27 @@ class HttpWorkerDaemon
             onLogLine(format("[worker] Exception: %s", e.msg));
         }
 
-        // Flush remaining log buffer
-        string[] finalLogs;
-        synchronized (logLock)
+        // The heartbeat can ask for a stop after the executor has finished, too. A stopped attempt
+        // reports nothing, and its log lines are not sent either: the server no longer holds the
+        // attempt and refuses both. It counts as processed, like an attempt the server refused.
+        if (stopped || stop.requested())
         {
-            finalLogs = logBuffer.dup;
-            logBuffer.length = 0;
+            logWarn("[worker] Stopped task '%s' (execution '%s', attempt %s): the server asked it to stop, so nothing is reported",
+                taskId, executionId, attempt);
+            m_tasksProcessed++;
+            return;
         }
-        if (finalLogs.length > 0)
+
+        // Flush remaining log buffer
+        if (logBuffer.length > 0)
         {
-            m_client.streamLogs(executionId, finalLogs, workerToken);
+            m_client.streamLogs(executionId, logBuffer, workerToken);
         }
 
         // Report the execution's completion over HTTP, after its last log lines (flushed above),
         // since the server refuses log lines for a finished execution
         result.attempt = attempt;
-        if (atomicLoad(lostExecution))
-        {
-            logError("[worker] Not reporting task '%s' (execution '%s'): the server no longer holds attempt %s for this worker",
-                taskId, msg.executionId, attempt);
-        }
-        else final switch (reportCompletionWithRetries(msg.executionId, result, workerToken, () => !atomicLoad(lostExecution)))
+        final switch (reportCompletionWithRetries(msg.executionId, result, workerToken, () => !stop.requested()))
         {
             case CompletionReport.recorded:
             case CompletionReport.rejected:
@@ -582,7 +583,6 @@ class HttpWorkerDaemon
         }
 
         m_tasksProcessed++;
-        return result;
     }
 
     /**
@@ -696,11 +696,13 @@ version (unittest)
     /// A step runner for tests: each line of a step's `command` config is one line of its
     /// output. A step whose command is "fail" fails with exit code 4, and one whose command is
     /// "sleep" takes a few seconds. A command of "sleep process" runs a process that outlasts the
-    /// task's deadline. Counts the steps it runs; it is
+    /// task's deadline or a stop. Counts the steps it runs; it is
     /// passed to the worker explicitly, so the worker's thread sees it.
     private final class ScriptedStepRunner : StepRunner
     {
         size_t stepsRun;
+        /// Set once a "sleep process" step has begun, from the worker's thread.
+        shared bool processStarted;
 
         StepResult run(in BuildStep step, ref StepContext context)
         {
@@ -720,9 +722,11 @@ version (unittest)
             }
             if (command == "sleep process")
             {
-                // Throws DeadlineException once the task's deadline passes
+                // Throws DeadlineException once the task's deadline passes, or StopRequestedException
+                // once the attempt is stopped
+                atomicStore(processStarted, true);
                 runProcess(shellArgs(sleepingCommand), context.workingDirectory, environment.toAA, context.deadline,
-                    StopLimits(1.seconds, 5.seconds, 5.seconds), context.log);
+                    StopLimits(1.seconds, 5.seconds, 5.seconds), context.stop, context.log);
                 return result;
             }
             if (command == "fail")
@@ -1188,6 +1192,69 @@ unittest
         }
         assert(next == expected.length, format("%s: streamed %s, expected %s in order", execution, streamed, expected));
     }
+}
+
+unittest
+{
+    // A heartbeat answered superseded stops the attempt while its step's process runs: the step is
+    // stopped well before its deadline, the step after it never starts, nothing is reported, and the
+    // attempt counts as processed
+    import core.time : MonoTime;
+    import std.file : exists, rmdirRecurse, mkdirRecurse;
+    import vibe.http.router : URLRouter;
+    import vibe.http.server : HTTPServerRequest, HTTPServerResponse, listenHTTP;
+
+    string testDir = "test_http_worker_superseded";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    auto steps = new ScriptedStepRunner();
+    auto router = new URLRouter();
+    size_t heartbeats = 0;
+    string[] completed;
+    // Answered superseded only once the step's process has begun, so the stop never lands before
+    // the step it is meant to stop
+    router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
+        ++heartbeats;
+        res.writeJsonBody(["answer": atomicLoad(steps.processStarted) ? "superseded" : "continue"]);
+    });
+    router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
+        res.writeJsonBody(["status": "ok"]);
+    });
+    router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
+        completed ~= req.params["execution_id"];
+        res.writeJsonBody(["status": "recorded"]);
+    });
+
+    const port = freePort();
+    auto listener = listenHTTP(loopbackServerSettings(port), router);
+    scope(exit) listener.stopListening();
+
+    HttpWorkerConfig config;
+    config.serverUrl = format("http://127.0.0.1:%d", port);
+    config.workerId = "test_superseded_worker";
+    config.workspaceDir = buildPath(testDir, "ws");
+    config.heartbeatIntervalSeconds = 1;
+    config.workerPoolCredential = testWorkerPoolCredential;
+    auto worker = new HttpWorkerDaemon(config, steps);
+    worker.initialize();
+
+    WorkOrder order;
+    order.executionId = "exe_superseded";
+    order.workerToken = "token_superseded";
+    order.fingerprint = "fp_superseded";
+    order.taskNode.id = "task_superseded";
+    order.taskNode.steps = [scriptedStep("Stoppable", "sleep process"), scriptedStep("Never", "never runs")];
+
+    const started = MonoTime.currTime;
+    runOffThread({ worker.processOneMessage(ClaimedWork(order, 1)); });
+    const elapsed = MonoTime.currTime - started;
+    assert(heartbeats > 0, "The worker never heartbeat");
+    assert(elapsed < 20.seconds, format("The superseded attempt ran for %s", elapsed));
+    assert(steps.stepsRun == 1, "A step started after the attempt was stopped");
+    assert(completed.length == 0, "A stopped attempt reported its completion");
+    assert(worker.tasksProcessed == 1, "A stopped attempt was not counted as processed");
 }
 
 unittest

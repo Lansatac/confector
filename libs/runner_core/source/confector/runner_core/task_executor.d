@@ -2,7 +2,7 @@ module confector.runner_core.task_executor;
 
 import confector.api.model;
 import confector.runner_core.artifacts;
-import confector.core.process : DeadlineException, LogDelegate, StopLimits;
+import confector.core.process : DeadlineException, LogDelegate, StopLimits, StopRequestedException, StopSignal;
 import confector.runner_core.steps.step : productionStopLimits, StepContext, StepResult, StepRunner;
 
 import std.format : format;
@@ -110,6 +110,16 @@ unittest
     assert(rejects([bin, flavor, src], "not a repository input", ["flavor": "https://example.test/x.git"]));
 }
 
+/// Throws StopRequestedException once `stop` has been requested, naming the point `what` the task
+/// had reached; a null signal is never requested.
+private void throwIfStopped(StopSignal stop, string taskId, string executionId, string what)
+{
+    if (stop !is null && stop.requested())
+    {
+        throw new StopRequestedException(format("Task '%s' of execution '%s' was asked to stop %s", taskId, executionId, what));
+    }
+}
+
 /**
  * Core stateless executor capable of executing single nodes. Runs each step with the
  * `StepRunner` it is given.
@@ -151,11 +161,14 @@ class TaskExecutor
      *   inputs = The task's resolved inputs from the work order, one per declared input.
      *   repositoryAddresses = Where to fetch each repository input from, keyed by input name.
      *   logCallback = Receives each output line as it is produced; when null, lines are dropped.
+     *   stop = Requested when the attempt is superseded or cancelled; null if it never is. No
+     *          step starts after it is requested, and a running step is stopped (`StepContext.stop`).
      *   manageArtifacts = When true, the executor stages upstream artifacts and packs outputs.
      *
      * Throws: Exception if `fingerprint` is empty, `timeout` is not positive or `inputs` do not
      * match the task's declared inputs (see `bindInputs`); whatever the step runner throws for a
-     * step it cannot run.
+     * step it cannot run. StopRequestedException if `stop` is requested before a step starts or
+     * while one runs; the attempt has no result to report.
      */
     TaskExecutionResult executeTask(
         string executionId,
@@ -166,6 +179,7 @@ class TaskExecutor
         in ResolvedInput[] inputs,
         in string[string] repositoryAddresses = null,
         LogDelegate logCallback = null,
+        StopSignal stop = null,
         bool manageArtifacts = true
     )
     {
@@ -231,6 +245,7 @@ class TaskExecutor
                 string targetLocal = effectiveWorkingDir;
                 string upFp = boundInputs[name].pinned.get!string;
 
+                throwIfStopped(stop, task.id, executionId, format("before staging upstream artifact '%s'", artId));
                 if (!m_artifactStorage.artifactExists(upFp, artId))
                 {
                     result.status = ExecutionStatus.failed;
@@ -273,6 +288,7 @@ class TaskExecutor
         stepCtx.inputs = boundInputs;
         stepCtx.deadline = deadline;
         stepCtx.stopLimits = stopLimits;
+        stepCtx.stop = stop;
         foreach (name, address; repositoryAddresses) stepCtx.repositoryAddresses[name] = address;
 
         // A step that runs past the deadline has its processes stopped by the step runner, which
@@ -290,6 +306,7 @@ class TaskExecutor
         {
             foreach (size_t stepIdx, ref const(BuildStep) step; task.steps)
             {
+                throwIfStopped(stop, task.id, executionId, format("before step %d", stepIdx + 1));
                 if (MonoTime.currTime >= deadline)
                 {
                     timedOut = true;
@@ -353,6 +370,8 @@ class TaskExecutor
             {
                 foreach (artDecl; task.outputs.artifacts)
                 {
+                    // Before the try: a stop must not be reported as a failed package
+                    throwIfStopped(stop, task.id, executionId, format("before packing output artifact '%s'", artDecl.id));
                     try
                     {
                         auto meta = ArtifactStager.packOutputArtifact(
@@ -403,7 +422,7 @@ version (unittest)
             StepResult res;
             const command = step.config["command"].get!string;
             const result = runProcess(shellArgs(command), context.workingDirectory, env,
-                context.deadline, context.stopLimits, context.log);
+                context.deadline, context.stopLimits, context.stop, context.log);
             if (result.outputAbandoned)
             {
                 context.log(format("[confector] The output of '%s' was cut off: a process it started still held it open", command));
@@ -598,4 +617,107 @@ unittest
 
     // A timeout must be positive
     assertThrown!Exception(engine.executeTask("exe_quick", quick, testDir, "fp_quick", 0.seconds, []));
+}
+
+unittest
+{
+    // A stop requested while a step runs stops the step's processes, and the task throws
+    // StopRequestedException: the step after the running one never starts
+    import core.thread : Thread;
+    import core.time : msecs;
+    import std.file : exists, mkdirRecurse, rmdirRecurse;
+    import std.path : buildPath;
+    import confector.core.process : StopSignal;
+    import confector.testing.processes : sleepingCommand;
+
+    string testDir = "test_runner_core_executor_stop";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    auto steps = new ShellStepRunner();
+    auto engine = new TaskExecutor(null, steps);
+    engine.stopLimits = StopLimits(1.seconds, 5.seconds, 5.seconds);
+
+    // The first step leaves a marker once it runs, and the stop is requested only then
+    TaskNode task;
+    task.id = "stoppable";
+    task.steps = [shellStep("Wait", "echo started > started.txt && " ~ sleepingCommand), shellStep("Never", "echo never > ran.txt")];
+    auto stop = new StopSignal;
+    const marker = buildPath(testDir, "started.txt");
+    auto requester = new Thread({
+        const waitUntil = MonoTime.currTime + 30.seconds;
+        while (!exists(marker) && MonoTime.currTime < waitUntil) Thread.sleep(20.msecs);
+        stop.request();
+    });
+    requester.start();
+
+    bool stopped = false;
+    const started = MonoTime.currTime;
+    try engine.executeTask("exe_stop", task, testDir, "fp_stop", 60.seconds, [], null, null, stop);
+    catch (StopRequestedException e) stopped = true;
+    requester.join();
+    assert(exists(marker), "The first step did not start");
+    assert(stopped, "A task asked to stop did not throw StopRequestedException");
+    assert(MonoTime.currTime - started < 30.seconds, "The running step was not stopped promptly");
+    assert(steps.seen.length == 1 && steps.seen[0].taskId == "stoppable", "A step started after the stop was requested");
+    assert(!exists(buildPath(testDir, "ran.txt")), "The step after the stopped one ran");
+}
+
+unittest
+{
+    // A stop requested by a step that has just finished is seen before the next step starts, and
+    // before the task's outputs are packed. The stop comes from the step itself, so nothing races it
+    import std.file : exists, mkdirRecurse, rmdirRecurse;
+    import confector.core.process : StopSignal;
+    import confector.testing.memory_artifact_storage : InMemoryArtifactStorage;
+
+    final class StopAfterStep : StepRunner
+    {
+        StopSignal stop;
+        size_t runs;
+
+        StepResult run(in BuildStep step, ref StepContext context)
+        {
+            ++runs;
+            stop.request();
+            StepResult result;
+            return result;
+        }
+    }
+
+    string testDir = "test_runner_core_executor_stop_between";
+    if (exists(testDir)) rmdirRecurse(testDir);
+    mkdirRecurse(testDir);
+    scope(exit) if (exists(testDir)) rmdirRecurse(testDir);
+
+    // Between two steps: the second never starts
+    auto stop = new StopSignal;
+    auto steps = new StopAfterStep();
+    steps.stop = stop;
+    auto engine = new TaskExecutor(null, steps);
+    TaskNode task;
+    task.id = "between";
+    task.steps = [shellStep("First", "unused"), shellStep("Second", "unused")];
+    bool stopped = false;
+    try engine.executeTask("exe_between", task, testDir, "fp_between", 60.seconds, [], null, null, stop);
+    catch (StopRequestedException e) stopped = true;
+    assert(stopped, "A task stopped between its steps did not throw StopRequestedException");
+    assert(steps.runs == 1, format("%s steps ran after the stop was requested", steps.runs));
+
+    // Before packing: the task's outputs are not packed or stored
+    auto packStop = new StopSignal;
+    auto packSteps = new StopAfterStep();
+    packSteps.stop = packStop;
+    auto storage = new InMemoryArtifactStorage();
+    auto packer = new TaskExecutor(storage, packSteps);
+    TaskNode packed;
+    packed.id = "packed";
+    packed.steps = [shellStep("Only", "unused")];
+    packed.outputs.artifacts = [OutputArtifactDecl("out.txt", "out.txt")];
+    stopped = false;
+    try packer.executeTask("exe_packed", packed, testDir, "fp_packed", 60.seconds, [], null, null, packStop);
+    catch (StopRequestedException e) stopped = true;
+    assert(stopped, "A task stopped before packing did not throw StopRequestedException");
+    assert(!storage.artifactExists("fp_packed", "out.txt"), "A stopped task stored its outputs");
 }

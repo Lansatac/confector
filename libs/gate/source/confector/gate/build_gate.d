@@ -15,6 +15,7 @@ import confector.api.document_store : DocumentStore;
 import confector.api.model;
 import confector.api.scheduler : schedulerSecretHeader;
 import confector.core.intake : RequestIntake;
+import confector.core.process : StopRequestedException;
 import confector.core.state_stores : StateStores;
 import confector.core.work_orders : ClaimedWork, LeaseAnswer, defaultMaxAttempts;
 import confector.core.worker_pool_credential : workerPoolCredentialHeader;
@@ -35,7 +36,8 @@ import std.format : format;
 import std.typecons : Nullable;
 import core.atomic : atomicLoad, atomicOp;
 import core.sync.semaphore : Semaphore;
-import core.time : Duration, minutes, seconds;
+import core.thread : Thread;
+import core.time : Duration, MonoTime, minutes, msecs, seconds;
 
 import vibe.vibe;
 
@@ -467,12 +469,15 @@ private void lostWorkerIsRetriedThenFails(FreshStore fresh)
 
 /// A step runner for the runner scenarios. When `awaitHeartbeat` is set, each step holds its
 /// execution until a heartbeat has been answered, so the worker's heartbeat runs while it is held.
+/// When `awaitStop` is set, each step is held until its attempt is asked to stop, and then stops
+/// with StopRequestedException, as a process does.
 private final class HeartbeatStepRunner : StepRunner
 {
     private Semaphore m_heartbeat;
     shared size_t heartbeats;
     size_t stepsRun;
     bool awaitHeartbeat = true;
+    bool awaitStop = false;
 
     this()
     {
@@ -490,6 +495,16 @@ private final class HeartbeatStepRunner : StepRunner
     {
         ++stepsRun;
         StepResult result;
+        if (awaitStop)
+        {
+            const until = MonoTime.currTime + 30.seconds;
+            while (!context.stop.requested())
+            {
+                if (MonoTime.currTime >= until) throw new Exception("No stop request reached the step");
+                Thread.sleep(10.msecs);
+            }
+            throw new StopRequestedException("The step was asked to stop");
+        }
         if (awaitHeartbeat && !m_heartbeat.wait(30.seconds))
         {
             result.success = false;
@@ -579,8 +594,8 @@ private void runnerRunsBuildOverHttp()
     assert(execution.attempts == 1 && execution.worker == "gate-runner", "The execution records the runner's one attempt");
 }
 
-/// A worker whose attempt was superseded while it ran: its heartbeat is answered superseded, so it
-/// reports nothing. The attempt holding it now is untouched.
+/// A worker whose attempt was superseded while it ran: its heartbeat is answered superseded, so its
+/// step is stopped and the worker reports nothing. The attempt holding it now is untouched.
 private void supersededWorkerReportsNothing()
 {
     auto env = new GateEnvironment(new InMemoryDocumentStore());
@@ -595,6 +610,7 @@ private void supersededWorkerReportsNothing()
 
     const port = freePort();
     auto steps = new HeartbeatStepRunner();
+    steps.awaitStop = true;
     auto counts = new ControlPlaneCounts();
     auto listener = serveControlPlane(env, port, steps, counts);
     scope(exit) listener.stopListening();
@@ -611,6 +627,7 @@ private void supersededWorkerReportsNothing()
     assert(steps.stepsRun == 1 && atomicLoad(steps.heartbeats) > 0, "The task ran until its heartbeat was answered");
     assert(counts.answers.get("heartbeat 200", 0) > 0, "The heartbeat was answered");
     assert(counts.calls.get("complete", 0) == 0, "A superseded worker reports no completion");
+    assert(runner.tasksProcessed == 1, "A stopped attempt was not counted as processed");
 
     // The worker's own heartbeat for attempt 1 is answered superseded
     LeaseAnswer answer;
