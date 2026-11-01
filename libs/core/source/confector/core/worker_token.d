@@ -238,15 +238,6 @@ void requireExecution(in WorkerTokenClaims claims, string executionId)
         throw new WorkerTokenScopeException(format("The worker token is for execution '%s', not '%s'", claims.executionId, executionId));
 }
 
-/// Throws WorkerTokenScopeException unless the token's attempt is `attempt`, the attempt a request
-/// names in its body: a token and a request that disagree are refused as out of scope.
-void requireCurrentAttempt(in WorkerTokenClaims claims, ulong attempt)
-{
-    if (claims.attempt != attempt)
-        throw new WorkerTokenScopeException(format("The worker token is for attempt %d of execution '%s', not attempt %d",
-            claims.attempt, claims.executionId, attempt));
-}
-
 /// Throws WorkerTokenSupersededException unless the token's attempt is `currentAttempt`, the
 /// attempt the execution is on now: a worker from a superseded attempt may not report or upload.
 void requireNotSuperseded(in WorkerTokenClaims claims, ulong currentAttempt)
@@ -419,7 +410,6 @@ unittest
 
     // Each scope check passes for what the claims name and refuses anything else with a 403
     requireExecution(claims, "exe_1");
-    requireCurrentAttempt(claims, 1);
     requireUpload(claims, "fp_1");
     requireInputArtifact(claims, "fp_engine", "engine.zip");
 
@@ -429,8 +419,6 @@ unittest
         assert(failure !is null && failure.statusCode == 403);
     }
     refused({ requireExecution(claims, "exe_2"); });
-    refused({ requireCurrentAttempt(claims, 2); });
-    refused({ requireCurrentAttempt(claims, 0); });
     refused({ requireUpload(claims, "fp_2"); });
     refused({ requireUpload(claims, "fp_engine"); });
     refused({ requireInputArtifact(claims, "fp_engine", "other.zip"); });
@@ -442,6 +430,4 @@ unittest
     auto superseded = cast(WorkerAuthException) collectException(requireNotSuperseded(claims, 2));
     assert(superseded !is null && superseded.statusCode == 409, "A superseded attempt is answered 409");
     assert(cast(WorkerTokenSupersededException) superseded !is null);
-    auto scopeOnly = cast(WorkerAuthException) collectException(requireCurrentAttempt(claims, 2));
-    assert(scopeOnly !is null && scopeOnly.statusCode == 403, "A request naming another attempt is out of scope: 403");
 }

@@ -12,14 +12,11 @@ module confector.core.chain_pins;
  *   `confector.core.input_resolution.graphResolution` takes. `sortPins` turns any list of pins
  *   into a well-formed one.
  * - `mergePins` adds pins to a list: pins only grow, and a pin once set never changes.
- * - `pinsAgree` and `missingPins` are what the input resolver needs to decide whether a request
- *   joins a chain and which pins it adds to it.
  * - `refsOf` lists the distinct pairs a request's bindings use and `selectPins` takes the pins of
  *   some of them from a list.
- * - `refsToResolve` and `pinsForRefs` turn the refs a request bound its inputs to into pins,
- *   resolving only the (repository, ref) pairs the chain lacks, each once, so every input bound to
- *   a ref agrees on its revision, including inputs of tasks added to the definition after the
- *   chain was created.
+ * - `pinsForRefs` turns the revisions the shell resolved for those pairs into pins, so every input
+ *   bound to a ref agrees on its revision, including inputs of tasks added to the definition after
+ *   the chain was created.
  * - `bindingMap` and `validateBindings` handle a request's bindings; `validatePins` checks a
  *   stored list.
  *
@@ -28,7 +25,6 @@ module confector.core.chain_pins;
  * info changes nothing, and the first info is kept.
  */
 
-import confector.core.dag : TaskGraph;
 import confector.core.fingerprinter : canonicalPinned;
 import confector.core.input_resolution : InputResolutionException, requiredPins;
 import confector.api.model;
@@ -224,41 +220,6 @@ RepositoryPin[] mergePins(in RepositoryPin[] existing, in RepositoryPin[] added)
 }
 
 /**
- * Whether `chainPins` agree with every pin in `resolved`: no (repository, ref) pinned in both is
- * pinned to different revisions. Refs pinned in only one of them do not matter; `missingPins`
- * lists the ones the chain lacks. A request joins a chain only if they agree.
- *
- * Throws: as `pinMap`, for either list.
- */
-bool pinsAgree(in RepositoryPin[] chainPins, in RepositoryPin[] resolved) @trusted
-{
-    const chain = pinMap(chainPins);
-    foreach (key, pin; pinMap(resolved))
-    {
-        auto pinned = key in chain;
-        if (pinned !is null && !samePin(*pinned, pin)) return false;
-    }
-    return true;
-}
-
-/**
- * Returns the pins of `resolved` whose (repository, ref) `chainPins` lacks, sorted by key: what a
- * request joining the chain adds to it (`ChainStore.addPins`).
- *
- * Throws: as `pinMap`, for either list.
- */
-RepositoryPin[] missingPins(in RepositoryPin[] chainPins, in RepositoryPin[] resolved) @trusted
-{
-    const chain = pinMap(chainPins);
-    RepositoryPin[RepositoryAt] missing;
-    foreach (key, pin; pinMap(resolved))
-    {
-        if (key !in chain) missing[key] = pin;
-    }
-    return sortedList(missing);
-}
-
-/**
  * Throws InvalidPinsException unless `bindings` is a well-formed list: every binding names a task,
  * an input and a ref name, and the list is sorted by input (`inputKeyLess`) with no input twice.
  * `owner` names whose bindings they are, for the message ("request 'r1'").
@@ -304,27 +265,6 @@ RepositoryRef[InputKey] bindingMap(in InputBinding[] bindings) @trusted
 }
 
 /**
- * Returns the distinct (repository, ref) pairs the repository inputs of `graph` need, bound by
- * `bindings`, that `chainPins` lacks, sorted by key: what the shell resolves, each exactly once,
- * before calling `pinsForRefs`. A pair the chain pins is reused as it is, never resolved again.
- *
- * Throws: InvalidPinsException as `bindingMap` and `pinMap` do; InputResolutionException as
- * `confector.core.input_resolution.requiredPins` does.
- */
-RepositoryAt[] refsToResolve(const TaskGraph graph, in InputBinding[] bindings, in RepositoryPin[] chainPins) @trusted
-{
-    const chain = pinMap(chainPins);
-    bool[RepositoryAt] distinct;
-    foreach (key, at; requiredPins(graph, bindingMap(bindings)))
-    {
-        if (at !in chain) distinct[at] = true;
-    }
-    auto result = distinct.keys;
-    result.sort!((a, b) => pinKeyLess(a, b));
-    return result;
-}
-
-/**
  * Returns the distinct (repository, ref) pairs that `required` (`requiredPins`) maps repository
  * inputs to, sorted by key: the pairs a request's pins must cover, each once.
  */
@@ -358,8 +298,8 @@ RepositoryPin[] selectPins(in RepositoryPin[] pins, in RepositoryAt[] refs) @tru
 
 /**
  * Returns the pins of `refs`, sorted by key: each (repository, ref) pinned to the revision
- * `revisions` holds for it. Pure: `revisions` is what the shell resolved, once per entry of
- * `refsToResolve`.
+ * `revisions` holds for it. Pure: `revisions` is what the shell resolved, once per ref it lacked
+ * a pin for (`refsOf` lists the refs a request uses).
  *
  * Throws: InvalidPinsException if a ref names no repository or ref name or a revision is empty;
  * InputResolutionException if `revisions` lacks a ref.
@@ -563,33 +503,6 @@ unittest
 
 unittest
 {
-    // Agreement and missing pins, as the input resolver decides a join
-    auto chain = [pinned("engine", "stable", "eee111"), pinned("game", "main", "aaa111")];
-
-    auto subset = [pinned("game", "main", "aaa111", ["subject": "Other info"])];
-    assert(pinsAgree(chain, subset) && missingPins(chain, subset).length == 0);
-
-    auto wider = [pinned("game", "main", "aaa111"), pinned("art", "main", "rrr111")];
-    assert(pinsAgree(chain, wider), "Refs the chain lacks do not disagree");
-    assert(missingPins(chain, wider) == [pinned("art", "main", "rrr111")]);
-
-    auto moved = [pinned("game", "main", "bbb222")];
-    assert(!pinsAgree(chain, moved), "A newer revision of a pinned ref belongs on another chain");
-
-    // The same repository at another ref is another pin: the chain lacks it, and it disagrees
-    // with nothing
-    auto otherRef = [pinned("game", "release", "aaa111")];
-    assert(pinsAgree(chain, otherRef) && missingPins(chain, otherRef) == otherRef);
-    auto both = mergePins(chain, missingPins(chain, otherRef));
-    assert(both == [pinned("engine", "stable", "eee111"), pinned("game", "main", "aaa111"), pinned("game", "release", "aaa111")]);
-    validatePins(both, "the test");
-
-    assert(pinsAgree(null, wider) && pinsAgree(chain, null) && missingPins(chain, null).length == 0);
-    assert(missingPins(null, subset) == subset);
-}
-
-unittest
-{
     // Keys order component by component, not by the text of a joined key: "a" sorts before
     // "a b" although a space sorts before a quote; refs of a repository sort by kind, then name
     assert(pinKeyLess(at("a", "z"), at("a b", "a")));
@@ -639,8 +552,8 @@ unittest
 
 unittest
 {
-    // A request resolves each distinct (repository, ref) the chain lacks once: inputs bound to one
-    // ref share its revision, and one repository at two refs gives two pins
+    // A request pins each distinct (repository, ref) once: inputs bound to one ref share its
+    // revision, and one repository at two refs gives two pins
     import confector.core.dag : TaskGraph;
 
     TaskNode compile; compile.id = "compile";
@@ -664,29 +577,27 @@ unittest
     assert(asRefs.length == 5 && asRefs[InputKey("package", "stable")] == RepositoryRef(RefKind.branch, "release"));
 
     // Only the inputs' (repository, ref) pairs count: three inputs of game at main are one
-    auto toResolve = refsToResolve(graph, bindings, null);
-    assert(toResolve == [at("engine", "main"), at("game", "main"), at("game", "release")],
+    assert(refsOf(requiredPins(graph, asRefs)) == [at("engine", "main"), at("game", "main"), at("game", "release")],
         "Each distinct (repository, ref) once, in a deterministic order");
 
-    // What the chain pins is reused, never resolved again
+    // The chain keeps its pin of game at main; the request adds the other two refs
     auto onChain = [pinned("game", "main", "aaa111")];
-    assert(refsToResolve(graph, bindings, onChain) == [at("engine", "main"), at("game", "release")]);
 
     InputPin[RepositoryAt] revisions = [
         at("engine", "main"): InputPin(Json("eee111")),
         at("game", "release"): InputPin(Json("ccc333"), ["subject": "Release"]),
     ];
-    auto added = pinsForRefs(refsToResolve(graph, bindings, onChain), revisions);
+    auto added = pinsForRefs([at("engine", "main"), at("game", "release")], revisions);
     assert(added == [pinned("engine", "main", "eee111"), pinned("game", "release", "ccc333", ["subject": "Release"])]);
     auto grown = mergePins(onChain, added);
     validatePins(grown, "the test");
-    assert(grown.length == 3 && refsToResolve(graph, bindings, grown).length == 0);
+    assert(grown.length == 3);
 
     // The same name as a tag is another ref, resolved on its own
     TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game");
     TaskNode b; b.id = "b"; b.inputs["src"] = repositoryInput("game");
-    auto tagged = refsToResolve(new TaskGraph([a, b]), [bound("a", "src", "main"),
-        InputBinding("b", "src", RepositoryRef(RefKind.tag, "main"))], null);
+    auto tagged = refsOf(requiredPins(new TaskGraph([a, b]), bindingMap([bound("a", "src", "main"),
+        InputBinding("b", "src", RepositoryRef(RefKind.tag, "main"))])));
     assert(tagged.length == 2);
 
     // An unresolved ref, an empty revision, an input left unbound or bound two ways fail loudly
@@ -694,11 +605,11 @@ unittest
     InputPin[RepositoryAt] empty = [at("game", "main"): InputPin(Json(""))];
     assert(throwsA!InvalidPinsException({ pinsForRefs([at("game", "main")], empty); }));
     assert(throwsA!InvalidPinsException({ pinsForRefs([at("", "main")], [at("", "main"): InputPin(Json("a"))]); }));
-    assert(throwsA!InputResolutionException({ refsToResolve(graph, bindings[0 .. 3], null); }), "package's inputs are unbound");
+    assert(throwsA!InputResolutionException({ requiredPins(graph, bindingMap(bindings[0 .. 3])); }), "package's inputs are unbound");
     assert(throwsA!InvalidPinsException({ bindingMap([bound("a", "src", "main"), bound("a", "src", "release")]); }));
     assert(throwsA!InvalidPinsException({ bindingMap([bound("", "src", "main")]); }));
     assert(throwsA!InvalidPinsException({ bindingMap([bound("a", "src", "")]); }));
-    assert(refsToResolve(new TaskGraph([]), null, null).length == 0 && pinsForRefs(null, null).length == 0);
+    assert(pinsForRefs(null, null).length == 0);
 
     // The refs a request's bindings use are its pins' refs: each distinct pair once, sorted, and
     // selectPins takes exactly those pins from a list
@@ -755,8 +666,9 @@ unittest
     auto externalBindings = [bound("external", "sdk", "v2"), bound("external", "src", "main")];
     auto graph = new TaskGraph([internal, external]);
     auto bindings = internalBindings ~ externalBindings;
-    assert(refsToResolve(graph, bindings, chainPins) == [at("console-sdk", "v2")], "game at main is the chain's, not resolved again");
-    auto grown = mergePins(chainPins, pinsForRefs(refsToResolve(graph, bindings, chainPins), [at("console-sdk", "v2"): InputPin(Json("sdk222"))]));
+    assert(refsOf(requiredPins(graph, bindingMap(bindings))) == [at("console-sdk", "v2"), at("game", "main")],
+        "The request uses two refs; game at main is the chain's, so only console-sdk at v2 is resolved");
+    auto grown = mergePins(chainPins, pinsForRefs([at("console-sdk", "v2")], [at("console-sdk", "v2"): InputPin(Json("sdk222"))]));
     auto later = atGenerationZero(graph, bindings, grown);
     assert(later.fingerprints["compile"] == first.fingerprints["compile"], "Adding a pin changes no existing fingerprint");
     assert(later.inputs["external"][0].pinned == Json("sdk222") && later.inputs["external"][1].pinned == Json("aaa111"),
@@ -769,9 +681,8 @@ unittest
     two.inputs["scripts"] = repositoryInput("game");
     auto twoBindings = [bound("two", "code", "feature/x"), bound("two", "scripts", "main")];
     auto twoGraph = new TaskGraph([two]);
-    auto missing = refsToResolve(twoGraph, twoBindings, chainPins);
-    assert(missing == [at("game", "feature/x")]);
-    auto both = mergePins(chainPins, pinsForRefs(missing, [at("game", "feature/x"): InputPin(Json("fff333"))]));
+    assert(refsOf(requiredPins(twoGraph, bindingMap(twoBindings))) == [at("game", "feature/x"), at("game", "main")]);
+    auto both = mergePins(chainPins, pinsForRefs([at("game", "feature/x")], [at("game", "feature/x"): InputPin(Json("fff333"))]));
     assert(both.length == 2);
     auto resolved = atGenerationZero(twoGraph, twoBindings, both);
     assert(resolved.inputs["two"][0].pinned == Json("fff333") && resolved.inputs["two"][1].pinned == Json("aaa111"));

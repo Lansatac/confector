@@ -1,6 +1,7 @@
 module confector.runner_core.worker;
 
 import confector.api.model;
+import confector.api.protocol : isPermanentRejection;
 import confector.core.work_orders : ClaimedWork, LeaseAnswer, maxLeaseDuration;
 import confector.core.worker_pool_credential : requireWorkerPoolCredential, workerPoolCredentialHeader;
 import confector.core.worker_token : workerTokenHeader;
@@ -45,9 +46,8 @@ enum CompletionReport
 {
     /// The server recorded it.
     recorded,
-    /// The server rejected it for good: the execution already finished or a later attempt holds
-    /// it (409), the completion is invalid (400, 422), the execution does not exist (404), or the
-    /// worker token does not allow it (401, 403). Reporting it again would be rejected the same way.
+    /// The server rejected it for good (see `isPermanentRejection`): reporting it again would be
+    /// rejected the same way.
     rejected,
     /// It did not reach the server, or the server failed (5xx, or any other status). The server did
     /// not record it, so the worker may report it again. If the worker gives up, the lease expires,
@@ -292,13 +292,12 @@ class HttpWorkerClient
         return ClaimedWork(deserializeJson!WorkOrder(res["work_order"]), res["attempt"].get!ulong).nullable;
     }
 
-    /// Extends the lease of attempt `attempt` of execution `executionId` by `leaseSeconds`, with
-    /// the execution's `workerToken`, and returns the server's answer: continue, cancel or
+    /// Extends the lease of execution `executionId` by `leaseSeconds`, with the execution's
+    /// `workerToken` (which names the attempt), and returns the server's answer: continue, cancel or
     /// superseded. Throws if the server cannot be reached or refuses the request.
-    LeaseAnswer heartbeat(string executionId, ulong attempt, size_t leaseSeconds, string workerToken)
+    LeaseAnswer heartbeat(string executionId, size_t leaseSeconds, string workerToken)
     {
         Json req = Json.emptyObject;
-        req["attempt"] = Json(attempt);
         req["lease_seconds"] = Json(leaseSeconds);
         req["worker_id"] = Json(m_workerId);
         return answerOf(sendJson(format("/executions/%s/heartbeat", executionId), "POST", req, workerToken));
@@ -348,10 +347,7 @@ class HttpWorkerClient
         }
         catch (ServerResponseException e)
         {
-            // The token of an execution does not change while it is held, so 401 and 403 would refuse
-            // the same report again
-            const permanent = e.statusCode == 400 || e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404
-                || e.statusCode == 409 || e.statusCode == 422;
+            const permanent = isPermanentRejection(e.statusCode);
             logError("[HttpWorkerClient] The server %s the completion of execution '%s' (task: %s): %s",
                 permanent ? "rejected" : "did not record", executionId, result.taskId, e.msg);
             return permanent ? CompletionReport.rejected : CompletionReport.notRecorded;
@@ -419,8 +415,8 @@ class HttpWorkerDaemon
     }
 
     /// Runs the work order `work` holds, heartbeating while it runs, and reports its completion
-    /// with the attempt the order was claimed as. An attempt the server answers superseded or
-    /// cancel is stopped, and nothing is reported for it.
+    /// for the attempt its token names. An attempt the server answers superseded or cancel is
+    /// stopped, and nothing is reported for it.
     void processOneMessage(in ClaimedWork work)
     {
         const WorkOrder msg = work.workOrder;
@@ -465,13 +461,25 @@ class HttpWorkerDaemon
                     if (!atomicLoad(heartbeatRunning)) break;
                     try
                     {
-                        const answer = m_client.heartbeat(executionId, attempt, leaseSeconds, workerToken);
+                        const answer = m_client.heartbeat(executionId, leaseSeconds, workerToken);
                         if (answer != LeaseAnswer.continue_)
                         {
                             stop.request();
                             logWarn("[worker] The server answered %s to the heartbeat of execution '%s' (attempt %s); stopping the task",
                                 cast(string) answer, executionId, attempt);
                         }
+                    }
+                    catch (ServerResponseException e)
+                    {
+                        // A heartbeat the server refuses for good is refused again, so the attempt can never
+                        // be completed either: stop it. Any other status may pass on the next heartbeat
+                        if (isPermanentRejection(e.statusCode))
+                        {
+                            stop.request();
+                            logWarn("[worker] The server refused the heartbeat of execution '%s' (attempt %s) for good (HTTP %d): %s; stopping the task",
+                                executionId, attempt, e.statusCode, e.msg);
+                        }
+                        else logWarn("[worker] Heartbeat of execution '%s' failed: %s", executionId, e.msg);
                     }
                     catch (Exception e)
                     {
@@ -567,7 +575,6 @@ class HttpWorkerDaemon
 
         // Report the execution's completion over HTTP, after its last log lines (flushed above),
         // since the server refuses log lines for a finished execution
-        result.attempt = attempt;
         final switch (reportCompletionWithRetries(msg.executionId, result, workerToken, () => !stop.requested()))
         {
             case CompletionReport.recorded:
@@ -751,8 +758,7 @@ version (unittest)
 unittest
 {
     // The worker protocol against a mock control plane: receive a work order, run the task with
-    // the step runner it was given, stream its logs, heartbeat, report its completion with the
-    // attempt it was given.
+    // the step runner it was given, stream its logs, heartbeat, and report its completion.
     // Handlers only record what they see; the test asserts after the worker is done, on this
     // thread, so a wrong value fails the test.
     import std.file : exists, rmdirRecurse, mkdirRecurse;
@@ -816,8 +822,9 @@ unittest
     TaskExecutionResult[] reported;
     bool[] reportedFingerprint;
     string[] heartbeatExecutions;
-    long[] heartbeatAttempts;
     string heartbeatAnswer = "continue";
+    // When not 0, the heartbeat is refused with this status instead of answered
+    int heartbeatStatus = 0;
     Json[] receiveRequests;
     // The answers the next completion reports get, in order: an HTTP status, or 0 to record it.
     // Once they run out, reports are recorded.
@@ -849,7 +856,12 @@ unittest
     router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
         recordToken(req);
         heartbeatExecutions ~= req.params["execution_id"];
-        heartbeatAttempts ~= req.json["attempt"].get!long;
+        if (heartbeatStatus != 0)
+        {
+            res.statusCode = heartbeatStatus;
+            res.writeJsonBody(["error": "refused"]);
+            return;
+        }
         res.writeJsonBody(["answer": heartbeatAnswer]);
     });
     router.post("/api/v1/executions/:execution_id/logs", (HTTPServerRequest req, HTTPServerResponse res) {
@@ -926,7 +938,6 @@ unittest
     assert(reportedFingerprint == [false], "The completion carries no fingerprint");
     assert(receiveRequests[0]["worker_id"].get!string == "test_worker_runner" && receiveRequests[0]["lease_seconds"].get!long == 60,
         "Receiving names the worker and the lease it asks for");
-    assert(reported[0].attempt == 1, "The completion carries the attempt the work order was claimed as");
     assert(loggedExecutions.length > 0);
     foreach (logged; loggedExecutions) assert(logged == "exe_mock_1", logged);
 
@@ -974,8 +985,8 @@ unittest
     assert(reported.length == 1, format("A lost lease stops the retries after one report: %s reports", reported.length));
 
     // A report rejected for good is not repeated: a duplicate or late completion (409), an invalid
-    // one (400, 422), or one the token does not allow (401, 403)
-    foreach (status; [400, 401, 403, 409, 422])
+    // one (400, 422), an unknown execution (404), or one the token does not allow (401, 403)
+    foreach (status; [400, 401, 403, 404, 409, 422])
     {
         completionAnswers = [status];
         reported = null;
@@ -997,6 +1008,21 @@ unittest
         assert(heartbeatExecutions.length > 0 && heartbeatExecutions[0] == "exe_mock_1", answered);
         assert(reported.length == 0, "A lost execution is not reported: " ~ answered);
     }
+    heartbeatAnswer = "continue";
+
+    // A heartbeat the server refuses for good stops the task the same way, and nothing is reported
+    foreach (refusal; [401, 404])
+    {
+        heartbeatStatus = refusal;
+        heartbeatExecutions = null;
+        reported = null;
+        WorkOrder slow = mockOrder;
+        slow.taskNode.steps = [scriptedStep("Slow", "sleep")];
+        runOffThread({ workerRunner.processOneMessage(ClaimedWork(slow, 1)); });
+        assert(heartbeatExecutions.length > 0 && heartbeatExecutions[0] == "exe_mock_1", format("HTTP %s", refusal));
+        assert(reported.length == 0, format("A refused heartbeat stops the task, which is not reported: HTTP %s", refusal));
+    }
+    heartbeatStatus = 0;
     heartbeatAnswer = "continue";
 
     // A failing step is reported as a failed task, with its exit code and error
@@ -1392,15 +1418,18 @@ unittest
 
     import core.time : seconds;
 
+    // The attempt each issued token was given, by token: the routes below take their attempt from it
+    ulong[string] attemptOfToken;
     auto router = new URLRouter();
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         auto work = claimWork(stores, req.json["worker_id"].get!string, req.json["lease_seconds"].get!long.seconds);
         if (work.isNull) return answerNoWork(res);
         work.get.workOrder.workerToken = "token_" ~ work.get.workOrder.executionId;
+        attemptOfToken[work.get.workOrder.workerToken] = work.get.attempt;
         res.writeJsonBody(testWork(work.get.attempt, work.get.workOrder));
     });
     router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
-        const answer = heartbeatExecution(stores, "fp_e2e", req.params["execution_id"], req.json["attempt"].get!ulong,
+        const answer = heartbeatExecution(stores, "fp_e2e", req.params["execution_id"], attemptOfToken[req.headers.get(workerTokenHeader, "")],
             req.json["lease_seconds"].get!long.seconds);
         res.writeJsonBody(["answer": cast(string) answer]);
     });
@@ -1410,7 +1439,7 @@ unittest
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            completeExecution(stores, "fp_e2e", req.params["execution_id"], deserializeJson!TaskExecutionResult(req.json));
+            completeExecution(stores, "fp_e2e", req.params["execution_id"], attemptOfToken[req.headers.get(workerTokenHeader, "")], deserializeJson!TaskExecutionResult(req.json));
             res.writeJsonBody(["status": "recorded"]);
         }
         catch (StaleCompletionException e)
@@ -1451,8 +1480,7 @@ unittest
     {
         TaskExecutionResult late;
         late.status = ExecutionStatus.failed;
-        late.attempt = 1;
-        completeExecution(stores, "fp_e2e", claimed.executionId, late);
+        completeExecution(stores, "fp_e2e", claimed.executionId, 1, late);
     }
     catch (StaleCompletionException e) rejected = true;
     assert(rejected && stores.executions.get(claimed.executionId).get.status == ExecutionStatus.succeeded);
@@ -1551,15 +1579,18 @@ unittest
     const claimed = stores.ledgers.claim("fp_timeout", 0, queued);
     assert(claimed.outcome == ClaimOutcome.won);
 
+    // The attempt each issued token was given, by token: the routes below take their attempt from it
+    ulong[string] attemptOfToken;
     auto router = new URLRouter();
     router.post("/api/v1/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         auto work = claimWork(stores, req.json["worker_id"].get!string, req.json["lease_seconds"].get!long.seconds);
         if (work.isNull) return answerNoWork(res);
         work.get.workOrder.workerToken = "token_" ~ work.get.workOrder.executionId;
+        attemptOfToken[work.get.workOrder.workerToken] = work.get.attempt;
         res.writeJsonBody(testWork(work.get.attempt, work.get.workOrder));
     });
     router.post("/api/v1/executions/:execution_id/heartbeat", (HTTPServerRequest req, HTTPServerResponse res) {
-        const answer = heartbeatExecution(stores, "fp_timeout", req.params["execution_id"], req.json["attempt"].get!ulong,
+        const answer = heartbeatExecution(stores, "fp_timeout", req.params["execution_id"], attemptOfToken[req.headers.get(workerTokenHeader, "")],
             req.json["lease_seconds"].get!long.seconds);
         res.writeJsonBody(["answer": cast(string) answer]);
     });
@@ -1569,7 +1600,7 @@ unittest
     router.post("/api/v1/executions/:execution_id/complete", (HTTPServerRequest req, HTTPServerResponse res) {
         try
         {
-            completeExecution(stores, "fp_timeout", req.params["execution_id"], deserializeJson!TaskExecutionResult(req.json));
+            completeExecution(stores, "fp_timeout", req.params["execution_id"], attemptOfToken[req.headers.get(workerTokenHeader, "")], deserializeJson!TaskExecutionResult(req.json));
             res.writeJsonBody(["status": "recorded"]);
         }
         catch (StaleCompletionException e)

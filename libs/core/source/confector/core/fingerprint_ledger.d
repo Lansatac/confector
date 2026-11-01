@@ -24,7 +24,7 @@ module confector.core.fingerprint_ledger;
  *   ends.
  * - `withStart`: a worker starts it (queued to running, one more attempt, a lease).
  *   `withLease`: a heartbeat extends the lease. `withLostLease`: an expired lease is counted and,
- *   with a requeue, puts it back to queued (through `withRequeue`).
+ *   with a requeue, puts it back to queued.
  * - It ends by writing the immutable TaskExecution (`ExecutionStore.create`, which only one ender
  *   can win) and then `fold`, which in one compare-and-set clears the active execution and records
  *   the outcome as `lastSuccessExecutionId` or `lastStoppedExecutionId` (with `stopSeq`
@@ -152,7 +152,7 @@ FingerprintLedger withLease(in FingerprintLedger ledger, string leaseExpiresAt) 
  *
  * Throws: InvalidStateTransitionException if the active execution is not running.
  */
-FingerprintLedger withRequeue(in FingerprintLedger ledger) @trusted
+private FingerprintLedger withRequeue(in FingerprintLedger ledger) @trusted
 {
     auto active = activeOf(ledger, "requeue");
     requireValid(active.status == ExecutionStatus.running, format("Execution '%s' is %s, so it cannot be requeued", active.id, active.status));
@@ -283,13 +283,6 @@ struct LedgerFold
  */
 final class LedgerStore
 {
-    /// How many times an operation re-reads and retries after losing a compare-and-set to a
-    /// concurrent write of the same ledger before failing. Every lost attempt means another write
-    /// succeeded, so this is reached only under sustained contention on one fingerprint. A ledger
-    /// is shared by every chain that needs the fingerprint and by the workers and the sweep, so
-    /// many writers can contend on it at once.
-    enum maxWriteAttempts = 100;
-
     private DocumentCollection!FingerprintLedger m_ledgers;
     private ExecutionStore m_executions;
     /// Ledgers per page of the `active` index.
@@ -406,8 +399,8 @@ final class LedgerStore
 
     /**
      * Replaces the ledger `current` with `next`, which may change only its active execution's
-     * attempt, status, worker, lease and lost leases (the `withStart`, `withLease`, `withRequeue`
-     * and `withLostLease` transitions): the claim and the fold have their own operations.
+     * attempt, status, worker, lease and lost leases (the `withStart`, `withLease` and
+     * `withLostLease` transitions): the claim and the fold have their own operations.
      *
      * Throws: DocumentConflictException if the ledger changed since `current` was read;
      * InvalidStateTransitionException if `next` changes anything else, or is malformed.
@@ -896,7 +889,6 @@ unittest
     // Transitions that cannot apply
     assert(throwsA!InvalidStateTransitionException({ withStart(counted.value, "w4", "2026-10-18T10:08:00Z", "2026-10-18T10:07:00Z"); }));
     assert(throwsA!InvalidStateTransitionException({ withLease(lostAndQueued.value, "2026-10-18T10:09:00Z"); }));
-    assert(throwsA!InvalidStateTransitionException({ withRequeue(requeued.value); }));
     assert(throwsA!InvalidStateTransitionException({ withLostLease(requeued.value, true); }));
     assert(throwsA!InvalidStateTransitionException({ withClaim(counted.value, proposal()); }), "An active execution cannot be claimed over");
 

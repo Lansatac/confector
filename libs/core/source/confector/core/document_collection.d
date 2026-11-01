@@ -20,6 +20,14 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, deserializeJson, serializeToJson;
 
 /**
+ * How many times a write that loses a compare-and-set to a concurrent writer of the same document
+ * re-reads and retries before it fails loudly. Every lost attempt means another write succeeded, so
+ * this is reached only under sustained contention on one document: a ledger or a chain is shared by
+ * every request, worker and sweep that needs it.
+ */
+enum maxWriteAttempts = 100;
+
+/**
  * A document's value together with the version it was read or written at. Pass the version back
  * to a compare-and-set write; the write fails with DocumentConflictException if the document
  * changed since. Versioned forwards to its value, except for a field of the value named `value`

@@ -62,12 +62,6 @@ enum size_t defaultPageSize = 100;
  */
 final class ChainStore
 {
-    /// How many times `addPins` re-reads and retries after losing a compare-and-set to a
-    /// concurrent write of the same chain before failing. Every lost attempt means another write
-    /// succeeded; like a ledger, a chain is shared by every request that joins it, so many can
-    /// add pins at once.
-    enum maxWriteAttempts = 100;
-
     private DocumentCollection!BuildChain m_chains;
     private CounterStore m_counters;
 
@@ -1069,7 +1063,7 @@ unittest
     try chains.addPins(id, [pinOf("video", "main", "vvv111")]);
     catch (Exception e) gaveUp = e.msg.canFind("attempts in a row");
     interleaving.beforeNextWrite = null;
-    assert(gaveUp && landed == ChainStore.maxWriteAttempts, "addPins must give up after maxWriteAttempts lost writes");
+    assert(gaveUp && landed == maxWriteAttempts, "addPins must give up after maxWriteAttempts lost writes");
     assert(direct.get(id).get.pins.length == pinsBefore);
 }
 

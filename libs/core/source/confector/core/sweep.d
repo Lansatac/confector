@@ -165,12 +165,11 @@ version (unittest)
         return stores.ledgers.get(fingerprint).get.active.get;
     }
 
-    /// A successful completion of attempt 1.
-    private TaskExecutionResult succeededFirstAttempt()
+    /// A successful completion.
+    private TaskExecutionResult succeededResult()
     {
         TaskExecutionResult result;
         result.status = ExecutionStatus.succeeded;
-        result.attempt = 1;
         return result;
     }
 }
@@ -207,7 +206,7 @@ unittest
     auto racing = new StateStores(interleaving);
     // The writes of the completion: 1 the execution's record, 2 the fold, 3 the reconcile's commit
     beforeWrite(interleaving, 3, () { throw new Exception("The wake's write is lost"); });
-    assert(completeExecution(racing, fingerprint, id, succeededFirstAttempt(), fixedNow()).status == ExecutionStatus.succeeded);
+    assert(completeExecution(racing, fingerprint, id, 1, succeededResult(), fixedNow()).status == ExecutionStatus.succeeded);
     assert(stores.requests.get("ra").get.state.outcome == RequestOutcome.open, "The lost wake leaves the request open");
 
     auto summary = sweepCoordination(stores, 3, fixedNow());

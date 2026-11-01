@@ -7,7 +7,6 @@ module confector.core.input_resolution;
  * evaluated against and the current rerun generations.
  *
  * - `requiredPins` lists the (repository, ref) each repository input in the graph needs, and
- *   `unpinnedRepositoryInputs` the inputs whose (repository, ref) given pins do not cover.
  * - `resolveGraphInputs` pins every task's repository and value inputs from given pins.
  * - `graphResolution` computes every task's fingerprint from the graph, its bindings, its pins and
  *   the current rerun generations; `completeGraphResolution` is the same for callers that hold
@@ -110,28 +109,6 @@ RepositoryAt[InputKey] requiredPins(const TaskGraph graph, in RepositoryRef[Inpu
             result[key] = RepositoryAt(decl.spec.repository, *bound);
         }
     }
-    return result;
-}
-
-/**
- * Returns the repository inputs declared anywhere in `graph` whose (repository, ref), bound by
- * `bindings`, `pins` does not pin, as keys sorted by task and then input name. The shell resolves
- * the refs (confector.core.chain_pins.refsToResolve); pre-supplied pins are never resolved live.
- *
- * Throws: InputResolutionException as `requiredPins` does, or if an entry of `pins` is not
- * stored under its own key.
- */
-InputKey[] unpinnedRepositoryInputs(const TaskGraph graph, in RepositoryRef[InputKey] bindings,
-    in RepositoryPin[RepositoryAt] pins) @trusted
-{
-    requireKeyed(pins);
-
-    InputKey[] result;
-    foreach (key, at; requiredPins(graph, bindings))
-    {
-        if (at !in pins) result ~= key;
-    }
-    result.sort!((a, b) => a.taskId != b.taskId ? a.taskId < b.taskId : a.input < b.input);
     return result;
 }
 
@@ -434,12 +411,9 @@ unittest
     auto graph = new TaskGraph([package_, lint, test, compile]);
     RepositoryPin[RepositoryAt] none;
     assert(requiredPins(graph, bindAll(graph)) == [InputKey("compile", "src"): at("game", mainBranch), InputKey("test", "src"): at("game", mainBranch)]);
-    assert(unpinnedRepositoryInputs(graph, bindAll(graph), none) == [InputKey("compile", "src"), InputKey("test", "src")],
-        "Each repository input is listed per task input, in a deterministic order");
 
     // One pin of (game, main) covers every input bound to it
     auto pins = pinsAt("game", mainBranch, "aaa111");
-    assert(unpinnedRepositoryInputs(graph, bindAll(graph), pins).length == 0);
     auto r = evaluate(graph, pins);
 
     assert(r.inputs.length == 4 && r.fingerprints.length == 4, "Every task must be resolved and fingerprinted");
@@ -580,20 +554,16 @@ unittest
 
     // A pin of the same repository at another ref does not cover an input bound to main
     auto onlyRelease = pinsAt("game", RepositoryRef(RefKind.branch, "release"), "aaa111");
-    assert(unpinnedRepositoryInputs(graph, bindAll(graph), onlyRelease) == [InputKey("b", "src"), InputKey("c", "src")]);
     assert(throwsA!InputResolutionException({ evaluate(graph, onlyRelease); }));
 
     // An input the request does not bind is refused, even when pinned
     auto pins = pinsAt("game", mainBranch, "aaa111");
     auto bound = bindAll(graph);
     bound.remove(InputKey("c", "src"));
-    foreach (attempt; [{ unpinnedRepositoryInputs(graph, bound, pins); }, { atGenerations("p", graph, bound, pins); }])
-    {
-        bool threw = false;
-        try attempt();
-        catch (InputResolutionException ex) threw = ex.taskId == "c" && ex.inputName == "src" && ex.msg.canFind("not bound");
-        assert(threw);
-    }
+    bool unbound = false;
+    try atGenerations("p", graph, bound, pins);
+    catch (InputResolutionException ex) unbound = ex.taskId == "c" && ex.inputName == "src" && ex.msg.canFind("not bound");
+    assert(unbound);
 
     // An undefined or null pin is not a value
     foreach (empty; [Json.undefined, Json(null)])
@@ -614,14 +584,12 @@ unittest
     TaskNode a; a.id = "a"; a.inputs["src"] = repositoryInput("game");
     auto graph = new TaskGraph([a]);
     auto fork = pinsAt("game-fork", mainBranch, "aaa111");
-    assert(unpinnedRepositoryInputs(graph, bindAll(graph), fork) == [InputKey("a", "src")]);
     bool threw = false;
     try evaluate(graph, fork);
     catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src" && ex.msg.canFind("'game'");
     assert(threw);
 
     RepositoryPin[RepositoryAt] misfiled = [at("game", mainBranch): RepositoryPin("game-fork", mainBranch, InputPin(Json("aaa111")))];
-    assert(throwsA!InputResolutionException({ unpinnedRepositoryInputs(graph, bindAll(graph), misfiled); }));
     assert(throwsA!InputResolutionException({ evaluate(graph, misfiled); }));
 }
 
@@ -633,10 +601,6 @@ unittest
     auto graph = new TaskGraph([a]);
     auto pins = pinsAt("", mainBranch, "aaa111");
     bool threw = false;
-    try unpinnedRepositoryInputs(graph, bindAll(graph), null);
-    catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
-    assert(threw, "An input without a repository must not be listed for resolving");
-    threw = false;
     try evaluate(graph, pins);
     catch (InputResolutionException ex) threw = ex.taskId == "a" && ex.inputName == "src";
     assert(threw, "An input without a repository must not resolve, even when pinned");

@@ -99,7 +99,7 @@ private struct ExecutionView
     string errorMessage;
 }
 
-/// An execution a worker holds: the attempt and token its requests present, and the work order.
+/// An execution a worker holds: the attempt it was given, the token its requests present, and the work order.
 private struct Held
 {
     string workerId;
@@ -199,7 +199,6 @@ private final class GateEnvironment
     string heartbeat(in Held held, long leaseSeconds)
     {
         Json payload = Json.emptyObject;
-        payload["attempt"] = Json(cast(long) held.attempt);
         payload["lease_seconds"] = Json(leaseSeconds);
         auto reply = send(HTTPMethod.POST, "/api/v1/executions/" ~ held.executionId ~ "/heartbeat",
             headers("Content-Type", "application/json", workerTokenHeader, held.token), payload.toString());
@@ -212,7 +211,6 @@ private final class GateEnvironment
     {
         TaskExecutionResult result;
         result.status = status;
-        result.attempt = held.attempt;
         auto reply = send(HTTPMethod.POST, "/api/v1/executions/" ~ held.executionId ~ "/complete",
             headers("Content-Type", "application/json", workerTokenHeader, held.token), serializeToJson(result).toString());
         assert(reply.status == HTTPStatus.ok, format("The completion was refused (HTTP %s): %s", reply.status, reply.body.toString()));
@@ -629,9 +627,9 @@ private void supersededWorkerReportsNothing()
     assert(counts.calls.get("complete", 0) == 0, "A superseded worker reports no completion");
     assert(runner.tasksProcessed == 1, "A stopped attempt was not counted as processed");
 
-    // The worker's own heartbeat for attempt 1 is answered superseded
+    // The worker's own heartbeat, with the token of attempt 1, is answered superseded
     LeaseAnswer answer;
-    runOffThread({ answer = runner.client.heartbeat(first.get.executionId, 1, 60, first.get.token); });
+    runOffThread({ answer = runner.client.heartbeat(first.get.executionId, 60, first.get.token); });
     assert(answer == LeaseAnswer.superseded, format("A superseded heartbeat was answered %s", answer));
 
     const holder = env.onlyExecutionAt(fingerprint);
@@ -660,7 +658,6 @@ private void repeatedCompletionIsRejected()
     TaskExecutionResult result;
     result.taskId = "compile";
     result.status = ExecutionStatus.succeeded;
-    result.attempt = held.get.attempt;
     CompletionReport report;
     Nullable!ClaimedWork idle;
     runOffThread({

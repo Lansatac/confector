@@ -707,9 +707,6 @@ struct TaskExecutionResult
     /// How the execution ended: succeeded, failed or cancelled. Required: a completion without
     /// a status is malformed, and one with an active status is rejected.
     @asName("status") ExecutionStatus status;
-    /// The attempt the worker was given with the work order (`ActiveExecution.attempt` when it
-    /// started the execution). Required: a completion from a superseded attempt is rejected.
-    @asName("attempt") ulong attempt;
     @optional @asName("exit_code") int exitCode = 0;
     @optional @asName("error_message") string errorMessage;
     @optional @asName("produced_artifacts") ArtifactMetadata[] producedArtifacts;
@@ -1132,8 +1129,8 @@ struct ActiveExecution
     /// queued (waiting for a worker) or running (held by `worker` under a lease).
     ExecutionStatus status;
     /// How many times a worker has started the execution; the current start's number is its
-    /// attempt. A worker's heartbeat and completion carry the attempt, and one from another attempt
-    /// is rejected. It fences workers only, so it is not the retry limit (see `expiredLeases`).
+    /// attempt. The attempt is in the worker's token, and a heartbeat or completion from another
+    /// attempt is rejected. It fences workers only, so it is not the retry limit (see `expiredLeases`).
     ulong attempt;
     /// The worker holding it and when its lease expires unless a heartbeat extends it (ISO 8601
     /// UTC); both empty unless running.
