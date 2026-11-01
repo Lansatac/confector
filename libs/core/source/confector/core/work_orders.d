@@ -50,7 +50,7 @@ import std.datetime.systime : Clock, SysTime;
 import std.datetime.timezone : UTC;
 import std.format : format;
 import std.typecons : Nullable, nullable;
-import vibe.core.log : logError, logWarn;
+import vibe.core.log : logWarn;
 
 /// How many times a write that loses a compare-and-set to a concurrent writer of the same
 /// ledger re-reads and retries. Every lost attempt means another write succeeded, so this is
@@ -138,11 +138,9 @@ WorkOrder workOrderFor(string fingerprint, in ActiveExecution active, in TaskNod
  * and each execution is started by compare-and-set (`startExecution`), so concurrent workers never
  * claim one execution twice: a worker that loses moves on to the next.
  *
- * An execution whose stored definition or task is missing is failed, saying so, and the next one
- * is claimed.
- *
- * Throws: InvalidLeaseRequestException if `workerId` is empty or `lease` is not valid; whatever
- * the stores throw.
+ * Throws: InvalidLeaseRequestException if `workerId` is empty or `lease` is not valid; Exception
+ * if the stored definition of the execution it starts, or its task, is missing (see `definedTask`);
+ * whatever the stores throw.
  */
 Nullable!ClaimedWork claimWork(StateStores stores, string workerId, Duration lease, string now = null)
 {
@@ -159,27 +157,6 @@ Nullable!ClaimedWork claimWork(StateStores stores, string workerId, Duration lea
         foreach (ref candidate; page.items)
         {
             if (candidate.active.isNull || candidate.active.get.status != ExecutionStatus.queued) continue;
-            // An execution that cannot be run is failed with the real cause before any worker
-            // holds it, so it never loops on lost leases
-            try
-            {
-                definedTask(stores, candidate.active.get);
-            }
-            catch (UnrunnableExecutionException e)
-            {
-                logError("[work] Failing execution '%s': %s", candidate.active.get.id, e.msg);
-                try
-                {
-                    finishExecution(stores, candidate.fingerprint, candidate.active.get.id, ExecutionStatus.failed, 1,
-                        "The execution could not be dispatched: " ~ e.msg, null, now);
-                }
-                catch (StaleCompletionException)
-                {
-                    // It ended or moved on since the index listed it: nothing left to fail
-                    logWarn("[work] Execution '%s' ended before it could be failed", candidate.active.get.id);
-                }
-                continue;
-            }
             auto started = startExecution(stores, candidate.fingerprint, workerId, lease, now);
             if (started.isNull) continue;
             const task = definedTask(stores, started.get);
@@ -190,30 +167,22 @@ Nullable!ClaimedWork claimWork(StateStores stores, string workerId, Duration lea
     }
 }
 
-/// An execution's stored definition, or its task in it, does not exist: it can never be run.
-class UnrunnableExecutionException : Exception
-{
-    this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
-    {
-        super(msg, file, line);
-    }
-}
-
-/// The task `active` runs, read from its stored definition.
+/// The task `active` runs, read from its stored definition. Definitions are never removed and the
+/// request reconciler only dispatches tasks its definition has, so a missing one is an internal error.
 ///
-/// Throws: UnrunnableExecutionException if the definition or the task is missing.
+/// Throws: Exception if the definition or the task is missing.
 private TaskNode definedTask(StateStores stores, in ActiveExecution active)
 {
     auto definition = stores.definitions.get(active.definitionId);
     if (definition.isNull)
     {
-        throw new UnrunnableExecutionException(format("Execution '%s' runs with definition '%s', which does not exist", active.id, active.definitionId));
+        throw new Exception(format("Execution '%s' runs with definition '%s', which does not exist", active.id, active.definitionId));
     }
     foreach (ref task; definition.get.tasks)
     {
         if (task.id == active.taskId) return task;
     }
-    throw new UnrunnableExecutionException(format("Execution '%s' runs task '%s', which definition '%s' does not have", active.id, active.taskId, active.definitionId));
+    throw new Exception(format("Execution '%s' runs task '%s', which definition '%s' does not have", active.id, active.taskId, active.definitionId));
 }
 
 /**
@@ -625,29 +594,6 @@ TaskExecution finishExecution(StateStores stores, string fingerprint, string exe
     const active = requireActiveExecution(stores, fingerprint, executionId);
     auto own = executionArtifacts(fingerprint, executionId, artifacts);
     return endExecution(stores, fingerprint, active, status, exitCode, errorMessage, own, now.length > 0 ? now : utcNow());
-}
-
-/**
- * Fails attempt `attempt` of execution `executionId` at `fingerprint` because no worker could be
- * given it (its work order could not be signed), recording `errorMessage`. Only the attempt that
- * holds the execution may fail it, as for a completion: an attempt a later one superseded is
- * rejected and nothing is recorded, so a stale claim never fails the attempt that holds the
- * execution now.
- *
- * Throws: SupersededAttemptException if the execution is not running attempt `attempt`; as
- * `finishExecution` otherwise.
- */
-TaskExecution failClaimedAttempt(StateStores stores, string fingerprint, string executionId, ulong attempt, string errorMessage,
-    string now = null)
-{
-    const active = requireActiveExecution(stores, fingerprint, executionId);
-    if (active.status != ExecutionStatus.running || active.attempt != attempt)
-    {
-        throw new SupersededAttemptException(format(
-            "Execution '%s' is %s at attempt %s; the failure of attempt %s is rejected",
-            executionId, active.status, active.attempt, attempt));
-    }
-    return endExecution(stores, fingerprint, active, ExecutionStatus.failed, 1, errorMessage, null, now.length > 0 ? now : utcNow());
 }
 
 /**
@@ -1742,56 +1688,6 @@ unittest
     assert(lost.disposition == LostLeaseDisposition.failed);
     const state = stores.requests.get("ra").get.value;
     assert(state.state.outcome == RequestOutcome.failed && taskOf(state, "compile").status == RequestTaskStatus.failed);
-}
-
-unittest
-{
-    // An execution whose stored definition is missing is failed with that cause before any worker
-    // holds it, and the next queued execution is handed out
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    auto broken = sampleClaim(stores, "2026-10-16T10:00:00Z");
-    broken.definitionId = "def_missing";
-    const brokenId = stores.ledgers.claim("fp_broken", 0, broken).executionId;
-    const healthyId = queueExecution(stores, "fp_healthy", "2026-10-16T10:00:05Z");
-
-    auto claimed = claimWork(stores, "w1", testLease, fixedNow());
-    assert(!claimed.isNull && claimed.get.workOrder.executionId == healthyId);
-    auto failed = stores.executions.get(brokenId).get;
-    assert(failed.status == ExecutionStatus.failed && failed.attempts == 0 && failed.worker.length == 0);
-    assert(failed.errorMessage.canFind("could not be dispatched") && failed.errorMessage.canFind("def_missing"), failed.errorMessage);
-    auto ledger = stores.ledgers.get("fp_broken").get;
-    assert(ledger.active.isNull && ledger.lastStoppedExecutionId == brokenId && ledger.stopSeq == 1);
-
-    // A definition without the task fails the same way
-    auto taskless = sampleClaim(stores, "2026-10-16T10:00:00Z");
-    taskless.taskId = "link";
-    const tasklessId = stores.ledgers.claim("fp_taskless", 0, taskless).executionId;
-    assert(claimWork(stores, "w2", testLease, fixedNow()).isNull);
-    assert(stores.executions.get(tasklessId).get.errorMessage.canFind("'link'"));
-}
-
-unittest
-{
-    // A failure of a worker's claim (its token could not be signed) is fenced by attempt: after the
-    // lease expired and attempt 2 started, attempt 1's failure is rejected and records nothing, so
-    // attempt 2 still holds the execution and its own failure is the one recorded
-    auto stores = new StateStores(new InMemoryDocumentStore());
-    const id = runningExecution(stores);
-    assert(expireLease(stores, "fp1", 3, later(2.minutes)).disposition == LostLeaseDisposition.requeued);
-    assert(claimWork(stores, "w2", testLease, later(2.minutes)).get.attempt == 2);
-
-    bool rejected = false;
-    try failClaimedAttempt(stores, "fp1", id, 1, "The execution could not be dispatched: stale", later(2.minutes));
-    catch (SupersededAttemptException e) rejected = e.msg.canFind("attempt 1");
-    assert(rejected, "A stale attempt's failure is rejected");
-    auto held = activeAt(stores);
-    assert(held.status == ExecutionStatus.running && held.attempt == 2 && held.worker == "w2", "The current attempt still holds it");
-    assert(stores.executions.get(id).isNull, "The rejected failure records nothing");
-
-    // The attempt holding the execution fails it
-    auto failed = failClaimedAttempt(stores, "fp1", id, 2, "The execution could not be dispatched: current", later(2.minutes));
-    assert(failed.status == ExecutionStatus.failed && failed.attempts == 2 && failed.errorMessage.canFind("current"));
-    assert(stores.executions.get(id).get.status == ExecutionStatus.failed);
 }
 
 unittest

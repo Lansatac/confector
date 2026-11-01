@@ -1,6 +1,6 @@
 module confector.core.worker_token;
 
-import confector.api.model : InputKind, WorkOrder;
+import confector.api.model : InputKind, ResolvedInput, TaskNode, WorkOrder;
 import confector.core.constant_time : constantTimeEquals;
 import core.time : minutes;
 import std.base64 : Base64URLNoPadding;
@@ -116,28 +116,49 @@ WorkerTokenClaims workerTokenClaimsFor(in WorkOrder order, ulong attempt, long i
     claims.fingerprint = order.fingerprint;
     claims.attempt = attempt;
     claims.expiresAt = issuedAt + order.timeoutSeconds + workerTokenGrace.total!"seconds";
-
-    import std.algorithm.sorting : sort;
-    foreach (name; order.taskNode.inputs.keys.sort)
+    try
     {
-        const decl = order.taskNode.inputs[name];
+        claims.inputs = inputArtifactsFor(order.taskNode, order.payload.inputs);
+    }
+    catch (Exception e)
+    {
+        throw new Exception(format("Cannot issue a worker token for execution '%s': %s", order.executionId, e.msg));
+    }
+    return claims;
+}
+
+/**
+ * The artifacts that the task output inputs of `task` declare, one per input that declares an
+ * artifact, in input-name order. Each such input must be resolved in `inputs` as a task output
+ * pinned to an upstream fingerprint, which the artifact is named under. Inputs that declare no
+ * artifact are dependencies only and contribute nothing. Pure.
+ *
+ * Throws: Exception if such an input has no resolved input of its name, or that input is not a
+ * task output pinned to a string.
+ */
+InputArtifact[] inputArtifactsFor(in TaskNode task, in ResolvedInput[] inputs)
+{
+    import std.algorithm.sorting : sort;
+
+    InputArtifact[] artifacts;
+    foreach (name; task.inputs.keys.sort)
+    {
+        const decl = task.inputs[name];
         if (decl.kind != InputKind.taskOutput || decl.spec.artifact.length == 0) continue;
         bool found = false;
-        foreach (resolved; order.payload.inputs)
+        foreach (resolved; inputs)
         {
             if (resolved.name != name) continue;
             if (resolved.kind != InputKind.taskOutput || resolved.pinned.type != Json.Type.string)
-                throw new Exception(format("Cannot issue a worker token for execution '%s': input '%s' is not pinned to an upstream fingerprint",
-                    order.executionId, name));
-            claims.inputs ~= InputArtifact(resolved.pinned.get!string, decl.spec.artifact);
+                throw new Exception(format("Input '%s' declares an artifact, but is not pinned to an upstream fingerprint", name));
+            artifacts ~= InputArtifact(resolved.pinned.get!string, decl.spec.artifact);
             found = true;
             break;
         }
         if (!found)
-            throw new Exception(format("Cannot issue a worker token for execution '%s': input '%s' has no resolved value",
-                order.executionId, name));
+            throw new Exception(format("Input '%s' declares an artifact, but has no resolved value", name));
     }
-    return claims;
+    return artifacts;
 }
 
 /**
@@ -327,6 +348,29 @@ unittest
     auto unresolved = testOrder();
     unresolved.payload.inputs = unresolved.payload.inputs[1 .. $];
     assertThrown!Exception(workerTokenClaimsFor(unresolved, 1, testNow));
+}
+
+unittest
+{
+    // An input that declares an artifact needs a task output pinned to a fingerprint, whatever the
+    // inputs' order; an input that declares none is a dependency and may be absent
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    const task = testOrder().taskNode;
+    const engine = ResolvedInput("engine", InputKind.taskOutput, Json("fp_engine"));
+    const setup = ResolvedInput("setup", InputKind.taskOutput, Json("fp_setup"));
+    assert(inputArtifactsFor(task, [setup, engine]) == [InputArtifact("fp_engine", "engine.zip")]);
+    assert(inputArtifactsFor(task, [engine]) == [InputArtifact("fp_engine", "engine.zip")]);
+
+    void rejected(in ResolvedInput[] inputs, string reason)
+    {
+        auto failure = collectException(inputArtifactsFor(task, inputs));
+        assert(failure !is null && failure.msg.canFind("'engine'") && failure.msg.canFind(reason), "Accepted: " ~ reason);
+    }
+    rejected([setup], "has no resolved value");
+    rejected([ResolvedInput("engine", InputKind.value, Json("fp_engine")), setup], "not pinned to an upstream fingerprint");
+    rejected([ResolvedInput("engine", InputKind.taskOutput, Json(3)), setup], "not pinned to an upstream fingerprint");
 }
 
 unittest

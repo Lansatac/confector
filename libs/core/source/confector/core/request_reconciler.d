@@ -28,8 +28,8 @@ module confector.core.request_reconciler;
  *
  * 1. Build the execution to claim from the request's definition, the task's resolved inputs and
  *    the registered repository addresses. A task that cannot be built (its repository is not
- *    registered or has no address) fails loudly here, before anything is written, so it never
- *    holds the fingerprint.
+ *    registered or has no address, or an artifact input is not pinned) fails loudly here, before
+ *    anything is written, so it never holds the fingerprint.
  * 2. `LedgerStore.claim(F, seen, ...)`, with `seen` the ledger's `executionSeq` as the evaluation
  *    read it (NeededExecution.seenExecutionSeq), so a decision made before another execution
  *    started and ended never builds F twice. Losing (another execution is active, or one was
@@ -62,6 +62,7 @@ import confector.core.request_evaluator;
 import confector.core.request_state : withEvaluation, withFailure;
 import confector.core.state_stores : StateStores;
 import confector.core.work_orders : utcNow;
+import confector.core.worker_token : inputArtifactsFor;
 import confector.api.document_store : DocumentConflictException;
 import confector.api.model;
 
@@ -70,9 +71,10 @@ import std.format : format;
 import vibe.core.log : logError;
 
 /**
- * An execution cannot be built for a task: the request's definition lacks the task, or a
+ * An execution cannot be built for a task: the request's definition lacks the task, a
  * repository input names a repository that is not registered or has no address to check out
- * from. Nothing was written.
+ * from, or a task output input that declares an artifact is not pinned to an upstream fingerprint.
+ * Nothing was written.
  */
 class UndispatchableExecutionException : Exception
 {
@@ -110,8 +112,10 @@ struct Dispatched
  * `inputs`, the address of each repository input from `repositories` (keyed by repository id), and
  * `createdAt` = `now`. Pure.
  *
- * Throws: UndispatchableExecutionException if the definition lacks the task, or a repository
- * input names a repository missing from `repositories` or without an address.
+ * Throws: UndispatchableExecutionException if the definition lacks the task, a repository
+ * input names a repository missing from `repositories` or without an address, or a task output
+ * input that declares an artifact has no resolved input of its name pinned to an upstream
+ * fingerprint (the worker token names that fingerprint, so the execution could not be run).
  */
 ActiveExecution activeExecutionFor(string taskId, in ResolvedInput[] inputs, in DefinedRequest request,
     in RepositoryRecord[string] repositories, string now) @trusted
@@ -132,6 +136,14 @@ ActiveExecution activeExecutionFor(string taskId, in ResolvedInput[] inputs, in 
     active.taskId = taskId;
     active.definitionId = request.request.definitionId;
     active.inputs = (cast(ResolvedInput[]) inputs).dup;
+    try
+    {
+        inputArtifactsFor(*task, inputs);
+    }
+    catch (Exception e)
+    {
+        throw new UndispatchableExecutionException(format("Task '%s' (request '%s'): %s", taskId, request.request.id, e.msg));
+    }
     foreach (name; task.inputs.keys.sort().release)
     {
         const decl = task.inputs[name];
@@ -941,6 +953,64 @@ unittest
     auto missingTask = cast(NeededExecution) needed;
     missingTask.taskId = "deploy";
     assert(throwsA!UndispatchableExecutionException({ reconciler.dispatch(missingTask, entry); }));
+    assert(stores.ledgers.get(needed.fingerprint).isNull, "Nothing was claimed");
+}
+
+unittest
+{
+    // An execution whose task has an artifact input that is not resolved is not built, and the
+    // failure names the task and the input
+    import vibe.data.json : Json;
+
+    DefinedRequest request;
+    request.request.id = "r1";
+    request.request.projectId = "p1";
+    request.request.definitionId = "d1";
+    TaskNode link;
+    link.id = "link";
+    link.inputs["engine"] = taskOutputInput("build-engine", "engine.zip");
+    request.definition.tasks = [link];
+    RepositoryRecord[string] none;
+
+    auto pinned = ResolvedInput("engine", InputKind.taskOutput, Json("fp_engine"));
+    assert(activeExecutionFor("link", [pinned], request, none, "2026-10-20T10:00:00Z").inputs == [pinned]);
+    try
+    {
+        activeExecutionFor("link", ResolvedInput[].init, request, none, "2026-10-20T10:00:00Z");
+        assert(false, "An artifact input without a resolved value must not be built");
+    }
+    catch (UndispatchableExecutionException e)
+    {
+        assert(e.msg.canFind("'engine'") && e.msg.canFind("'link'") && e.msg.canFind("'r1'") && e.msg.canFind("has no resolved value"), e.msg);
+    }
+}
+
+unittest
+{
+    // A needed execution whose request declares an artifact input the evaluation did not pin is
+    // undispatchable: nothing is claimed, and the failure names the input. (The evaluation pins every
+    // task output input to its upstream fingerprint, so only a definition changed after evaluating
+    // it reaches this.)
+    auto stores = new StateStores(new InMemoryDocumentStore());
+    auto reconciler = reconcilerOf(stores);
+    createChain(stores, "c1");
+    intake(stores, "c1", "r1", ["test"], "2026-10-20T10:00:00Z");
+    auto entry = definedRequest(stores, "r1");
+    const needed = evaluateFrom(stores, "r1").needed[0];
+    foreach (ref task; entry.definition.tasks)
+    {
+        if (task.id == needed.taskId) task.inputs["setup"] = taskOutputInput("setup", "setup.zip");
+    }
+
+    try
+    {
+        reconciler.dispatch(needed, entry);
+        assert(false, "An artifact input without a pin must fail the dispatch");
+    }
+    catch (UndispatchableExecutionException e)
+    {
+        assert(e.msg.canFind("'setup'") && e.msg.canFind("has no resolved value"), e.msg);
+    }
     assert(stores.ledgers.get(needed.fingerprint).isNull, "Nothing was claimed");
 }
 

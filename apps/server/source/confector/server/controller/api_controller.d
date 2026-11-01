@@ -18,7 +18,7 @@ import confector.server.authenticator : Authenticator;
 import confector.server.route_access : AuthorizedRoutes, ExcludedBy;
 import confector.core.sweep : sweepCoordination;
 import confector.core.work_orders : InvalidLeaseRequestException, LeaseAnswer, StaleCompletionException, UnknownExecutionException, claimWork,
-    completeExecution, failClaimedAttempt, heartbeatExecution, leaseOfSeconds, requireAttemptLimit, utcNow;
+    completeExecution, heartbeatExecution, leaseOfSeconds, requireAttemptLimit, utcNow;
 
 import std.format : format;
 import std.uuid : randomUUID;
@@ -215,8 +215,8 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
     // Receiving work: the worker pool credential admits a worker, which asks for one execution to
     // run under a lease of `lease_seconds`. The control plane claims a queued execution for it
     // and answers with the attempt and the work order, which carries the execution's worker
-    // token, or with 204 when nothing is queued. A claimed execution that cannot be given a token
-    // is failed, with the reason, and the next one is claimed.
+    // token, or with 204 when nothing is queued. An execution that cannot be given a token is never
+    // queued (the request reconciler checks it), so a failure here is a server error.
     poolRoute("/queue/receive", (HTTPServerRequest req, HTTPServerResponse res) {
         if (!authenticateWorkerPool(workerPoolCredential, req, res)) return;
         if (!requireStores(res)) return;
@@ -242,45 +242,20 @@ AuthorizedRoutes apiRouter(Authenticator authenticator, string schedulerCallback
             {
                 throw new InvalidLeaseRequestException(format("Malformed request: it needs a string worker_id and an integer lease_seconds: %s", e.msg));
             }
-            while (true)
+            auto claimed = claimWork(stores, workerId, lease, clock());
+            if (claimed.isNull)
             {
-                auto claimed = claimWork(stores, workerId, lease, clock());
-                if (claimed.isNull)
-                {
-                    res.statusCode = HTTPStatus.noContent;
-                    res.writeVoidBody();
-                    return;
-                }
-                auto work = claimed.get;
-                try
-                {
-                    work.workOrder.workerToken = mintWorkerToken(workerTokenKey,
-                        workerTokenClaimsFor(work.workOrder, work.attempt, Clock.currTime.toUnixTime()));
-                }
-                catch (Exception e)
-                {
-                    // This execution cannot be run (say, an input without a resolved
-                    // value), and would fail every receive that meets it. Fail the attempt that was
-                    // claimed, recording why, and hand out the next one. An attempt that a later one
-                    // superseded no longer holds the execution, so it fails nothing.
-                    logError("[api] Failing execution '%s': it cannot be given a worker token: %s", work.workOrder.executionId, e.msg);
-                    try
-                    {
-                        failClaimedAttempt(stores, work.workOrder.fingerprint, work.workOrder.executionId, work.attempt,
-                            "The execution could not be dispatched: " ~ e.msg, clock());
-                    }
-                    catch (StaleCompletionException superseded)
-                    {
-                        logWarn("[api] Execution '%s' moved on before its failure was recorded: %s", work.workOrder.executionId, superseded.msg);
-                    }
-                    continue;
-                }
-                Json answer = Json.emptyObject;
-                answer["attempt"] = Json(work.attempt);
-                answer["work_order"] = serializeToJson(work.workOrder);
-                res.writeJsonBody(answer);
+                res.statusCode = HTTPStatus.noContent;
+                res.writeVoidBody();
                 return;
             }
+            auto work = claimed.get;
+            work.workOrder.workerToken = mintWorkerToken(workerTokenKey,
+                workerTokenClaimsFor(work.workOrder, work.attempt, Clock.currTime.toUnixTime()));
+            Json answer = Json.emptyObject;
+            answer["attempt"] = Json(work.attempt);
+            answer["work_order"] = serializeToJson(work.workOrder);
+            res.writeJsonBody(answer);
         }
         catch (InvalidLeaseRequestException e)
         {
@@ -1151,21 +1126,19 @@ unittest
         assert(postWith(unknownToken, "/executions/exe_unknown/heartbeat", `{"attempt": 1, "lease_seconds": 30}`) == HTTPStatus.notFound);
     }
 
-    // An execution that cannot be given a token (its input has no resolved value) is failed,
-    // with the reason; the receive goes on to the next queued execution
+    // A queued execution whose artifact input has no resolved value cannot be given a token. The
+    // reconciler never queues one, so this state is written directly here: the receive fails loudly
+    // with 500 and the reason, and the claim is left to the lease sweep like any lost worker's
     {
         TaskNode needy = node;
         needy.inputs["up"] = taskOutputInput("up-task", "a.zip");
         TaskNode upstream;
         upstream.id = "up-task";
-        const brokenId = queueExecution(stores, "fp_broken", needy, "2026-10-16T10:00:01Z", [upstream]);
-        const healthyId = queueExecution(stores, "fp_healthy", node, "2026-10-16T10:00:02Z");
-        const batch = postReply(null, "/queue/receive", `{"worker_id": "w-batch", "lease_seconds": 30}`);
-        assert(batch.status == HTTPStatus.ok && bodyOf(batch)["work_order"]["execution_id"].get!string == healthyId, batch.body);
-        const broken = stores.executions.get(brokenId).get;
-        assert(broken.status == ExecutionStatus.failed && broken.errorMessage.canFind("could not be dispatched")
-            && broken.errorMessage.canFind("up"), broken.errorMessage);
-        assert(postReply(null, "/queue/receive", `{"worker_id": "w-batch", "lease_seconds": 30}`).status == HTTPStatus.noContent);
+        queueExecution(stores, "fp_broken", needy, "2026-10-16T10:00:01Z", [upstream]);
+        const failedReceive = postReply(null, "/queue/receive", `{"worker_id": "w-batch", "lease_seconds": 30}`);
+        assert(failedReceive.status == HTTPStatus.internalServerError && failedReceive.body.canFind("no resolved value"), failedReceive.body);
+        assert(activeAt(stores, "fp_broken").status == ExecutionStatus.running && activeAt(stores, "fp_broken").attempt == 1,
+            "The claim is held under its lease until the sweep expires it");
     }
 
     // Build logs fail loudly until the log store exists: uploading lines and reading a log both
